@@ -76,8 +76,12 @@ impl App {
     }
 
     pub fn append_token(&mut self, token: String) {
-        if let AppState::Streaming { response } = &mut self.state {
-            response.push_str(&token);
+        if let AppState::Streaming { response } = &self.state {
+            let mut new_response = response.clone();
+            new_response.push_str(&token);
+            self.state = AppState::Streaming {
+                response: new_response,
+            };
         }
     }
 }

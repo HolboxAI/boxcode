@@ -41,7 +41,9 @@ impl Config {
     }
 
     fn config_path() -> PathBuf {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
         home.join(".tuisample-code").join("config.toml")
     }
 }
