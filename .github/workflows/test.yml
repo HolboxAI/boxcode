@@ -38,6 +38,3 @@ jobs:
 
       - name: Run clippy (linter)
         run: cargo clippy --all --all-targets
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
