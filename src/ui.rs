@@ -96,12 +96,10 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 
     // Render cursor if in input mode
-    if matches!(app.state, AppState::AwaitingInput) {
-        if area.height > 1 && area.width > 2 {
-            let cursor_x = area.x + (app.input_buffer.len() as u16).min(area.width - 3) + 1;
-            let cursor_y = area.y + 1;
-            f.set_cursor(cursor_x, cursor_y);
-        }
+    if matches!(app.state, AppState::AwaitingInput) && area.height > 1 && area.width > 2 {
+        let cursor_x = area.x + (app.input_buffer.len() as u16).min(area.width - 3) + 1;
+        let cursor_y = area.y + 1;
+        f.set_cursor(cursor_x, cursor_y);
     }
 }
 

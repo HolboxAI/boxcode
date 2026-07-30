@@ -65,8 +65,7 @@ pub async fn stream_chat(
         let chunk_str = String::from_utf8(chunk_bytes.to_vec())?;
 
         for line in chunk_str.lines() {
-            if line.starts_with("data: ") {
-                let json_str = &line[6..];
+            if let Some(json_str) = line.strip_prefix("data: ") {
                 if json_str == "[DONE]" {
                     break;
                 }
