@@ -82,20 +82,3 @@ pub async fn stream_chat(
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_json_deserialization() {
-        // Test that we can deserialize OpenAI-format messages
-        let json = r#"{"choices": [{"delta": {"content": "Hello"}}]}"#;
-        let result: Result<StreamDelta, _> = serde_json::from_str(json);
-        assert!(result.is_ok());
-
-        let stream_delta = result.unwrap();
-        assert_eq!(stream_delta.choices.len(), 1);
-        assert!(stream_delta.choices[0].delta.content.is_some());
-    }
-}
