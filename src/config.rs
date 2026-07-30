@@ -27,6 +27,7 @@ impl Config {
         }
     }
 
+    #[allow(dead_code)]
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = Self::config_path();
 
