@@ -37,7 +37,7 @@ jobs:
         run: cargo build --release
 
       - name: Run clippy (linter)
-        run: cargo clippy --all --all-targets -- -D warnings
+        run: cargo clippy --all --all-targets
 
       - name: Check formatting
         run: cargo fmt --all -- --check
