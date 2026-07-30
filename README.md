@@ -27,7 +27,7 @@ Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-
 ### 1. Install
 
 ```bash
-curl -fsSL https://github.com/yourcompany/tuisample-code/releases/download/latest/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/HolboxAI/tuisample-code/main/install.sh | bash
 ```
 
 Or build from source:

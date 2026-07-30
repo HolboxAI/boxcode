@@ -36,19 +36,36 @@ case "$ARCH" in
     ;;
 esac
 
-# Download latest release
-RELEASE_URL="https://github.com/yourcompany/tuisample-code/releases/latest/download/tuisample-code-${OS_NAME}-${ARCH_NAME}"
-echo "Downloading from: $RELEASE_URL"
+# Get latest release tag
+LATEST_TAG=$(curl -fsSL https://api.github.com/repos/HolboxAI/tuisample-code/releases/latest | grep -oP '"tag_name": "\K[^"]+')
+if [ -z "$LATEST_TAG" ]; then
+  echo "Error: Could not fetch latest release from GitHub"
+  exit 1
+fi
+
+# Download latest release binary
+RELEASE_URL="https://github.com/HolboxAI/tuisample-code/releases/download/${LATEST_TAG}/tuisample-code-${OS_NAME}-${ARCH_NAME}"
+if [ "$OS_NAME" = "windows" ]; then
+  RELEASE_URL="${RELEASE_URL}.exe"
+fi
+
+echo "Downloading tuisample-code ${LATEST_TAG} for ${OS_NAME}-${ARCH_NAME}..."
 
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
 # Download binary
-curl -fsSL -o "$TEMP_DIR/tuisample-code" "$RELEASE_URL"
+if ! curl -fsSL -o "$TEMP_DIR/tuisample-code" "$RELEASE_URL"; then
+  echo "Error: Failed to download binary from $RELEASE_URL"
+  echo "Binary not found for ${OS_NAME}-${ARCH_NAME}"
+  exit 1
+fi
+
 chmod +x "$TEMP_DIR/tuisample-code"
 
 # Install to /usr/local/bin
+echo "Installing to /usr/local/bin..."
 sudo mv "$TEMP_DIR/tuisample-code" /usr/local/bin/tuisample-code
 
 echo "✓ Installed successfully!"
