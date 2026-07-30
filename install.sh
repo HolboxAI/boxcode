@@ -1,81 +1,60 @@
 #!/bin/bash
 set -e
 
-echo "Installing tuisample-code..."
+echo "🚀 Installing tuisample-code..."
+echo ""
 
-# Detect OS and architecture
-OS=$(uname -s)
-ARCH=$(uname -m)
+# Check for Rust/Cargo, install if needed
+if ! command -v cargo &> /dev/null; then
+  echo "📦 Rust not found. Installing Rust automatically..."
+  echo "   (This takes 1-2 minutes on first install)"
+  echo ""
 
-case "$OS" in
-  Darwin)
-    OS_NAME="macos"
-    ;;
-  Linux)
-    OS_NAME="linux"
-    ;;
-  MINGW64_NT*|MSYS_NT*)
-    OS_NAME="windows"
-    ;;
-  *)
-    echo "Unsupported OS: $OS"
-    exit 1
-    ;;
-esac
+  # Install Rust
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-case "$ARCH" in
-  x86_64|amd64)
-    ARCH_NAME="x86_64"
-    ;;
-  arm64|aarch64)
-    ARCH_NAME="aarch64"
-    ;;
-  *)
-    echo "Unsupported architecture: $ARCH"
-    exit 1
-    ;;
-esac
+  # Load Rust into current shell
+  export PATH="$HOME/.cargo/bin:$PATH"
+  source "$HOME/.cargo/env" 2>/dev/null || true
 
-# Get latest release tag (macOS and Linux compatible)
-LATEST_TAG=$(curl -fsSL https://api.github.com/repos/HolboxAI/tuisample-code/releases/latest | grep '"tag_name"' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' | head -1)
-if [ -z "$LATEST_TAG" ]; then
-  echo "Error: Could not fetch latest release from GitHub"
+  echo ""
+  echo "✓ Rust installed successfully"
+  echo ""
+fi
+
+# Verify cargo works
+if ! command -v cargo &> /dev/null; then
+  echo "Error: Could not install Rust. Please visit https://rustup.rs/"
   exit 1
 fi
 
-# Download latest release binary
-RELEASE_URL="https://github.com/HolboxAI/tuisample-code/releases/download/${LATEST_TAG}/tuisample-code-${OS_NAME}-${ARCH_NAME}"
-if [ "$OS_NAME" = "windows" ]; then
-  RELEASE_URL="${RELEASE_URL}.exe"
-fi
-
-echo "Downloading tuisample-code ${LATEST_TAG} for ${OS_NAME}-${ARCH_NAME}..."
-
-# Create temporary directory
+# Clone repo
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
-# Download binary
-if ! curl -fsSL -o "$TEMP_DIR/tuisample-code" "$RELEASE_URL"; then
-  echo "Error: Failed to download binary from $RELEASE_URL"
-  echo "Binary not found for ${OS_NAME}-${ARCH_NAME}"
-  exit 1
-fi
+echo "📥 Cloning repository..."
+git clone https://github.com/HolboxAI/tuisample-code.git "$TEMP_DIR"
 
-chmod +x "$TEMP_DIR/tuisample-code"
+echo "⚙️  Building tuisample-code (this takes 2-3 minutes)..."
+cd "$TEMP_DIR"
+cargo build --release
 
-# Install to /usr/local/bin
-echo "Installing to /usr/local/bin..."
-sudo mv "$TEMP_DIR/tuisample-code" /usr/local/bin/tuisample-code
+# Install binary
+echo "📍 Installing to /usr/local/bin..."
+sudo cp target/release/tuisample-code /usr/local/bin/tuisample-code
+sudo chmod +x /usr/local/bin/tuisample-code
 
-echo "✓ Installed successfully!"
 echo ""
-echo "Next steps:"
+echo "✅ Installation complete!"
+echo ""
+echo "🎯 Next steps:"
 echo "1. Configure your LLM endpoint:"
-echo "   export TUISAMPLE_ENDPOINT=https://llm.company.internal:8443"
-echo "   export TUISAMPLE_MODEL=company-llm-70b-v1.2"
-echo "   export TUISAMPLE_API_KEY=sk_company_xxx"
+echo "   export TUISAMPLE_ENDPOINT=https://api.openai.com"
+echo "   export TUISAMPLE_MODEL=gpt-4"
+echo "   export TUISAMPLE_API_KEY=sk-..."
 echo ""
 echo "2. Run tuisample-code:"
 echo "   tuisample-code"
+echo ""
+echo "📖 For more info: https://github.com/HolboxAI/tuisample-code"
 echo ""
