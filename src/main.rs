@@ -71,7 +71,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let tx_clone = tx.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = llm::stream_chat(&endpoint, &model, &api_key, &prompt_clone, tx_clone).await {
+                if let Err(e) =
+                    llm::stream_chat(&endpoint, &model, &api_key, &prompt_clone, tx_clone).await
+                {
                     tracing::error!("LLM error: {}", e);
                 }
             });

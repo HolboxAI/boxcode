@@ -66,13 +66,9 @@ fn render_messages(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(""));
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Messages ");
+    let block = Block::default().borders(Borders::ALL).title(" Messages ");
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
 
     f.render_widget(paragraph, area);
 }
@@ -84,9 +80,7 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
         app.input_buffer.clone()
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Input ");
+    let block = Block::default().borders(Borders::ALL).title(" Input ");
 
     let paragraph = Paragraph::new(input_text)
         .block(block)
