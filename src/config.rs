@@ -22,38 +22,8 @@ impl Config {
             let contents = std::fs::read_to_string(&config_path)?;
             Ok(toml::from_str(&contents)?)
         } else {
-            // Check if env vars are set
-            let endpoint = std::env::var("TUISAMPLE_ENDPOINT").ok();
-            let model = std::env::var("TUISAMPLE_MODEL").ok();
-            let api_key = std::env::var("TUISAMPLE_API_KEY").ok();
-
-            if endpoint.is_some() && model.is_some() && api_key.is_some() {
-                // Use env vars
-                Ok(Self::default())
-            } else {
-                // Interactive setup
-                println!("\n🚀 Welcome to tuisample-code!\n");
-                println!("No configuration found. Let's set up your LLM connection.\n");
-
-                let endpoint = Self::prompt("LLM Endpoint (e.g., https://api.openai.com)")?;
-                let model = Self::prompt("Model name (e.g., gpt-4)")?;
-                let api_key = Self::prompt("API Key")?;
-
-                let config = Config {
-                    llm: LlmConfig {
-                        endpoint,
-                        model,
-                        api_key,
-                    },
-                };
-
-                // Save config for next time
-                config.save().ok(); // Ignore save errors
-
-                println!("\n✓ Configuration saved to ~/.tuisample-code/config.toml\n");
-
-                Ok(config)
-            }
+            // Just load defaults or env vars - no interactive prompt
+            Ok(Self::default())
         }
     }
 
