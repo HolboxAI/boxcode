@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -15,16 +16,54 @@ pub struct LlmConfig {
 
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        // Try to load from ~/.tuisample-code/config.toml
         let config_path = Self::config_path();
 
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
             Ok(toml::from_str(&contents)?)
         } else {
-            // Return default config
-            Ok(Self::default())
+            // Check if env vars are set
+            let endpoint = std::env::var("TUISAMPLE_ENDPOINT").ok();
+            let model = std::env::var("TUISAMPLE_MODEL").ok();
+            let api_key = std::env::var("TUISAMPLE_API_KEY").ok();
+
+            if endpoint.is_some() && model.is_some() && api_key.is_some() {
+                // Use env vars
+                Ok(Self::default())
+            } else {
+                // Interactive setup
+                println!("\n🚀 Welcome to tuisample-code!\n");
+                println!("No configuration found. Let's set up your LLM connection.\n");
+
+                let endpoint = Self::prompt("LLM Endpoint (e.g., https://api.openai.com)")?;
+                let model = Self::prompt("Model name (e.g., gpt-4)")?;
+                let api_key = Self::prompt("API Key")?;
+
+                let config = Config {
+                    llm: LlmConfig {
+                        endpoint,
+                        model,
+                        api_key,
+                    },
+                };
+
+                // Save config for next time
+                config.save().ok(); // Ignore save errors
+
+                println!("\n✓ Configuration saved to ~/.tuisample-code/config.toml\n");
+
+                Ok(config)
+            }
         }
+    }
+
+    fn prompt(label: &str) -> Result<String, Box<dyn std::error::Error>> {
+        print!("{}: ", label);
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        Ok(input.trim().to_string())
     }
 
     #[allow(dead_code)]
