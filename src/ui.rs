@@ -1,6 +1,6 @@
 use crate::app::{App, AppState};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
@@ -41,29 +41,58 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 fn render_messages(f: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
 
-    for msg in &app.messages {
-        let role_style = if msg.role == "You" {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::Yellow)
-        };
-
-        lines.push(Line::from(vec![Span::styled(
-            format!("{}: ", msg.role),
-            role_style,
-        )]));
-        lines.push(Line::from(msg.content.clone()));
+    // Show welcome screen if no messages yet
+    if app.messages.is_empty() || (app.messages.len() == 1 && app.messages[0].role == "Assistant") {
         lines.push(Line::from(""));
-    }
-
-    // Add streaming response if present
-    if let AppState::Streaming { response } = &app.state {
         lines.push(Line::from(vec![Span::styled(
-            "Assistant: ",
-            Style::default().fg(Color::Yellow),
+            "🚀 Welcome to tuisample-code",
+            Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
         )]));
-        lines.push(Line::from(response.clone()));
         lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Connected to: ",
+            Style::default().fg(Color::DarkGray),
+        ), Span::styled(
+            &app.config.llm.model,
+            Style::default().fg(Color::Green),
+        )]));
+        lines.push(Line::from(""));
+        lines.push(Line::from("📝 How to use:"));
+        lines.push(Line::from("  • Type your prompt below"));
+        lines.push(Line::from("  • Press Ctrl+Enter to send"));
+        lines.push(Line::from("  • Press Esc to cancel"));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "✓ Ready to go!",
+            Style::default().fg(Color::Green),
+        )]));
+        lines.push(Line::from(""));
+    } else {
+        // Show message history
+        for msg in &app.messages {
+            let role_style = if msg.role == "You" {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+
+            lines.push(Line::from(vec![Span::styled(
+                format!("{}: ", msg.role),
+                role_style,
+            )]));
+            lines.push(Line::from(msg.content.clone()));
+            lines.push(Line::from(""));
+        }
+
+        // Add streaming response if present
+        if let AppState::Streaming { response } = &app.state {
+            lines.push(Line::from(vec![Span::styled(
+                "Assistant: ",
+                Style::default().fg(Color::Yellow),
+            )]));
+            lines.push(Line::from(response.clone()));
+            lines.push(Line::from(""));
+        }
     }
 
     let block = Block::default().borders(Borders::ALL).title(" Messages ");
