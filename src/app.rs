@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crossterm::event::KeyEvent;
 
 #[derive(Clone, Debug)]
 pub enum AppState {

@@ -1,12 +1,11 @@
 use crate::app::{App, AppState};
-use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-pub fn render<B: Backend>(f: &mut Frame<B>, app: &App) {
+pub fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -18,19 +17,19 @@ pub fn render<B: Backend>(f: &mut Frame<B>, app: &App) {
         .split(f.size());
 
     // Header
-    render_header::<B>(f, chunks[0], app);
+    render_header(f, chunks[0], app);
 
     // Messages area (scrollable)
-    render_messages::<B>(f, chunks[1], app);
+    render_messages(f, chunks[1], app);
 
     // Input area
-    render_input::<B>(f, chunks[2], app);
+    render_input(f, chunks[2], app);
 
     // Footer (stats)
-    render_footer::<B>(f, chunks[3], app);
+    render_footer(f, chunks[3], app);
 }
 
-fn render_header<B: Backend>(f: &mut Frame<B>, area: Rect, app: &App) {
+fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let title = format!(
         "tuisample-code | {} | model: {}",
         app.config.llm.endpoint, app.config.llm.model
@@ -39,7 +38,7 @@ fn render_header<B: Backend>(f: &mut Frame<B>, area: Rect, app: &App) {
     f.render_widget(header, area);
 }
 
-fn render_messages<B: Backend>(f: &mut Frame<B>, area: Rect, app: &App) {
+fn render_messages(f: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in &app.messages {
@@ -78,7 +77,7 @@ fn render_messages<B: Backend>(f: &mut Frame<B>, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
-fn render_input<B: Backend>(f: &mut Frame<B>, area: Rect, app: &App) {
+fn render_input(f: &mut Frame, area: Rect, app: &App) {
     let input_text = if app.input_buffer.is_empty() {
         "Type your prompt... (Ctrl-Enter to send, Esc to cancel)".to_string()
     } else {
@@ -106,7 +105,7 @@ fn render_input<B: Backend>(f: &mut Frame<B>, area: Rect, app: &App) {
     }
 }
 
-fn render_footer<B: Backend>(f: &mut Frame<B>, area: Rect, app: &App) {
+fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let status = match &app.state {
         AppState::AwaitingInput => "Ready",
         AppState::Sending { .. } => "Sending...",
