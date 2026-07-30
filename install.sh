@@ -39,10 +39,37 @@ echo "⚙️  Building tuisample-code (this takes 2-3 minutes)..."
 cd "$TEMP_DIR"
 cargo build --release
 
+# Verify binary exists
+BINARY_PATH="$TEMP_DIR/target/release/tuisample-code"
+if [ ! -f "$BINARY_PATH" ]; then
+  echo "❌ Error: Binary not found at $BINARY_PATH"
+  echo "Build may have failed. Check the output above."
+  exit 1
+fi
+
+echo "✓ Binary built successfully"
+
 # Install binary
 echo "📍 Installing to /usr/local/bin..."
-sudo cp target/release/tuisample-code /usr/local/bin/tuisample-code
-sudo chmod +x /usr/local/bin/tuisample-code
+if ! sudo cp "$BINARY_PATH" /usr/local/bin/tuisample-code 2>/dev/null; then
+  echo "⚠️  Failed to install to /usr/local/bin (permission issue)"
+  echo "Trying alternative installation to ~/.local/bin..."
+
+  mkdir -p ~/.local/bin
+  cp "$BINARY_PATH" ~/.local/bin/tuisample-code
+  chmod +x ~/.local/bin/tuisample-code
+
+  # Check if ~/.local/bin is in PATH
+  if [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
+    echo "✓ Installed to ~/.local/bin (already in PATH)"
+  else
+    echo "⚠️  Installed to ~/.local/bin"
+    echo "Add to your PATH: export PATH=\"\$HOME/.local/bin:\$PATH\""
+  fi
+else
+  sudo chmod +x /usr/local/bin/tuisample-code
+  echo "✓ Installed to /usr/local/bin"
+fi
 
 echo ""
 echo "✅ Installation complete!"
