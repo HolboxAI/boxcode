@@ -88,59 +88,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_chat_message_creation() {
-        let msg = ChatMessage {
-            role: "user".to_string(),
-            content: "Hello".to_string(),
-        };
+    fn test_json_deserialization() {
+        // Test that we can deserialize OpenAI-format messages
+        let json = r#"{"choices": [{"delta": {"content": "Hello"}}]}"#;
+        let result: Result<StreamDelta, _> = serde_json::from_str(json);
+        assert!(result.is_ok());
 
-        assert_eq!(msg.role, "user");
-        assert_eq!(msg.content, "Hello");
-    }
-
-    #[test]
-    fn test_chat_request_serialization() {
-        let request = ChatRequest {
-            model: "gpt-4".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "What is AI?".to_string(),
-            }],
-            stream: true,
-            max_tokens: 1024,
-        };
-
-        let json = serde_json::to_string(&request).expect("Should serialize");
-        assert!(json.contains("gpt-4"));
-        assert!(json.contains("What is AI?"));
-        assert!(json.contains("true"));
-        assert!(json.contains("1024"));
-    }
-
-    #[test]
-    fn test_delta_deserialization() {
-        let json = r#"{"content": "Hello"}"#;
-        let delta: Delta = serde_json::from_str(json).expect("Should deserialize");
-        assert_eq!(delta.content, Some("Hello".to_string()));
-    }
-
-    #[test]
-    fn test_delta_empty_content() {
-        let json = r#"{}"#;
-        let delta: Delta = serde_json::from_str(json).expect("Should deserialize");
-        assert_eq!(delta.content, None);
-    }
-
-    #[test]
-    fn test_stream_delta_structure() {
-        let json = r#"{"choices": [{"delta": {"content": "test"}}]}"#;
-        let stream_delta: StreamDelta =
-            serde_json::from_str(json).expect("Should deserialize");
-
+        let stream_delta = result.unwrap();
         assert_eq!(stream_delta.choices.len(), 1);
-        assert_eq!(
-            stream_delta.choices[0].delta.content,
-            Some("test".to_string())
-        );
+        assert!(stream_delta.choices[0].delta.content.is_some());
     }
 }

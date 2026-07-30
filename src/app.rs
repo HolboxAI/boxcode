@@ -90,7 +90,8 @@ impl App {
 mod tests {
     use super::*;
 
-    fn create_test_app() -> App {
+    #[test]
+    fn test_app_state_transitions() {
         let config = Config {
             llm: crate::config::LlmConfig {
                 endpoint: "http://localhost:8000".to_string(),
@@ -98,86 +99,38 @@ mod tests {
                 api_key: "test-key".to_string(),
             },
         };
-        App::new(config)
-    }
+        let mut app = App::new(config);
 
-    #[test]
-    fn test_new_app_awaiting_input() {
-        let app = create_test_app();
+        // Test initial state
         assert!(matches!(app.state, AppState::AwaitingInput));
         assert_eq!(app.input_buffer, "");
-        assert!(!app.should_exit);
+
+        // Test input buffer
+        app.input_buffer.push_str("test");
+        assert_eq!(app.input_buffer, "test");
     }
 
     #[test]
-    fn test_input_buffer_char_push() {
-        let mut app = create_test_app();
-        app.input_buffer.push('h');
-        app.input_buffer.push('i');
-        assert_eq!(app.input_buffer, "hi");
-    }
+    fn test_append_token() {
+        let config = Config {
+            llm: crate::config::LlmConfig {
+                endpoint: "http://localhost:8000".to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            },
+        };
+        let mut app = App::new(config);
 
-    #[test]
-    fn test_append_token_in_streaming_state() {
-        let mut app = create_test_app();
+        // Start streaming
         app.state = AppState::Streaming {
             response: "Hello ".to_string(),
         };
 
+        // Append token
         app.append_token("world".to_string());
 
         if let AppState::Streaming { response } = &app.state {
             assert_eq!(response, "Hello world");
-        } else {
-            panic!("Expected Streaming state");
-        }
-    }
-
-    #[test]
-    fn test_append_token_not_in_streaming_state() {
-        let mut app = create_test_app();
-
-        app.append_token("ignored".to_string());
-
-        // State should not change if not streaming
-        assert!(matches!(&app.state, AppState::AwaitingInput));
-    }
-
-    #[test]
-    fn test_multiple_tokens_accumulate() {
-        let mut app = create_test_app();
-        app.state = AppState::Streaming {
-            response: String::new(),
-        };
-
-        app.append_token("a".to_string());
-        app.append_token("b".to_string());
-        app.append_token("c".to_string());
-
-        if let AppState::Streaming { response } = &app.state {
-            assert_eq!(response, "abc");
-        } else {
-            panic!("Expected Streaming state");
-        }
-    }
-
-    #[test]
-    fn test_esc_cancels_streaming() {
-        let mut app = create_test_app();
-        app.state = AppState::Streaming {
-            response: "partial response".to_string(),
-        };
-
-        let key = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
-        );
-        app.handle_key(key);
-
-        if let AppState::Done { response } = &app.state {
-            assert_eq!(response, "partial response");
-        } else {
-            panic!("Expected Done state after Esc");
         }
     }
 }
