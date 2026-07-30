@@ -18,16 +18,16 @@ pub fn render<B: Backend>(f: &mut Frame<B>, app: &App) {
         .split(f.size());
 
     // Header
-    render_header(f, chunks[0], app);
+    render_header::<B>(f, chunks[0], app);
 
     // Messages area (scrollable)
-    render_messages(f, chunks[1], app);
+    render_messages::<B>(f, chunks[1], app);
 
     // Input area
-    render_input(f, chunks[2], app);
+    render_input::<B>(f, chunks[2], app);
 
     // Footer (stats)
-    render_footer(f, chunks[3], app);
+    render_footer::<B>(f, chunks[3], app);
 }
 
 fn render_header<B: Backend>(f: &mut Frame<B>, area: Rect, app: &App) {
@@ -79,10 +79,6 @@ fn render_messages<B: Backend>(f: &mut Frame<B>, area: Rect, app: &App) {
 }
 
 fn render_input<B: Backend>(f: &mut Frame<B>, area: Rect, app: &App) {
-    let cursor_style = Style::default()
-        .bg(Color::White)
-        .fg(Color::Black);
-
     let input_text = if app.input_buffer.is_empty() {
         "Type your prompt... (Ctrl-Enter to send, Esc to cancel)".to_string()
     } else {

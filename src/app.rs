@@ -136,7 +136,6 @@ mod tests {
     #[test]
     fn test_append_token_not_in_streaming_state() {
         let mut app = create_test_app();
-        let initial_state = app.state.clone();
 
         app.append_token("ignored".to_string());
 
