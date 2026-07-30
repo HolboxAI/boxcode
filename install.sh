@@ -36,8 +36,8 @@ case "$ARCH" in
     ;;
 esac
 
-# Get latest release tag
-LATEST_TAG=$(curl -fsSL https://api.github.com/repos/HolboxAI/tuisample-code/releases/latest | grep -oP '"tag_name": "\K[^"]+')
+# Get latest release tag (macOS and Linux compatible)
+LATEST_TAG=$(curl -fsSL https://api.github.com/repos/HolboxAI/tuisample-code/releases/latest | grep '"tag_name"' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' | head -1)
 if [ -z "$LATEST_TAG" ]; then
   echo "Error: Could not fetch latest release from GitHub"
   exit 1

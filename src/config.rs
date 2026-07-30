@@ -62,3 +62,44 @@ impl Default for Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert_eq!(config.llm.endpoint, "http://localhost:8000");
+        assert_eq!(config.llm.model, "gpt-3.5-turbo");
+        assert_eq!(config.llm.api_key, "sk_test");
+    }
+
+    #[test]
+    fn test_llm_config_struct() {
+        let llm_config = LlmConfig {
+            endpoint: "https://api.example.com".to_string(),
+            model: "custom-model".to_string(),
+            api_key: "sk_custom".to_string(),
+        };
+
+        assert_eq!(llm_config.endpoint, "https://api.example.com");
+        assert_eq!(llm_config.model, "custom-model");
+        assert_eq!(llm_config.api_key, "sk_custom");
+    }
+
+    #[test]
+    fn test_config_serialization() {
+        let config = Config {
+            llm: LlmConfig {
+                endpoint: "http://test:8000".to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            },
+        };
+
+        let toml_str = toml::to_string(&config).expect("Should serialize");
+        assert!(toml_str.contains("http://test:8000"));
+        assert!(toml_str.contains("test-model"));
+    }
+}
