@@ -21,8 +21,29 @@ use std::io;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Handle flags before touching the terminal, so `--version` works when piped.
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                println!("tuisample-code {VERSION}");
+                return Ok(());
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            other => {
+                eprintln!("Unknown argument: {other}\n");
+                print_help();
+                std::process::exit(2);
+            }
+        }
+    }
+
     let config = Config::load()?;
 
     let enhanced = setup_terminal()?;
@@ -105,6 +126,31 @@ async fn run_app<B: ratatui::backend::Backend>(
     }
 
     Ok(())
+}
+
+fn print_help() {
+    println!(
+        "tuisample-code {VERSION}
+Terminal UI for an OpenAI-compatible LLM endpoint.
+
+USAGE:
+    tuisample-code [FLAGS]
+
+FLAGS:
+    -V, --version    Print version and exit
+    -h, --help       Print this help and exit
+
+CONFIG (environment overrides ~/.tuisample-code/config.toml):
+    TUISAMPLE_ENDPOINT    Base URL, e.g. https://llm.internal:8443
+    TUISAMPLE_MODEL       Model name
+    TUISAMPLE_API_KEY     Bearer token
+
+KEYS:
+    Enter                 Send prompt
+    Alt/Shift-Enter       New line
+    Esc                   Cancel request
+    Ctrl-C                Exit"
+    );
 }
 
 /// Returns true if the kitty keyboard protocol was enabled (so it can be popped later).
