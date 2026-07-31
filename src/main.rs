@@ -26,7 +26,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Handle flags before touching the terminal, so `--version` works when piped.
-    for arg in std::env::args().skip(1) {
+    if let Some(arg) = std::env::args().nth(1) {
         match arg.as_str() {
             "-V" | "--version" => {
                 println!("tuisample-code {VERSION}");
