@@ -41,3 +41,6 @@ jobs:
 
       - name: Run clippy (linter)
         run: cargo clippy --all --all-targets
+
+      - name: Test install script
+        run: bash tests/install_script_test.sh
