@@ -13,13 +13,17 @@ pub const PROVIDERS: &[Provider] = &[
         id: "deepseek",
         label: "DeepSeek",
         endpoint: "https://api.deepseek.com",
-        models: &["deepseek-chat", "deepseek-reasoner"],
+        // deepseek-chat / deepseek-reasoner were retired 2026-07-24; current
+        // lineup is v4-pro (flagship) / v4-flash (faster, cheaper).
+        models: &["deepseek-v4-pro", "deepseek-v4-flash"],
     },
     Provider {
         id: "openai",
         label: "OpenAI",
         endpoint: "https://api.openai.com",
-        models: &["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
+        // gpt-4o / gpt-4-turbo / gpt-3.5-turbo are deprecated; current lineup
+        // is the GPT-5.6 family: sol (frontier), terra (balanced), luna (cost).
+        models: &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
     },
 ];
 

@@ -183,7 +183,7 @@ mod tests {
             let config = Config {
                 llm: LlmConfig {
                     endpoint: "https://api.deepseek.com".to_string(),
-                    model: "deepseek-chat".to_string(),
+                    model: "deepseek-v4-pro".to_string(),
                     api_key: "sk-test-key".to_string(),
                     provider: "deepseek".to_string(),
                 },
@@ -192,7 +192,7 @@ mod tests {
 
             let loaded = Config::load().expect("load should succeed");
             assert_eq!(loaded.llm.endpoint, "https://api.deepseek.com");
-            assert_eq!(loaded.llm.model, "deepseek-chat");
+            assert_eq!(loaded.llm.model, "deepseek-v4-pro");
             assert_eq!(loaded.llm.api_key, "sk-test-key");
             assert_eq!(loaded.llm.provider, "deepseek");
 
