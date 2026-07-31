@@ -50,25 +50,57 @@ fi
 echo "✓ Binary built successfully"
 
 # Install binary
+SYSTEM_BIN=/usr/local/bin/tuisample-code
+USER_BIN="$HOME/.local/bin/tuisample-code"
+
 echo "📍 Installing to /usr/local/bin..."
-if ! sudo cp "$BINARY_PATH" /usr/local/bin/tuisample-code 2>/dev/null; then
-  echo "⚠️  Failed to install to /usr/local/bin (permission issue)"
-  echo "Trying alternative installation to ~/.local/bin..."
+if sudo cp "$BINARY_PATH" "$SYSTEM_BIN"; then
+  sudo chmod +x "$SYSTEM_BIN"
+  INSTALLED_AT="$SYSTEM_BIN"
+  OTHER_COPY="$USER_BIN"
+  echo "✓ Installed to /usr/local/bin"
+else
+  echo "⚠️  Could not write to /usr/local/bin, using ~/.local/bin instead..."
 
-  mkdir -p ~/.local/bin
-  cp "$BINARY_PATH" ~/.local/bin/tuisample-code
-  chmod +x ~/.local/bin/tuisample-code
+  mkdir -p "$HOME/.local/bin"
+  cp "$BINARY_PATH" "$USER_BIN"
+  chmod +x "$USER_BIN"
+  INSTALLED_AT="$USER_BIN"
+  OTHER_COPY="$SYSTEM_BIN"
 
-  # Check if ~/.local/bin is in PATH
   if [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
     echo "✓ Installed to ~/.local/bin (already in PATH)"
   else
     echo "⚠️  Installed to ~/.local/bin"
     echo "Add to your PATH: export PATH=\"\$HOME/.local/bin:\$PATH\""
   fi
+fi
+
+# An older install in the *other* location would shadow (or be shadowed by) the
+# copy we just wrote, depending on PATH order — leaving users on a stale build.
+if [ -f "$OTHER_COPY" ]; then
+  echo ""
+  echo "🧹 Removing stale copy at $OTHER_COPY..."
+  if [ "$OTHER_COPY" = "$SYSTEM_BIN" ]; then
+    sudo rm -f "$OTHER_COPY" || echo "⚠️  Could not remove it. Run: sudo rm $OTHER_COPY"
+  else
+    rm -f "$OTHER_COPY" || echo "⚠️  Could not remove it. Run: rm $OTHER_COPY"
+  fi
+fi
+
+# Confirm the shell actually resolves to what we just installed.
+hash -r 2>/dev/null || true
+RESOLVED=$(command -v tuisample-code || true)
+if [ -z "$RESOLVED" ]; then
+  echo "⚠️  tuisample-code is not on your PATH yet. Open a new shell and retry."
+elif [ "$RESOLVED" != "$INSTALLED_AT" ]; then
+  echo ""
+  echo "⚠️  WARNING: 'tuisample-code' resolves to $RESOLVED,"
+  echo "   but this build was installed to $INSTALLED_AT."
+  echo "   Remove the other copy, or fix your PATH order, or you will keep"
+  echo "   running the old version."
 else
-  sudo chmod +x /usr/local/bin/tuisample-code
-  echo "✓ Installed to /usr/local/bin"
+  echo "✓ Verified: $RESOLVED ($("$RESOLVED" --version 2>/dev/null || echo 'version unknown'))"
 fi
 
 echo ""
