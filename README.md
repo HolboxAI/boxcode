@@ -16,7 +16,7 @@ Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-
 │ You: > write a hello world function                     │
 │                                                           │
 ├──────────────────────────────────────────────────────────┤
-│ > your prompt here... (Ctrl-Enter to send, Esc cancel)  │
+│ > your prompt here... (Enter to send, Esc cancel)        │
 ├──────────────────────────────────────────────────────────┤
 │ Status: Ready | Press Ctrl-C to exit                    │
 └──────────────────────────────────────────────────────────┘
@@ -64,10 +64,19 @@ tuisample-code
 
 ## Usage
 
-- **Type prompt** — Bottom input line
-- **Ctrl-Enter** — Send prompt
+- **Type prompt** — Bottom input line (paste works too)
+- **Enter** — Send prompt
+- **Alt-Enter** / **Shift-Enter** — Insert a newline for multi-line prompts
 - **Esc** — Cancel ongoing request
+- **↑ / ↓ / PgUp / PgDn** — Scroll the transcript
+- **Ctrl-A / Ctrl-E** — Jump to start / end of line
+- **Ctrl-W** — Delete previous word
+- **Ctrl-U / Ctrl-K** — Delete to start / end of line
 - **Ctrl-C** — Exit
+
+`endpoint` may be given as `https://host`, `https://host/v1`, or the full
+`https://host/v1/chat/completions` — all three resolve correctly. Environment
+variables override values in `config.toml`.
 
 ## Architecture
 
