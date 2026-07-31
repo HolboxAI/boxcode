@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod llm;
+mod providers;
 mod ui;
 
 use app::{App, AppState};
@@ -144,6 +145,10 @@ CONFIG (environment overrides ~/.tuisample-code/config.toml):
     TUISAMPLE_ENDPOINT    Base URL, e.g. https://llm.internal:8443
     TUISAMPLE_MODEL       Model name
     TUISAMPLE_API_KEY     Bearer token
+
+COMMANDS (type in the input box, press Enter):
+    /provider             Pick a provider + model + API key, saved to config.toml
+    /model                Pick a model for the currently configured provider
 
 KEYS:
     Enter                 Send prompt

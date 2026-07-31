@@ -40,7 +40,18 @@ cargo build --release
 
 ### 2. Configure
 
-Set environment variables or create `~/.tuisample-code/config.toml`:
+Fastest way: launch `tuisample-code` and type `/provider` — pick a provider from the
+list (arrow keys, Enter), then pick a model. If you already have that provider's
+conventional API key exported (e.g. `DEEPSEEK_API_KEY` for DeepSeek,
+`OPENAI_API_KEY` for OpenAI — pattern is `{PROVIDER}_API_KEY`), it's picked up
+automatically; otherwise you're prompted to paste or type it (input hidden). The
+choice is written to `~/.tuisample-code/config.toml` so it's remembered next launch.
+Not on the list, or pointing at a self-hosted/internal endpoint? Pick
+**"Custom endpoint..."** at the bottom of the list instead — you'll be walked
+through endpoint, model, and API key manually, same as filling in the file by hand.
+
+Alternatively, skip the picker and set environment variables or write
+`~/.tuisample-code/config.toml` directly:
 
 ```toml
 [llm]
@@ -78,6 +89,21 @@ tuisample-code
 `https://host/v1/chat/completions` — all three resolve correctly. Environment
 variables override values in `config.toml`.
 
+### Slash Commands
+
+- **`/provider`** — Opens a picker (↑/↓ to navigate, Enter to select, Esc to
+  cancel) of built-in providers, plus a **"Custom endpoint..."** entry that
+  preserves the "any OpenAI-compatible endpoint" support above — it's not
+  limited to the built-in list. Selecting a provider chains straight into a
+  model picker for it.
+- **`/model`** — Re-picks just the model for whichever provider is currently
+  configured, without going through `/provider` again. If no provider has been
+  set yet (e.g. you're only using `TUISAMPLE_*` env vars or a custom endpoint),
+  this shows an inline error telling you to run `/provider` first.
+
+Both write the result to `~/.tuisample-code/config.toml` and apply it
+immediately — no restart needed, even mid-session.
+
 ## Architecture
 
 - **Rust + Ratatui** — Terminal UI framework
@@ -90,6 +116,7 @@ Clean, modular structure for easy feature additions:
 - `src/ui.rs` — Terminal rendering
 - `src/llm.rs` — LLM client + streaming
 - `src/config.rs` — Configuration loading
+- `src/providers.rs` — Built-in provider/model registry for `/provider` and `/model`
 
 ## What's Next
 
