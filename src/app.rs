@@ -16,8 +16,8 @@ pub enum Role {
     Assistant,
     Error,
     /// Confirmations from `/provider` and `/model`, e.g. "Switched to deepseek /
-    /// deepseek-chat." Distinct from Assistant (would wrongly imply the model
-    /// said it) and Error (wrong tone/color for a success message).
+    /// deepseek-v4-flash." Distinct from Assistant (would wrongly imply the
+    /// model said it) and Error (wrong tone/color for a success message).
     System,
 }
 
