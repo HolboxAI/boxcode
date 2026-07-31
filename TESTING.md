@@ -45,7 +45,7 @@ export TUISAMPLE_API_KEY=sk-...
 #### Expected Behavior
 1. TUI launches (header, messages area, input box, status)
 2. Can type prompt in input area
-3. Press Ctrl-Enter to send
+3. Press Enter to send
 4. Response streams from LLM
 5. Can cancel with Esc
 6. Exit with Ctrl-C

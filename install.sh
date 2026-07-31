@@ -1,6 +1,34 @@
 #!/bin/bash
 set -e
 
+# Remove any other "tuisample-code" executable found on $PATH so a stale
+# build from a previous install can't shadow (or be shadowed by) the one we
+# just installed, regardless of which directory it ended up in.
+sweep_path_for_stale_copies() {
+  local installed_at="$1"
+  local dir candidate found=0
+  local saved_ifs="$IFS"
+  IFS=':'
+  for dir in $PATH; do
+    IFS="$saved_ifs"
+    [ -n "$dir" ] || continue
+    candidate="$dir/tuisample-code"
+    if [ -f "$candidate" ] && [ "$candidate" != "$installed_at" ]; then
+      found=1
+      echo "🧹 Removing stale copy on PATH: $candidate"
+      if [ -w "$dir" ]; then
+        rm -f "$candidate" || echo "⚠️  Could not remove it. Run: rm $candidate"
+      else
+        sudo rm -f "$candidate" || echo "⚠️  Could not remove it. Run: sudo rm $candidate"
+      fi
+    fi
+    IFS=':'
+  done
+  IFS="$saved_ifs"
+  return 0
+}
+
+main() {
 echo "🚀 Installing tuisample-code..."
 echo ""
 
@@ -88,6 +116,10 @@ if [ -f "$OTHER_COPY" ]; then
   fi
 fi
 
+# A stale copy can also live in some *other* directory entirely (a custom bin
+# dir, homebrew, etc.) — not just the two locations above.
+sweep_path_for_stale_copies "$INSTALLED_AT"
+
 # Confirm the shell actually resolves to what we just installed.
 hash -r 2>/dev/null || true
 RESOLVED=$(command -v tuisample-code || true)
@@ -117,3 +149,10 @@ echo "   tuisample-code"
 echo ""
 echo "📖 For more info: https://github.com/HolboxAI/tuisample-code"
 echo ""
+}
+
+# Guarded so tests can `source` this file (to reach sweep_path_for_stale_copies)
+# without triggering a full install.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+  main "$@"
+fi
