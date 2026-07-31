@@ -14,6 +14,11 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(default)]
     pub api_key: String,
+    /// Registry id from `providers::PROVIDERS` (e.g. "deepseek"), set by the
+    /// `/provider` overlay. Empty means a custom/manually-entered endpoint, in
+    /// which case a standalone `/model` has nothing to scope to.
+    #[serde(default)]
+    pub provider: String,
 }
 
 impl Config {
@@ -51,6 +56,7 @@ impl Config {
         self.llm.endpoint = self.llm.endpoint.trim().trim_end_matches('/').to_string();
         self.llm.model = self.llm.model.trim().to_string();
         self.llm.api_key = self.llm.api_key.trim().to_string();
+        self.llm.provider = self.llm.provider.trim().to_string();
 
         let d = LlmConfig::default();
         if self.llm.endpoint.is_empty() {
@@ -80,7 +86,6 @@ impl Config {
         warnings
     }
 
-    #[allow(dead_code)]
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = Self::config_path();
 
@@ -123,6 +128,89 @@ impl Default for LlmConfig {
             endpoint: "http://localhost:8000".to_string(),
             model: "gpt-3.5-turbo".to_string(),
             api_key: String::new(),
+            provider: String::new(),
         }
+    }
+}
+
+/// Test-only helper for isolating `$HOME` so `Config::save()`/`load()` never
+/// touch the real developer/CI home directory. Shared across every test module
+/// in the crate (this is a single binary crate with one test binary, so `$HOME`
+/// is genuinely global process state -- two independent per-module mutexes
+/// would not actually serialize against each other).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn with_isolated_home<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("failed to create temp HOME");
+        let prev = std::env::var("HOME").ok();
+        std::env::set_var("HOME", dir.path());
+
+        let result = f();
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::with_isolated_home;
+    use super::*;
+
+    #[test]
+    fn save_then_load_round_trips_all_llm_fields_including_provider() {
+        with_isolated_home(|| {
+            // TUISAMPLE_* env vars win over the file (by design), so a developer
+            // machine that happens to have one exported must not leak into this
+            // assertion.
+            let saved_env: Vec<(&str, Option<String>)> =
+                ["TUISAMPLE_ENDPOINT", "TUISAMPLE_MODEL", "TUISAMPLE_API_KEY"]
+                    .iter()
+                    .map(|&k| (k, std::env::var(k).ok()))
+                    .collect();
+            for (k, _) in &saved_env {
+                std::env::remove_var(k);
+            }
+
+            let config = Config {
+                llm: LlmConfig {
+                    endpoint: "https://api.deepseek.com".to_string(),
+                    model: "deepseek-chat".to_string(),
+                    api_key: "sk-test-key".to_string(),
+                    provider: "deepseek".to_string(),
+                },
+            };
+            config.save().expect("save should succeed");
+
+            let loaded = Config::load().expect("load should succeed");
+            assert_eq!(loaded.llm.endpoint, "https://api.deepseek.com");
+            assert_eq!(loaded.llm.model, "deepseek-chat");
+            assert_eq!(loaded.llm.api_key, "sk-test-key");
+            assert_eq!(loaded.llm.provider, "deepseek");
+
+            for (k, v) in saved_env {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn save_creates_the_parent_directory_if_missing() {
+        with_isolated_home(|| {
+            assert!(!Config::config_path().parent().unwrap().exists());
+            Config::default().save().expect("save should succeed");
+            assert!(Config::config_path().exists());
+        });
     }
 }
