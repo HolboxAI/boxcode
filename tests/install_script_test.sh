@@ -42,3 +42,44 @@ PATH="$dir_installed:$dir_a:$dir_b:/bin:/usr/bin" \
 [ -f "$dir_installed/tuisample-code" ] || fail "the newly installed binary must not be removed"
 
 echo "PASS: sweep_path_for_stale_copies removes stale copies elsewhere on \$PATH but keeps the installed one"
+
+# --- install_binary ---------------------------------------------------------
+# `tuisample-code --upgrade` runs this installer from the very binary being
+# replaced. Writing over the destination in place fails with ETXTBSY on Linux,
+# so install_binary must swap the inode by rename instead.
+
+bin_dir="$workdir/install-binary"
+mkdir -p "$bin_dir"
+echo "new-build" > "$bin_dir/src"
+echo "old-build" > "$bin_dir/dest"
+chmod 755 "$bin_dir/dest"
+
+# Stand-in for the inode a running process holds open: a hard link to dest.
+ln "$bin_dir/dest" "$bin_dir/held-open"
+
+install_binary "$bin_dir/src" "$bin_dir/dest" || fail "install_binary returned non-zero"
+
+[ "$(cat "$bin_dir/dest")" = "new-build" ] || fail "dest should hold the new build"
+# Had install_binary written in place, the hard link would show the new content
+# too — and on Linux the write would have failed outright with ETXTBSY.
+[ "$(cat "$bin_dir/held-open")" = "old-build" ] ||
+  fail "replacing a binary must swap the inode, not write in place"
+[ -x "$bin_dir/dest" ] || fail "dest should be executable"
+[ -z "$(ls "$bin_dir"/dest.new.* 2>/dev/null)" ] || fail "temp file should not be left behind"
+
+# A destination that cannot be written must report failure, not half-install.
+# Skipped as root, where directory permissions don't stop the write.
+if [ "$(id -u)" -ne 0 ]; then
+  unwritable="$workdir/unwritable"
+  mkdir -p "$unwritable"
+  chmod 500 "$unwritable"
+  if install_binary "$bin_dir/src" "$unwritable/tuisample-code" 2>/dev/null; then
+    chmod 700 "$unwritable"
+    fail "install_binary should return non-zero when the destination is unwritable"
+  fi
+  chmod 700 "$unwritable"
+  [ -z "$(ls "$unwritable"/tuisample-code.new.* 2>/dev/null)" ] ||
+    fail "failed install should not leave a temp file behind"
+fi
+
+echo "PASS: install_binary replaces a running binary by rename and cleans up on failure"
