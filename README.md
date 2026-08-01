@@ -73,6 +73,30 @@ export TUISAMPLE_API_KEY=sk_company_xxx
 tuisample-code
 ```
 
+### 4. Update
+
+```bash
+tuisample-code --upgrade
+```
+
+Checks `main` for a newer version and, if there is one, reinstalls in place —
+no need to dig out the curl command again. It removes stale copies from other
+directories on your `$PATH` and confirms the shell resolves to the new build.
+
+`main` can also carry changes that haven't been given a new version number yet.
+To rebuild from the latest source regardless, use `tuisample-code --upgrade
+--force`.
+
+> Upgrading from 0.2.0 or earlier? Those builds predate this flag — run the
+> install command from step 1 once more, and `--upgrade` works from then on.
+
+Running somewhere with no route to github.com? Point upgrades at a fork or an
+internal mirror serving the same `Cargo.toml` and `install.sh`:
+
+```bash
+export TUISAMPLE_UPGRADE_URL_BASE=https://git.company.internal/tuisample-code/raw/main
+```
+
 ## Usage
 
 - **Type prompt** — Bottom input line (paste works too)
