@@ -3,6 +3,7 @@ mod config;
 mod llm;
 mod providers;
 mod ui;
+mod upgrade;
 
 use app::{App, AppState};
 use config::Config;
@@ -26,8 +27,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Handle flags before touching the terminal, so `--version` works when piped.
-    if let Some(arg) = std::env::args().nth(1) {
+    // Handle flags before touching the terminal, so `--version` works when
+    // piped and `--upgrade` still runs even if the config file is broken.
+    let mut upgrade = false;
+    let mut force = false;
+    for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-V" | "--version" => {
                 println!("tuisample-code {VERSION}");
@@ -37,12 +41,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 print_help();
                 return Ok(());
             }
+            "-u" | "--upgrade" => upgrade = true,
+            "-f" | "--force" => force = true,
             other => {
                 eprintln!("Unknown argument: {other}\n");
                 print_help();
                 std::process::exit(2);
             }
         }
+    }
+
+    if upgrade {
+        // Handled here rather than returned: the default runtime handler prints
+        // Err via Debug, which turns a connection failure into a wall of
+        // struct-dump instead of a sentence.
+        if let Err(e) = upgrade::run(force).await {
+            eprintln!("❌ Upgrade failed: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if force {
+        eprintln!("--force only means something alongside --upgrade.\n");
+        print_help();
+        std::process::exit(2);
     }
 
     let config = Config::load()?;
@@ -140,11 +162,18 @@ USAGE:
 FLAGS:
     -V, --version    Print version and exit
     -h, --help       Print this help and exit
+    -u, --upgrade    Update to the latest release
+    -f, --force      With --upgrade: reinstall even if already up to date
 
 CONFIG (environment overrides ~/.tuisample-code/config.toml):
     TUISAMPLE_ENDPOINT    Base URL, e.g. https://llm.internal:8443
     TUISAMPLE_MODEL       Model name
     TUISAMPLE_API_KEY     Bearer token
+
+UPGRADE:
+    TUISAMPLE_UPGRADE_URL_BASE
+                          Fetch updates from a fork or internal mirror
+                          instead of github.com
 
 COMMANDS (type in the input box, press Enter):
     /provider             Pick a provider + model + API key, saved to config.toml

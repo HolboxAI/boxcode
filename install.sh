@@ -28,6 +28,25 @@ sweep_path_for_stale_copies() {
   return 0
 }
 
+# Put a binary at $dest, replacing whatever is there.
+#
+# Writing straight over the destination breaks `tuisample-code --upgrade`: that
+# runs this script from the very binary being replaced, and on Linux writing to
+# a running executable fails with ETXTBSY. So write a sibling temp file and
+# rename it over the target — rename swaps the inode atomically, leaving the
+# still-running process on the old one and never exposing a half-copied binary.
+#
+# $3 is the privilege escalation command ("sudo", or empty for none).
+install_binary() {
+  local src="$1" dest="$2" runner="${3:-}"
+  local tmp="$dest.new.$$"
+  if $runner cp "$src" "$tmp" && $runner chmod 755 "$tmp" && $runner mv -f "$tmp" "$dest"; then
+    return 0
+  fi
+  $runner rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
 main() {
 echo "🚀 Installing tuisample-code..."
 echo ""
@@ -82,8 +101,7 @@ SYSTEM_BIN=/usr/local/bin/tuisample-code
 USER_BIN="$HOME/.local/bin/tuisample-code"
 
 echo "📍 Installing to /usr/local/bin..."
-if sudo cp "$BINARY_PATH" "$SYSTEM_BIN"; then
-  sudo chmod +x "$SYSTEM_BIN"
+if install_binary "$BINARY_PATH" "$SYSTEM_BIN" sudo; then
   INSTALLED_AT="$SYSTEM_BIN"
   OTHER_COPY="$USER_BIN"
   echo "✓ Installed to /usr/local/bin"
@@ -91,8 +109,10 @@ else
   echo "⚠️  Could not write to /usr/local/bin, using ~/.local/bin instead..."
 
   mkdir -p "$HOME/.local/bin"
-  cp "$BINARY_PATH" "$USER_BIN"
-  chmod +x "$USER_BIN"
+  install_binary "$BINARY_PATH" "$USER_BIN" || {
+    echo "❌ Error: could not install to $USER_BIN"
+    exit 1
+  }
   INSTALLED_AT="$USER_BIN"
   OTHER_COPY="$SYSTEM_BIN"
 
