@@ -1,13 +1,22 @@
 use crate::config::Config;
+use crate::llm::{ChatMessage, ToolCall};
 use crate::providers;
+use crate::tools::{self, ToolOutcome};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::collections::{HashSet, VecDeque};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppState {
     AwaitingInput,
     /// Transient: the event loop picks this up, fires the request, and moves to `Streaming`.
-    Sending { prompt: String },
+    Sending,
     Streaming,
+    /// A command is on screen waiting for the user to allow or refuse it. The
+    /// only thing standing between the model and the machine, so the turn stops
+    /// dead here until a key is pressed.
+    AwaitingApproval,
+    /// Commands are running in a spawned task; results arrive on the channel.
+    ExecutingTools,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -19,12 +28,40 @@ pub enum Role {
     /// deepseek-v4-flash." Distinct from Assistant (would wrongly imply the
     /// model said it) and Error (wrong tone/color for a success message).
     System,
+    /// The result of one tool call, sent back to the model as `role: "tool"`.
+    Tool,
 }
 
 #[derive(Clone)]
 pub struct Message {
     pub role: Role,
+    /// What goes on the wire. For a tool result this is the entire file, which is
+    /// why it is not what gets drawn.
     pub content: String,
+    /// What the transcript shows, when that differs from `content`.
+    pub display: Option<String>,
+    /// Tool calls the assistant asked for. Only ever set on `Role::Assistant`.
+    pub tool_calls: Vec<ToolCall>,
+    /// Which call this message answers. Only ever set on `Role::Tool`.
+    pub tool_call_id: Option<String>,
+}
+
+impl Message {
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            display: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// The text to draw, which for a tool result is a one-line summary rather
+    /// than the file it fetched.
+    pub fn body(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.content)
+    }
 }
 
 impl Role {
@@ -34,6 +71,7 @@ impl Role {
             Role::Assistant => "Assistant",
             Role::Error => "Error",
             Role::System => "System",
+            Role::Tool => "Tool",
         }
     }
 }
@@ -55,6 +93,14 @@ pub enum Overlay {
         model: String,
     },
     CustomEndpoint(CustomStep),
+    /// Asks about `pending_tools.front()`. Unlike the other overlays this one
+    /// appears while the app is busy, mid-turn.
+    CommandApproval {
+        command: String,
+        purpose: Option<String>,
+        /// How many more commands are queued behind this one.
+        remaining: usize,
+    },
 }
 
 /// Sequential manual entry used when the user picks "Custom endpoint..." instead
@@ -95,6 +141,25 @@ pub struct App {
     /// never fight over `f.set_cursor(...)` in the same frame.
     pub overlay_input: String,
     pub overlay_cursor: usize,
+    /// Calls still awaiting a yes or no, front first.
+    pub pending_tools: VecDeque<ToolCall>,
+    /// Calls the user allowed, waiting for the event loop to spawn them.
+    pub approved_tools: Vec<ToolCall>,
+    /// Set by "a" at an approval prompt: stop asking for the rest of the session.
+    /// Session-only and never persisted -- a permanent version of this belongs in
+    /// config.toml, where turning it on is a deliberate act rather than a
+    /// keystroke made while impatient.
+    pub auto_approve: bool,
+    /// Tool rounds spent on the current prompt, reset by `submit`. Once this hits
+    /// the configured ceiling the schemas stop being sent, which is what makes a
+    /// model that will not stop calling tools produce an answer instead.
+    pub tool_steps: usize,
+    /// One line for the welcome screen describing where commands will run, or
+    /// why the tool is off. Set by `main` once the workspace has been resolved.
+    pub workspace_status: String,
+    /// The resolved working directory, shown on the approval prompt so it is
+    /// always clear *where* a command is about to run.
+    pub workspace_root: String,
 }
 
 impl App {
@@ -115,6 +180,12 @@ impl App {
             overlay: None,
             overlay_input: String::new(),
             overlay_cursor: 0,
+            pending_tools: VecDeque::new(),
+            approved_tools: Vec::new(),
+            auto_approve: false,
+            tool_steps: 0,
+            workspace_status: String::new(),
+            workspace_root: String::new(),
         }
     }
 
@@ -238,11 +309,9 @@ impl App {
         self.greeted = true;
         self.follow_tail = true;
         self.streaming_response.clear();
-        self.messages.push(Message {
-            role: Role::User,
-            content: prompt.clone(),
-        });
-        self.state = AppState::Sending { prompt };
+        self.tool_steps = 0;
+        self.messages.push(Message::new(Role::User, prompt));
+        self.state = AppState::Sending;
     }
 
     fn cancel(&mut self) {
@@ -254,20 +323,177 @@ impl App {
         }
         // Bump the id so any tokens already in flight on the channel are discarded.
         self.request_id += 1;
+        self.pending_tools.clear();
+        self.approved_tools.clear();
+        self.overlay = None;
+
+        // Before anything else is appended: synthetic results have to sit
+        // directly after the calls they answer.
+        self.settle_unanswered_tool_calls("The user cancelled before this command ran.");
 
         let partial = std::mem::take(&mut self.streaming_response);
         if !partial.trim().is_empty() {
-            self.messages.push(Message {
-                role: Role::Assistant,
-                content: format!("{partial}\n[cancelled]"),
-            });
+            self.messages.push(Message::new(
+                Role::Assistant,
+                format!("{partial}\n[cancelled]"),
+            ));
         } else {
-            self.messages.push(Message {
-                role: Role::Error,
-                content: "Request cancelled.".to_string(),
-            });
+            self.messages
+                .push(Message::new(Role::Error, "Request cancelled."));
         }
         self.state = AppState::AwaitingInput;
+    }
+
+    /// The model asked to run something. Commit whatever prose it streamed
+    /// alongside the request, then start asking the user about each command.
+    pub fn request_tools(&mut self, calls: Vec<ToolCall>) {
+        if self.state != AppState::Streaming || calls.is_empty() {
+            return;
+        }
+        self.abort = None;
+        self.follow_tail = true;
+        let content = std::mem::take(&mut self.streaming_response);
+        self.messages.push(Message {
+            role: Role::Assistant,
+            content: content.trim().to_string(),
+            display: None,
+            tool_calls: calls.clone(),
+            tool_call_id: None,
+        });
+        self.pending_tools = calls.into();
+        self.tool_steps += 1;
+        self.advance_approvals();
+    }
+
+    /// Walk the queue until something needs a decision, or it is empty.
+    ///
+    /// Called once when the calls arrive and again after every keypress, so the
+    /// prompt advances one command at a time. When the queue empties, the turn
+    /// moves on: to `ExecutingTools` if anything was allowed, or straight back to
+    /// `Sending` if everything was refused (the model still gets told, and can
+    /// answer without it).
+    fn advance_approvals(&mut self) {
+        while let Some(call) = self.pending_tools.front() {
+            if !self.needs_approval() {
+                let call = self.pending_tools.pop_front().expect("front just matched");
+                self.approved_tools.push(call);
+                continue;
+            }
+            match tools::described_command(call) {
+                Some((command, purpose)) => {
+                    self.overlay = Some(Overlay::CommandApproval {
+                        command,
+                        purpose,
+                        remaining: self.pending_tools.len().saturating_sub(1),
+                    });
+                    self.state = AppState::AwaitingApproval;
+                    return;
+                }
+                // Nothing coherent to show, so nothing to approve. Let it through
+                // to the runner, which reports the malformed arguments back to
+                // the model rather than asking the user about gibberish.
+                None => {
+                    let call = self.pending_tools.pop_front().expect("front just matched");
+                    self.approved_tools.push(call);
+                }
+            }
+        }
+
+        self.overlay = None;
+        self.state = if self.approved_tools.is_empty() {
+            AppState::Sending
+        } else {
+            AppState::ExecutingTools
+        };
+    }
+
+    fn needs_approval(&self) -> bool {
+        self.config.tools.require_approval && !self.auto_approve
+    }
+
+    /// y allow · n refuse · a stop asking for this session · Esc refuse.
+    ///
+    /// Esc means refuse rather than cancel-the-turn: at a prompt asking whether
+    /// to run something, the reflexive keypress has to be the safe one.
+    fn handle_command_approval_key(&mut self, key: KeyEvent) {
+        let decision = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.auto_approve = true;
+                self.messages.push(Message::new(
+                    Role::System,
+                    "Running commands without asking for the rest of this session.",
+                ));
+                Some(true)
+            }
+            _ => None,
+        };
+
+        let Some(allowed) = decision else {
+            return; // unrecognised key: leave the prompt exactly as it was
+        };
+        let Some(call) = self.pending_tools.pop_front() else {
+            return;
+        };
+
+        if allowed {
+            self.approved_tools.push(call);
+        } else {
+            self.push_tool_outcome(tools::declined(&call));
+        }
+        self.follow_tail = true;
+        self.advance_approvals();
+    }
+
+    /// Results of the commands that ran, from the spawned runner.
+    pub fn finish_tools(&mut self, outcomes: Vec<ToolOutcome>) {
+        if self.state != AppState::ExecutingTools {
+            return;
+        }
+        for outcome in outcomes {
+            self.push_tool_outcome(outcome);
+        }
+        self.follow_tail = true;
+        // Back around: the model needs a turn to use what it just got.
+        self.state = AppState::Sending;
+    }
+
+    pub fn push_tool_outcome(&mut self, outcome: ToolOutcome) {
+        self.messages.push(Message {
+            role: Role::Tool,
+            content: outcome.content,
+            display: Some(outcome.display),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(outcome.call_id),
+        });
+    }
+
+    /// Answer every tool call that never got a result.
+    ///
+    /// Providers require each `tool_calls` entry to be matched by a `tool` message
+    /// quoting its id. A turn abandoned mid-loop -- Esc, or a failed request --
+    /// otherwise leaves a hole, and the resulting 400 lands on the user's *next*
+    /// prompt, where it looks like an unrelated failure. So the hole gets filled
+    /// rather than left.
+    fn settle_unanswered_tool_calls(&mut self, reason: &str) {
+        let answered: HashSet<&str> = self
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+
+        let unanswered: Vec<ToolCall> = self
+            .messages
+            .iter()
+            .flat_map(|m| m.tool_calls.iter())
+            .filter(|call| !answered.contains(call.id.as_str()))
+            .cloned()
+            .collect();
+
+        for call in unanswered {
+            self.push_tool_outcome(tools::unanswered(&call, reason));
+        }
     }
 
     pub fn append_token(&mut self, token: &str) {
@@ -276,6 +502,9 @@ impl App {
         }
     }
 
+    /// Terminates the turn. Deliberately a no-op unless still `Streaming`: a
+    /// response carrying tool calls sends `ToolCalls` and *then* `Done`, and by
+    /// the time `Done` arrives the turn has moved on to `ExecutingTools`.
     pub fn finish_stream(&mut self) {
         if self.state != AppState::Streaming {
             return;
@@ -283,45 +512,63 @@ impl App {
         self.abort = None;
         let response = std::mem::take(&mut self.streaming_response);
         if response.trim().is_empty() {
-            self.messages.push(Message {
-                role: Role::Error,
-                content: "The endpoint returned an empty response.".to_string(),
-            });
+            self.messages.push(Message::new(
+                Role::Error,
+                "The endpoint returned an empty response.",
+            ));
         } else {
-            self.messages.push(Message {
-                role: Role::Assistant,
-                content: response,
-            });
+            self.messages.push(Message::new(Role::Assistant, response));
         }
         self.state = AppState::AwaitingInput;
     }
 
     pub fn fail_stream(&mut self, error: String) {
         self.abort = None;
+        self.pending_tools.clear();
+        self.approved_tools.clear();
+        self.overlay = None;
+        // First, so the results land against the calls they belong to.
+        self.settle_unanswered_tool_calls("The request failed before this command ran.");
+
         let partial = std::mem::take(&mut self.streaming_response);
         if !partial.trim().is_empty() {
-            self.messages.push(Message {
-                role: Role::Assistant,
-                content: partial,
-            });
+            self.messages.push(Message::new(Role::Assistant, partial));
         }
-        self.messages.push(Message {
-            role: Role::Error,
-            content: error,
-        });
+        self.messages.push(Message::new(Role::Error, error));
         self.state = AppState::AwaitingInput;
     }
 
-    /// Conversation so far, for sending as request context.
-    pub fn history(&self) -> Vec<(String, String)> {
-        self.messages
-            .iter()
-            .filter_map(|m| match m.role {
-                Role::User => Some(("user".to_string(), m.content.clone())),
-                Role::Assistant => Some(("assistant".to_string(), m.content.clone())),
-                Role::Error | Role::System => None,
-            })
-            .collect()
+    /// Conversation so far, in wire form.
+    ///
+    /// Error and System messages are local commentary and never sent. Everything
+    /// else must survive intact, tool calls included -- an assistant message whose
+    /// `tool_calls` were dropped here would leave the following `tool` messages
+    /// answering nothing.
+    pub fn history(&self, system: Option<&str>) -> Vec<ChatMessage> {
+        let mut out = Vec::new();
+        if let Some(system) = system {
+            out.push(ChatMessage::text("system", system));
+        }
+        for message in &self.messages {
+            match message.role {
+                Role::User => out.push(ChatMessage::text("user", message.content.clone())),
+                Role::Assistant => out.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    // None rather than "" when the model only asked for tools.
+                    content: Some(message.content.clone()).filter(|c| !c.trim().is_empty()),
+                    tool_calls: message.tool_calls.clone(),
+                    tool_call_id: None,
+                }),
+                Role::Tool => out.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(message.content.clone()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: message.tool_call_id.clone(),
+                }),
+                Role::Error | Role::System => {}
+            }
+        }
+        out
     }
 
     // ---- input buffer editing -------------------------------------------------
@@ -399,10 +646,10 @@ impl App {
                 });
             }
             None => {
-                self.messages.push(Message {
-                    role: Role::Error,
-                    content: "No provider configured yet. Run /provider first.".to_string(),
-                });
+                self.messages.push(Message::new(
+                    Role::Error,
+                    "No provider configured yet. Run /provider first.",
+                ));
             }
         }
     }
@@ -422,6 +669,13 @@ impl App {
                 self.handle_api_key_prompt_key(key, provider_id, model)
             }
             Overlay::CustomEndpoint(step) => self.handle_custom_endpoint_key(key, step),
+            // Put back first: an unrecognised key must leave the prompt standing
+            // rather than silently dismissing it, and `handle_overlay_key` took
+            // the overlay before dispatching here.
+            approval @ Overlay::CommandApproval { .. } => {
+                self.overlay = Some(approval);
+                self.handle_command_approval_key(key);
+            }
         }
     }
 
@@ -514,10 +768,8 @@ impl App {
                 self.overlay_input.clear();
                 self.overlay_cursor = 0;
                 if api_key.is_empty() {
-                    self.messages.push(Message {
-                        role: Role::Error,
-                        content: "No API key entered; cancelled.".to_string(),
-                    });
+                    self.messages
+                        .push(Message::new(Role::Error, "No API key entered; cancelled."));
                     return;
                 }
                 self.apply_llm_config(
@@ -555,20 +807,20 @@ impl App {
                 match step {
                     CustomStep::Endpoint => {
                         if value.is_empty() {
-                            self.messages.push(Message {
-                                role: Role::Error,
-                                content: "Endpoint cannot be empty; cancelled.".to_string(),
-                            });
+                            self.messages.push(Message::new(
+                                Role::Error,
+                                "Endpoint cannot be empty; cancelled.",
+                            ));
                             return;
                         }
                         self.overlay = Some(Overlay::CustomEndpoint(CustomStep::Model { endpoint: value }));
                     }
                     CustomStep::Model { endpoint } => {
                         if value.is_empty() {
-                            self.messages.push(Message {
-                                role: Role::Error,
-                                content: "Model cannot be empty; cancelled.".to_string(),
-                            });
+                            self.messages.push(Message::new(
+                                Role::Error,
+                                "Model cannot be empty; cancelled.",
+                            ));
                             return;
                         }
                         self.overlay = Some(Overlay::CustomEndpoint(CustomStep::ApiKey {
@@ -616,14 +868,14 @@ impl App {
             self.config.llm.provider.as_str()
         };
         let message = match self.config.save() {
-            Ok(()) => Message {
-                role: Role::System,
-                content: format!("Switched to {label} / {}.", self.config.llm.model),
-            },
-            Err(e) => Message {
-                role: Role::Error,
-                content: format!("Using it for this session, but failed to save to config.toml: {e}"),
-            },
+            Ok(()) => Message::new(
+                Role::System,
+                format!("Switched to {label} / {}.", self.config.llm.model),
+            ),
+            Err(e) => Message::new(
+                Role::Error,
+                format!("Using it for this session, but failed to save to config.toml: {e}"),
+            ),
         };
         self.messages.push(message);
         self.overlay = None;
@@ -706,12 +958,7 @@ mod tests {
 
         a.handle_key(key(KeyCode::Enter));
 
-        assert_eq!(
-            a.state,
-            AppState::Sending {
-                prompt: "hello world".to_string()
-            }
-        );
+        assert_eq!(a.state, AppState::Sending);
         assert!(a.input_buffer.is_empty());
         assert_eq!(a.messages.len(), 1);
         assert_eq!(a.messages[0].content, "hello world");
@@ -722,7 +969,7 @@ mod tests {
         let mut a = app();
         type_str(&mut a, "hi");
         a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
-        assert!(matches!(a.state, AppState::Sending { .. }));
+        assert_eq!(a.state, AppState::Sending);
     }
 
     #[test]
@@ -736,12 +983,8 @@ mod tests {
         assert_eq!(a.state, AppState::AwaitingInput);
 
         a.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            a.state,
-            AppState::Sending {
-                prompt: "line1\nline2".to_string()
-            }
-        );
+        assert_eq!(a.state, AppState::Sending);
+        assert_eq!(a.messages[0].content, "line1\nline2");
     }
 
     #[test]
@@ -859,7 +1102,7 @@ mod tests {
         // The user can immediately try again.
         type_str(&mut a, "retry");
         a.handle_key(key(KeyCode::Enter));
-        assert!(matches!(a.state, AppState::Sending { .. }));
+        assert_eq!(a.state, AppState::Sending);
     }
 
     #[test]
@@ -889,14 +1132,330 @@ mod tests {
         type_str(&mut a, "second");
         a.handle_key(key(KeyCode::Enter));
 
-        let history = a.history();
+        let history = a.history(None);
         assert_eq!(
             history,
             vec![
-                ("user".to_string(), "first".to_string()),
-                ("assistant".to_string(), "answer".to_string()),
-                ("user".to_string(), "second".to_string()),
+                ChatMessage::text("user", "first"),
+                ChatMessage::text("assistant", "answer"),
+                ChatMessage::text("user", "second"),
             ]
+        );
+    }
+
+    #[test]
+    fn the_system_prompt_is_prepended_when_one_is_given() {
+        let mut a = app();
+        type_str(&mut a, "hi");
+        a.handle_key(key(KeyCode::Enter));
+
+        let history = a.history(Some("you are a robot"));
+        assert_eq!(history[0], ChatMessage::text("system", "you are a robot"));
+        assert_eq!(history[1].role, "user");
+    }
+
+    // ---- commands and approval -----------------------------------------------
+
+    fn command_call(id: &str, command: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::RUN_COMMAND.to_string(),
+                arguments: serde_json::json!({ "command": command }).to_string(),
+            },
+        }
+    }
+
+    fn outcome(call_id: &str, content: &str) -> ToolOutcome {
+        ToolOutcome {
+            call_id: call_id.to_string(),
+            display: format!("$ … — {content}"),
+            content: content.to_string(),
+        }
+    }
+
+    fn streaming_app() -> App {
+        let mut a = app();
+        a.workspace_root = "/tmp/project".to_string();
+        type_str(&mut a, "what does main.rs do?");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::Streaming;
+        a
+    }
+
+    /// Nothing runs until a human says so. If this ever regresses, the model has
+    /// an unattended shell.
+    #[test]
+    fn a_command_is_not_runnable_until_it_is_approved() {
+        let mut a = streaming_app();
+        a.append_token("Let me look.");
+        a.request_tools(vec![command_call("call_1", "cat src/main.rs")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert!(
+            a.approved_tools.is_empty(),
+            "nothing may reach the runner before approval"
+        );
+        assert_eq!(a.tool_steps, 1);
+
+        match &a.overlay {
+            Some(Overlay::CommandApproval { command, .. }) => {
+                assert_eq!(command, "cat src/main.rs")
+            }
+            other => panic!("expected an approval prompt, got {other:?}"),
+        }
+        // The prose streamed alongside the call is kept.
+        assert_eq!(a.messages.last().unwrap().content, "Let me look.");
+    }
+
+    #[test]
+    fn pressing_y_releases_the_command_to_the_runner() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.approved_tools.len(), 1);
+        assert_eq!(a.overlay, None);
+    }
+
+    /// Esc at an approval prompt means "no", not "cancel the turn": the
+    /// reflexive keypress has to be the safe one.
+    #[test]
+    fn esc_refuses_the_command_rather_than_cancelling_the_turn() {
+        for refuse in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut a = streaming_app();
+            a.request_tools(vec![command_call("call_1", "rm -rf /")]);
+            a.handle_key(key(refuse));
+
+            assert!(a.approved_tools.is_empty(), "{refuse:?} must not run anything");
+            // The model is told, so it can take another route.
+            let told = a.messages.last().unwrap();
+            assert_eq!(told.tool_call_id.as_deref(), Some("call_1"));
+            assert!(told.content.contains("declined"), "{}", told.content);
+            assert_eq!(a.state, AppState::Sending);
+            assert_history_is_well_formed(&a.history(None));
+        }
+    }
+
+    #[test]
+    fn each_queued_command_is_asked_about_separately() {
+        let mut a = streaming_app();
+        a.request_tools(vec![
+            command_call("call_1", "ls"),
+            command_call("call_2", "cat Cargo.toml"),
+        ]);
+
+        match &a.overlay {
+            Some(Overlay::CommandApproval { command, remaining, .. }) => {
+                assert_eq!(command, "ls");
+                assert_eq!(*remaining, 1);
+            }
+            other => panic!("expected the first prompt, got {other:?}"),
+        }
+
+        a.handle_key(key(KeyCode::Char('y')));
+        match &a.overlay {
+            Some(Overlay::CommandApproval { command, remaining, .. }) => {
+                assert_eq!(command, "cat Cargo.toml");
+                assert_eq!(*remaining, 0);
+            }
+            other => panic!("expected the second prompt, got {other:?}"),
+        }
+
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.approved_tools.len(), 1); // only `ls`
+    }
+
+    #[test]
+    fn a_stray_keypress_leaves_the_prompt_standing() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+
+        for stray in [KeyCode::Char('q'), KeyCode::Down, KeyCode::Backspace] {
+            a.handle_key(key(stray));
+            assert_eq!(a.state, AppState::AwaitingApproval, "{stray:?} dismissed the prompt");
+            assert!(a.overlay.is_some(), "{stray:?} dismissed the prompt");
+        }
+    }
+
+    #[test]
+    fn a_stops_asking_for_the_rest_of_the_session() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Char('a')));
+        assert!(a.auto_approve);
+        assert_eq!(a.approved_tools.len(), 1);
+
+        // A later round goes straight through with no prompt.
+        a.finish_tools(vec![outcome("call_1", "ok")]);
+        a.state = AppState::Streaming;
+        a.request_tools(vec![command_call("call_2", "cat Cargo.toml")]);
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.overlay, None);
+    }
+
+    #[test]
+    fn approval_is_skipped_entirely_when_the_config_turns_it_off() {
+        let mut a = app();
+        a.config.tools.require_approval = false;
+        type_str(&mut a, "go");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::Streaming;
+
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.overlay, None);
+    }
+
+    /// A response carrying tool calls emits ToolCalls and *then* Done. If that
+    /// trailing Done were honoured it would end the turn before anything ran.
+    #[test]
+    fn the_done_that_follows_tool_calls_does_not_end_the_turn() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.finish_stream();
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert_eq!(a.pending_tools.len(), 1);
+    }
+
+    #[test]
+    fn results_go_back_as_tool_messages_and_are_summarised_on_screen() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "cat a.rs")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        a.finish_tools(vec![ToolOutcome {
+            call_id: "call_1".to_string(),
+            display: "$ cat a.rs — 3 lines".to_string(),
+            content: "exit code: 0\n--- stdout ---\nfn main() {}\n".to_string(),
+        }]);
+
+        assert_eq!(a.state, AppState::Sending);
+        let wire = a.history(None);
+        let tool = wire.last().unwrap();
+        assert_eq!(tool.role, "tool");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
+        assert!(tool.content.as_deref().unwrap().contains("fn main"));
+
+        // The transcript shows the summary, never the whole output.
+        assert_eq!(a.messages.last().unwrap().body(), "$ cat a.rs — 3 lines");
+    }
+
+    /// An assistant turn that is nothing but tool calls must serialize with no
+    /// content field at all; `""` is rejected by several providers.
+    #[test]
+    fn an_assistant_turn_of_pure_tool_calls_carries_no_content() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+
+        let assistant = a
+            .history(None)
+            .into_iter()
+            .find(|m| m.role == "assistant")
+            .expect("the assistant turn must be in the history");
+        assert_eq!(assistant.content, None);
+        assert_eq!(assistant.tool_calls.len(), 1);
+    }
+
+    /// The subtle one. Abandoning a turn between "the model asked" and "we ran
+    /// it" leaves a tool_calls entry with no answer. Providers 400 on that -- and
+    /// the 400 surfaces on the *next* prompt, looking unrelated.
+    #[test]
+    fn cancelling_mid_tool_loop_leaves_a_history_the_endpoint_will_accept() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls"), command_call("call_2", "pwd")]);
+        a.handle_key(key(KeyCode::Char('y'))); // allow the first
+        a.handle_key(key(KeyCode::Char('y'))); // allow the second, now ExecutingTools
+        a.cancel();
+
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert!(a.pending_tools.is_empty());
+        assert!(a.approved_tools.is_empty());
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    #[test]
+    fn a_failure_mid_tool_loop_also_leaves_a_valid_history() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.fail_stream("HTTP 500".to_string());
+
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert_eq!(a.overlay, None);
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    /// A call already answered must not be answered twice -- duplicate
+    /// tool_call_ids are just as invalid as missing ones.
+    #[test]
+    fn already_answered_calls_are_not_settled_again() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls"), command_call("call_2", "pwd")]);
+        a.handle_key(key(KeyCode::Char('n'))); // call_1 declined, already answered
+        a.handle_key(key(KeyCode::Char('y'))); // call_2 approved, still unanswered
+        a.cancel();
+
+        let answers: Vec<&str> = a
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(answers, vec!["call_1", "call_2"]);
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    #[test]
+    fn a_new_prompt_resets_the_step_budget() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        a.finish_tools(vec![outcome("call_1", "ok")]);
+        assert_eq!(a.tool_steps, 1);
+
+        a.state = AppState::AwaitingInput;
+        type_str(&mut a, "another question");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.tool_steps, 0);
+    }
+
+    /// Results from a turn the user already abandoned must not be spliced into
+    /// the next one -- the runner is spawned, so it can land late.
+    #[test]
+    fn late_results_from_an_abandoned_turn_are_ignored() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "sleep 30")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        a.cancel();
+
+        let before = a.messages.len();
+        a.finish_tools(vec![outcome("call_1", "too late")]);
+        assert_eq!(a.messages.len(), before, "a late result was appended anyway");
+    }
+
+    /// Every `tool_calls` entry answered exactly once, by a `tool` message, and
+    /// no `tool` message answering a call that was never made.
+    fn assert_history_is_well_formed(history: &[ChatMessage]) {
+        let requested: Vec<&str> = history
+            .iter()
+            .flat_map(|m| m.tool_calls.iter())
+            .map(|c| c.id.as_str())
+            .collect();
+        let mut answered: Vec<&str> = history
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+
+        let mut expected = requested.clone();
+        expected.sort_unstable();
+        answered.sort_unstable();
+        assert_eq!(
+            answered, expected,
+            "every tool call must be answered exactly once\nhistory: {history:#?}"
         );
     }
 
