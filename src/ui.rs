@@ -50,14 +50,43 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
         lines.extend(welcome_lines(app));
     } else {
         for msg in &app.messages {
+            // Tool activity is scaffolding, not conversation: one dim line each,
+            // no speaker label and no blank separator, so a run of six reads as a
+            // compact block rather than three screens of transcript. The full
+            // result still goes to the model -- it is just not drawn.
+            if msg.role == Role::Tool {
+                for wrapped in wrap(msg.body(), width) {
+                    lines.push(Line::from(Span::styled(wrapped, role_style(Role::Tool))));
+                }
+                continue;
+            }
+            // An assistant turn that was nothing but tool calls has no prose to
+            // show; the calls speak for themselves on the lines that follow.
+            if msg.role == Role::Assistant && !msg.tool_calls.is_empty() && msg.content.trim().is_empty()
+            {
+                continue;
+            }
+
             lines.push(Line::from(vec![Span::styled(
                 format!("{}: ", msg.role.label()),
                 role_style(msg.role),
             )]));
-            for wrapped in wrap(&msg.content, width) {
+            for wrapped in wrap(msg.body(), width) {
                 lines.push(Line::from(wrapped));
             }
             lines.push(Line::from(""));
+        }
+
+        if app.state == AppState::ExecutingTools {
+            for call in &app.approved_tools {
+                let running = crate::tools::described_command(call)
+                    .map(|(command, _)| command)
+                    .unwrap_or_else(|| call.function.name.clone());
+                lines.push(Line::from(Span::styled(
+                    format!("$ {running} …"),
+                    role_style(Role::Tool),
+                )));
+            }
         }
 
         if app.state == AppState::Streaming {
@@ -123,6 +152,32 @@ fn welcome_lines(app: &App) -> Vec<Line<'static>> {
                 Style::default().fg(Color::Green),
             ),
         ]),
+    ];
+
+    // Where commands will run, stated up front. A user should never have to
+    // guess this about a tool that can change their files -- and the two
+    // dangerous configurations shout rather than blend in.
+    if !app.workspace_status.is_empty() {
+        let alarming = app.workspace_status.contains("UNATTENDED");
+        let colour = if alarming {
+            Color::Red
+        } else if app.workspace_status.starts_with("off") || app.workspace_status.contains("broad")
+        {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        let mut style = Style::default().fg(colour);
+        if alarming {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        lines.push(Line::from(vec![
+            Span::styled("Commands:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(app.workspace_status.clone(), style),
+        ]));
+    }
+
+    lines.extend([
         Line::from(""),
         Line::from("📝 How to use:"),
         Line::from("  • Type your prompt below"),
@@ -130,7 +185,7 @@ fn welcome_lines(app: &App) -> Vec<Line<'static>> {
         Line::from("  • Alt+Enter (or Shift+Enter) for a new line"),
         Line::from("  • Press Esc to cancel a running request"),
         Line::from(""),
-    ];
+    ]);
 
     let warnings = app.config.warnings();
     if warnings.is_empty() {
@@ -156,6 +211,7 @@ fn role_style(role: Role) -> Style {
         Role::Assistant => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         Role::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         Role::System => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        Role::Tool => Style::default().fg(Color::Blue),
     }
 }
 
@@ -232,17 +288,21 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let (status, color) = match &app.state {
         AppState::AwaitingInput => ("Ready", Color::Green),
-        AppState::Sending { .. } => ("Sending…", Color::Yellow),
+        AppState::Sending => ("Sending…", Color::Yellow),
         AppState::Streaming => ("Streaming…", Color::Yellow),
+        AppState::AwaitingApproval => ("Waiting for you", Color::Magenta),
+        AppState::ExecutingTools => ("Running command…", Color::Blue),
+    };
+
+    let keys = match &app.state {
+        AppState::AwaitingApproval => " | y run · n skip · a allow all · Ctrl-C exit",
+        _ => " | Enter send · Alt+Enter newline · Esc cancel · Ctrl-C exit",
     };
 
     let footer = Line::from(vec![
         Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
         Span::styled(status, Style::default().fg(color)),
-        Span::styled(
-            " | Enter send · Alt+Enter newline · Esc cancel · Ctrl-C exit",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(keys, Style::default().fg(Color::DarkGray)),
     ]);
 
     f.render_widget(Paragraph::new(footer), area);
@@ -251,6 +311,12 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
 // ---- /provider and /model overlays ---------------------------------------------
 
 fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
+    // Nothing can be drawn into a frame with no cells, and trying panics inside
+    // `Clear`, which indexes the buffer without checking. Terminals do report
+    // 0x0 -- during a resize, and on a pty opened without a window size.
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     match &app.overlay {
         None => {}
         Some(Overlay::ProviderPicker { selected }) => {
@@ -305,15 +371,88 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
             };
             render_text_prompt(f, area, title, hint, &app.overlay_input, masked);
         }
+        Some(Overlay::CommandApproval {
+            command,
+            purpose,
+            remaining,
+        }) => render_command_approval(f, area, app, command, purpose.as_deref(), *remaining),
     }
+}
+
+/// The approval prompt. This is the only thing standing between the model and
+/// the machine, so it shows the command verbatim and in full -- never elided,
+/// never summarised. Approving something you cannot fully see is not approval.
+fn render_command_approval(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    command: &str,
+    purpose: Option<&str>,
+    remaining: usize,
+) {
+    let width = area.width.saturating_sub(10).clamp(MIN_POPUP_WIDTH, 90);
+    let inner = width.saturating_sub(4).max(1) as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(purpose) = purpose {
+        for wrapped in wrap(purpose, inner) {
+            lines.push(Line::from(Span::styled(
+                wrapped,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    for wrapped in wrap(command, inner) {
+        lines.push(Line::from(Span::styled(
+            format!("$ {wrapped}"),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("in {}", app.workspace_root),
+        Style::default().fg(Color::DarkGray),
+    )));
+    if remaining > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("({remaining} more queued after this one)"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("y", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(" run   ", Style::default().fg(Color::DarkGray)),
+        Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(" skip   ", Style::default().fg(Color::DarkGray)),
+        Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " run everything this session",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+
+    let popup = centered_rect(width, lines.len() as u16 + 2, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(" Run this command? ");
+    f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Centers a popup sized to its content within `area`, clamped so it never
 /// exceeds the available space, with an absolute floor so tiny terminals don't
 /// produce an unreadably small popup.
+///
+/// The floor is applied *before* the clamp, never after: `max(MIN).min(area)`
+/// stays inside the frame, while `min(area).max(MIN)` would grow a popup back
+/// out past the edge of a small terminal and index off the end of the buffer.
 fn centered_rect(desired_width: u16, desired_height: u16, area: Rect) -> Rect {
-    let width = desired_width.max(MIN_POPUP_WIDTH).min(area.width.max(1));
-    let height = desired_height.max(MIN_POPUP_HEIGHT).min(area.height.max(1));
+    let width = desired_width.max(MIN_POPUP_WIDTH).min(area.width);
+    let height = desired_height.max(MIN_POPUP_HEIGHT).min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect { x, y, width, height }
@@ -447,4 +586,83 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn frame(width: u16, height: u16) -> Rect {
+        Rect { x: 0, y: 0, width, height }
+    }
+
+    /// Regression: a popup wider or taller than the frame indexes off the end of
+    /// the buffer, and `Clear` panics rather than clipping. Terminals really do
+    /// report sizes this small -- mid-resize, and on a pty with no window size.
+    #[test]
+    fn a_popup_never_escapes_a_small_frame() {
+        for (w, h) in [(0, 0), (1, 1), (5, 3), (20, 4), (39, 5), (200, 60)] {
+            let area = frame(w, h);
+            let popup = centered_rect(60, 12, area);
+            assert!(
+                popup.width <= area.width && popup.height <= area.height,
+                "{w}x{h}: popup {}x{} escaped the frame",
+                popup.width,
+                popup.height
+            );
+            assert!(
+                popup.right() <= area.right() && popup.bottom() <= area.bottom(),
+                "{w}x{h}: popup runs past the frame edge"
+            );
+        }
+    }
+
+    /// The end of the same bug: rendering an overlay into a zero-cell frame.
+    #[test]
+    fn rendering_an_overlay_into_a_zero_size_frame_does_not_panic() {
+        let mut app = App::new(crate::config::Config::default());
+        app.overlay = Some(Overlay::CommandApproval {
+            command: "rm -rf /".to_string(),
+            purpose: Some("something alarming".to_string()),
+            remaining: 2,
+        });
+
+        for (w, h) in [(1, 1), (2, 2), (10, 4), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| render(f, &mut app))
+                .unwrap_or_else(|e| panic!("{w}x{h} failed to render: {e}"));
+        }
+    }
+
+    /// The command must appear verbatim: approving something you cannot read is
+    /// not approval.
+    #[test]
+    fn the_approval_prompt_shows_the_command_and_the_keys() {
+        let mut app = App::new(crate::config::Config::default());
+        app.workspace_root = "/tmp/project".to_string();
+        app.overlay = Some(Overlay::CommandApproval {
+            command: "rm -rf build".to_string(),
+            purpose: None,
+            remaining: 0,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(rendered.contains("rm -rf build"), "the command must be shown");
+        assert!(rendered.contains("Run this command?"), "{rendered}");
+        assert!(rendered.contains("/tmp/project"), "where it runs must be shown");
+        assert!(rendered.contains("y run"), "the keys must be shown");
+    }
 }

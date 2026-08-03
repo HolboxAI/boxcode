@@ -2,11 +2,14 @@ mod app;
 mod config;
 mod llm;
 mod providers;
+mod tools;
 mod ui;
 mod upgrade;
+mod workspace;
 
 use app::{App, AppState};
 use config::Config;
+use workspace::Workspace;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -68,6 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let config = Config::load()?;
+    let (workspace, workspace_status) = open_workspace(&config);
 
     let enhanced = setup_terminal()?;
     install_panic_hook(enhanced);
@@ -76,9 +80,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config);
+    app.workspace_status = workspace_status;
+    app.workspace_root = workspace
+        .as_ref()
+        .map(|ws| ws.root().display().to_string())
+        .unwrap_or_default();
     let (tx, mut rx) = mpsc::channel::<(u64, StreamEvent)>(256);
 
-    let result = run_app(&mut terminal, &mut app, tx, &mut rx).await;
+    let result = run_app(&mut terminal, &mut app, workspace.as_ref(), tx, &mut rx).await;
 
     restore_terminal(enhanced)?;
     if let Err(e) = &result {
@@ -88,9 +97,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
     result
 }
 
+/// Resolve the root the model is confined to, and a line describing the outcome.
+///
+/// A workspace that cannot be opened must not stop the app: it still works as a
+/// plain chat client, just without file access, so the failure degrades to a
+/// notice on the welcome screen instead of a startup error.
+fn open_workspace(config: &Config) -> (Option<Workspace>, String) {
+    if !config.tools.enabled {
+        return (None, "off (enabled = false in config.toml)".to_string());
+    }
+    match Workspace::new(&config.tools.workspace) {
+        Ok(workspace) => {
+            let root = workspace.root().display().to_string();
+            // Every one of these is worth seeing before typing the first prompt:
+            // a shell tool can change anything, and unattended mode means it can
+            // do so without asking.
+            let mut status = format!("commands run in {root}");
+            if !config.tools.require_approval {
+                status.push_str(" — UNATTENDED, no approval prompt");
+            }
+            if workspace.is_broad() {
+                status.push_str(" — this is a very broad directory");
+            }
+            (Some(workspace), status)
+        }
+        Err(e) => (None, format!("off — {e}")),
+    }
+}
+
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
+    workspace: Option<&Workspace>,
     tx: mpsc::Sender<(u64, StreamEvent)>,
     rx: &mut mpsc::Receiver<(u64, StreamEvent)>,
 ) -> Result<(), Box<dyn Error>> {
@@ -120,27 +158,76 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
             match event {
                 StreamEvent::Token(token) => app.append_token(&token),
+                StreamEvent::ToolCalls(calls) => app.request_tools(calls),
+                StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
                 StreamEvent::Done => app.finish_stream(),
                 StreamEvent::Error(err) => app.fail_stream(err),
             }
         }
 
         // Fire a pending request.
-        if let AppState::Sending { .. } = &app.state {
+        if app.state == AppState::Sending {
             app.request_id += 1;
             let id = app.request_id;
             let endpoint = app.config.llm.endpoint.clone();
             let model = app.config.llm.model.clone();
             let api_key = app.config.llm.api_key.clone();
-            let history = app.history();
+
+            // Withholding the schemas once the budget is spent is what actually
+            // stops a runaway loop: the model has nothing left to call, so it
+            // answers. Saying "stop" in the prompt alone would only be a request.
+            let budget_left = app.tool_steps < app.config.tools.max_steps;
+            let (schemas, system) = match workspace {
+                Some(ws) => (
+                    if budget_left { tools::schemas() } else { Vec::new() },
+                    Some(tools::system_prompt(ws, &app.config.tools, budget_left)),
+                ),
+                None => (Vec::new(), None),
+            };
+            let history = app.history(system.as_deref());
             let tx_clone = tx.clone();
 
             let handle = tokio::spawn(async move {
-                llm::stream_chat(&endpoint, &model, &api_key, history, id, tx_clone).await;
+                llm::stream_chat(&endpoint, &model, &api_key, history, schemas, id, tx_clone).await;
             });
 
             app.abort = Some(handle.abort_handle());
             app.state = AppState::Streaming;
+        }
+
+        // Run the commands the user allowed.
+        //
+        // Spawned rather than run inline: a command may take a minute, and doing
+        // it on the event loop would freeze the whole UI -- no redraw, no Esc, no
+        // way to tell a slow build from a hang. Results come back on the same
+        // channel as tokens, so the stale-request-id guard covers them too.
+        if app.state == AppState::ExecutingTools && !app.approved_tools.is_empty() {
+            let calls = std::mem::take(&mut app.approved_tools);
+            let tools_config = app.config.tools.clone();
+            match workspace {
+                Some(ws) => {
+                    let ws = ws.clone();
+                    let id = app.request_id;
+                    let tx_clone = tx.clone();
+                    let handle = tokio::spawn(async move {
+                        let mut outcomes = Vec::with_capacity(calls.len());
+                        for call in &calls {
+                            outcomes.push(tools::execute(call, &ws, &tools_config).await);
+                        }
+                        let _ = tx_clone
+                            .send((id, StreamEvent::ToolsFinished(outcomes)))
+                            .await;
+                    });
+                    app.abort = Some(handle.abort_handle());
+                }
+                // Only reachable if a model invents tool calls for a schema it
+                // was never sent. Answer them anyway, or the history is left
+                // invalid and the next prompt fails instead of this one.
+                None => app.fail_stream(
+                    "The model asked to run a command, but the command tool is not enabled."
+                        .to_string(),
+                ),
+            }
         }
 
         if app.should_exit {
@@ -169,6 +256,15 @@ CONFIG (environment overrides ~/.tuisample-code/config.toml):
     TUISAMPLE_ENDPOINT    Base URL, e.g. https://llm.internal:8443
     TUISAMPLE_MODEL       Model name
     TUISAMPLE_API_KEY     Bearer token
+
+COMMANDS (the model can run shell commands, with your approval each time):
+    TUISAMPLE_WORKSPACE       Directory commands run in (default: cwd)
+    TUISAMPLE_TOOLS_ENABLED   Set to 0 to send no tool schema at all
+    TUISAMPLE_TOOLS_APPROVAL  Set to 0 to stop asking before each command.
+                              For scripted testing only -- it hands the model
+                              an unattended shell.
+                              See the [tools] table in config.toml for
+                              command_timeout_secs, max_output_bytes, max_steps.
 
 UPGRADE:
     TUISAMPLE_UPGRADE_URL_BASE
