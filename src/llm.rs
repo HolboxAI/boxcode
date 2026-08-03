@@ -99,8 +99,6 @@ pub struct FunctionDef {
 }
 
 impl ToolDef {
-    /// Called by the tool registry once it exists.
-    #[allow(dead_code)]
     pub fn function(name: &str, description: &str, parameters: serde_json::Value) -> Self {
         Self {
             kind: "function",

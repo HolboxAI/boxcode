@@ -2,6 +2,9 @@ mod app;
 mod config;
 mod llm;
 mod providers;
+/// Complete and tested, but nothing reaches for a tool until the agent loop lands.
+#[allow(dead_code)]
+mod tools;
 mod ui;
 mod upgrade;
 
