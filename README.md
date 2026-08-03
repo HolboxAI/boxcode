@@ -97,6 +97,73 @@ internal mirror serving the same `Cargo.toml` and `install.sh`:
 export TUISAMPLE_UPGRADE_URL_BASE=https://git.company.internal/tuisample-code/raw/main
 ```
 
+## Running commands
+
+The model can run shell commands in the directory you launched from, so you can
+ask about the actual project instead of pasting code in:
+
+```
+> what does the event loop in main.rs do?
+$ sed -n '90,150p' src/main.rs — 61 lines
+Assistant: It polls for terminal input every 16ms, drains …
+```
+
+Reading a file is `cat`, searching is `grep`, listing an archive is `unzip -l`,
+extracting text from a PDF is `pdftotext` — anything installed on your machine.
+
+### You approve every command
+
+Each command stops and waits for you:
+
+```
+┌ Run this command? ───────────────────────────┐
+│ check what the tests cover                   │
+│                                              │
+│ $ grep -rn "fn test" tests/                  │
+│                                              │
+│ in /Users/you/project                        │
+│                                              │
+│ y run   n skip   a run everything this session│
+└──────────────────────────────────────────────┘
+```
+
+**`y`** runs it · **`n`** or **Esc** skips it and tells the model to try
+something else · **`a`** stops asking for the rest of the session.
+
+This prompt is the *only* thing limiting what the model can do. A shell command
+can read any file your user can read, write anywhere, and delete anything —
+there is no sandbox, and there is no honest way to build one by inspecting
+command strings. Read each command before pressing `y`.
+
+Commands run with **stdin closed** and are killed after a timeout, so anything
+interactive (`vim`, a dev server, a REPL) will time out rather than hang.
+
+### Configuration
+
+```toml
+[tools]
+enabled = true            # false sends no tool schema at all
+workspace = "."           # "." = the directory you launched from
+require_approval = true   # false = the model runs commands unattended
+command_timeout_secs = 60
+max_output_bytes = 65536  # ceiling on one command's output
+max_steps = 10            # command rounds per prompt before the model must answer
+```
+
+Per-run: `TUISAMPLE_WORKSPACE=/path/to/project`, `TUISAMPLE_TOOLS_ENABLED=0`.
+
+> **`require_approval = false` hands the model an unattended shell** on your
+> machine. It exists for scripted testing. If you set it, the welcome screen
+> says `UNATTENDED` in red every launch.
+
+Works on macOS, Linux, and Windows — commands run through `sh -c`, or `cmd /C`
+on Windows, and the model is told which platform it is on so it reaches for
+`dir`/`type`/`findstr` rather than `ls`/`cat`/`grep`.
+
+> Your endpoint needs to support OpenAI-style tool calling. If it doesn't, the
+> request comes back as `HTTP 400` — set `enabled = false` under `[tools]` and
+> everything else keeps working as before.
+
 ## Usage
 
 - **Type prompt** — Bottom input line (paste works too)
@@ -141,12 +208,13 @@ Clean, modular structure for easy feature additions:
 - `src/llm.rs` — LLM client + streaming
 - `src/config.rs` — Configuration loading
 - `src/providers.rs` — Built-in provider/model registry for `/provider` and `/model`
+- `src/tools.rs` — The `run_command` tool: schema, execution, timeouts
+- `src/workspace.rs` — The working directory commands run in
 
 ## What's Next
 
-Day 2+:
-- Code generation command (separate flow)
-- File context collection
+- A diff preview when a command is about to modify tracked files
+- Remembering per-command approvals across a session
 - GitHub integration (VPC-only)
 - Test generation
 
