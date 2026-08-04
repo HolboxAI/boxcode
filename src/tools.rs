@@ -21,6 +21,7 @@
 //! reason to abandon the turn.
 
 use crate::config::ToolsConfig;
+use crate::danger;
 use crate::llm::ToolCall;
 use crate::workspace::Workspace;
 use serde::Deserialize;
@@ -352,6 +353,16 @@ pub fn is_read_only(command: &str) -> bool {
 }
 
 pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
+    // Belt and braces. `app::advance_approvals` already refuses blocked calls
+    // before they can be queued, so reaching this is a bug -- but the cost of
+    // the check is a string scan and the cost of missing it is an erased disk,
+    // so the runner refuses independently rather than trusting its caller.
+    if let Some(Action::Command { command, .. }) = describe_action(call) {
+        if let danger::Risk::Blocked(reason) = danger::classify(&command, workspace.root()) {
+            return refused_as_dangerous(call, &reason);
+        }
+    }
+
     match call.function.name.as_str() {
         RUN_COMMAND => execute_run_command(call, workspace, config).await,
         READ_FILE => execute_read_file(call, workspace, config).await,
@@ -583,6 +594,28 @@ pub fn declined(call: &ToolCall) -> ToolOutcome {
         "The user declined to let this happen. Do not try it again; take a different \
          approach or answer without it."
             .to_string(),
+    )
+}
+
+/// The result for a call the guardrails refused outright.
+///
+/// Worded so the model treats it as a settled boundary rather than an obstacle
+/// to route around: without that it tends to retry the same thing spelled
+/// differently, which is exactly what a blocklist is worst at catching.
+pub fn refused_as_dangerous(call: &ToolCall, reason: &str) -> ToolOutcome {
+    let label = describe_action(call)
+        .map(|a| a.label())
+        .unwrap_or_else(|| call.function.name.clone());
+    outcome(
+        &call.id,
+        format!("⛔ {} — blocked", clip(&label, 60)),
+        format!(
+            "Blocked by the safety guardrails and never run: {reason}.\n\
+             This was refused by the tool itself, not by the user, and no setting can permit \
+             it. Do not attempt this again in any form, and do not try to work around it. \
+             Tell the user plainly what you wanted to do and why it was blocked, and let them \
+             run it themselves if they judge it safe."
+        ),
     )
 }
 
