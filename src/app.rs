@@ -146,11 +146,6 @@ pub struct App {
     pub pending_tools: VecDeque<ToolCall>,
     /// Calls the user allowed, waiting for the event loop to spawn them.
     pub approved_tools: Vec<ToolCall>,
-    /// Set by "a" at an approval prompt: stop asking for the rest of the session.
-    /// Session-only and never persisted -- a permanent version of this belongs in
-    /// config.toml, where turning it on is a deliberate act rather than a
-    /// keystroke made while impatient.
-    pub auto_approve: bool,
     /// Tool rounds spent on the current prompt, reset by `submit`. Once this hits
     /// the configured ceiling the schemas stop being sent, which is what makes a
     /// model that will not stop calling tools produce an answer instead.
@@ -183,7 +178,6 @@ impl App {
             overlay_cursor: 0,
             pending_tools: VecDeque::new(),
             approved_tools: Vec::new(),
-            auto_approve: false,
             tool_steps: 0,
             workspace_status: String::new(),
             workspace_root: String::new(),
@@ -452,7 +446,7 @@ impl App {
         if self.risk_of(call).is_dangerous() {
             return true;
         }
-        if !self.config.tools.require_approval || self.auto_approve {
+        if !self.config.tools.require_approval {
             return false;
         }
         if self.config.tools.auto_approve_read_only {
@@ -467,22 +461,21 @@ impl App {
         true
     }
 
-    /// y allow · n refuse · a stop asking for this session · Esc refuse.
+    /// y allow · n refuse · Esc refuse.
     ///
     /// Esc means refuse rather than cancel-the-turn: at a prompt asking whether
     /// to run something, the reflexive keypress has to be the safe one.
+    ///
+    /// There is deliberately no "allow everything from now on" key. A decision
+    /// made once, while impatient, would otherwise silently cover every command
+    /// for the rest of the session -- including ones the model had not thought
+    /// of yet. `[tools] require_approval = false` still exists for scripted
+    /// runs, where turning it off is an explicit, visible act rather than a
+    /// keystroke.
     fn handle_command_approval_key(&mut self, key: KeyEvent) {
         let decision = match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(true),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.auto_approve = true;
-                self.messages.push(Message::new(
-                    Role::System,
-                    "Running commands without asking for the rest of this session.",
-                ));
-                Some(true)
-            }
             _ => None,
         };
 
@@ -1394,22 +1387,20 @@ mod tests {
         assert_history_is_well_formed(&a.history(None));
     }
 
-    /// The bypasses are the reason this feature exists. Before it, pressing `a`
-    /// or setting `require_approval = false` made `needs_approval` return false
-    /// for *everything*, `rm -rf /` included.
+    /// The bypasses are the reason this feature exists. Before it,
+    /// `require_approval = false` made `needs_approval` return false for
+    /// *everything*, `rm -rf /` included.
     #[test]
-    fn no_setting_or_keypress_can_unblock_a_catastrophic_command() {
+    fn no_setting_can_unblock_a_catastrophic_command() {
         type Bypass = (&'static str, fn(&mut App));
-        let bypasses: [Bypass; 4] = [
-            ("session auto-approve", |a| a.auto_approve = true),
+        let bypasses: [Bypass; 3] = [
             ("unattended mode", |a| {
                 a.config.tools.require_approval = false
             }),
             ("read-only fast path", |a| {
                 a.config.tools.auto_approve_read_only = true
             }),
-            ("all of them at once", |a| {
-                a.auto_approve = true;
+            ("both at once", |a| {
                 a.config.tools.require_approval = false;
                 a.config.tools.auto_approve_read_only = true;
             }),
@@ -1429,11 +1420,10 @@ mod tests {
     }
 
     /// The other half: a destructive-but-legitimate command must still stop,
-    /// even for a user who has said "yes to everything".
+    /// even with approval switched off entirely.
     #[test]
-    fn dangerous_commands_still_ask_even_after_pressing_a() {
+    fn dangerous_commands_still_ask_in_unattended_mode() {
         let mut a = streaming_app();
-        a.auto_approve = true;
         a.config.tools.require_approval = false;
 
         a.request_tools(vec![command_call("call_1", "rm -rf build")]);
@@ -1441,7 +1431,7 @@ mod tests {
         assert_eq!(
             a.state,
             AppState::AwaitingApproval,
-            "`rm -rf build` must not ride the auto-approve fast path"
+            "`rm -rf build` must not ride the unattended fast path"
         );
         assert!(a.overlay.is_some());
     }
@@ -1450,7 +1440,7 @@ mod tests {
     #[test]
     fn ordinary_commands_are_unaffected_by_the_guardrails() {
         let mut a = streaming_app();
-        a.auto_approve = true;
+        a.config.tools.require_approval = false;
         a.request_tools(vec![command_call("call_1", "cargo build")]);
 
         assert_eq!(a.state, AppState::ExecutingTools);
@@ -1461,7 +1451,7 @@ mod tests {
     #[test]
     fn a_blocked_call_mixed_with_a_normal_one_leaves_a_valid_history() {
         let mut a = streaming_app();
-        a.auto_approve = true;
+        a.config.tools.require_approval = false;
         a.request_tools(vec![
             command_call("call_1", "rm -rf /"),
             command_call("call_2", "ls"),
@@ -1473,21 +1463,32 @@ mod tests {
         assert_history_is_well_formed(&a.history(None));
     }
 
+    /// "Allow everything from now on" was removed deliberately. `a` is now an
+    /// ordinary unrecognised key, which means the prompt stays up rather than
+    /// being dismissed -- a stray keystroke must never be read as consent.
     #[test]
-    fn a_stops_asking_for_the_rest_of_the_session() {
+    fn there_is_no_key_that_approves_everything_for_the_session() {
         let mut a = streaming_app();
         a.request_tools(vec![command_call("call_1", "ls")]);
-        a.handle_key(key(KeyCode::Char('a')));
-        assert!(a.auto_approve);
-        assert_eq!(a.approved_tools.len(), 1);
 
-        // A later round goes straight through with no prompt.
+        for stray in [KeyCode::Char('a'), KeyCode::Char('A')] {
+            a.handle_key(key(stray));
+            assert_eq!(
+                a.state,
+                AppState::AwaitingApproval,
+                "{stray:?} approved something"
+            );
+            assert!(a.approved_tools.is_empty(), "{stray:?} approved something");
+            assert!(a.overlay.is_some(), "{stray:?} dismissed the prompt");
+        }
+
+        // Each later command is asked about on its own, with no memory of past
+        // answers.
+        a.handle_key(key(KeyCode::Char('y')));
         a.finish_tools(vec![outcome("call_1", "ok")]);
         a.state = AppState::Streaming;
         a.request_tools(vec![command_call("call_2", "cat Cargo.toml")]);
-
-        assert_eq!(a.state, AppState::ExecutingTools);
-        assert_eq!(a.overlay, None);
+        assert_eq!(a.state, AppState::AwaitingApproval, "the second command must ask too");
     }
 
     #[test]

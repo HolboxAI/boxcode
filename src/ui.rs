@@ -297,7 +297,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let keys = match &app.state {
-        AppState::AwaitingApproval => " | y run · n skip · a allow all · Ctrl-C exit",
+        AppState::AwaitingApproval => " | y run · n or Esc skip · Ctrl-C exit",
         _ => " | Enter send · Alt+Enter newline · Esc cancel · Ctrl-C exit",
     };
 
@@ -488,11 +488,8 @@ fn render_tool_approval(f: &mut Frame, area: Rect, app: &App, action: &Action, r
         Span::styled(format!(" {verb}   "), Style::default().fg(Color::DarkGray)),
         Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         Span::styled(" skip   ", Style::default().fg(Color::DarkGray)),
-        Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            " run everything this session",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(" skip", Style::default().fg(Color::DarkGray)),
     ]));
 
     let popup = centered_rect(width, lines.len() as u16 + 2, area);

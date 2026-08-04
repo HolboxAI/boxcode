@@ -128,14 +128,16 @@ not a shell string:
 │                                              │
 │ in /Users/you/project                        │
 │                                              │
-│ y write   n skip   a run everything this session│
+│ y write   n skip   Esc skip                  │
 └──────────────────────────────────────────────┘
 ```
 
 **`y`** does it · **`n`** or **Esc** skips it and tells the model to try
-something else · **`a`** stops asking for the rest of the session. Reads of a
-short, conservative allowlist (`ls`, `cat`, `grep`, `git status`/`diff`, ...)
-skip the prompt by default — see `auto_approve_read_only` below.
+something else. Every action is asked about individually — there is
+deliberately no "allow everything from now on" key, so one impatient keystroke
+can never cover commands the model has not thought of yet. Reads of a short,
+conservative allowlist (`ls`, `cat`, `grep`, `git status`/`diff`, ...) skip the
+prompt by default — see `auto_approve_read_only` below.
 
 These prompts are the *only* thing limiting what the model can do. `run_command`
 can read any file your user can read, write anywhere, and delete anything —
@@ -168,12 +170,18 @@ executing base64-decoded data, `kill -9 1`, and recursive `chmod`/`chown` on
 system paths. Every segment of a chained command is checked, so
 `ls && rm -rf /` is caught too.
 
-**No setting or keypress reaches this.** Not `a`, not
-`require_approval = false`, not `auto_approve_read_only`. There is deliberately
-no config option to turn it off.
+Windows and PowerShell are covered by the same rules: `del /f /s /q C:\`,
+`rd /s /q C:\`, `Remove-Item -Recurse -Force C:\`, `format`, `diskpart`,
+`cipher /w`, `bcdedit`, `reg delete HKLM`, `Clear-Disk`, and
+`vssadmin delete shadows` (which destroys the backups that would let you
+recover).
+
+**No setting reaches this.** Not `require_approval = false`, not
+`auto_approve_read_only`. There is deliberately no config option to turn it off.
 
 A middle tier — destructive but legitimate — always stops for an explicit
-decision, *even after you press `a`*: `rm -rf build`, `git reset --hard`,
+decision, *even with approval switched off entirely*: `rm -rf build`,
+`git reset --hard`,
 `git clean -fd`, force-push, `sudo` anything, `find … -delete`, uninstalls,
 `docker prune`. The prompt shows a red **DESTRUCTIVE** banner and why.
 
