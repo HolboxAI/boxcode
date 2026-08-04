@@ -95,10 +95,9 @@ pub enum Overlay {
     CustomEndpoint(CustomStep),
     /// Asks about `pending_tools.front()`. Unlike the other overlays this one
     /// appears while the app is busy, mid-turn.
-    CommandApproval {
-        command: String,
-        purpose: Option<String>,
-        /// How many more commands are queued behind this one.
+    ToolApproval {
+        action: tools::Action,
+        /// How many more calls are queued behind this one.
         remaining: usize,
     },
 }
@@ -379,11 +378,10 @@ impl App {
                 self.approved_tools.push(call);
                 continue;
             }
-            match tools::described_command(call) {
-                Some((command, purpose)) => {
-                    self.overlay = Some(Overlay::CommandApproval {
-                        command,
-                        purpose,
+            match tools::describe_action(call) {
+                Some(action) => {
+                    self.overlay = Some(Overlay::ToolApproval {
+                        action,
                         remaining: self.pending_tools.len().saturating_sub(1),
                     });
                     self.state = AppState::AwaitingApproval;
@@ -411,18 +409,23 @@ impl App {
     ///
     /// Order matters: the session-wide escape hatches (`require_approval`,
     /// `auto_approve`) are checked first since they should short-circuit
-    /// regardless of what the command is, and `auto_approve_read_only` only
-    /// waives the prompt for a narrow, conservative slice of commands (see
-    /// `tools::is_read_only`) -- everything else still asks.
+    /// regardless of what the call is, and `auto_approve_read_only` only
+    /// waives the prompt for a narrow, conservative slice of calls --
+    /// `read_file` unconditionally (it cannot write anything), and shell
+    /// commands via `tools::is_read_only`. `write_file` never qualifies:
+    /// unlike a shell command's read-only-ness, which has to be inferred,
+    /// "this writes a file" is certain, so it always asks.
     fn needs_approval(&self, call: &ToolCall) -> bool {
         if !self.config.tools.require_approval || self.auto_approve {
             return false;
         }
         if self.config.tools.auto_approve_read_only {
-            if let Some((command, _)) = tools::described_command(call) {
-                if tools::is_read_only(&command) {
+            match tools::describe_action(call) {
+                Some(tools::Action::Read { .. }) => return false,
+                Some(tools::Action::Command { command, .. }) if tools::is_read_only(&command) => {
                     return false;
                 }
+                _ => {}
             }
         }
         true
@@ -689,7 +692,7 @@ impl App {
             // Put back first: an unrecognised key must leave the prompt standing
             // rather than silently dismissing it, and `handle_overlay_key` took
             // the overlay before dispatching here.
-            approval @ Overlay::CommandApproval { .. } => {
+            approval @ Overlay::ToolApproval { .. } => {
                 self.overlay = Some(approval);
                 self.handle_command_approval_key(key);
             }
@@ -1193,6 +1196,28 @@ mod tests {
         }
     }
 
+    fn read_file_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::READ_FILE.to_string(),
+                arguments: serde_json::json!({ "path": path }).to_string(),
+            },
+        }
+    }
+
+    fn write_file_call(id: &str, path: &str, content: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::WRITE_FILE.to_string(),
+                arguments: serde_json::json!({ "path": path, "content": content }).to_string(),
+            },
+        }
+    }
+
     fn outcome(call_id: &str, content: &str) -> ToolOutcome {
         ToolOutcome {
             call_id: call_id.to_string(),
@@ -1226,7 +1251,7 @@ mod tests {
         assert_eq!(a.tool_steps, 1);
 
         match &a.overlay {
-            Some(Overlay::CommandApproval { command, .. }) => {
+            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, .. }) => {
                 assert_eq!(command, "cat src/main.rs")
             }
             other => panic!("expected an approval prompt, got {other:?}"),
@@ -1274,7 +1299,7 @@ mod tests {
         ]);
 
         match &a.overlay {
-            Some(Overlay::CommandApproval { command, remaining, .. }) => {
+            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, remaining }) => {
                 assert_eq!(command, "ls");
                 assert_eq!(*remaining, 1);
             }
@@ -1283,7 +1308,7 @@ mod tests {
 
         a.handle_key(key(KeyCode::Char('y')));
         match &a.overlay {
-            Some(Overlay::CommandApproval { command, remaining, .. }) => {
+            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, remaining }) => {
                 assert_eq!(command, "cat Cargo.toml");
                 assert_eq!(*remaining, 0);
             }
@@ -1386,11 +1411,42 @@ mod tests {
 
         assert_eq!(a.approved_tools.len(), 1, "the read-only call ran with no prompt");
         match &a.overlay {
-            Some(Overlay::CommandApproval { command, remaining, .. }) => {
+            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, remaining }) => {
                 assert_eq!(command, "rm -rf build");
                 assert_eq!(*remaining, 0);
             }
             other => panic!("expected a prompt for the risky call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_file_skips_the_prompt_when_the_fast_path_is_on() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![read_file_call("call_1", "src/main.rs")]);
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.overlay, None);
+        assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// Unlike a shell command's read-only-ness, "this writes a file" is
+    /// certain rather than inferred -- so it must never ride the fast path,
+    /// no matter how permissive `auto_approve_read_only` is.
+    #[test]
+    fn write_file_always_asks_even_with_the_fast_path_on() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![write_file_call("call_1", "hello.py", "print('hi')\n")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert!(a.approved_tools.is_empty());
+        match &a.overlay {
+            Some(Overlay::ToolApproval { action: tools::Action::Write { path, content }, .. }) => {
+                assert_eq!(path, "hello.py");
+                assert_eq!(content, "print('hi')\n");
+            }
+            other => panic!("expected a write approval prompt, got {other:?}"),
         }
     }
 
