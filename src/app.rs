@@ -160,6 +160,9 @@ pub struct App {
     /// The resolved working directory, shown on the approval prompt so it is
     /// always clear *where* a command is about to run.
     pub workspace_root: String,
+    /// One line for the welcome screen describing free-tier enrolment, or why it
+    /// is unavailable. Empty when the user brought their own key.
+    pub free_tier_status: String,
     /// Today's request / token / spend tallies, loaded at startup and written
     /// back after every request.
     pub usage: DailyUsage,
@@ -178,6 +181,7 @@ impl App {
         Self {
             usage,
             warned_today: false,
+            free_tier_status: String::new(),
             state: AppState::AwaitingInput,
             messages: Vec::new(),
             input_buffer: String::new(),

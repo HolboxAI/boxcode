@@ -174,6 +174,19 @@ fn welcome_lines(app: &App) -> Vec<Line<'static>> {
         ]),
     ];
 
+    // Whether this install is on the free tier, and what that buys, stated
+    // before the first prompt rather than discovered when a limit is hit.
+    if !app.free_tier_status.is_empty() {
+        let unavailable = app.free_tier_status.starts_with("unavailable");
+        lines.push(Line::from(vec![
+            Span::styled("Plan:         ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.free_tier_status.clone(),
+                Style::default().fg(if unavailable { Color::Yellow } else { Color::Cyan }),
+            ),
+        ]));
+    }
+
     // Where commands will run, stated up front. A user should never have to
     // guess this about a tool that can change their files -- and the two
     // dangerous configurations shout rather than blend in.

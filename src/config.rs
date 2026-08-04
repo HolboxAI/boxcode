@@ -14,6 +14,48 @@ pub struct Config {
     /// Same again for `[quota]`, which is newer still.
     #[serde(default)]
     pub quota: QuotaConfig,
+    /// ...and for `[free_tier]`, newer again.
+    #[serde(default)]
+    pub free_tier: FreeTierConfig,
+}
+
+/// Anonymous free-tier enrolment.
+///
+/// A fresh install with no API key registers with the gateway and receives a
+/// device token good for a small daily budget on one model. The gateway holds
+/// the real provider key -- it is never shipped in this binary, because a key
+/// compiled into a distributed binary is a published key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FreeTierConfig {
+    /// False stops this install from ever contacting the gateway.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Base URL of the gateway.
+    #[serde(default = "default_gateway")]
+    pub gateway: String,
+    /// Device token from `/register`. Not a provider key: it only spends this
+    /// device's daily allowance and is useless for anything else.
+    #[serde(default)]
+    pub device_token: String,
+    /// Stable identifier for machines with no readable hardware id. Persisted so
+    /// such a machine does not draw a fresh budget on every launch.
+    #[serde(default)]
+    pub fallback_id: String,
+}
+
+fn default_gateway() -> String {
+    crate::freetier::DEFAULT_GATEWAY.to_string()
+}
+
+impl Default for FreeTierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: yes(),
+            gateway: default_gateway(),
+            device_token: String::new(),
+            fallback_id: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -238,6 +280,12 @@ impl Config {
                 config.quota.max_usd_per_day = n;
             }
         }
+        if let Some(v) = env_var("TUISAMPLE_GATEWAY") {
+            config.free_tier.gateway = v;
+        }
+        if let Some(v) = env_var("TUISAMPLE_FREE_TIER") {
+            config.free_tier.enabled = truthy(&v);
+        }
 
         config.normalize();
         Ok(config)
@@ -278,6 +326,12 @@ impl Config {
         if self.quota.max_usd_per_day < 0.0 {
             self.quota.max_usd_per_day = 0.0;
         }
+        self.free_tier.gateway = self.free_tier.gateway.trim().trim_end_matches('/').to_string();
+        self.free_tier.device_token = self.free_tier.device_token.trim().to_string();
+        if self.free_tier.gateway.is_empty() {
+            self.free_tier.gateway = default_gateway();
+        }
+
         self.quota.pricing.retain(|_, price| {
             price.input_per_mtok >= 0.0
                 && price.output_per_mtok >= 0.0
@@ -290,7 +344,10 @@ impl Config {
     /// the welcome screen rather than failing silently on the first prompt.
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
-        if self.llm.api_key.is_empty() {
+        // Not a warning when the free tier is available: an install that is
+        // about to enrol anonymously has nothing for the user to fix, and
+        // telling them to go find an API key would be wrong.
+        if self.llm.api_key.is_empty() && !self.free_tier.enabled {
             warnings.push(
                 "No API key set. Export TUISAMPLE_API_KEY or add api_key to ~/.tuisample-code/config.toml."
                     .to_string(),
@@ -407,6 +464,7 @@ mod tests {
                 },
                 tools: ToolsConfig::default(),
                 quota: QuotaConfig::default(),
+                free_tier: FreeTierConfig::default(),
             };
             config.save().expect("save should succeed");
 
@@ -561,6 +619,51 @@ output_per_mtok = 0.28
                 .expect("pricing must survive a rewrite");
             assert!((price.input_per_mtok - 0.14).abs() < 1e-9);
         });
+    }
+
+    /// The upgrade path once more, for `[free_tier]`.
+    #[test]
+    fn a_config_written_before_the_free_tier_existed_still_loads() {
+        let parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"https://api.deepseek.com\"\napi_key = \"sk-mine\"\n",
+        )
+        .expect("a pre-free-tier config must still load");
+        assert!(parsed.free_tier.enabled);
+        assert!(parsed.free_tier.device_token.is_empty());
+        assert!(!parsed.free_tier.gateway.is_empty());
+    }
+
+    /// Someone with their own key must not be told to go find an API key, and
+    /// must not be nudged onto the free tier either.
+    #[test]
+    fn a_missing_api_key_is_not_a_warning_when_the_free_tier_can_supply_one() {
+        let mut config = Config::default();
+        config.llm.endpoint = "https://api.deepseek.com".to_string();
+        assert!(config.llm.api_key.is_empty());
+        assert!(
+            !config.warnings().iter().any(|w| w.contains("No API key")),
+            "a fresh install about to enrol has nothing to fix"
+        );
+
+        // ...but with the free tier off, the missing key is worth saying.
+        config.free_tier.enabled = false;
+        assert!(config.warnings().iter().any(|w| w.contains("No API key")));
+    }
+
+    #[test]
+    fn a_blank_gateway_falls_back_to_the_default() {
+        let mut config = Config::default();
+        config.free_tier.gateway = "   ".to_string();
+        config.normalize();
+        assert_eq!(config.free_tier.gateway, crate::freetier::DEFAULT_GATEWAY);
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_gateway_is_trimmed() {
+        let mut config = Config::default();
+        config.free_tier.gateway = "https://gw.example/".to_string();
+        config.normalize();
+        assert_eq!(config.free_tier.gateway, "https://gw.example");
     }
 
     #[test]

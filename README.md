@@ -184,6 +184,52 @@ on Windows, and the model is told which platform it is on so it reaches for
 > request comes back as `HTTP 400` — set `enabled = false` under `[tools]` and
 > everything else keeps working as before.
 
+## Free tier (no sign-in)
+
+A fresh install with no API key enrols itself anonymously and gets a small daily
+budget on one model. No account, no email, nothing to click.
+
+```
+🚀 Welcome to tuisample-code
+
+Connected to: deepseek-v4-flash
+Plan:         free tier — deepseek-v4-flash · $1.00/day (type /usage for today's budget)
+```
+
+**What is sent:** a SHA-256 of your machine's hardware id, your OS name, and the
+client version. That is all. The raw hardware id never leaves the machine, and
+the server salts the hash again before storing it — neither side holds anything
+that identifies your hardware. **Prompts and responses are never logged by the
+gateway**, only token counts.
+
+The hash exists so that reinstalling doesn't read as a brand-new device with a
+brand-new budget. It cannot be reversed into a machine id or linked to you.
+
+**If you bring your own API key, none of this happens.** Configuring a key — via
+`/provider`, `TUISAMPLE_API_KEY`, or `config.toml` — means your traffic goes
+straight to your provider and never touches our gateway. That is checked before
+enrolment, not after.
+
+Turn it off entirely with `TUISAMPLE_FREE_TIER=0`, or:
+
+```toml
+[free_tier]
+enabled = false
+```
+
+When the daily budget runs out you get a clear message and a way forward:
+
+```
+Error: Daily free-tier limit reached ($1.00 of $1.00). Resets at 2026-08-05T00:00:00Z.
+
+       The free tier resets at UTC midnight. To keep working now, add your
+       own API key with /provider.
+```
+
+> The free-tier budget resets at **UTC** midnight, not local midnight. It is
+> enforced server-side, where a client's clock and timezone cannot be trusted.
+> Your own `[quota]` limits (below) are separate and reset at *local* midnight.
+
 ## Daily usage quota
 
 Every request is counted against a per-day budget, so a long agentic session

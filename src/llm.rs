@@ -267,6 +267,37 @@ async fn run(
         } else {
             format!("\n{}", truncate(detail, 800))
         };
+        // The free-tier gateway answers with these, and they are not faults the
+        // user can debug from a raw status line -- so say what happened and what
+        // they can do, rather than "HTTP 402".
+        match status.as_u16() {
+            402 => {
+                return Err(format!(
+                    "{}\n\nThe free tier resets at UTC midnight. To keep working now, add your own API key with /provider.",
+                    crate::freetier::summarise_error(&body)
+                ))
+            }
+            503 => {
+                return Err(format!(
+                    "{}\n\nAdd your own API key with /provider to continue immediately.",
+                    crate::freetier::summarise_error(&body)
+                ))
+            }
+            401 if body.contains("invalid_token") || body.contains("missing_token") => {
+                return Err(
+                    "This device is no longer registered for the free tier. Restart the app to register again, or add your own API key with /provider."
+                        .to_string(),
+                )
+            }
+            429 => {
+                return Err(format!(
+                    "{}\n\nThis is a rate limit, not a fault -- wait a moment and try again.",
+                    crate::freetier::summarise_error(&body)
+                ))
+            }
+            _ => {}
+        }
+
         // The most likely cause of a 400 the moment file tools ship is an
         // endpoint that does not implement tool calling, so name the fix.
         let hint = if status == reqwest::StatusCode::BAD_REQUEST && sent_tools {

@@ -1,5 +1,7 @@
 mod app;
 mod config;
+mod device;
+mod freetier;
 mod llm;
 mod providers;
 mod tools;
@@ -71,7 +73,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     }
 
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+
+    // A fresh install has no key. Enrol in the free tier before the terminal is
+    // touched, so a slow or unreachable gateway shows as an ordinary message on
+    // stdout rather than a frozen alternate screen.
+    let free_tier_status = enrol_free_tier(&mut config).await;
+
     let (workspace, workspace_status) = open_workspace(&config);
 
     let enhanced = setup_terminal()?;
@@ -81,6 +89,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config);
+    app.free_tier_status = free_tier_status;
     app.workspace_status = workspace_status;
     app.workspace_root = workspace
         .as_ref()
@@ -96,6 +105,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("Goodbye!");
     result
+}
+
+/// Enrol in the free tier if this install needs it, returning a line for the
+/// welcome screen.
+///
+/// Every failure degrades to a notice rather than an error: someone who is
+/// offline, behind a restrictive proxy, or bringing their own key must still get
+/// a working app. An empty string means there is nothing worth saying.
+async fn enrol_free_tier(config: &mut Config) -> String {
+    if freetier::is_free_tier(config) {
+        return format!("free tier — {} (type /usage for today's budget)", config.llm.model);
+    }
+    if !freetier::should_register(config) {
+        return String::new();
+    }
+
+    println!("Setting up the free tier (no sign-in needed)…");
+    match freetier::register(config).await {
+        Ok(enrolment) => {
+            // Persist so the next launch reuses the same device rather than
+            // enrolling again.
+            if let Err(e) = config.save() {
+                eprintln!("Warning: could not save the device token ({e}). It will re-register next launch.");
+            }
+            format!(
+                "free tier — {} · ${:.2}/day (type /usage for today's budget)",
+                enrolment.model, enrolment.daily_limit_usd
+            )
+        }
+        Err(e) => {
+            eprintln!("Free tier unavailable: {e}");
+            format!("unavailable — {e}")
+        }
+    }
 }
 
 /// Resolve the root the model is confined to, and a line describing the outcome.
@@ -273,6 +316,14 @@ TOOLS (read_file, write_file, run_command; writes and commands need your
                               See the [tools] table in config.toml for
                               auto_approve_read_only, command_timeout_secs,
                               max_output_bytes, max_steps.
+
+FREE TIER (a fresh install with no API key enrols anonymously and gets a
+           small daily budget on one model -- no sign-in. Only a hash of a
+           hardware id is sent; prompts are never logged. Configuring your
+           own key opts out entirely and sends traffic straight to your
+           provider):
+    TUISAMPLE_FREE_TIER       Set to 0 to never contact the gateway
+    TUISAMPLE_GATEWAY         Point at a different gateway (e.g. staging)
 
 DAILY QUOTA (requests, tokens and USD are tracked per local day in
              ~/.tuisample-code/usage.json; every limit defaults to 0,
