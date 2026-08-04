@@ -184,6 +184,99 @@ on Windows, and the model is told which platform it is on so it reaches for
 > request comes back as `HTTP 400` — set `enabled = false` under `[tools]` and
 > everything else keeps working as before.
 
+## Daily usage quota
+
+Every request is counted against a per-day budget, so a long agentic session
+cannot quietly run up a bill. Three things are tracked independently for the
+current **local** calendar day, and any one of them can stop further prompts:
+
+| Metric | Accuracy |
+| --- | --- |
+| **Requests** | Exact on every endpoint |
+| **Tokens** | Exact when the endpoint reports usage, otherwise estimated |
+| **Spend (USD)** | Only for models you have priced (see below) |
+
+Today's totals appear in the header (`today: 12 req · 8.4k tok · $0.03`) and in
+full via `/usage`. Counters live in `~/.tuisample-code/usage.json` and reset at
+local midnight.
+
+```toml
+[quota]
+enabled = true             # false disables tracking and enforcement entirely
+max_requests_per_day = 0   # 0 = track but never block
+max_tokens_per_day = 0     # prompt + completion
+max_usd_per_day = 0.0
+warn_at_percent = 80       # when the "approaching limit" notice appears
+include_usage = true       # ask the endpoint to report token counts
+```
+
+**Every limit defaults to `0`, which means unlimited.** Out of the box this
+feature only *reports*; it starts enforcing when you set a ceiling. Upgrading
+never causes a prompt that worked yesterday to be refused.
+
+Per-run: `TUISAMPLE_MAX_REQUESTS_PER_DAY=200`, `TUISAMPLE_MAX_TOKENS_PER_DAY`,
+`TUISAMPLE_MAX_USD_PER_DAY`, `TUISAMPLE_QUOTA_ENABLED=0`.
+
+### Pricing is yours to supply
+
+There is **no built-in price table**, deliberately. Prices change without
+notice, differ per account, and do not exist at all for local or self-hosted
+models — a confidently wrong dollar figure is worse than an absent one. Give
+the rates you are actually billed, in USD per million tokens:
+
+```toml
+[quota.pricing."deepseek-v4-flash"]
+input_per_mtok = 0.14
+output_per_mtok = 0.28
+
+[quota.pricing."gpt-5.6-terra"]
+input_per_mtok = 1.25
+output_per_mtok = 10.00
+```
+
+*(Those numbers are placeholders — substitute your real rates.)*
+
+A model with no entry still has its requests and tokens counted, but its cost
+is unknowable. Rather than count it as `$0.00` and understate the day silently,
+the total is marked incomplete (`$1.20+`) and `/usage` names how many requests
+it could not price. A `max_usd_per_day` limit therefore only constrains usage
+on models you have priced.
+
+### When token counts are estimates
+
+Token counts come from the endpoint via `stream_options.include_usage`. Many
+OpenAI-compatible servers ignore or reject that field; when counts are missing
+or zero, they fall back to a local character estimate (~4 chars per token),
+shown with a `~` prefix everywhere — `~8.4k tok`. The estimate is rough,
+especially for code and non-Latin scripts. Requests are still counted exactly,
+so a request limit remains reliable regardless. If your endpoint rejects the
+field outright, set `include_usage = false`.
+
+### Hitting the limit
+
+The prompt is refused, it **stays in the input box** rather than being
+discarded, and the transcript says which limit tripped and when it resets:
+
+```
+Error: Daily quota reached — requests: 200 of 200. Resets in 6h 12m.
+       Type /quota override to continue today, or raise the limit in
+       ~/.tuisample-code/config.toml.
+```
+
+`/quota override` unblocks the rest of the day; `/quota reset` cancels it. An
+override clears at midnight along with the counters — it is a decision about
+today, not a standing exemption.
+
+Two things worth knowing:
+
+- **A tool-using turn spends several requests.** Each round trip after a
+  command runs is a real, billable call and is counted as one. `max_steps`
+  (default 10) bounds how many a single prompt can make.
+- **The limit is checked when you submit, never mid-turn.** Interrupting a turn
+  between tool rounds would leave tool calls unanswered and invalidate the
+  conversation for every later request, so a turn already under way is allowed
+  to finish.
+
 ## Usage
 
 - **Type prompt** — Bottom input line (paste works too)
@@ -212,8 +305,13 @@ variables override values in `config.toml`.
   set yet (e.g. you're only using `TUISAMPLE_*` env vars or a custom endpoint),
   this shows an inline error telling you to run `/provider` first.
 
-Both write the result to `~/.tuisample-code/config.toml` and apply it
-immediately — no restart needed, even mid-session.
+- **`/usage`** — Today's requests, tokens and spend, each against its limit,
+  plus how long until the counters reset. `/quota` shows the same report.
+- **`/quota override`** — Keep working past today's limit; clears at midnight.
+- **`/quota reset`** — Cancel an active override.
+
+`/provider` and `/model` write the result to `~/.tuisample-code/config.toml` and
+apply it immediately — no restart needed, even mid-session.
 
 ## Architecture
 
@@ -229,6 +327,7 @@ Clean, modular structure for easy feature additions:
 - `src/config.rs` — Configuration loading
 - `src/providers.rs` — Built-in provider/model registry for `/provider` and `/model`
 - `src/tools.rs` — The model's tools (`run_command`, `read_file`, `write_file`): schemas, execution, timeouts
+- `src/usage.rs` — Daily request/token/spend tracking and quota enforcement
 - `src/workspace.rs` — The working directory commands run in
 
 ## What's Next

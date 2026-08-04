@@ -14,6 +14,26 @@ pub struct ChatRequest {
     /// calling should see exactly the request it saw before this feature landed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
+    /// Asks a streaming endpoint to append a final chunk carrying token counts.
+    /// Omitted unless requested, for the same reason as `tools`: plenty of
+    /// OpenAI-compatible servers reject fields they do not recognise, and usage
+    /// reporting is not worth breaking a working endpoint over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
+}
+
+/// Token counts as the endpoint reports them.
+#[derive(Deserialize, Clone, Copy, Debug, Default)]
+pub struct ApiUsage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -71,7 +91,12 @@ pub struct FunctionCall {
 
 #[derive(Deserialize)]
 pub struct StreamDelta {
+    /// `default` because the usage chunk carries `"choices": []`, and some
+    /// endpoints omit the key entirely on that final chunk.
+    #[serde(default)]
     pub choices: Vec<Choice>,
+    #[serde(default)]
+    pub usage: Option<ApiUsage>,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +152,11 @@ pub enum StreamEvent {
     /// channel, so the event loop has one place to drain and one stale-id guard
     /// covering both sources.
     ToolsFinished(Vec<crate::tools::ToolOutcome>),
+    /// Token counts for the request that just finished. Sent exactly once per
+    /// request, before `Done`, whether the numbers came from the endpoint or
+    /// from local estimation -- so the day's request tally cannot drift from the
+    /// number of requests actually made.
+    Usage(crate::usage::TokenUsage),
     Done,
     Error(String),
 }
@@ -144,16 +174,28 @@ pub fn chat_completions_url(endpoint: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_chat(
     endpoint: &str,
     model: &str,
     api_key: &str,
     messages: Vec<ChatMessage>,
     tools: Vec<Value>,
+    include_usage: bool,
     request_id: u64,
     tx: mpsc::Sender<(u64, StreamEvent)>,
 ) {
-    let result = run(endpoint, model, api_key, messages, tools, request_id, &tx).await;
+    let result = run(
+        endpoint,
+        model,
+        api_key,
+        messages,
+        tools,
+        include_usage,
+        request_id,
+        &tx,
+    )
+    .await;
     let event = match result {
         Ok(()) => StreamEvent::Done,
         Err(e) => StreamEvent::Error(e),
@@ -161,12 +203,14 @@ pub async fn stream_chat(
     let _ = tx.send((request_id, event)).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     endpoint: &str,
     model: &str,
     api_key: &str,
     messages: Vec<ChatMessage>,
     tools: Vec<Value>,
+    include_usage: bool,
     request_id: u64,
     tx: &mpsc::Sender<(u64, StreamEvent)>,
 ) -> Result<(), String> {
@@ -175,6 +219,13 @@ async fn run(
         return Err("Nothing to send.".to_string());
     }
 
+    // Measured before the messages are moved into the request, so a fallback
+    // estimate is available even if the endpoint reports nothing.
+    let prompt_chars: usize = messages
+        .iter()
+        .map(|m| m.content.as_deref().map_or(0, str::len))
+        .sum();
+
     let sent_tools = !tools.is_empty();
     let request = ChatRequest {
         model: model.to_string(),
@@ -182,6 +233,7 @@ async fn run(
         stream: true,
         max_tokens: 4096,
         tools,
+        stream_options: include_usage.then_some(StreamOptions { include_usage: true }),
     };
 
     let client = reqwest::Client::builder()
@@ -240,15 +292,20 @@ async fn run(
             .map_err(|e| format!("Could not read response body: {e}"))?;
         let parsed: StreamDelta = serde_json::from_str(&body)
             .map_err(|e| format!("Unexpected response from {url}: {e}\n{}", truncate(&body, 800)))?;
+        let reported = parsed.usage;
+        let mut completion_chars = 0usize;
         if let Some(message) = parsed.choices.into_iter().next().and_then(|c| c.message) {
             if let Some(text) = message.content.filter(|t| !t.is_empty()) {
+                completion_chars += text.len();
                 let _ = tx.send((request_id, StreamEvent::Token(text))).await;
             }
             let calls = finalize_tool_calls(message.tool_calls);
             if !calls.is_empty() {
+                completion_chars += calls.iter().map(|c| c.function.arguments.len()).sum::<usize>();
                 let _ = tx.send((request_id, StreamEvent::ToolCalls(calls))).await;
             }
         }
+        send_usage(reported, prompt_chars, completion_chars, request_id, tx).await;
         return Ok(());
     }
 
@@ -257,6 +314,8 @@ async fn run(
     // and only consume whole lines, otherwise tokens get dropped or decoding fails.
     let mut buf: Vec<u8> = Vec::new();
     let mut pending: Vec<ToolCall> = Vec::new();
+    let mut reported: Option<ApiUsage> = None;
+    let mut completion_chars = 0usize;
 
     'read: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Stream interrupted: {e}"))?;
@@ -267,7 +326,9 @@ async fn run(
             let line = String::from_utf8_lossy(&line[..line.len() - 1]);
             match parse_sse_line(line.trim_end_matches('\r')) {
                 SseLine::Done => break 'read,
+                SseLine::Usage(usage) => reported = Some(usage),
                 SseLine::Delta(delta) => {
+                    completion_chars += delta_chars(&delta);
                     if !apply_delta(delta, &mut pending, request_id, tx).await {
                         return Ok(()); // receiver gone; app is shutting down
                     }
@@ -280,8 +341,13 @@ async fn run(
     // Trailing line without a final newline.
     if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf).to_string();
-        if let SseLine::Delta(delta) = parse_sse_line(line.trim()) {
-            apply_delta(delta, &mut pending, request_id, tx).await;
+        match parse_sse_line(line.trim()) {
+            SseLine::Usage(usage) => reported = Some(usage),
+            SseLine::Delta(delta) => {
+                completion_chars += delta_chars(&delta);
+                apply_delta(delta, &mut pending, request_id, tx).await;
+            }
+            _ => {}
         }
     }
 
@@ -292,7 +358,53 @@ async fn run(
         let _ = tx.send((request_id, StreamEvent::ToolCalls(calls))).await;
     }
 
+    // After ToolCalls, so the ordering the app relies on (tools before the
+    // terminating event) is undisturbed.
+    send_usage(reported, prompt_chars, completion_chars, request_id, tx).await;
+
     Ok(())
+}
+
+/// Characters of model output in one delta, counted for the estimate fallback.
+/// Tool-call arguments count: they are generated tokens and are billed as such.
+fn delta_chars(delta: &Delta) -> usize {
+    delta.content.as_deref().map_or(0, str::len)
+        + delta
+            .tool_calls
+            .iter()
+            .filter_map(|f| f.function.as_ref())
+            .map(|f| {
+                f.name.as_deref().map_or(0, str::len) + f.arguments.as_deref().map_or(0, str::len)
+            })
+            .sum::<usize>()
+}
+
+/// Emit exactly one usage event, preferring the endpoint's numbers and falling
+/// back to a character estimate. Always sent, so a request is never uncounted --
+/// an endpoint that reports nothing must still consume quota, or the limit could
+/// be evaded simply by pointing at a server that stays quiet.
+async fn send_usage(
+    reported: Option<ApiUsage>,
+    prompt_chars: usize,
+    completion_chars: usize,
+    request_id: u64,
+    tx: &mpsc::Sender<(u64, StreamEvent)>,
+) {
+    let usage = match reported {
+        // Some endpoints advertise usage support and then send zeroes; that is
+        // indistinguishable from not reporting, so treat it the same way.
+        Some(u) if u.prompt_tokens > 0 || u.completion_tokens > 0 => crate::usage::TokenUsage {
+            prompt: u.prompt_tokens,
+            completion: u.completion_tokens,
+            estimated: false,
+        },
+        _ => crate::usage::TokenUsage {
+            prompt: crate::usage::TokenUsage::estimate_from_chars(prompt_chars),
+            completion: crate::usage::TokenUsage::estimate_from_chars(completion_chars),
+            estimated: true,
+        },
+    };
+    let _ = tx.send((request_id, StreamEvent::Usage(usage))).await;
 }
 
 /// Returns false if the receiver is gone.
@@ -363,6 +475,8 @@ fn finalize_tool_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
 
 pub enum SseLine {
     Delta(Delta),
+    /// The trailing `include_usage` chunk, which carries counts and no choices.
+    Usage(ApiUsage),
     Done,
     Ignore,
 }
@@ -380,12 +494,12 @@ pub fn parse_sse_line(line: &str) -> SseLine {
     }
 
     match serde_json::from_str::<StreamDelta>(payload) {
-        Ok(parsed) => parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| SseLine::Delta(c.delta))
-            .unwrap_or(SseLine::Ignore),
+        Ok(parsed) => match parsed.choices.into_iter().next() {
+            Some(choice) => SseLine::Delta(choice.delta),
+            // Content chunks take precedence; a chunk with no choices is either
+            // the usage report or nothing worth acting on.
+            None => parsed.usage.map(SseLine::Usage).unwrap_or(SseLine::Ignore),
+        },
         Err(_) => SseLine::Ignore,
     }
 }
@@ -574,6 +688,7 @@ mod tests {
             "sk-test",
             vec![ChatMessage::text("user", "hi")],
             Vec::new(),
+            true,
             1,
             tx,
         )
@@ -583,6 +698,13 @@ mod tests {
             events.push(e);
         }
         events
+    }
+
+    fn usage_of(events: &[StreamEvent]) -> Option<crate::usage::TokenUsage> {
+        events.iter().find_map(|e| match e {
+            StreamEvent::Usage(u) => Some(*u),
+            _ => None,
+        })
     }
 
     fn text_of(events: &[StreamEvent]) -> String {
@@ -652,18 +774,126 @@ mod tests {
         assert_eq!(calls[0].function.arguments, r#"{"path": "src/main.rs"}"#);
 
         // Ordering matters: the app leaves `Streaming` on ToolCalls, and relies on
-        // the trailing Done arriving afterwards to be ignored.
+        // the trailing Done arriving afterwards to be ignored. Usage slots in
+        // before Done and must not displace the tool calls.
         let kinds: Vec<&str> = events
             .iter()
             .map(|e| match e {
                 StreamEvent::Token(_) => "token",
                 StreamEvent::ToolCalls(_) => "tools",
                 StreamEvent::ToolsFinished(_) => "finished",
+                StreamEvent::Usage(_) => "usage",
                 StreamEvent::Done => "done",
                 StreamEvent::Error(_) => "error",
             })
             .collect();
-        assert_eq!(kinds, vec!["token", "tools", "done"]);
+        assert_eq!(kinds, vec!["token", "tools", "usage", "done"]);
+    }
+
+    /// The endpoint's own numbers must win over any local estimate.
+    #[tokio::test]
+    async fn token_counts_are_taken_from_the_trailing_usage_chunk() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":123,\"completion_tokens\":45}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+
+        let usage = usage_of(&collect(&addr).await).expect("a usage event must be sent");
+        assert_eq!(usage.prompt, 123);
+        assert_eq!(usage.completion, 45);
+        assert!(!usage.estimated, "reported counts are not estimates");
+    }
+
+    /// The quota must not be evadable by pointing at an endpoint that never
+    /// reports usage, so a request with no counts still produces an estimate.
+    #[tokio::test]
+    async fn an_endpoint_that_reports_no_usage_still_produces_an_estimate() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"12345678\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+
+        let usage = usage_of(&collect(&addr).await).expect("a usage event must still be sent");
+        assert!(usage.estimated, "absent counts must be marked estimated");
+        assert_eq!(usage.completion, 2, "8 chars ≈ 2 tokens");
+        assert!(usage.prompt > 0, "the prompt was not empty");
+    }
+
+    /// Some endpoints accept `include_usage` and then report zeroes, which is
+    /// indistinguishable from not reporting at all.
+    #[tokio::test]
+    async fn an_all_zero_usage_report_falls_back_to_estimation() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"abcd\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+
+        let usage = usage_of(&collect(&addr).await).expect("a usage event must be sent");
+        assert!(usage.estimated);
+        assert_eq!(usage.completion, 1);
+    }
+
+    #[tokio::test]
+    async fn a_non_streaming_response_reports_its_usage_too() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"Plain reply"}}],"usage":{"prompt_tokens":11,"completion_tokens":22}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+
+        let usage = usage_of(&collect(&addr).await).expect("a usage event must be sent");
+        assert_eq!(usage.prompt, 11);
+        assert_eq!(usage.completion, 22);
+        assert!(!usage.estimated);
+    }
+
+    #[test]
+    fn a_usage_chunk_with_no_choices_parses_as_usage_rather_than_being_ignored() {
+        match parse_sse_line(r#"data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":8}}"#) {
+            SseLine::Usage(u) => {
+                assert_eq!(u.prompt_tokens, 7);
+                assert_eq!(u.completion_tokens, 8);
+            }
+            _ => panic!("the trailing usage chunk must be recognised"),
+        }
+    }
+
+    /// `stream_options` is the field most likely to be rejected by a minimal
+    /// OpenAI-compatible server, so it must be absent unless asked for.
+    #[test]
+    fn stream_options_is_omitted_entirely_when_usage_reporting_is_off() {
+        let without = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            stream: true,
+            max_tokens: 4096,
+            tools: Vec::new(),
+            stream_options: None,
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(!json.contains("stream_options"), "{json}");
+
+        let with = ChatRequest {
+            stream_options: Some(StreamOptions { include_usage: true }),
+            ..without
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""stream_options":{"include_usage":true}"#), "{json}");
     }
 
     /// Endpoints that ignore `stream: true` must still produce an answer.
@@ -734,6 +964,7 @@ mod tests {
             "k",
             vec![ChatMessage::text("user", "hi")],
             vec![serde_json::json!({"type": "function"})],
+            true,
             1,
             tx,
         )
@@ -747,6 +978,58 @@ mod tests {
             Some(StreamEvent::Error(e)) => assert!(e.contains("enabled = false"), "{e}"),
             other => panic!("expected an Error event, got {other:?}"),
         }
+    }
+
+    /// The whole feature, end to end over a real socket: a streamed reply with a
+    /// usage chunk, routed through the same `handle_event` the event loop uses,
+    /// landing in a persisted daily total with a dollar figure attached.
+    ///
+    /// Covers the seam the per-module tests cannot: that `Usage` actually reaches
+    /// `record_usage` rather than being dropped by the event loop.
+    #[tokio::test]
+    async fn a_streamed_request_lands_in_the_persisted_daily_total() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000000,\"completion_tokens\":500000}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        let addr = serve(response.into_bytes(), 7).await;
+        let events = collect(&addr).await;
+
+        crate::config::test_support::with_isolated_home(|| {
+            let mut config = crate::config::Config::default();
+            config.llm.model = "test-model".to_string();
+            config.quota.max_requests_per_day = 10;
+            config.quota.pricing.insert(
+                "test-model".to_string(),
+                crate::usage::ModelPrice { input_per_mtok: 1.0, output_per_mtok: 2.0 },
+            );
+
+            let mut app = crate::app::App::new(config);
+            app.usage = crate::usage::DailyUsage {
+                date: crate::usage::today_local(),
+                ..Default::default()
+            };
+            app.state = crate::app::AppState::Streaming;
+
+            for event in events {
+                app.handle_event(event);
+            }
+
+            assert_eq!(app.usage.requests, 1);
+            assert_eq!(app.usage.total_tokens(), 1_500_000);
+            // 1M input @ $1 + 0.5M output @ $2 = $2.00
+            assert!((app.usage.usd - 2.0).abs() < 1e-9, "{}", app.usage.usd);
+            assert!(!app.usage.any_estimated, "the endpoint reported real counts");
+
+            // ...and it survived to disk, so the quota outlives the process.
+            let reloaded = crate::usage::DailyUsage::load(&crate::usage::today_local());
+            assert_eq!(reloaded.requests, 1);
+            assert_eq!(reloaded.total_tokens(), 1_500_000);
+        });
     }
 
     #[tokio::test]

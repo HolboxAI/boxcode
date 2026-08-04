@@ -5,6 +5,7 @@ mod providers;
 mod tools;
 mod ui;
 mod upgrade;
+mod usage;
 mod workspace;
 
 use app::{App, AppState};
@@ -156,13 +157,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             if id != app.request_id {
                 continue; // stale: belongs to a cancelled request
             }
-            match event {
-                StreamEvent::Token(token) => app.append_token(&token),
-                StreamEvent::ToolCalls(calls) => app.request_tools(calls),
-                StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
-                StreamEvent::Done => app.finish_stream(),
-                StreamEvent::Error(err) => app.fail_stream(err),
-            }
+            app.handle_event(event);
         }
 
         // Fire a pending request.
@@ -186,9 +181,20 @@ async fn run_app<B: ratatui::backend::Backend>(
             };
             let history = app.history(system.as_deref());
             let tx_clone = tx.clone();
+            let include_usage = app.config.quota.enabled && app.config.quota.include_usage;
 
             let handle = tokio::spawn(async move {
-                llm::stream_chat(&endpoint, &model, &api_key, history, schemas, id, tx_clone).await;
+                llm::stream_chat(
+                    &endpoint,
+                    &model,
+                    &api_key,
+                    history,
+                    schemas,
+                    include_usage,
+                    id,
+                    tx_clone,
+                )
+                .await;
             });
 
             app.abort = Some(handle.abort_handle());
@@ -268,6 +274,17 @@ TOOLS (read_file, write_file, run_command; writes and commands need your
                               auto_approve_read_only, command_timeout_secs,
                               max_output_bytes, max_steps.
 
+DAILY QUOTA (requests, tokens and USD are tracked per local day in
+             ~/.tuisample-code/usage.json; every limit defaults to 0,
+             meaning track but never block):
+    TUISAMPLE_QUOTA_ENABLED        Set to 0 to disable tracking entirely
+    TUISAMPLE_MAX_REQUESTS_PER_DAY Requests before prompts are refused
+    TUISAMPLE_MAX_TOKENS_PER_DAY   Prompt + completion tokens per day
+    TUISAMPLE_MAX_USD_PER_DAY      Spend per day; needs [quota.pricing]
+                                   entries for the models you use, or
+                                   cost cannot be computed and is
+                                   reported as unpriced rather than $0.
+
 UPGRADE:
     TUISAMPLE_UPGRADE_URL_BASE
                           Fetch updates from a fork or internal mirror
@@ -276,6 +293,9 @@ UPGRADE:
 COMMANDS (type in the input box, press Enter):
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider
+    /usage                Show today's requests, tokens and spend
+    /quota override       Keep working past today's limit
+    /quota reset          Cancel an override
 
 KEYS:
     Enter                 Send prompt

@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::llm::{ChatMessage, ToolCall};
 use crate::providers;
 use crate::tools::{self, ToolOutcome};
+use crate::usage::{self, DailyUsage, QuotaVerdict, TokenUsage};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{HashSet, VecDeque};
 
@@ -159,11 +160,24 @@ pub struct App {
     /// The resolved working directory, shown on the approval prompt so it is
     /// always clear *where* a command is about to run.
     pub workspace_root: String,
+    /// Today's request / token / spend tallies, loaded at startup and written
+    /// back after every request.
+    pub usage: DailyUsage,
+    /// Set when a warning has already been shown for the current day, so an
+    /// approaching-limit notice appears once rather than before every prompt.
+    pub warned_today: bool,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
+        let usage = if config.quota.enabled {
+            DailyUsage::load(&usage::today_local())
+        } else {
+            DailyUsage::default()
+        };
         Self {
+            usage,
+            warned_today: false,
             state: AppState::AwaitingInput,
             messages: Vec::new(),
             input_buffer: String::new(),
@@ -229,6 +243,21 @@ impl App {
                             self.input_buffer.clear();
                             self.cursor = 0;
                             self.open_model_picker_from_config();
+                        }
+                        "/usage" | "/quota" if !self.is_busy() => {
+                            self.input_buffer.clear();
+                            self.cursor = 0;
+                            self.show_usage();
+                        }
+                        "/quota override" if !self.is_busy() => {
+                            self.input_buffer.clear();
+                            self.cursor = 0;
+                            self.set_quota_override(true);
+                        }
+                        "/quota reset" if !self.is_busy() => {
+                            self.input_buffer.clear();
+                            self.cursor = 0;
+                            self.set_quota_override(false);
                         }
                         _ => self.submit(),
                     }
@@ -303,6 +332,24 @@ impl App {
             return;
         }
 
+        // Before the limits are consulted, so a session open past midnight is
+        // judged against today's allowance rather than yesterday's.
+        self.roll_over_if_needed();
+
+        // Checked before the prompt is accepted, and only here -- never mid-turn.
+        // Blocking between tool rounds would strand `tool_calls` with no matching
+        // results, which invalidates the conversation for every later request.
+        // `tools.max_steps` already bounds how far a single turn can run.
+        if let Some(message) = self.quota_block() {
+            // The prompt deliberately stays in the input box. It was never sent,
+            // and silently destroying something the user just typed -- possibly
+            // at length -- is a worse outcome than the refusal itself.
+            self.greeted = true;
+            self.follow_tail = true;
+            self.messages.push(Message::new(Role::Error, message));
+            return;
+        }
+
         self.input_buffer.clear();
         self.cursor = 0;
         self.greeted = true;
@@ -310,7 +357,162 @@ impl App {
         self.streaming_response.clear();
         self.tool_steps = 0;
         self.messages.push(Message::new(Role::User, prompt));
+
+        if let Some(warning) = self.quota_warning() {
+            self.messages.push(Message::new(Role::System, warning));
+        }
         self.state = AppState::Sending;
+    }
+
+    /// Start a new day if the local date has moved on since the counters were
+    /// last touched.
+    ///
+    /// This app is a TUI that people leave open for days, so a rollover that only
+    /// happened at startup would keep yesterday's spent allowance in force well
+    /// into the morning -- and an override granted yesterday would never expire.
+    fn roll_over_if_needed(&mut self) {
+        if !self.config.quota.enabled {
+            return;
+        }
+        let today = usage::today_local();
+        if self.usage.date != today {
+            self.usage.roll_over(&today);
+            self.warned_today = false;
+            let _ = self.usage.save();
+        }
+    }
+
+    /// The reason this prompt cannot be sent, if any.
+    fn quota_block(&self) -> Option<String> {
+        match usage::evaluate(
+            &self.usage,
+            &self.config.quota,
+            &usage::time_until_local_midnight(),
+        ) {
+            QuotaVerdict::Blocked(message) => Some(message),
+            _ => None,
+        }
+    }
+
+    /// A once-per-day nudge that a limit is close, or that an override is live.
+    fn quota_warning(&mut self) -> Option<String> {
+        if self.warned_today {
+            return None;
+        }
+        match usage::evaluate(
+            &self.usage,
+            &self.config.quota,
+            &usage::time_until_local_midnight(),
+        ) {
+            QuotaVerdict::Warn(message) => {
+                self.warned_today = true;
+                Some(message)
+            }
+            _ => None,
+        }
+    }
+
+    /// Fold one finished request into today's totals and persist them.
+    ///
+    /// Called for every request the endpoint answered, including the extra ones a
+    /// tool-using turn makes -- each is a real, billable call.
+    pub fn record_usage(&mut self, tokens: TokenUsage) {
+        if !self.config.quota.enabled {
+            return;
+        }
+        self.roll_over_if_needed();
+        let price = self.config.quota.price_for(&self.config.llm.model);
+        self.usage.record(&tokens, price);
+        // Written per request rather than at exit: the app is a TUI that people
+        // close with Ctrl-C, and a quota that forgets on exit is not a quota.
+        let _ = self.usage.save();
+    }
+
+    /// `/usage` -- today's totals, spelled out.
+    fn show_usage(&mut self) {
+        self.roll_over_if_needed();
+        let quota = &self.config.quota;
+        let mut lines = vec![format!("Usage for {} (local day)", self.usage.date)];
+
+        let limit = |used: String, limit: String, unlimited: bool| {
+            if unlimited {
+                format!("{used} (no limit set)")
+            } else {
+                format!("{used} of {limit}")
+            }
+        };
+
+        lines.push(format!(
+            "  Requests: {}",
+            limit(
+                self.usage.requests.to_string(),
+                quota.max_requests_per_day.to_string(),
+                quota.max_requests_per_day == 0,
+            )
+        ));
+        lines.push(format!(
+            "  Tokens:   {}{}",
+            limit(
+                usage::format_tokens(self.usage.total_tokens()),
+                usage::format_tokens(quota.max_tokens_per_day),
+                quota.max_tokens_per_day == 0,
+            ),
+            if self.usage.any_estimated {
+                "  (estimated — this endpoint does not report token counts)"
+            } else {
+                ""
+            }
+        ));
+        lines.push(format!(
+            "            {} prompt + {} completion",
+            usage::format_tokens(self.usage.prompt_tokens),
+            usage::format_tokens(self.usage.completion_tokens)
+        ));
+        lines.push(format!(
+            "  Spend:    {}",
+            limit(
+                format!("${:.2}", self.usage.usd),
+                format!("${:.2}", quota.max_usd_per_day),
+                quota.max_usd_per_day == 0.0,
+            )
+        ));
+        // Naming the gap matters more than the number: a total that silently
+        // omits half the day's requests is worse than no total.
+        if self.usage.unpriced_requests > 0 {
+            lines.push(format!(
+                "            excludes {} request(s) on a model with no price in [quota.pricing]",
+                self.usage.unpriced_requests
+            ));
+        }
+        if self.usage.override_active {
+            lines.push("  Override: active for today".to_string());
+        }
+        lines.push(format!(
+            "  Resets in {} (local midnight)",
+            usage::time_until_local_midnight()
+        ));
+
+        self.greeted = true;
+        self.follow_tail = true;
+        self.messages
+            .push(Message::new(Role::System, lines.join("\n")));
+    }
+
+    /// `/quota override` -- spend past the limit for the rest of today.
+    fn set_quota_override(&mut self, active: bool) {
+        // Otherwise an override could be granted against yesterday's record and
+        // then be wiped by the next rollover, silently doing nothing.
+        self.roll_over_if_needed();
+        self.usage.override_active = active;
+        let _ = self.usage.save();
+        self.greeted = true;
+        self.follow_tail = true;
+        let text = if active {
+            "Quota override active for the rest of today. It clears at local midnight."
+        } else {
+            "Quota override cleared; the daily limits apply again."
+        };
+        self.messages.push(Message::new(Role::System, text));
     }
 
     fn cancel(&mut self) {
@@ -513,6 +715,23 @@ impl App {
 
         for call in unanswered {
             self.push_tool_outcome(tools::unanswered(&call, reason));
+        }
+    }
+
+    /// Route one event from the request task or the command runner.
+    ///
+    /// Lives here rather than inline in the event loop so the mapping from wire
+    /// event to state transition can be tested directly -- `Usage` in particular
+    /// must reach `record_usage` for the day's tallies to mean anything.
+    pub fn handle_event(&mut self, event: crate::llm::StreamEvent) {
+        use crate::llm::StreamEvent;
+        match event {
+            StreamEvent::Token(token) => self.append_token(&token),
+            StreamEvent::ToolCalls(calls) => self.request_tools(calls),
+            StreamEvent::ToolsFinished(outcomes) => self.finish_tools(outcomes),
+            StreamEvent::Usage(tokens) => self.record_usage(tokens),
+            StreamEvent::Done => self.finish_stream(),
+            StreamEvent::Error(err) => self.fail_stream(err),
         }
     }
 
@@ -964,6 +1183,13 @@ mod tests {
     fn app() -> App {
         let mut app = App::new(Config::default());
         app.config.tools.auto_approve_read_only = false;
+        // `App::new` reads ~/.tuisample-code/usage.json. Tests must not inherit
+        // whatever the developer's real day happens to look like, so start every
+        // fixture on a clean, known day.
+        app.usage = DailyUsage {
+            date: usage::today_local(),
+            ..Default::default()
+        };
         app
     }
 
@@ -1903,5 +2129,302 @@ mod tests {
         if let Some(v) = prev {
             std::env::set_var("DEEPSEEK_API_KEY", v);
         }
+    }
+
+    // ---- daily usage quota ----------------------------------------------------
+
+    /// An app with a request ceiling and `spent` requests already used today.
+    fn quota_app(limit: u64, spent: u64) -> App {
+        let mut a = app();
+        a.config.quota.max_requests_per_day = limit;
+        a.usage.requests = spent;
+        a
+    }
+
+    #[test]
+    fn a_prompt_is_refused_once_the_daily_request_limit_is_spent() {
+        let mut a = quota_app(5, 5);
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+
+        // Nothing was sent...
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert!(
+            !a.messages.iter().any(|m| m.role == Role::User),
+            "a refused prompt must not enter the conversation"
+        );
+        // ...and the refusal explains itself.
+        let error = a
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Error)
+            .expect("a refusal must be shown");
+        assert!(error.content.contains("Daily quota reached"), "{}", error.content);
+        assert!(error.content.contains("/quota override"), "{}", error.content);
+    }
+
+    /// Losing a long prompt to a quota refusal would be a worse outcome than the
+    /// refusal itself, so the text stays where the user can still get at it.
+    #[test]
+    fn a_refused_prompt_is_left_in_the_input_box() {
+        let mut a = quota_app(1, 1);
+        type_str(&mut a, "a carefully written prompt");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.input_buffer, "a carefully written prompt");
+    }
+
+    #[test]
+    fn one_request_below_the_limit_still_sends() {
+        let mut a = quota_app(5, 4);
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+        assert!(a.messages.iter().any(|m| m.role == Role::User));
+    }
+
+    /// The upgrade-safety property, at the level that matters: a user who has set
+    /// no limits must never see a prompt refused.
+    #[test]
+    fn with_no_limits_configured_nothing_is_ever_refused() {
+        let mut a = app();
+        a.usage.requests = 100_000;
+        a.usage.prompt_tokens = 500_000_000;
+        a.usage.usd = 4_000.0;
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+    }
+
+    #[test]
+    fn a_token_limit_refuses_independently_of_the_request_count() {
+        let mut a = app();
+        a.config.quota.max_tokens_per_day = 1_000;
+        a.usage.prompt_tokens = 600;
+        a.usage.completion_tokens = 400;
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    #[test]
+    fn a_spend_limit_refuses_independently_of_tokens_and_requests() {
+        let mut a = app();
+        a.config.quota.max_usd_per_day = 2.50;
+        a.usage.usd = 2.50;
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    #[test]
+    fn quota_override_unblocks_sending_for_the_rest_of_the_day() {
+        with_isolated_home(|| {
+            let mut a = quota_app(5, 5);
+            type_str(&mut a, "/quota override");
+            a.handle_key(key(KeyCode::Enter));
+            assert!(a.usage.override_active);
+
+            type_str(&mut a, "hello");
+            a.handle_key(key(KeyCode::Enter));
+            assert_eq!(a.state, AppState::Sending);
+        });
+    }
+
+    #[test]
+    fn quota_reset_puts_the_limit_back() {
+        with_isolated_home(|| {
+            let mut a = quota_app(5, 5);
+            a.usage.override_active = true;
+            type_str(&mut a, "/quota reset");
+            a.handle_key(key(KeyCode::Enter));
+            assert!(!a.usage.override_active);
+
+            type_str(&mut a, "hello");
+            a.handle_key(key(KeyCode::Enter));
+            assert_eq!(a.state, AppState::AwaitingInput);
+        });
+    }
+
+    #[test]
+    fn approaching_the_limit_warns_once_rather_than_every_prompt() {
+        let mut a = quota_app(10, 8); // 80%
+        type_str(&mut a, "one");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+        let warnings = |a: &App| {
+            a.messages
+                .iter()
+                .filter(|m| m.role == Role::System && m.content.contains("Approaching"))
+                .count()
+        };
+        assert_eq!(warnings(&a), 1);
+
+        // A second prompt in the same day must not repeat it.
+        a.state = AppState::AwaitingInput;
+        type_str(&mut a, "two");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(warnings(&a), 1);
+    }
+
+    #[test]
+    fn recording_a_request_updates_the_running_totals() {
+        with_isolated_home(|| {
+            let mut a = app();
+            a.config.llm.model = "priced-model".to_string();
+            a.config.quota.pricing.insert(
+                "priced-model".to_string(),
+                crate::usage::ModelPrice { input_per_mtok: 2.0, output_per_mtok: 4.0 },
+            );
+
+            a.record_usage(TokenUsage { prompt: 1_000_000, completion: 1_000_000, estimated: false });
+
+            assert_eq!(a.usage.requests, 1);
+            assert_eq!(a.usage.total_tokens(), 2_000_000);
+            assert!((a.usage.usd - 6.0).abs() < 1e-9, "{}", a.usage.usd);
+        });
+    }
+
+    /// Usage on a model the user never priced must not quietly read as free.
+    #[test]
+    fn recording_on_an_unpriced_model_counts_tokens_but_not_dollars() {
+        with_isolated_home(|| {
+            let mut a = app();
+            a.config.llm.model = "some-local-model".to_string();
+            a.record_usage(TokenUsage { prompt: 1_000, completion: 1_000, estimated: false });
+
+            assert_eq!(a.usage.total_tokens(), 2_000);
+            assert_eq!(a.usage.usd, 0.0);
+            assert_eq!(a.usage.unpriced_requests, 1);
+        });
+    }
+
+    #[test]
+    fn recording_is_skipped_entirely_when_tracking_is_disabled() {
+        let mut a = app();
+        a.config.quota.enabled = false;
+        a.record_usage(TokenUsage { prompt: 100, completion: 100, estimated: false });
+        assert_eq!(a.usage.requests, 0);
+    }
+
+    /// Regression: the rollover used to happen only at startup and after a
+    /// recorded request, so a TUI left open overnight kept refusing prompts
+    /// against yesterday's spent allowance until it was restarted.
+    #[test]
+    fn a_session_open_past_midnight_is_judged_against_the_new_day() {
+        with_isolated_home(|| {
+            let mut a = quota_app(5, 5); // yesterday's limit, fully spent
+            a.usage.date = "2000-01-01".to_string();
+
+            type_str(&mut a, "hello");
+            a.handle_key(key(KeyCode::Enter));
+
+            assert_eq!(a.state, AppState::Sending, "a new day must start clean");
+            assert_eq!(a.usage.date, usage::today_local());
+            assert_eq!(a.usage.requests, 0);
+        });
+    }
+
+    /// ...and an override granted yesterday must not still be in force today.
+    #[test]
+    fn an_override_does_not_survive_into_the_next_day() {
+        with_isolated_home(|| {
+            let mut a = quota_app(5, 5);
+            a.usage.date = "2000-01-01".to_string();
+            a.usage.override_active = true;
+
+            type_str(&mut a, "/usage");
+            a.handle_key(key(KeyCode::Enter));
+
+            assert!(!a.usage.override_active, "yesterday's override must expire");
+        });
+    }
+
+    /// A session left running overnight must start the new day clean rather than
+    /// keep charging against yesterday's allowance.
+    #[test]
+    fn a_request_recorded_after_midnight_rolls_the_day_over() {
+        with_isolated_home(|| {
+            let mut a = quota_app(10, 9);
+            a.usage.date = "2000-01-01".to_string(); // yesterday, by a wide margin
+            a.warned_today = true;
+
+            a.record_usage(TokenUsage { prompt: 10, completion: 10, estimated: false });
+
+            assert_eq!(a.usage.date, usage::today_local());
+            assert_eq!(a.usage.requests, 1, "yesterday's 9 must not carry over");
+            assert!(!a.warned_today, "a new day gets its warning back");
+        });
+    }
+
+    /// Every request a turn makes is billed, including the extra round trips a
+    /// tool-using turn performs, so each must consume quota.
+    #[test]
+    fn each_recorded_request_counts_including_tool_round_trips() {
+        with_isolated_home(|| {
+            let mut a = app();
+            for _ in 0..3 {
+                a.record_usage(TokenUsage { prompt: 10, completion: 10, estimated: false });
+            }
+            assert_eq!(a.usage.requests, 3);
+        });
+    }
+
+    #[test]
+    fn the_usage_command_reports_all_three_metrics() {
+        let mut a = app();
+        a.usage.requests = 3;
+        a.usage.prompt_tokens = 1_500;
+        a.config.quota.max_requests_per_day = 10;
+
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+
+        let report = a
+            .messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .expect("a report must be shown");
+        assert!(report.content.contains("Requests: 3 of 10"), "{}", report.content);
+        assert!(report.content.contains("Tokens:"), "{}", report.content);
+        assert!(report.content.contains("Spend:"), "{}", report.content);
+        assert!(report.content.contains("Resets in"), "{}", report.content);
+        // An unset limit must read as unset, not as zero.
+        assert!(report.content.contains("no limit set"), "{}", report.content);
+        // /usage is a local command and never becomes a prompt.
+        assert!(!a.messages.iter().any(|m| m.role == Role::User));
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    #[test]
+    fn the_usage_report_names_requests_it_could_not_price() {
+        let mut a = app();
+        a.usage.requests = 2;
+        a.usage.unpriced_requests = 2;
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+
+        let report = a.messages.iter().find(|m| m.role == Role::System).unwrap();
+        assert!(report.content.contains("no price"), "{}", report.content);
+    }
+
+    #[test]
+    fn the_usage_report_flags_estimated_token_counts() {
+        let mut a = app();
+        a.usage.any_estimated = true;
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+
+        let report = a.messages.iter().find(|m| m.role == Role::System).unwrap();
+        assert!(report.content.contains("estimated"), "{}", report.content);
+    }
+
+    #[test]
+    fn quota_commands_are_ignored_while_a_request_is_in_flight() {
+        let mut a = streaming_app();
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+        // Still streaming, and the text was treated as ordinary input rather
+        // than executed as a command mid-turn.
+        assert_eq!(a.state, AppState::Streaming);
     }
 }

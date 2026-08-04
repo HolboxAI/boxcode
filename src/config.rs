@@ -1,4 +1,6 @@
+use crate::usage::ModelPrice;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -9,6 +11,9 @@ pub struct Config {
     /// the moment a user upgrades.
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// Same again for `[quota]`, which is newer still.
+    #[serde(default)]
+    pub quota: QuotaConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +68,87 @@ pub struct ToolsConfig {
     /// commands burns tokens until the user notices.
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
+}
+
+/// Daily usage tracking and its limits.
+///
+/// Every limit defaults to zero, which means "no limit". Usage is still counted,
+/// so the feature is informative out of the box and only becomes enforcing once
+/// the user deliberately sets a ceiling -- upgrading must never start refusing
+/// prompts that worked yesterday.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuotaConfig {
+    /// Off means no counting, no persistence and no enforcement at all.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Prompts per local day. One turn can spend several of these: a tool round
+    /// trip is another request to the endpoint, and is counted as one.
+    #[serde(default)]
+    pub max_requests_per_day: u64,
+    /// Prompt + completion tokens per local day.
+    #[serde(default)]
+    pub max_tokens_per_day: u64,
+    /// Dollars per local day. Only meaningful for models that appear in
+    /// `[quota.pricing]`; usage on an unpriced model cannot contribute to it.
+    #[serde(default)]
+    pub max_usd_per_day: f64,
+    /// Percentage of a limit at which the UI starts warning.
+    #[serde(default = "default_warn_at")]
+    pub warn_at_percent: u8,
+    /// Ask the endpoint to report token counts via `stream_options`. Turn off for
+    /// endpoints that reject the field -- counts then fall back to a local
+    /// character estimate, which is marked as such everywhere it is shown.
+    #[serde(default = "yes")]
+    pub include_usage: bool,
+    /// Per-model prices in USD per million tokens, keyed by the exact model name
+    /// sent on the wire:
+    ///
+    /// ```toml
+    /// [quota.pricing."deepseek-v4-flash"]
+    /// input_per_mtok = 0.14
+    /// output_per_mtok = 0.28
+    /// ```
+    ///
+    /// Empty by default and deliberately so. Shipping a built-in table would mean
+    /// guessing at prices that change without notice and do not exist at all for
+    /// local or self-hosted endpoints; a confidently wrong spend figure is worse
+    /// than an absent one. A model with no entry has its tokens counted and its
+    /// cost reported as unknown.
+    #[serde(default)]
+    pub pricing: HashMap<String, ModelPrice>,
+}
+
+fn default_warn_at() -> u8 {
+    80
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: yes(),
+            max_requests_per_day: 0,
+            max_tokens_per_day: 0,
+            max_usd_per_day: 0.0,
+            warn_at_percent: default_warn_at(),
+            include_usage: yes(),
+            pricing: HashMap::new(),
+        }
+    }
+}
+
+impl QuotaConfig {
+    /// Price for a model, or `None` if the user has not supplied one.
+    pub fn price_for(&self, model: &str) -> Option<ModelPrice> {
+        self.pricing.get(model).copied()
+    }
+
+    /// True when at least one ceiling is actually set.
+    pub fn has_limits(&self) -> bool {
+        self.enabled
+            && (self.max_requests_per_day > 0
+                || self.max_tokens_per_day > 0
+                || self.max_usd_per_day > 0.0)
+    }
 }
 
 fn yes() -> bool {
@@ -134,6 +220,24 @@ impl Config {
         if let Some(v) = env_var("TUISAMPLE_TOOLS_APPROVAL") {
             config.tools.require_approval = truthy(&v);
         }
+        if let Some(v) = env_var("TUISAMPLE_QUOTA_ENABLED") {
+            config.quota.enabled = truthy(&v);
+        }
+        if let Some(v) = env_var("TUISAMPLE_MAX_REQUESTS_PER_DAY") {
+            if let Ok(n) = v.trim().parse() {
+                config.quota.max_requests_per_day = n;
+            }
+        }
+        if let Some(v) = env_var("TUISAMPLE_MAX_TOKENS_PER_DAY") {
+            if let Ok(n) = v.trim().parse() {
+                config.quota.max_tokens_per_day = n;
+            }
+        }
+        if let Some(v) = env_var("TUISAMPLE_MAX_USD_PER_DAY") {
+            if let Ok(n) = v.trim().parse() {
+                config.quota.max_usd_per_day = n;
+            }
+        }
 
         config.normalize();
         Ok(config)
@@ -165,6 +269,21 @@ impl Config {
         self.tools.max_output_bytes = self.tools.max_output_bytes.clamp(1024, 8 * 1024 * 1024);
         self.tools.command_timeout_secs = self.tools.command_timeout_secs.clamp(1, 3600);
         self.tools.max_steps = self.tools.max_steps.clamp(1, 50);
+
+        // A warn threshold of 0 would fire a warning on the very first request;
+        // above 100 it could never fire at all. Both read as a broken feature
+        // rather than a setting, so pull them back to something meaningful.
+        self.quota.warn_at_percent = self.quota.warn_at_percent.clamp(1, 100);
+        // A negative price would credit the user for using the model.
+        if self.quota.max_usd_per_day < 0.0 {
+            self.quota.max_usd_per_day = 0.0;
+        }
+        self.quota.pricing.retain(|_, price| {
+            price.input_per_mtok >= 0.0
+                && price.output_per_mtok >= 0.0
+                && price.input_per_mtok.is_finite()
+                && price.output_per_mtok.is_finite()
+        });
     }
 
     /// Human-readable reasons the app cannot talk to an endpoint yet, shown on
@@ -287,6 +406,7 @@ mod tests {
                     provider: "deepseek".to_string(),
                 },
                 tools: ToolsConfig::default(),
+                quota: QuotaConfig::default(),
             };
             config.save().expect("save should succeed");
 
@@ -365,6 +485,115 @@ mod tests {
         assert_eq!(config.tools.command_timeout_secs, 1);
         assert_eq!(config.tools.max_steps, 1);
         assert_eq!(config.tools.workspace, ".");
+    }
+
+    /// The upgrade path again, for `[quota]`: a config written before this
+    /// feature existed has no such table, and must still load.
+    #[test]
+    fn a_config_written_before_quotas_existed_still_loads() {
+        let parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"http://x\"\n\n[tools]\nenabled = true\n",
+        )
+        .expect("a pre-quota config must still load");
+        assert!(parsed.quota.enabled);
+        // Tracking on, enforcement off: nobody's existing workflow breaks.
+        assert!(!parsed.quota.has_limits());
+        assert_eq!(parsed.quota.max_requests_per_day, 0);
+        assert_eq!(parsed.quota.max_usd_per_day, 0.0);
+    }
+
+    #[test]
+    fn pricing_is_read_per_model_from_the_quota_table() {
+        let parsed: Config = toml::from_str(
+            r#"
+[llm]
+endpoint = "http://x"
+
+[quota]
+max_usd_per_day = 5.0
+
+[quota.pricing."deepseek-v4-flash"]
+input_per_mtok = 0.14
+output_per_mtok = 0.28
+"#,
+        )
+        .expect("should parse");
+
+        let price = parsed.quota.price_for("deepseek-v4-flash").expect("priced");
+        assert!((price.input_per_mtok - 0.14).abs() < 1e-9);
+        assert!((price.output_per_mtok - 0.28).abs() < 1e-9);
+        // A model the user never priced stays unpriced rather than free.
+        assert!(parsed.quota.price_for("gpt-5.6-sol").is_none());
+        assert!(parsed.quota.has_limits());
+    }
+
+    /// `/provider` and `/model` rewrite the whole file with `Config::save()`.
+    /// Hand-added prices and limits have to survive that, or picking a new model
+    /// would quietly wipe the user's spend tracking.
+    #[test]
+    fn hand_written_prices_and_limits_survive_a_save_from_the_model_picker() {
+        with_isolated_home(|| {
+            for k in ["TUISAMPLE_ENDPOINT", "TUISAMPLE_MODEL", "TUISAMPLE_API_KEY"] {
+                std::env::remove_var(k);
+            }
+
+            let mut config = Config::default();
+            config.quota.max_requests_per_day = 200;
+            config.quota.max_usd_per_day = 5.0;
+            config.quota.pricing.insert(
+                "deepseek-v4-flash".to_string(),
+                ModelPrice { input_per_mtok: 0.14, output_per_mtok: 0.28 },
+            );
+            config.save().expect("save should succeed");
+
+            // Exactly what happens when the user then runs `/model`.
+            let mut reloaded = Config::load().expect("load should succeed");
+            reloaded.llm.model = "deepseek-v4-pro".to_string();
+            reloaded.save().expect("second save should succeed");
+
+            let finally = Config::load().expect("load should succeed");
+            assert_eq!(finally.llm.model, "deepseek-v4-pro");
+            assert_eq!(finally.quota.max_requests_per_day, 200);
+            assert_eq!(finally.quota.max_usd_per_day, 5.0);
+            let price = finally
+                .quota
+                .price_for("deepseek-v4-flash")
+                .expect("pricing must survive a rewrite");
+            assert!((price.input_per_mtok - 0.14).abs() < 1e-9);
+        });
+    }
+
+    #[test]
+    fn nonsense_quota_settings_are_clamped_or_dropped() {
+        let mut config = Config::default();
+        config.quota.warn_at_percent = 0;
+        config.quota.max_usd_per_day = -5.0;
+        config.quota.pricing.insert(
+            "bad".to_string(),
+            ModelPrice { input_per_mtok: -1.0, output_per_mtok: 1.0 },
+        );
+        config.quota.pricing.insert(
+            "good".to_string(),
+            ModelPrice { input_per_mtok: 1.0, output_per_mtok: 2.0 },
+        );
+        config.normalize();
+
+        assert_eq!(config.quota.warn_at_percent, 1);
+        assert_eq!(config.quota.max_usd_per_day, 0.0);
+        // A negative price would pay the user to use the model.
+        assert!(config.quota.price_for("bad").is_none());
+        assert!(config.quota.price_for("good").is_some());
+    }
+
+    #[test]
+    fn has_limits_is_false_until_a_ceiling_is_actually_set() {
+        let mut config = Config::default();
+        assert!(!config.quota.has_limits());
+        config.quota.max_tokens_per_day = 1;
+        assert!(config.quota.has_limits());
+        // ...and turning the feature off disables enforcement regardless.
+        config.quota.enabled = false;
+        assert!(!config.quota.has_limits());
     }
 
     #[test]

@@ -39,8 +39,27 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         "tuisample-code | {} | model: {}",
         app.config.llm.endpoint, app.config.llm.model
     );
-    let header = Paragraph::new(title).style(Style::default().fg(Color::Cyan));
-    f.render_widget(header, area);
+    let mut spans = vec![Span::styled(title, Style::default().fg(Color::Cyan))];
+
+    // Today's spend sits in the one line that is always visible, so a quota is
+    // never a surprise discovered only when a prompt is refused.
+    if app.config.quota.enabled && app.usage.requests > 0 {
+        spans.push(Span::styled(
+            format!(" | today: {}", crate::usage::summary_line(&app.usage)),
+            Style::default().fg(quota_color(app)),
+        ));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Green under the limits, yellow approaching one, red once one is spent.
+fn quota_color(app: &App) -> Color {
+    match crate::usage::evaluate(&app.usage, &app.config.quota, "") {
+        crate::usage::QuotaVerdict::Ok => Color::DarkGray,
+        crate::usage::QuotaVerdict::Warn(_) => Color::Yellow,
+        crate::usage::QuotaVerdict::Blocked(_) => Color::Red,
+    }
 }
 
 fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
@@ -175,6 +194,32 @@ fn welcome_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::styled("Commands:     ", Style::default().fg(Color::DarkGray)),
             Span::styled(app.workspace_status.clone(), style),
+        ]));
+    }
+
+    // Only worth a line once a ceiling actually exists -- otherwise it is noise
+    // on a screen that is already dense.
+    if app.config.quota.has_limits() {
+        let mut parts = Vec::new();
+        if app.config.quota.max_requests_per_day > 0 {
+            parts.push(format!("{} requests", app.config.quota.max_requests_per_day));
+        }
+        if app.config.quota.max_tokens_per_day > 0 {
+            parts.push(format!(
+                "{} tokens",
+                crate::usage::format_tokens(app.config.quota.max_tokens_per_day)
+            ));
+        }
+        if app.config.quota.max_usd_per_day > 0.0 {
+            parts.push(format!("${:.2}", app.config.quota.max_usd_per_day));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("Daily limit:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(parts.join(" · "), Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("  (used today: {})", crate::usage::summary_line(&app.usage)),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
     }
 
@@ -739,5 +784,106 @@ mod tests {
         assert!(rendered.contains("print"), "the content must be shown");
         assert!(rendered.contains("Write this file?"), "{rendered}");
         assert!(rendered.contains("y write"), "the keys must say write, not run");
+    }
+
+    // ---- daily usage quota ----------------------------------------------------
+
+    fn draw(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn quota_app() -> App {
+        let mut app = App::new(crate::config::Config::default());
+        app.usage = crate::usage::DailyUsage {
+            date: crate::usage::today_local(),
+            ..Default::default()
+        };
+        app.greeted = true; // show the transcript, not the welcome panel
+        app
+    }
+
+    #[test]
+    fn the_header_shows_todays_usage_once_there_is_any() {
+        let mut app = quota_app();
+        app.usage.requests = 12;
+        app.usage.prompt_tokens = 8_000;
+        app.usage.completion_tokens = 400;
+
+        let rendered = draw(&mut app);
+        assert!(rendered.contains("12 req"), "{rendered}");
+        assert!(rendered.contains("8.4k tok"), "{rendered}");
+    }
+
+    /// Nothing spent yet means nothing to report -- the header should not gain a
+    /// permanent "0 req" fixture.
+    #[test]
+    fn the_header_stays_clean_before_the_first_request() {
+        let mut app = quota_app();
+        assert!(!draw(&mut app).contains("req"));
+    }
+
+    /// A spend figure that excludes unpriced usage must not read as complete.
+    #[test]
+    fn an_unpriced_day_never_renders_a_dollar_zero_total() {
+        let mut app = quota_app();
+        app.usage.requests = 4;
+        app.usage.unpriced_requests = 4;
+
+        let rendered = draw(&mut app);
+        assert!(rendered.contains("unpriced"), "{rendered}");
+        assert!(!rendered.contains("$0.00"), "a silent $0.00 would be a lie: {rendered}");
+    }
+
+    #[test]
+    fn estimated_token_counts_are_marked_in_the_header() {
+        let mut app = quota_app();
+        app.usage.requests = 1;
+        app.usage.prompt_tokens = 500;
+        app.usage.any_estimated = true;
+        assert!(draw(&mut app).contains("~500 tok"));
+    }
+
+    #[test]
+    fn the_welcome_screen_states_the_limit_when_one_is_set() {
+        let mut app = quota_app();
+        app.greeted = false;
+        app.config.quota.max_requests_per_day = 200;
+        app.config.quota.max_usd_per_day = 5.0;
+
+        let rendered = draw(&mut app);
+        assert!(rendered.contains("Daily limit"), "{rendered}");
+        assert!(rendered.contains("200 requests"), "{rendered}");
+        assert!(rendered.contains("$5.00"), "{rendered}");
+    }
+
+    #[test]
+    fn the_welcome_screen_says_nothing_about_quotas_when_none_are_set() {
+        let mut app = quota_app();
+        app.greeted = false;
+        assert!(!draw(&mut app).contains("Daily limit"));
+    }
+
+    /// The usage readout must not push the endpoint and model off a narrow
+    /// terminal, and must never panic there.
+    #[test]
+    fn the_header_survives_a_narrow_terminal() {
+        let mut app = quota_app();
+        app.usage.requests = 999;
+        app.usage.prompt_tokens = 12_345_678;
+
+        for (w, h) in [(1, 1), (20, 5), (40, 10), (200, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| render(f, &mut app))
+                .unwrap_or_else(|e| panic!("{w}x{h} failed to render: {e}"));
+        }
     }
 }
