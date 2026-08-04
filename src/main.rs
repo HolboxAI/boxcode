@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod danger;
 mod llm;
 mod providers;
 mod tools;

@@ -1,9 +1,11 @@
 use crate::config::Config;
+use crate::danger;
 use crate::llm::{ChatMessage, ToolCall};
 use crate::providers;
 use crate::tools::{self, ToolOutcome};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{HashSet, VecDeque};
+use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppState {
@@ -144,11 +146,6 @@ pub struct App {
     pub pending_tools: VecDeque<ToolCall>,
     /// Calls the user allowed, waiting for the event loop to spawn them.
     pub approved_tools: Vec<ToolCall>,
-    /// Set by "a" at an approval prompt: stop asking for the rest of the session.
-    /// Session-only and never persisted -- a permanent version of this belongs in
-    /// config.toml, where turning it on is a deliberate act rather than a
-    /// keystroke made while impatient.
-    pub auto_approve: bool,
     /// Tool rounds spent on the current prompt, reset by `submit`. Once this hits
     /// the configured ceiling the schemas stop being sent, which is what makes a
     /// model that will not stop calling tools produce an answer instead.
@@ -181,7 +178,6 @@ impl App {
             overlay_cursor: 0,
             pending_tools: VecDeque::new(),
             approved_tools: Vec::new(),
-            auto_approve: false,
             tool_steps: 0,
             workspace_status: String::new(),
             workspace_root: String::new(),
@@ -373,6 +369,23 @@ impl App {
     /// answer without it).
     fn advance_approvals(&mut self) {
         while let Some(call) = self.pending_tools.front() {
+            // Refused outright, and never put in front of the user at all.
+            // Offering `rm -rf /` as a y/n question is itself the bug: it takes
+            // one mistyped keystroke to accept, and there is no undo. There is
+            // deliberately no key, flag, or config value that reaches this.
+            if let danger::Risk::Blocked(reason) = self.risk_of(call) {
+                let call = self.pending_tools.pop_front().expect("front just matched");
+                let label = tools::describe_action(&call)
+                    .map(|a| a.label())
+                    .unwrap_or_else(|| call.function.name.clone());
+                self.messages.push(Message::new(
+                    Role::Error,
+                    format!("Blocked: {label}\n{reason}"),
+                ));
+                self.push_tool_outcome(tools::refused_as_dangerous(&call, &reason));
+                self.follow_tail = true;
+                continue;
+            }
             if !self.needs_approval(call) {
                 let call = self.pending_tools.pop_front().expect("front just matched");
                 self.approved_tools.push(call);
@@ -405,18 +418,35 @@ impl App {
         };
     }
 
+    /// What the guardrails make of this call, judged against the directory it
+    /// would actually run in.
+    pub fn risk_of(&self, call: &ToolCall) -> danger::Risk {
+        match tools::describe_action(call) {
+            Some(tools::Action::Command { command, .. }) => {
+                danger::classify(&command, Path::new(&self.workspace_root))
+            }
+            // Reads and writes are already confined to the workspace by
+            // `tools::resolve_in_workspace`, and cannot invoke a shell.
+            _ => danger::Risk::Normal,
+        }
+    }
+
     /// Whether `call` needs a human decision before it runs.
     ///
-    /// Order matters: the session-wide escape hatches (`require_approval`,
-    /// `auto_approve`) are checked first since they should short-circuit
-    /// regardless of what the call is, and `auto_approve_read_only` only
-    /// waives the prompt for a narrow, conservative slice of calls --
-    /// `read_file` unconditionally (it cannot write anything), and shell
-    /// commands via `tools::is_read_only`. `write_file` never qualifies:
-    /// unlike a shell command's read-only-ness, which has to be inferred,
-    /// "this writes a file" is certain, so it always asks.
+    /// Order matters, and the destructive check comes first *because* it must
+    /// outrank the session-wide escape hatches: "yes to everything this
+    /// session" and `require_approval = false` must not silently cover
+    /// `rm -rf build` an hour later. Below that, the hatches short-circuit
+    /// regardless of the call, and `auto_approve_read_only` waives the prompt
+    /// only for a narrow slice -- `read_file` unconditionally (it cannot write
+    /// anything), and shell commands via `tools::is_read_only`. `write_file`
+    /// never qualifies: unlike a shell command's read-only-ness, which has to
+    /// be inferred, "this writes a file" is certain, so it always asks.
     fn needs_approval(&self, call: &ToolCall) -> bool {
-        if !self.config.tools.require_approval || self.auto_approve {
+        if self.risk_of(call).is_dangerous() {
+            return true;
+        }
+        if !self.config.tools.require_approval {
             return false;
         }
         if self.config.tools.auto_approve_read_only {
@@ -431,22 +461,21 @@ impl App {
         true
     }
 
-    /// y allow · n refuse · a stop asking for this session · Esc refuse.
+    /// y allow · n refuse · Esc refuse.
     ///
     /// Esc means refuse rather than cancel-the-turn: at a prompt asking whether
     /// to run something, the reflexive keypress has to be the safe one.
+    ///
+    /// There is deliberately no "allow everything from now on" key. A decision
+    /// made once, while impatient, would otherwise silently cover every command
+    /// for the rest of the session -- including ones the model had not thought
+    /// of yet. `[tools] require_approval = false` still exists for scripted
+    /// runs, where turning it off is an explicit, visible act rather than a
+    /// keystroke.
     fn handle_command_approval_key(&mut self, key: KeyEvent) {
         let decision = match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(true),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.auto_approve = true;
-                self.messages.push(Message::new(
-                    Role::System,
-                    "Running commands without asking for the rest of this session.",
-                ));
-                Some(true)
-            }
             _ => None,
         };
 
@@ -1277,7 +1306,9 @@ mod tests {
     fn esc_refuses_the_command_rather_than_cancelling_the_turn() {
         for refuse in [KeyCode::Char('n'), KeyCode::Esc] {
             let mut a = streaming_app();
-            a.request_tools(vec![command_call("call_1", "rm -rf /")]);
+            // Dangerous but not blocked: this test is about the *prompt*, and a
+            // blocked command never reaches one.
+            a.request_tools(vec![command_call("call_1", "rm -rf build")]);
             a.handle_key(key(refuse));
 
             assert!(a.approved_tools.is_empty(), "{refuse:?} must not run anything");
@@ -1332,21 +1363,132 @@ mod tests {
         }
     }
 
+    // ---- destructive-command guardrails -------------------------------------
+
+    /// The whole point of the blocked tier: it is never put in front of the
+    /// user as a y/n question, because one mistyped keystroke would accept it.
     #[test]
-    fn a_stops_asking_for_the_rest_of_the_session() {
+    fn a_catastrophic_command_is_refused_without_ever_prompting() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "rm -rf /")]);
+
+        assert_eq!(a.overlay, None, "must never be offered for approval");
+        assert!(a.approved_tools.is_empty(), "must never reach the runner");
+        assert_eq!(a.state, AppState::Sending);
+
+        let told = a.messages.last().unwrap();
+        assert_eq!(told.tool_call_id.as_deref(), Some("call_1"));
+        assert!(told.content.contains("Blocked"), "{}", told.content);
+        assert!(
+            told.content.contains("no setting can permit it"),
+            "the model must be told this is settled: {}",
+            told.content
+        );
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    /// The bypasses are the reason this feature exists. Before it,
+    /// `require_approval = false` made `needs_approval` return false for
+    /// *everything*, `rm -rf /` included.
+    #[test]
+    fn no_setting_can_unblock_a_catastrophic_command() {
+        type Bypass = (&'static str, fn(&mut App));
+        let bypasses: [Bypass; 3] = [
+            ("unattended mode", |a| {
+                a.config.tools.require_approval = false
+            }),
+            ("read-only fast path", |a| {
+                a.config.tools.auto_approve_read_only = true
+            }),
+            ("both at once", |a| {
+                a.config.tools.require_approval = false;
+                a.config.tools.auto_approve_read_only = true;
+            }),
+        ];
+
+        for (label, setup) in bypasses {
+            let mut a = streaming_app();
+            setup(&mut a);
+            a.request_tools(vec![command_call("call_1", "sudo rm -rf /")]);
+
+            assert!(
+                a.approved_tools.is_empty(),
+                "{label} let a blocked command through"
+            );
+            assert_eq!(a.overlay, None, "{label} turned it into a prompt");
+        }
+    }
+
+    /// The other half: a destructive-but-legitimate command must still stop,
+    /// even with approval switched off entirely.
+    #[test]
+    fn dangerous_commands_still_ask_in_unattended_mode() {
+        let mut a = streaming_app();
+        a.config.tools.require_approval = false;
+
+        a.request_tools(vec![command_call("call_1", "rm -rf build")]);
+
+        assert_eq!(
+            a.state,
+            AppState::AwaitingApproval,
+            "`rm -rf build` must not ride the unattended fast path"
+        );
+        assert!(a.overlay.is_some());
+    }
+
+    /// ...while ordinary work is untouched by any of this.
+    #[test]
+    fn ordinary_commands_are_unaffected_by_the_guardrails() {
+        let mut a = streaming_app();
+        a.config.tools.require_approval = false;
+        a.request_tools(vec![command_call("call_1", "cargo build")]);
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// A blocked call still has to be answered, or the next prompt 400s.
+    #[test]
+    fn a_blocked_call_mixed_with_a_normal_one_leaves_a_valid_history() {
+        let mut a = streaming_app();
+        a.config.tools.require_approval = false;
+        a.request_tools(vec![
+            command_call("call_1", "rm -rf /"),
+            command_call("call_2", "ls"),
+        ]);
+
+        assert_eq!(a.approved_tools.len(), 1, "only `ls` may run");
+        a.state = AppState::ExecutingTools;
+        a.finish_tools(vec![outcome("call_2", "ok")]);
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    /// "Allow everything from now on" was removed deliberately. `a` is now an
+    /// ordinary unrecognised key, which means the prompt stays up rather than
+    /// being dismissed -- a stray keystroke must never be read as consent.
+    #[test]
+    fn there_is_no_key_that_approves_everything_for_the_session() {
         let mut a = streaming_app();
         a.request_tools(vec![command_call("call_1", "ls")]);
-        a.handle_key(key(KeyCode::Char('a')));
-        assert!(a.auto_approve);
-        assert_eq!(a.approved_tools.len(), 1);
 
-        // A later round goes straight through with no prompt.
+        for stray in [KeyCode::Char('a'), KeyCode::Char('A')] {
+            a.handle_key(key(stray));
+            assert_eq!(
+                a.state,
+                AppState::AwaitingApproval,
+                "{stray:?} approved something"
+            );
+            assert!(a.approved_tools.is_empty(), "{stray:?} approved something");
+            assert!(a.overlay.is_some(), "{stray:?} dismissed the prompt");
+        }
+
+        // Each later command is asked about on its own, with no memory of past
+        // answers.
+        a.handle_key(key(KeyCode::Char('y')));
         a.finish_tools(vec![outcome("call_1", "ok")]);
         a.state = AppState::Streaming;
         a.request_tools(vec![command_call("call_2", "cat Cargo.toml")]);
-
-        assert_eq!(a.state, AppState::ExecutingTools);
-        assert_eq!(a.overlay, None);
+        assert_eq!(a.state, AppState::AwaitingApproval, "the second command must ask too");
     }
 
     #[test]
@@ -1391,7 +1533,10 @@ mod tests {
     fn a_read_only_prefix_chained_into_something_else_still_asks() {
         let mut a = streaming_app();
         a.config.tools.auto_approve_read_only = true;
-        a.request_tools(vec![command_call("call_1", "cat file; rm -rf /")]);
+        // Chained into a *dangerous* second command rather than a blocked one:
+        // blocking is a separate mechanism, and this test is about the fast path
+        // not being fooled by the `cat` prefix.
+        a.request_tools(vec![command_call("call_1", "cat file; rm -rf build")]);
 
         assert_eq!(a.state, AppState::AwaitingApproval);
         assert!(a.approved_tools.is_empty());

@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use std::path::Path;
 
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MAX_INPUT_HEIGHT: u16 = 10;
@@ -296,7 +297,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let keys = match &app.state {
-        AppState::AwaitingApproval => " | y run · n skip · a allow all · Ctrl-C exit",
+        AppState::AwaitingApproval => " | y run · n or Esc skip · Ctrl-C exit",
         _ => " | Enter send · Alt+Enter newline · Esc cancel · Ctrl-C exit",
     };
 
@@ -393,6 +394,27 @@ fn render_tool_approval(f: &mut Frame, area: Rect, app: &App, action: &Action, r
     let inner = width.saturating_sub(4).max(1) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
+
+    // A destructive command gets a banner before anything else. The prompt for
+    // `rm -rf build` must not look identical to the one for `cargo build` --
+    // that sameness is what trains people to press `y` without reading.
+    if let Action::Command { command, .. } = action {
+        let verdict = crate::danger::classify(command, Path::new(&app.workspace_root));
+        if let Some(reason) = verdict.reason() {
+            lines.push(Line::from(Span::styled(
+                "⚠  DESTRUCTIVE",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            for wrapped in wrap(reason, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
     let (title, verb) = match action {
         Action::Command { command, purpose } => {
             if let Some(purpose) = purpose {
@@ -466,11 +488,8 @@ fn render_tool_approval(f: &mut Frame, area: Rect, app: &App, action: &Action, r
         Span::styled(format!(" {verb}   "), Style::default().fg(Color::DarkGray)),
         Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         Span::styled(" skip   ", Style::default().fg(Color::DarkGray)),
-        Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            " run everything this session",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(" skip", Style::default().fg(Color::DarkGray)),
     ]));
 
     let popup = centered_rect(width, lines.len() as u16 + 2, area);
