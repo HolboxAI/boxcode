@@ -97,43 +97,53 @@ internal mirror serving the same `Cargo.toml` and `install.sh`:
 export TUISAMPLE_UPGRADE_URL_BASE=https://git.company.internal/tuisample-code/raw/main
 ```
 
-## Running commands
+## Running commands, and reading/writing files
 
-The model can run shell commands in the directory you launched from, so you can
-ask about the actual project instead of pasting code in:
-
-```
-> what does the event loop in main.rs do?
-$ sed -n '90,150p' src/main.rs — 61 lines
-Assistant: It polls for terminal input every 16ms, drains …
-```
-
-Reading a file is `cat`, searching is `grep`, listing an archive is `unzip -l`,
-extracting text from a PDF is `pdftotext` — anything installed on your machine.
-
-### You approve every command
-
-Each command stops and waits for you:
+The model has three tools in the directory you launched from, so you can ask
+about the actual project instead of pasting code in, and have it create or
+change files directly instead of hand-encoding writes into shell commands:
 
 ```
-┌ Run this command? ───────────────────────────┐
-│ check what the tests cover                   │
+> create hello.py and run it
+📝 /Users/you/project/hello.py
+Assistant: Created it — printing "Hello, World!" and running it now.
+$ python3 hello.py — 1 line
+```
+
+`read_file`/`write_file` handle reading and creating/overwriting a single
+file. `run_command` is for everything else — search (`grep`), builds, tests,
+running a program, listing an archive (`unzip -l`), extracting a PDF
+(`pdftotext`) — anything installed on your machine.
+
+### You approve every write and every command
+
+Each one stops and waits for you — a write shows the file's full new content,
+not a shell string:
+
+```
+┌ Write this file? ────────────────────────────┐
+│ 📝 hello.py                                   │
 │                                              │
-│ $ grep -rn "fn test" tests/                  │
+│ print("Hello, World!")                       │
 │                                              │
 │ in /Users/you/project                        │
 │                                              │
-│ y run   n skip   a run everything this session│
+│ y write   n skip   a run everything this session│
 └──────────────────────────────────────────────┘
 ```
 
-**`y`** runs it · **`n`** or **Esc** skips it and tells the model to try
-something else · **`a`** stops asking for the rest of the session.
+**`y`** does it · **`n`** or **Esc** skips it and tells the model to try
+something else · **`a`** stops asking for the rest of the session. Reads of a
+short, conservative allowlist (`ls`, `cat`, `grep`, `git status`/`diff`, ...)
+skip the prompt by default — see `auto_approve_read_only` below.
 
-This prompt is the *only* thing limiting what the model can do. A shell command
+These prompts are the *only* thing limiting what the model can do. `run_command`
 can read any file your user can read, write anywhere, and delete anything —
 there is no sandbox, and there is no honest way to build one by inspecting
-command strings. Read each command before pressing `y`.
+command strings. `write_file`/`read_file` are checked against the project
+directory before anything happens (see `tools::resolve_in_workspace`), which
+a raw shell command cannot offer, but that is a guardrail against typos and
+injected paths, not a sandbox either. Read each prompt before pressing `y`.
 
 Commands run with **stdin closed** and are killed after a timeout, so anything
 interactive (`vim`, a dev server, a REPL) will time out rather than hang.
@@ -218,7 +228,7 @@ Clean, modular structure for easy feature additions:
 - `src/llm.rs` — LLM client + streaming
 - `src/config.rs` — Configuration loading
 - `src/providers.rs` — Built-in provider/model registry for `/provider` and `/model`
-- `src/tools.rs` — The `run_command` tool: schema, execution, timeouts
+- `src/tools.rs` — The model's tools (`run_command`, `read_file`, `write_file`): schemas, execution, timeouts
 - `src/workspace.rs` — The working directory commands run in
 
 ## What's Next

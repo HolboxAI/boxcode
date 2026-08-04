@@ -1,5 +1,6 @@
 use crate::app::{App, AppState, CustomStep, Overlay, Role};
 use crate::providers;
+use crate::tools::Action;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -79,11 +80,11 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
 
         if app.state == AppState::ExecutingTools {
             for call in &app.approved_tools {
-                let running = crate::tools::described_command(call)
-                    .map(|(command, _)| command)
+                let label = crate::tools::describe_action(call)
+                    .map(|a| a.label())
                     .unwrap_or_else(|| call.function.name.clone());
                 lines.push(Line::from(Span::styled(
-                    format!("$ {running} …"),
+                    format!("{label} …"),
                     role_style(Role::Tool),
                 )));
             }
@@ -371,44 +372,83 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
             };
             render_text_prompt(f, area, title, hint, &app.overlay_input, masked);
         }
-        Some(Overlay::CommandApproval {
-            command,
-            purpose,
-            remaining,
-        }) => render_command_approval(f, area, app, command, purpose.as_deref(), *remaining),
+        Some(Overlay::ToolApproval { action, remaining }) => {
+            render_tool_approval(f, area, app, action, *remaining)
+        }
     }
 }
 
+/// How many lines of a `write_file` preview to show before eliding the rest.
+/// A cap, not a limit on the write itself -- the full content still gets
+/// written; this only bounds how tall the popup gets.
+const WRITE_PREVIEW_LINES: usize = 20;
+
 /// The approval prompt. This is the only thing standing between the model and
-/// the machine, so it shows the command verbatim and in full -- never elided,
-/// never summarised. Approving something you cannot fully see is not approval.
-fn render_command_approval(
-    f: &mut Frame,
-    area: Rect,
-    app: &App,
-    command: &str,
-    purpose: Option<&str>,
-    remaining: usize,
-) {
+/// the machine, so a command or a write's content is shown verbatim and in
+/// full -- never elided, never summarised (`write_file` content is capped at
+/// `WRITE_PREVIEW_LINES` purely so one huge file cannot produce an unusable
+/// popup). Approving something you cannot fully see is not approval.
+fn render_tool_approval(f: &mut Frame, area: Rect, app: &App, action: &Action, remaining: usize) {
     let width = area.width.saturating_sub(10).clamp(MIN_POPUP_WIDTH, 90);
     let inner = width.saturating_sub(4).max(1) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(purpose) = purpose {
-        for wrapped in wrap(purpose, inner) {
-            lines.push(Line::from(Span::styled(
-                wrapped,
-                Style::default().fg(Color::DarkGray),
-            )));
+    let (title, verb) = match action {
+        Action::Command { command, purpose } => {
+            if let Some(purpose) = purpose {
+                for wrapped in wrap(purpose, inner) {
+                    lines.push(Line::from(Span::styled(
+                        wrapped,
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(""));
+            }
+            for wrapped in wrap(command, inner) {
+                lines.push(Line::from(Span::styled(
+                    format!("$ {wrapped}"),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                )));
+            }
+            (" Run this command? ", "run")
         }
-        lines.push(Line::from(""));
-    }
-    for wrapped in wrap(command, inner) {
-        lines.push(Line::from(Span::styled(
-            format!("$ {wrapped}"),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        )));
-    }
+        Action::Read { path } => {
+            lines.push(Line::from(Span::styled(
+                format!("📄 {path}"),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            (" Read this file? ", "read")
+        }
+        Action::Write { path, content } => {
+            lines.push(Line::from(Span::styled(
+                format!("📝 {path}"),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            if content.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "(empty file)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                let total = content.lines().count();
+                for (i, line) in content.lines().enumerate() {
+                    if i >= WRITE_PREVIEW_LINES {
+                        lines.push(Line::from(Span::styled(
+                            format!("… {} more line{}", total - i, if total - i == 1 { "" } else { "s" }),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                        break;
+                    }
+                    for wrapped in wrap(line, inner) {
+                        lines.push(Line::from(Span::styled(wrapped, Style::default().fg(Color::White))));
+                    }
+                }
+            }
+            (" Write this file? ", "write")
+        }
+    };
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!("in {}", app.workspace_root),
@@ -423,7 +463,7 @@ fn render_command_approval(
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("y", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::styled(" run   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" {verb}   "), Style::default().fg(Color::DarkGray)),
         Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         Span::styled(" skip   ", Style::default().fg(Color::DarkGray)),
         Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -439,7 +479,7 @@ fn render_command_approval(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta))
-        .title(" Run this command? ");
+        .title(title);
     f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -623,9 +663,11 @@ mod tests {
     #[test]
     fn rendering_an_overlay_into_a_zero_size_frame_does_not_panic() {
         let mut app = App::new(crate::config::Config::default());
-        app.overlay = Some(Overlay::CommandApproval {
-            command: "rm -rf /".to_string(),
-            purpose: Some("something alarming".to_string()),
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Command {
+                command: "rm -rf /".to_string(),
+                purpose: Some("something alarming".to_string()),
+            },
             remaining: 2,
         });
 
@@ -643,9 +685,11 @@ mod tests {
     fn the_approval_prompt_shows_the_command_and_the_keys() {
         let mut app = App::new(crate::config::Config::default());
         app.workspace_root = "/tmp/project".to_string();
-        app.overlay = Some(Overlay::CommandApproval {
-            command: "rm -rf build".to_string(),
-            purpose: None,
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Command {
+                command: "rm -rf build".to_string(),
+                purpose: None,
+            },
             remaining: 0,
         });
 
@@ -664,5 +708,36 @@ mod tests {
         assert!(rendered.contains("Run this command?"), "{rendered}");
         assert!(rendered.contains("/tmp/project"), "where it runs must be shown");
         assert!(rendered.contains("y run"), "the keys must be shown");
+    }
+
+    /// A write shows its content, not a shell command -- and the verb in the
+    /// key hints matches the action ("write", not "run").
+    #[test]
+    fn the_write_approval_prompt_shows_the_path_and_content() {
+        let mut app = App::new(crate::config::Config::default());
+        app.workspace_root = "/tmp/project".to_string();
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Write {
+                path: "hello.py".to_string(),
+                content: "print('hi')\n".to_string(),
+            },
+            remaining: 0,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(rendered.contains("hello.py"), "the path must be shown");
+        assert!(rendered.contains("print"), "the content must be shown");
+        assert!(rendered.contains("Write this file?"), "{rendered}");
+        assert!(rendered.contains("y write"), "the keys must say write, not run");
     }
 }

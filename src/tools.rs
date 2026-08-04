@@ -1,24 +1,37 @@
-//! The one tool the model gets: run a shell command.
+//! The model's tools: a shell escape hatch, and two typed file operations.
 //!
-//! A single `run_command` replaces per-operation tools. It is far more capable --
-//! reading a PDF is `pdftotext`, listing an archive is `unzip -l`, searching is
-//! `grep` -- at the cost of any enforceable sandbox. Inspecting a command string
-//! cannot tell you what it will do (`cat $(echo ... | base64 -d)`), so the only
-//! real control is the user approving each command before it runs. That approval
-//! lives in `app.rs`; this module assumes a decision has already been made.
+//! `run_command` is the general-purpose one -- inspecting a command string
+//! cannot tell you what it will do (`cat $(echo ... | base64 -d)`), so the
+//! only real control is the user approving each one before it runs. That
+//! approval lives in `app.rs`; this module assumes a decision has already
+//! been made.
+//!
+//! `read_file`/`write_file` exist alongside it because routing every file
+//! operation through the shell has real costs: writing more than a line or
+//! two of code means the model hand-encoding it into a heredoc or a quoted
+//! `printf`, which is exactly the kind of string-escaping work models are
+//! worst at, and it hides "create this file" and "run this file" behind one
+//! opaque approval instead of two reviewable ones. A typed `write_file` also
+//! gets a real (if narrow) safety property a shell command cannot: its path
+//! is resolved and checked against the workspace root before anything
+//! happens, see `resolve_in_workspace`.
 //!
 //! Failures come back as results the model can read rather than Rust errors: a
-//! non-zero exit is information, not a reason to abandon the turn.
+//! non-zero exit, a missing file, or bad arguments are information, not a
+//! reason to abandon the turn.
 
 use crate::config::ToolsConfig;
 use crate::llm::ToolCall;
 use crate::workspace::Workspace;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 pub const RUN_COMMAND: &str = "run_command";
+pub const READ_FILE: &str = "read_file";
+pub const WRITE_FILE: &str = "write_file";
 
 /// One executed (or declined) tool call, on its way back to the model.
 #[derive(Debug, Clone)]
@@ -45,32 +58,79 @@ pub fn shell() -> (&'static str, &'static str) {
 
 pub fn schemas() -> Vec<Value> {
     let (shell_name, shell_flag) = shell();
-    vec![json!({
-        "type": "function",
-        "function": {
-            "name": RUN_COMMAND,
-            "description": format!(
-                "Run a shell command in the user's project directory via `{shell_name} {shell_flag}` \
-                 and get back its exit code, stdout and stderr. Use this to inspect and change the \
-                 project: read files by printing them, search with grep/findstr, run builds and tests. \
-                 The user must approve every command before it runs."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The command line to run, e.g. `cat src/main.rs` or `grep -rn TODO src`."
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": RUN_COMMAND,
+                "description": format!(
+                    "Run a shell command in the user's project directory via `{shell_name} {shell_flag}` \
+                     and get back its exit code, stdout and stderr. Use this for things that are not \
+                     reading or writing a single file: searching (grep/findstr), running builds and \
+                     tests, installing packages. Prefer {READ_FILE}/{WRITE_FILE} over this for reading \
+                     or writing files. The user must approve every command before it runs."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command line to run, e.g. `grep -rn TODO src` or `python3 -m pytest`."
+                        },
+                        "purpose": {
+                            "type": "string",
+                            "description": "One short sentence on why you need it. Shown to the user in the approval prompt, so be specific and honest."
+                        }
                     },
-                    "purpose": {
-                        "type": "string",
-                        "description": "One short sentence on why you need it. Shown to the user in the approval prompt, so be specific and honest."
-                    }
-                },
-                "required": ["command"]
+                    "required": ["command"]
+                }
             }
-        }
-    })]
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": READ_FILE,
+                "description": "Read a file's contents from the user's project directory. Prefer this \
+                                 over running `cat`/`type` through run_command -- it is not subject to \
+                                 shell quoting.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file, relative to the project directory."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": WRITE_FILE,
+                "description": "Create a file, or overwrite an existing one, with new content. Creates \
+                                 parent directories as needed. Prefer this over shell redirection or \
+                                 `sed` through run_command -- the full new content is one argument, not \
+                                 something to hand-encode into a shell string. The user approves every \
+                                 write before it happens.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to write, relative to the project directory."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The file's full new contents. This replaces the entire file."
+                        }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+    ]
 }
 
 /// What the model is told about its situation.
@@ -99,21 +159,26 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
     format!(
         "You are tuisample-code, a terminal coding assistant.\n\n\
          Working directory: {}\n\
-         Operating system: {os} — commands run through `{shell_name} {shell_flag}`\n\n\
-         Tool:\n\
+         Operating system: {os} — shell commands run through `{shell_name} {shell_flag}`\n\n\
+         Tools:\n\
+         - {READ_FILE}(path): read a file's contents.\n\
+         - {WRITE_FILE}(path, content): create a file, or overwrite one, with new content.\n\
          - {RUN_COMMAND}(command, purpose): run a shell command and get back its exit code, \
            stdout and stderr.\n\n\
          Rules:\n\
          - {os_hint}\n\
-         - To read a file, print it. To find something, search for it. Look at the real \
-           project instead of guessing what it contains.\n\
-         - Commands are NON-INTERACTIVE: stdin is closed. Never run anything that waits for \
-           input, opens an editor (vim, nano), or runs a server in the foreground. Such a \
-           command will simply time out after {} seconds.\n\
-         - The user approves every command before it runs. If one is declined, do not retry \
-           it — take a different approach or answer without it.\n\
+         - Use {READ_FILE} to read a file and {WRITE_FILE} to create or change one -- not \
+           `cat`/`type`/`sed`/shell redirection through {RUN_COMMAND}. Reserve {RUN_COMMAND} for \
+           things that are not reading or writing a single file: search, builds, tests, running \
+           a program. Look at the real project instead of guessing what it contains.\n\
+         - Commands run through {RUN_COMMAND} are NON-INTERACTIVE: stdin is closed. Never run \
+           anything that waits for input, opens an editor (vim, nano), or runs a server in the \
+           foreground. Such a command will simply time out after {} seconds.\n\
+         - The user approves every write and every command before it runs (reads of a short, \
+           conservative allowlist may go through without asking). If something is declined, do \
+           not retry it — take a different approach or answer without it.\n\
          - Anything that changes or deletes files is real and immediate. Be conservative, \
-           prefer the narrowest command that does the job, and say what you are about to do.\n\
+           prefer the narrowest action that does the job, and say what you are about to do.\n\
          - Answers appear in a terminal: keep them short and concrete.",
         workspace.root().display(),
         config.command_timeout_secs,
@@ -127,18 +192,102 @@ struct RunArgs {
     purpose: Option<String>,
 }
 
-/// The command a call wants to run, for the approval prompt. `None` if the model
-/// sent something unusable, in which case there is nothing to approve.
-pub fn described_command(call: &ToolCall) -> Option<(String, Option<String>)> {
-    if call.function.name != RUN_COMMAND {
-        return None;
+#[derive(Deserialize)]
+struct ReadFileArgs {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct WriteFileArgs {
+    path: String,
+    content: String,
+}
+
+/// What a call is asking to do, in a form the approval popup and the
+/// transcript can render without knowing which tool produced it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    Command { command: String, purpose: Option<String> },
+    Read { path: String },
+    Write { path: String, content: String },
+}
+
+impl Action {
+    /// One line for `$ ... —` / transcript-style summaries, with a leading
+    /// icon so the three kinds stay visually distinct in a transcript full
+    /// of them.
+    pub fn label(&self) -> String {
+        match self {
+            Action::Command { command, .. } => format!("$ {command}"),
+            Action::Read { path } => format!("📄 read {path}"),
+            Action::Write { path, .. } => format!("📝 write {path}"),
+        }
     }
-    let args: RunArgs = serde_json::from_str(&call.function.arguments).ok()?;
-    let command = args.command.trim().to_string();
-    if command.is_empty() {
-        return None;
+}
+
+/// What `call` is asking to do, for the approval prompt. `None` if the model
+/// sent something unusable (unknown tool name, unparseable or empty
+/// arguments), in which case there is nothing to approve -- the runner
+/// reports the malformed arguments back to the model instead.
+pub fn describe_action(call: &ToolCall) -> Option<Action> {
+    match call.function.name.as_str() {
+        RUN_COMMAND => {
+            let args: RunArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let command = args.command.trim().to_string();
+            if command.is_empty() {
+                return None;
+            }
+            Some(Action::Command {
+                command,
+                purpose: args.purpose.filter(|p| !p.trim().is_empty()),
+            })
+        }
+        READ_FILE => {
+            let args: ReadFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            (!path.is_empty()).then_some(Action::Read { path })
+        }
+        WRITE_FILE => {
+            let args: WriteFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            (!path.is_empty()).then_some(Action::Write { path, content: args.content })
+        }
+        _ => None,
     }
-    Some((command, args.purpose.filter(|p| !p.trim().is_empty())))
+}
+
+/// Joins `path` onto the workspace root and rejects anything that resolves
+/// outside it, purely by collapsing `..`/`.` components -- no filesystem
+/// access, so this works for a `write_file` target that does not exist yet.
+///
+/// This is a guardrail against typos and prompt-injected paths, not a
+/// sandbox: it does not follow symlinks, so a symlink inside the workspace
+/// pointing outside it is not caught. It is nonetheless a real safety
+/// property `run_command`'s shell cannot offer at all -- see the module doc.
+fn resolve_in_workspace(workspace: &Workspace, path: &str) -> Result<PathBuf, String> {
+    let mut resolved = workspace.root().to_path_buf();
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => resolved.push(part),
+            // An absolute `path` (a leading `/`, or `C:\` on Windows) is
+            // exactly the escape this function exists to catch: replace
+            // rather than join, and let the `starts_with` check below reject it.
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                resolved = PathBuf::from(component.as_os_str());
+            }
+        }
+    }
+    if !resolved.starts_with(workspace.root()) {
+        return Err(format!(
+            "'{path}' resolves outside the workspace ({})",
+            workspace.root().display()
+        ));
+    }
+    Ok(resolved)
 }
 
 /// Any of these and a command is not judged read-only, no matter what it
@@ -192,18 +341,23 @@ pub fn is_read_only(command: &str) -> bool {
 }
 
 pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
-    if call.function.name != RUN_COMMAND {
-        return outcome(
+    match call.function.name.as_str() {
+        RUN_COMMAND => execute_run_command(call, workspace, config).await,
+        READ_FILE => execute_read_file(call, workspace, config).await,
+        WRITE_FILE => execute_write_file(call, workspace).await,
+        other => outcome(
             &call.id,
-            format!("⚙ {} — unknown tool", call.function.name),
+            format!("⚙ {other} — unknown tool"),
             format!(
-                "Error: there is no tool named '{}'. The only tool is {RUN_COMMAND}.",
-                call.function.name
+                "Error: there is no tool named '{other}'. The tools are {RUN_COMMAND}, \
+                 {READ_FILE}, {WRITE_FILE}."
             ),
-        );
+        ),
     }
+}
 
-    let Some((command, _)) = described_command(call) else {
+async fn execute_run_command(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<RunArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
             "⚙ run_command — unusable arguments".to_string(),
@@ -213,6 +367,14 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
             ),
         );
     };
+    let command = args.command.trim().to_string();
+    if command.is_empty() {
+        return outcome(
+            &call.id,
+            "⚙ run_command — empty command".to_string(),
+            "Error: the command was empty. Nothing was run.".to_string(),
+        );
+    }
 
     let (shell_name, shell_flag) = shell();
     let mut cmd = tokio::process::Command::new(shell_name);
@@ -290,15 +452,124 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
     )
 }
 
+async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<ReadFileArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "📄 read_file — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"path": "src/main.rs"}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+    let path = args.path.trim();
+    if path.is_empty() {
+        return outcome(
+            &call.id,
+            "📄 read_file — empty path".to_string(),
+            "Error: the path was empty. Nothing was read.".to_string(),
+        );
+    }
+
+    let resolved = match resolve_in_workspace(workspace, path) {
+        Ok(p) => p,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("📄 read {} — refused", clip(path, 50)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    match tokio::fs::read(&resolved).await {
+        Ok(bytes) => {
+            // Lossy on purpose, matching run_command's stdout/stderr handling:
+            // a source file is not guaranteed valid UTF-8, and replacement
+            // characters beat refusing to report anything.
+            let text = String::from_utf8_lossy(&bytes);
+            let lines = text.lines().count();
+            outcome(
+                &call.id,
+                format!("📄 read {} — {lines} line{}", clip(path, 50), if lines == 1 { "" } else { "s" }),
+                clip(&text, config.max_output_bytes),
+            )
+        }
+        Err(e) => outcome(
+            &call.id,
+            format!("📄 read {} — failed", clip(path, 50)),
+            format!("Error: could not read {path}: {e}"),
+        ),
+    }
+}
+
+async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<WriteFileArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "📝 write_file — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"path": "hello.py", "content": "..."}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+    let path = args.path.trim();
+    if path.is_empty() {
+        return outcome(
+            &call.id,
+            "📝 write_file — empty path".to_string(),
+            "Error: the path was empty. Nothing was written.".to_string(),
+        );
+    }
+
+    let resolved = match resolve_in_workspace(workspace, path) {
+        Ok(p) => p,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("📝 write {} — refused", clip(path, 50)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    if let Some(parent) = resolved.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return outcome(
+                    &call.id,
+                    format!("📝 write {} — failed", clip(path, 50)),
+                    format!("Error: could not create the directory for {path}: {e}"),
+                );
+            }
+        }
+    }
+
+    match tokio::fs::write(&resolved, &args.content).await {
+        Ok(()) => outcome(
+            &call.id,
+            format!("📝 write {} — {} bytes", clip(path, 50), args.content.len()),
+            format!("Wrote {} bytes to {path}", args.content.len()),
+        ),
+        Err(e) => outcome(
+            &call.id,
+            format!("📝 write {} — failed", clip(path, 50)),
+            format!("Error: could not write {path}: {e}"),
+        ),
+    }
+}
+
 /// The result to hand back when the user says no.
 pub fn declined(call: &ToolCall) -> ToolOutcome {
-    let command = described_command(call)
-        .map(|(command, _)| command)
+    let label = describe_action(call)
+        .map(|a| a.label())
         .unwrap_or_else(|| call.function.name.clone());
     outcome(
         &call.id,
-        format!("$ {} — declined", clip(&command, 60)),
-        "The user declined to run this command. Do not try it again; take a different \
+        format!("{} — declined", clip(&label, 60)),
+        "The user declined to let this happen. Do not try it again; take a different \
          approach or answer without it."
             .to_string(),
     )
@@ -306,12 +577,12 @@ pub fn declined(call: &ToolCall) -> ToolOutcome {
 
 /// The result for a call abandoned before any decision was made.
 pub fn unanswered(call: &ToolCall, reason: &str) -> ToolOutcome {
-    let command = described_command(call)
-        .map(|(command, _)| command)
+    let label = describe_action(call)
+        .map(|a| a.label())
         .unwrap_or_else(|| call.function.name.clone());
     outcome(
         &call.id,
-        format!("$ {} — not run", clip(&command, 60)),
+        format!("{} — not run", clip(&label, 60)),
         reason.to_string(),
     )
 }
@@ -352,6 +623,28 @@ mod tests {
             function: FunctionCall {
                 name: RUN_COMMAND.to_string(),
                 arguments: json!({ "command": command }).to_string(),
+            },
+        }
+    }
+
+    fn read_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: READ_FILE.to_string(),
+                arguments: json!({ "path": path }).to_string(),
+            },
+        }
+    }
+
+    fn write_call(path: &str, content: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: WRITE_FILE.to_string(),
+                arguments: json!({ "path": path, "content": content }).to_string(),
             },
         }
     }
@@ -493,9 +786,36 @@ mod tests {
         })
         .to_string();
 
-        let (command, purpose) = described_command(&c).expect("should describe");
-        assert_eq!(command, "rm -rf build");
-        assert_eq!(purpose.as_deref(), Some("clear stale build output"));
+        match describe_action(&c).expect("should describe") {
+            Action::Command { command, purpose } => {
+                assert_eq!(command, "rm -rf build");
+                assert_eq!(purpose.as_deref(), Some("clear stale build output"));
+            }
+            other => panic!("expected Action::Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_and_write_actions_are_described_for_the_approval_prompt() {
+        match describe_action(&read_call("src/main.rs")).expect("should describe") {
+            Action::Read { path } => assert_eq!(path, "src/main.rs"),
+            other => panic!("expected Action::Read, got {other:?}"),
+        }
+
+        match describe_action(&write_call("hello.py", "print('hi')\n")).expect("should describe") {
+            Action::Write { path, content } => {
+                assert_eq!(path, "hello.py");
+                assert_eq!(content, "print('hi')\n");
+            }
+            other => panic!("expected Action::Write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_call_with_an_unknown_tool_name_has_no_action_to_describe() {
+        let mut c = call("ls");
+        c.function.name = "delete_everything".to_string();
+        assert_eq!(describe_action(&c), None);
     }
 
     #[test]
@@ -572,10 +892,10 @@ mod tests {
     }
 
     #[test]
-    fn the_schema_names_exactly_the_tool_that_executes() {
+    fn the_schemas_name_exactly_the_tools_that_execute() {
         let schemas = schemas();
-        assert_eq!(schemas.len(), 1);
-        assert_eq!(schemas[0]["function"]["name"], RUN_COMMAND);
+        let names: Vec<_> = schemas.iter().map(|s| s["function"]["name"].clone()).collect();
+        assert_eq!(names, vec![RUN_COMMAND, READ_FILE, WRITE_FILE]);
     }
 
     #[test]
@@ -583,5 +903,84 @@ mod tests {
         let clipped = clip("héllo wörld→", 4);
         assert!(clipped.starts_with("héll"), "{clipped}");
         assert!(clipped.contains("truncated"), "{clipped}");
+    }
+
+    // ---- read_file / write_file --------------------------------------------
+
+    #[tokio::test]
+    async fn write_file_creates_parent_directories_and_writes_content() {
+        let (dir, ws, cfg) = fixture();
+        let out = execute(&write_call("nested/hello.py", "print('hi')\n"), &ws, &cfg).await;
+
+        assert!(out.content.contains("Wrote"), "{}", out.content);
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("nested/hello.py")).await.unwrap(),
+            "print('hi')\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_overwrites_an_existing_file() {
+        let (_dir, ws, cfg) = fixture();
+        execute(&write_call("hello.txt", "new content\n"), &ws, &cfg).await;
+        let out = execute(&read_call("hello.txt"), &ws, &cfg).await;
+        assert_eq!(out.content, "new content\n");
+    }
+
+    #[tokio::test]
+    async fn read_file_reports_the_content_and_line_count() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&read_call("hello.txt"), &ws, &cfg).await;
+
+        assert_eq!(out.content, "one\ntwo\nthree\n");
+        assert!(out.display.contains("3 lines"), "{}", out.display);
+    }
+
+    #[tokio::test]
+    async fn reading_a_missing_file_is_reported_not_a_panic() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&read_call("does-not-exist.txt"), &ws, &cfg).await;
+        assert!(out.content.starts_with("Error:"), "{}", out.content);
+    }
+
+    /// The one safety property a typed file tool has that the shell tool
+    /// cannot: the path is checked before anything happens, not merely hoped
+    /// to be well-behaved.
+    #[tokio::test]
+    async fn a_path_that_escapes_the_workspace_is_refused() {
+        let (_dir, ws, cfg) = fixture();
+        for escaping in ["../outside.txt", "../../etc/passwd", "/etc/passwd"] {
+            let out = execute(&write_call(escaping, "pwned"), &ws, &cfg).await;
+            assert!(
+                out.content.contains("outside the workspace"),
+                "{escaping}: {}",
+                out.content
+            );
+
+            let out = execute(&read_call(escaping), &ws, &cfg).await;
+            assert!(
+                out.content.contains("outside the workspace"),
+                "{escaping}: {}",
+                out.content
+            );
+        }
+    }
+
+    /// `..` that nets out *inside* the workspace must still work -- the guard
+    /// is about where a path ends up, not whether it merely contains `..`.
+    #[tokio::test]
+    async fn a_path_using_dotdot_that_stays_inside_the_workspace_is_allowed() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&read_call("subdir/../hello.txt"), &ws, &cfg).await;
+        assert_eq!(out.content, "one\ntwo\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn read_output_is_capped_like_command_output() {
+        let (dir, ws, mut cfg) = fixture();
+        cfg.max_output_bytes = 10;
+        std::fs::write(dir.path().join("big.txt"), "a".repeat(1000)).unwrap();
+        let out = execute(&read_call("big.txt"), &ws, &cfg).await;
+        assert!(out.content.contains("truncated at 10"), "{}", out.content);
     }
 }
