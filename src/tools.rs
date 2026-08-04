@@ -173,6 +173,11 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
            (e.g. \"Created hello.py and ran it — it printed Hello, World!\"). Never end a turn \
            with only tool calls and nothing said about them; the tool log is not a substitute \
            for telling the user what you did.\n\
+         - Verify before declaring success: run what you wrote, or run a real check -- the test \
+           suite, a linter, importing the module, curling the endpoint -- and read the actual \
+           output. Do not assume something works because the code looks right. If a command \
+           fails, read the error and fix the real problem before retrying; do not repeat the \
+           same failing command unchanged.\n\
          - Use {READ_FILE} to read a file and {WRITE_FILE} to create or change one -- not \
            `cat`/`type`/`sed`/shell redirection through {RUN_COMMAND}. Reserve {RUN_COMMAND} for \
            things that are not reading or writing a single file: search, builds, tests, running \
@@ -910,6 +915,25 @@ mod tests {
         assert!(prompt.contains("After tool results come back"), "{prompt}");
         assert!(
             prompt.contains("Never end a turn with only tool calls"),
+            "{prompt}"
+        );
+    }
+
+    /// Without this a model can write code, never run it, and declare success
+    /// on the strength of "it looks right" -- the same class of gap narration
+    /// closed for communication, but for correctness.
+    #[test]
+    fn the_system_prompt_requires_verifying_work_before_declaring_success() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(prompt.contains("Verify before declaring success"), "{prompt}");
+        assert!(
+            prompt.contains("Do not assume something works because the code looks right"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("do not repeat the same failing command unchanged"),
             "{prompt}"
         );
     }
