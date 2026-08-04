@@ -1,6 +1,9 @@
 mod app;
 mod config;
 mod llm;
+/// Complete and tested, but nothing consults it until the agent loop lands.
+#[allow(dead_code)]
+mod permission;
 mod providers;
 /// Complete and tested, but nothing reaches for a tool until the agent loop lands.
 #[allow(dead_code)]
