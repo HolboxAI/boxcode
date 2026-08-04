@@ -1,9 +1,37 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub llm: LlmConfig,
+    /// Absent from configs written before agent mode existed, hence `default`.
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// How many rounds of "model asks for tools, we run them" one prompt may
+    /// take before giving up. The backstop against a model that never concludes.
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: usize,
+    #[serde(default = "default_shell_timeout")]
+    pub shell_timeout_secs: u64,
+    /// Coding turns carry whole files; the old 4096 truncated them routinely.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+}
+
+fn default_max_iterations() -> usize {
+    25
+}
+
+fn default_shell_timeout() -> u64 {
+    120
+}
+
+fn default_max_tokens() -> u32 {
+    8192
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,6 +93,11 @@ impl Config {
         if self.llm.model.is_empty() {
             self.llm.model = d.model;
         }
+
+        // A hand-edited 0 would make every prompt fail before it started.
+        self.agent.max_iterations = self.agent.max_iterations.clamp(1, 200);
+        self.agent.shell_timeout_secs = self.agent.shell_timeout_secs.clamp(1, 600);
+        self.agent.max_tokens = self.agent.max_tokens.max(256);
     }
 
     /// Human-readable reasons the app cannot talk to an endpoint yet, shown on
@@ -114,10 +147,12 @@ fn env_var(name: &str) -> Option<String> {
     }
 }
 
-impl Default for Config {
+impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            llm: LlmConfig::default(),
+            max_iterations: default_max_iterations(),
+            shell_timeout_secs: default_shell_timeout(),
+            max_tokens: default_max_tokens(),
         }
     }
 }
@@ -187,6 +222,7 @@ mod tests {
                     api_key: "sk-test-key".to_string(),
                     provider: "deepseek".to_string(),
                 },
+                ..Config::default()
             };
             config.save().expect("save should succeed");
 
@@ -203,6 +239,41 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// Configs written by 0.3.0 and earlier have no [agent] table at all.
+    #[test]
+    fn a_config_without_an_agent_section_still_loads_with_defaults() {
+        let parsed: Config = toml::from_str(
+            r#"
+            [llm]
+            endpoint = "https://api.deepseek.com"
+            model = "deepseek-v4-pro"
+            "#,
+        )
+        .expect("an [agent]-less config must still parse");
+
+        assert_eq!(parsed.agent.max_iterations, 25);
+        assert_eq!(parsed.agent.shell_timeout_secs, 120);
+        assert_eq!(parsed.agent.max_tokens, 8192);
+    }
+
+    #[test]
+    fn agent_settings_are_clamped_to_usable_values() {
+        let mut config = Config {
+            agent: AgentConfig {
+                max_iterations: 0,
+                shell_timeout_secs: 100_000,
+                max_tokens: 1,
+            },
+            ..Config::default()
+        };
+        config.normalize();
+
+        // 0 iterations would fail every prompt before it started.
+        assert_eq!(config.agent.max_iterations, 1);
+        assert_eq!(config.agent.shell_timeout_secs, 600);
+        assert_eq!(config.agent.max_tokens, 256);
     }
 
     #[test]

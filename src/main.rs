@@ -1,20 +1,14 @@
-/// The loop itself. Nothing drives it until the UI can show tool calls and
-/// ask for approval.
-#[allow(dead_code)]
 mod agent;
 mod app;
 mod config;
 mod llm;
-/// Complete and tested, but nothing consults it until the agent loop lands.
-#[allow(dead_code)]
 mod permission;
 mod providers;
-/// Complete and tested, but nothing reaches for a tool until the agent loop lands.
-#[allow(dead_code)]
 mod tools;
 mod ui;
 mod upgrade;
 
+use agent::{AgentEvent, RunCtx};
 use app::{App, AppState};
 use config::Config;
 use crossterm::event::{
@@ -25,11 +19,11 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
     LeaveAlternateScreen,
 };
-use llm::StreamEvent;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::error::Error;
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -78,6 +72,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let config = Config::load()?;
+    // The directory the tool was launched from is the workspace. Everything the
+    // agent reads or writes has to resolve inside it.
+    let workspace = std::env::current_dir()?;
 
     let enhanced = setup_terminal()?;
     install_panic_hook(enhanced);
@@ -86,9 +83,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config);
-    let (tx, mut rx) = mpsc::channel::<(u64, StreamEvent)>(256);
+    let (tx, mut rx) = mpsc::channel::<(u64, AgentEvent)>(512);
 
-    let result = run_app(&mut terminal, &mut app, tx, &mut rx).await;
+    let result = run_app(&mut terminal, &mut app, workspace, tx, &mut rx).await;
 
     restore_terminal(enhanced)?;
     if let Err(e) = &result {
@@ -101,9 +98,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    tx: mpsc::Sender<(u64, StreamEvent)>,
-    rx: &mut mpsc::Receiver<(u64, StreamEvent)>,
+    workspace: PathBuf,
+    tx: mpsc::Sender<(u64, AgentEvent)>,
+    rx: &mut mpsc::Receiver<(u64, AgentEvent)>,
 ) -> Result<(), Box<dyn Error>> {
+    // One client for the whole session: a fresh one per turn would pay for a TLS
+    // handshake on every step of every run.
+    let client = llm::build_client()?;
+
     loop {
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -122,35 +124,52 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
-        // Drain every token that has arrived; doing only one per frame caps
+        // Drain every event that has arrived; doing only one per frame caps
         // throughput at ~60 tokens/sec and looks like the app is stalling.
         while let Ok((id, event)) = rx.try_recv() {
-            if id != app.request_id {
-                continue; // stale: belongs to a cancelled request
-            }
-            match event {
-                StreamEvent::Token(token) => app.append_token(&token),
-                StreamEvent::Done => app.finish_stream(),
-                StreamEvent::Error(err) => app.fail_stream(err),
-            }
+            app.handle_agent_event(id, event);
         }
 
-        // Fire a pending request.
-        if let AppState::Sending { .. } = &app.state {
+        // Start a pending run.
+        if let AppState::Sending { prompt } = &app.state {
+            let prompt = prompt.clone();
             app.request_id += 1;
             let id = app.request_id;
-            let endpoint = app.config.llm.endpoint.clone();
-            let model = app.config.llm.model.clone();
-            let api_key = app.config.llm.api_key.clone();
-            let history = app.history();
-            let tx_clone = tx.clone();
+
+            let ctx = RunCtx {
+                run_id: id,
+                client: client.clone(),
+                // Re-read from config every time, so `/provider` mid-session
+                // takes effect on the very next prompt.
+                target: llm::Target {
+                    endpoint: app.config.llm.endpoint.clone(),
+                    model: app.config.llm.model.clone(),
+                    api_key: app.config.llm.api_key.clone(),
+                    max_tokens: app.config.agent.max_tokens,
+                },
+                tools: tools::ToolCtx::new(
+                    workspace.clone(),
+                    Duration::from_secs(app.config.agent.shell_timeout_secs),
+                ),
+                allowlist: app.allowlist.clone(),
+                max_iterations: app.config.agent.max_iterations,
+                cancel: app.cancel.clone(),
+                tx: tx.clone(),
+            };
+
+            let spec = agent::default_agent();
+            let messages = app.session_messages.clone();
+            let done = tx.clone();
 
             let handle = tokio::spawn(async move {
-                llm::stream_chat(&endpoint, &model, &api_key, history, id, tx_clone).await;
+                let (result, messages) = agent::run::run(spec, prompt, messages, ctx).await;
+                let _ = done
+                    .send((id, AgentEvent::Finished { result, messages }))
+                    .await;
             });
 
             app.abort = Some(handle.abort_handle());
-            app.state = AppState::Streaming;
+            app.state = AppState::Working;
         }
 
         if app.should_exit {
@@ -164,7 +183,10 @@ async fn run_app<B: ratatui::backend::Backend>(
 fn print_help() {
     println!(
         "tuisample-code {VERSION}
-Terminal UI for an OpenAI-compatible LLM endpoint.
+Agentic coding assistant in your terminal, on any OpenAI-compatible endpoint.
+
+Run it from the root of the project you want it to work on -- that directory is
+the workspace, and the agent cannot read or write outside it.
 
 USAGE:
     tuisample-code [FLAGS]
@@ -180,6 +202,9 @@ CONFIG (environment overrides ~/.tuisample-code/config.toml):
     TUISAMPLE_MODEL       Model name
     TUISAMPLE_API_KEY     Bearer token
 
+    [agent] in config.toml also takes max_iterations, shell_timeout_secs and
+    max_tokens.
+
 UPGRADE:
     TUISAMPLE_UPGRADE_URL_BASE
                           Fetch updates from a fork or internal mirror
@@ -188,11 +213,16 @@ UPGRADE:
 COMMANDS (type in the input box, press Enter):
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider
+    /new                  Forget the conversation and start fresh
+
+APPROVALS:
+    Reads and searches run on their own. Before writing a file or running a
+    command the agent asks: [a] allow once, [s] allow for the session, [d] deny.
 
 KEYS:
     Enter                 Send prompt
     Alt/Shift-Enter       New line
-    Esc                   Cancel request
+    Esc                   Cancel the run
     Ctrl-C                Exit"
     );
 }

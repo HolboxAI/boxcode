@@ -65,9 +65,6 @@ impl ChatMessage {
         }
     }
 
-    /// Reply to one tool call. Nothing constructs these until the agent loop
-    /// lands; the protocol is incomplete without it.
-    #[allow(dead_code)]
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool".to_string(),
@@ -135,7 +132,6 @@ pub struct FunctionCall {
 impl ToolCall {
     /// Parse `arguments` into a JSON object. An absent/blank argument string is
     /// treated as `{}` -- models routinely omit it for zero-argument tools.
-    #[allow(dead_code)]
     pub fn parsed_arguments(&self) -> Result<serde_json::Value, String> {
         let raw = self.function.arguments.trim();
         if raw.is_empty() {
@@ -155,8 +151,6 @@ pub struct AssistantTurn {
 }
 
 impl AssistantTurn {
-    /// Fold a finished turn back into the conversation. Used by the agent loop.
-    #[allow(dead_code)]
     pub fn into_message(self) -> ChatMessage {
         ChatMessage::assistant(self.text, self.tool_calls)
     }
@@ -477,61 +471,6 @@ pub fn parse_sse_line(line: &str) -> SseLine {
     }
 }
 
-// ---- legacy chat-only path -----------------------------------------------------
-// The UI still speaks in (role, content) pairs and knows nothing about tools.
-// This bridges it to `stream_turn` so behaviour is unchanged, and goes away once
-// the agent loop drives requests instead.
-
-/// What the request task reports back to the event loop. Every request ends with
-/// exactly one `Done` or `Error`, so the UI can never get stuck on "Streaming…".
-#[derive(Debug)]
-pub enum StreamEvent {
-    Token(String),
-    Done,
-    Error(String),
-}
-
-pub async fn stream_chat(
-    endpoint: &str,
-    model: &str,
-    api_key: &str,
-    history: Vec<(String, String)>,
-    request_id: u64,
-    tx: mpsc::Sender<(u64, StreamEvent)>,
-) {
-    let messages: Vec<ChatMessage> = history
-        .into_iter()
-        .map(|(role, content)| match role.as_str() {
-            "system" => ChatMessage::system(content),
-            "assistant" => ChatMessage::assistant(content, Vec::new()),
-            _ => ChatMessage::user(content),
-        })
-        .collect();
-
-    let target = Target {
-        endpoint: endpoint.to_string(),
-        model: model.to_string(),
-        api_key: api_key.to_string(),
-        max_tokens: 4096,
-    };
-
-    let event = match build_client() {
-        Err(e) => StreamEvent::Error(e),
-        // No tools: an ordinary chat request, byte for byte what it was before.
-        Ok(client) => {
-            match stream_turn(&client, &target, &messages, &[], &tx, |text| {
-                (request_id, StreamEvent::Token(text))
-            })
-            .await
-            {
-                Ok(_) => StreamEvent::Done,
-                Err(e) => StreamEvent::Error(e),
-            }
-        }
-    };
-    let _ = tx.send((request_id, event)).await;
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -814,66 +753,6 @@ mod tests {
         assert_eq!(turn.text, "Hello wörld→");
         assert!(turn.tool_calls.is_empty());
         assert_eq!(tokens.concat(), "Hello wörld→");
-    }
-
-    /// The path the UI still uses has to behave exactly as it did before: the
-    /// tokens, then exactly one `Done`, all tagged with the request id.
-    #[tokio::test]
-    async fn the_legacy_chat_path_is_unchanged() {
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n",
-            "data: [DONE]\n\n",
-        );
-        let addr = serve(sse(body), 7).await;
-
-        let (tx, mut rx) = mpsc::channel(64);
-        stream_chat(
-            &addr,
-            "test-model",
-            "sk-test",
-            vec![("user".to_string(), "hi".to_string())],
-            7,
-            tx,
-        )
-        .await;
-
-        let mut events = Vec::new();
-        while let Ok((id, event)) = rx.try_recv() {
-            assert_eq!(id, 7, "every event carries the request id");
-            events.push(event);
-        }
-
-        let text: String = events
-            .iter()
-            .filter_map(|e| match e {
-                StreamEvent::Token(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(text, "Hello there");
-        assert!(matches!(events.last(), Some(StreamEvent::Done)));
-    }
-
-    #[tokio::test]
-    async fn the_legacy_chat_path_ends_on_one_error_when_the_endpoint_is_down() {
-        let (tx, mut rx) = mpsc::channel(64);
-        stream_chat(
-            "http://127.0.0.1:1",
-            "test-model",
-            "sk-test",
-            vec![("user".to_string(), "hi".to_string())],
-            1,
-            tx,
-        )
-        .await;
-
-        let mut events = Vec::new();
-        while let Ok((_, event)) = rx.try_recv() {
-            events.push(event);
-        }
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events.last(), Some(StreamEvent::Error(e)) if e.contains("Could not reach")));
     }
 
     /// The same 7-byte split, but over a tool call -- the JSON arguments are torn

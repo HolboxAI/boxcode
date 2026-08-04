@@ -1,4 +1,6 @@
-use crate::app::{App, AppState, CustomStep, Overlay, Role};
+use crate::agent;
+use crate::app::{App, AppState, CustomStep, Entry, Overlay, ToolStatus};
+use crate::permission;
 use crate::providers;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -10,6 +12,9 @@ const MIN_INPUT_HEIGHT: u16 = 3;
 const MAX_INPUT_HEIGHT: u16 = 10;
 const MIN_POPUP_WIDTH: u16 = 40;
 const MIN_POPUP_HEIGHT: u16 = 6;
+/// How much of a tool's output to show inline. The model gets all of it; the
+/// transcript only needs enough to see what happened.
+const TOOL_DETAIL_LINES: usize = 6;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let size = f.size();
@@ -34,8 +39,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
+    let workspace = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| ".".to_string());
     let title = format!(
-        "tuisample-code | {} | model: {}",
+        "tuisample-code | {} | model: {} | workspace: {workspace}",
         app.config.llm.endpoint, app.config.llm.model
     );
     let header = Paragraph::new(title).style(Style::default().fg(Color::Cyan));
@@ -46,34 +55,25 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
     let width = area.width.saturating_sub(2).max(1) as usize;
     let mut lines: Vec<Line> = Vec::new();
 
-    if !app.greeted && app.messages.is_empty() {
+    if !app.greeted && app.entries.is_empty() {
         lines.extend(welcome_lines(app));
     } else {
-        for msg in &app.messages {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{}: ", msg.role.label()),
-                role_style(msg.role),
-            )]));
-            for wrapped in wrap(&msg.content, width) {
-                lines.push(Line::from(wrapped));
-            }
-            lines.push(Line::from(""));
+        for entry in &app.entries {
+            lines.extend(entry_lines(entry, width));
         }
 
-        if app.state == AppState::Streaming {
-            lines.push(Line::from(vec![Span::styled(
-                "Assistant: ",
-                role_style(Role::Assistant),
-            )]));
-            let body = if app.streaming_response.is_empty() {
-                "…".to_string()
-            } else {
-                app.streaming_response.clone()
-            };
-            for wrapped in wrap(&body, width) {
+        // The turn in flight, not yet committed to an entry.
+        if app.is_busy() && !app.streaming_response.is_empty() {
+            lines.push(labelled(agent_label(app.active_agent), Color::Yellow));
+            for wrapped in wrap(&app.streaming_response, width) {
                 lines.push(Line::from(wrapped));
             }
             lines.push(Line::from(""));
+        } else if app.is_busy() && !app.awaiting_permission() {
+            lines.push(Line::from(Span::styled(
+                "…",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
     }
 
@@ -101,11 +101,101 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(paragraph, area);
 }
 
+fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match entry {
+        Entry::User(text) => {
+            lines.push(labelled("You", Color::Green));
+            lines.extend(wrapped_lines(text, width, Style::default()));
+            lines.push(Line::from(""));
+        }
+        Entry::Agent { agent, text } => {
+            lines.push(labelled(agent_label(agent), Color::Yellow));
+            lines.extend(wrapped_lines(text, width, Style::default()));
+            lines.push(Line::from(""));
+        }
+        Entry::Tool {
+            summary,
+            status,
+            detail,
+            ..
+        } => {
+            let (glyph, color) = match status {
+                ToolStatus::Running => ("◐", Color::Yellow),
+                ToolStatus::Ok => ("●", Color::Green),
+                ToolStatus::Failed => ("✗", Color::Red),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                Span::styled(summary.clone(), Style::default().fg(Color::White)),
+            ]));
+            lines.extend(detail_lines(detail, width));
+            lines.push(Line::from(""));
+        }
+        Entry::System(text) => {
+            lines.push(labelled("System", Color::Magenta));
+            lines.extend(wrapped_lines(text, width, Style::default()));
+            lines.push(Line::from(""));
+        }
+        Entry::Error(text) => {
+            lines.push(labelled("Error", Color::Red));
+            lines.extend(wrapped_lines(text, width, Style::default()));
+            lines.push(Line::from(""));
+        }
+    }
+    lines
+}
+
+/// A preview of a tool's output, indented under its call. Truncated on purpose:
+/// a 400-line `cargo test` run would otherwise bury the conversation.
+fn detail_lines(detail: &str, width: usize) -> Vec<Line<'static>> {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return Vec::new();
+    }
+
+    let style = Style::default().fg(Color::DarkGray);
+    let inner = width.saturating_sub(4).max(1);
+    let all: Vec<&str> = detail.lines().collect();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    for line in all.iter().take(TOOL_DETAIL_LINES) {
+        for chunk in hard_wrap(line, inner) {
+            lines.push(Line::from(Span::styled(format!("  │ {chunk}"), style)));
+        }
+    }
+    if all.len() > TOOL_DETAIL_LINES {
+        lines.push(Line::from(Span::styled(
+            format!("  │ … {} more lines", all.len() - TOOL_DETAIL_LINES),
+            style,
+        )));
+    }
+    lines
+}
+
+fn labelled(label: &str, color: Color) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("{label}: "),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn wrapped_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    wrap(text, width)
+        .into_iter()
+        .map(|w| Line::from(Span::styled(w, style)))
+        .collect()
+}
+
+fn agent_label(id: &str) -> &'static str {
+    agent::find(id).map(|a| a.label).unwrap_or("Assistant")
+}
+
 fn welcome_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "🚀 Welcome to tuisample-code",
+            "🚀 tuisample-code",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )]),
         Line::from(""),
@@ -123,12 +213,28 @@ fn welcome_lines(app: &App) -> Vec<Line<'static>> {
                 Style::default().fg(Color::Green),
             ),
         ]),
+        Line::from(vec![
+            Span::styled("Workspace:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| ".".to_string()),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
         Line::from(""),
-        Line::from("📝 How to use:"),
-        Line::from("  • Type your prompt below"),
-        Line::from("  • Press Enter to send"),
-        Line::from("  • Alt+Enter (or Shift+Enter) for a new line"),
-        Line::from("  • Press Esc to cancel a running request"),
+        Line::from("📝 Ask for a change, not just an answer:"),
+        Line::from("  • \"add a --json flag to the CLI and a test for it\""),
+        Line::from("  • \"why does the auth test fail on CI but not locally?\""),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "The agent reads and searches on its own. It asks before writing files",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(vec![Span::styled(
+            "or running commands. Esc cancels a run at any point.",
+            Style::default().fg(Color::DarkGray),
+        )]),
         Line::from(""),
     ];
 
@@ -150,15 +256,6 @@ fn welcome_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-fn role_style(role: Role) -> Style {
-    match role {
-        Role::User => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        Role::Assistant => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        Role::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        Role::System => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-    }
-}
-
 fn input_height(app: &App, total_width: u16) -> u16 {
     let width = total_width.saturating_sub(2).max(1) as usize;
     let rows: usize = app
@@ -174,10 +271,13 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
     let busy = app.is_busy();
 
     let (text, style) = if app.input_buffer.is_empty() {
-        let hint = if busy {
-            "Waiting for the model… (Esc to cancel)".to_string()
+        let hint = if app.awaiting_permission() {
+            "Waiting for your answer above…".to_string()
+        } else if busy {
+            "Agent working… (Esc to cancel)".to_string()
         } else {
-            "Type your prompt… (Enter to send, Alt+Enter for newline, Ctrl-C to exit)".to_string()
+            "What should I change? (Enter to send, Alt+Enter for newline, Ctrl-C to exit)"
+                .to_string()
         };
         (hint, Style::default().fg(Color::DarkGray))
     } else {
@@ -209,7 +309,7 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
 
     // Cursor: only meaningful while the user can actually type, and only one
     // widget may claim it per frame -- render_overlay claims it instead while
-    // an overlay is active (f.set_cursor is last-write-wins).
+    // a text-entry overlay is active (f.set_cursor is last-write-wins).
     if !busy && app.overlay.is_none() && area.height > 2 && area.width > 2 {
         let (row, col) = app.cursor_position();
         let mut screen_row = 0usize;
@@ -230,17 +330,21 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let (status, color) = match &app.state {
-        AppState::AwaitingInput => ("Ready", Color::Green),
-        AppState::Sending { .. } => ("Sending…", Color::Yellow),
-        AppState::Streaming => ("Streaming…", Color::Yellow),
+    let (status, color) = if app.awaiting_permission() {
+        ("Needs approval", Color::Magenta)
+    } else {
+        match &app.state {
+            AppState::AwaitingInput => ("Ready", Color::Green),
+            AppState::Sending { .. } => ("Starting…", Color::Yellow),
+            AppState::Working => ("Working…", Color::Yellow),
+        }
     };
 
     let footer = Line::from(vec![
         Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
         Span::styled(status, Style::default().fg(color)),
         Span::styled(
-            " | Enter send · Alt+Enter newline · Esc cancel · Ctrl-C exit",
+            " | Enter send · Alt+Enter newline · Esc cancel · /new reset · Ctrl-C exit",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -248,17 +352,26 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(footer), area);
 }
 
-// ---- /provider and /model overlays ---------------------------------------------
+// ---- overlays ------------------------------------------------------------------
 
 fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
     match &app.overlay {
         None => {}
+        Some(Overlay::Permission { summary, grant }) => {
+            render_permission(f, area, summary, grant.as_deref())
+        }
         Some(Overlay::ProviderPicker { selected }) => {
-            let mut items: Vec<String> = providers::PROVIDERS.iter().map(|p| p.label.to_string()).collect();
+            let mut items: Vec<String> = providers::PROVIDERS
+                .iter()
+                .map(|p| p.label.to_string())
+                .collect();
             items.push("Custom endpoint...".to_string());
             render_picker(f, area, " Select a provider ", &items, *selected);
         }
-        Some(Overlay::ModelPicker { provider_id, selected }) => {
+        Some(Overlay::ModelPicker {
+            provider_id,
+            selected,
+        }) => {
             let provider = providers::find_provider(provider_id)
                 .expect("provider_id on a ModelPicker overlay always names a registry entry");
             let items: Vec<String> = provider.models.iter().map(|m| m.to_string()).collect();
@@ -308,22 +421,90 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// The gate between the model and the user's disk. It shows exactly the call
+/// that is about to run, in the same wording the transcript will use afterwards.
+fn render_permission(f: &mut Frame, area: Rect, summary: &str, grant: Option<&str>) {
+    let Some(popup) = popup_area(72, 9, area) else {
+        return;
+    };
+    f.render_widget(Clear, popup);
+
+    let inner = popup.width.saturating_sub(2).max(1) as usize;
+    let mut lines = vec![Line::from(Span::styled(
+        "The agent wants to:",
+        Style::default().fg(Color::DarkGray),
+    ))];
+    for chunk in wrap(summary, inner) {
+        lines.push(Line::from(Span::styled(
+            chunk,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[a]", Style::default().fg(Color::Green)),
+        Span::raw(" allow once   "),
+        Span::styled("[d]", Style::default().fg(Color::Red)),
+        Span::raw(" deny"),
+    ]));
+    // Only offered when the call is actually safe to generalise -- a compound
+    // shell command carries no grant key and must be answered every time.
+    match grant {
+        Some(key) => lines.push(Line::from(vec![
+            Span::styled("[s]", Style::default().fg(Color::Cyan)),
+            Span::raw(format!(" allow {} for this session", permission::grant_description(key))),
+        ])),
+        None => lines.push(Line::from(Span::styled(
+            "(not offered for the session: this command combines several programs)",
+            Style::default().fg(Color::DarkGray),
+        ))),
+    }
+    lines.push(Line::from(Span::styled(
+        "Esc cancels the whole run.",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(" Approve action ");
+    f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
 /// Centers a popup sized to its content within `area`, clamped so it never
 /// exceeds the available space, with an absolute floor so tiny terminals don't
 /// produce an unreadably small popup.
-fn centered_rect(desired_width: u16, desired_height: u16, area: Rect) -> Rect {
-    let width = desired_width.max(MIN_POPUP_WIDTH).min(area.width.max(1));
-    let height = desired_height.max(MIN_POPUP_HEIGHT).min(area.height.max(1));
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect { x, y, width, height }
+///
+/// Returns `None` when `area` has no room at all. It really can be zero-sized --
+/// a terminal reporting 0x0 (a pty opened without a window size, a window
+/// dragged shut) -- and drawing into it panics inside ratatui rather than
+/// clipping, so every caller must skip instead.
+fn popup_area(desired_width: u16, desired_height: u16, area: Rect) -> Option<Rect> {
+    let width = desired_width.max(MIN_POPUP_WIDTH).min(area.width);
+    let height = desired_height.max(MIN_POPUP_HEIGHT).min(area.height);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    })
 }
 
 fn render_picker(f: &mut Frame, area: Rect, title: &str, items: &[String], selected: usize) {
-    let popup = centered_rect(50, items.len() as u16 + 2, area);
+    let Some(popup) = popup_area(50, items.len() as u16 + 2, area) else {
+        return;
+    };
     f.render_widget(Clear, popup);
 
-    let list_items: Vec<ListItem> = items.iter().map(|label| ListItem::new(label.clone())).collect();
+    let list_items: Vec<ListItem> = items
+        .iter()
+        .map(|label| ListItem::new(label.clone()))
+        .collect();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -346,8 +527,17 @@ fn render_picker(f: &mut Frame, area: Rect, title: &str, items: &[String], selec
 /// Single-line text entry (masked or plain). The cursor always sits at the end
 /// of `value` -- the overlay's editing model only supports insert/backspace, no
 /// repositioning, so there is nothing else for it to reflect.
-fn render_text_prompt(f: &mut Frame, area: Rect, title: &str, hint: &str, value: &str, masked: bool) {
-    let popup = centered_rect(60, 5, area);
+fn render_text_prompt(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    hint: &str,
+    value: &str,
+    masked: bool,
+) {
+    let Some(popup) = popup_area(60, 5, area) else {
+        return;
+    };
     f.render_widget(Clear, popup);
 
     let display = if masked {
@@ -367,7 +557,10 @@ fn render_text_prompt(f: &mut Frame, area: Rect, title: &str, hint: &str, value:
             Style::default().fg(Color::DarkGray),
         ))
     } else {
-        Line::from(Span::styled(display.clone(), Style::default().fg(Color::White)))
+        Line::from(Span::styled(
+            display.clone(),
+            Style::default().fg(Color::White),
+        ))
     };
 
     let lines = vec![
@@ -447,4 +640,170 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::CustomStep;
+    use crate::config::Config;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Draw a whole frame into a buffer of exactly this size.
+    fn render_at(width: u16, height: u16, app: &mut App) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+    }
+
+    fn app_with(overlay: Option<Overlay>) -> App {
+        let mut app = App::new(Config::default());
+        app.overlay = overlay;
+        app
+    }
+
+    /// A terminal really can report 0x0 (a pty opened with no window size, a
+    /// window dragged shut). ratatui's `Clear` indexes the buffer directly, so
+    /// an overlay drawn into a space too small for it panics rather than
+    /// clipping -- which took down the whole app the first time it happened.
+    #[test]
+    fn overlays_do_not_panic_in_a_terminal_too_small_to_hold_them() {
+        let overlays = [
+            Overlay::Permission {
+                summary: "run_shell(cargo test --all)".to_string(),
+                grant: Some("run_shell:cargo".to_string()),
+            },
+            Overlay::ProviderPicker { selected: 0 },
+            Overlay::ModelPicker {
+                provider_id: "deepseek",
+                selected: 0,
+            },
+            Overlay::CustomEndpoint(CustomStep::Endpoint),
+        ];
+
+        for overlay in overlays {
+            for (w, h) in [(0, 0), (1, 1), (4, 2), (20, 6), (80, 24)] {
+                render_at(w, h, &mut app_with(Some(overlay.clone())));
+            }
+        }
+    }
+
+    #[test]
+    fn the_base_layout_survives_a_zero_sized_terminal() {
+        let mut app = app_with(None);
+        app.entries.push(Entry::User("hello".to_string()));
+        app.entries.push(Entry::Tool {
+            call_id: "c1".to_string(),
+            summary: "read_file(a.rs)".to_string(),
+            status: ToolStatus::Running,
+            detail: "some output".to_string(),
+        });
+        for (w, h) in [(0, 0), (1, 1), (3, 3), (80, 24)] {
+            render_at(w, h, &mut app);
+        }
+    }
+
+    fn text_of(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_tool_entry_renders_its_status_glyph_and_summary() {
+        let entry = Entry::Tool {
+            call_id: "c1".to_string(),
+            summary: "run_shell(cargo test)".to_string(),
+            status: ToolStatus::Ok,
+            detail: "test result: ok.".to_string(),
+        };
+        let rendered = text_of(&entry_lines(&entry, 60));
+        assert!(rendered.contains("● run_shell(cargo test)"), "{rendered}");
+        assert!(rendered.contains("│ test result: ok."), "{rendered}");
+    }
+
+    #[test]
+    fn a_failed_tool_entry_is_marked_distinctly_from_a_running_one() {
+        let make = |status| {
+            text_of(&entry_lines(
+                &Entry::Tool {
+                    call_id: "c1".to_string(),
+                    summary: "edit_file(a.rs)".to_string(),
+                    status,
+                    detail: String::new(),
+                },
+                60,
+            ))
+        };
+        assert!(make(ToolStatus::Failed).starts_with('✗'));
+        assert!(make(ToolStatus::Running).starts_with('◐'));
+        assert!(make(ToolStatus::Ok).starts_with('●'));
+    }
+
+    /// A long `cargo test` run must not bury the conversation.
+    #[test]
+    fn long_tool_output_is_truncated_with_a_count() {
+        let detail = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = Entry::Tool {
+            call_id: "c1".to_string(),
+            summary: "run_shell(cargo test)".to_string(),
+            status: ToolStatus::Ok,
+            detail,
+        };
+        let rendered = text_of(&entry_lines(&entry, 60));
+        assert!(rendered.contains("line 0"));
+        assert!(!rendered.contains("line 30"));
+        assert!(
+            rendered.contains(&format!("… {} more lines", 40 - TOOL_DETAIL_LINES)),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_tool_entry_with_no_output_yet_renders_only_its_call_line() {
+        let entry = Entry::Tool {
+            call_id: "c1".to_string(),
+            summary: "read_file(a.rs)".to_string(),
+            status: ToolStatus::Running,
+            detail: String::new(),
+        };
+        // Call line plus the trailing blank separator, nothing else.
+        assert_eq!(entry_lines(&entry, 60).len(), 2);
+    }
+
+    #[test]
+    fn agent_entries_are_labelled_with_the_agents_display_name() {
+        let entry = Entry::Agent {
+            agent: "coder",
+            text: "Done.".to_string(),
+        };
+        assert!(text_of(&entry_lines(&entry, 60)).starts_with("Coder: "));
+    }
+
+    /// An unknown id must not panic the renderer -- agent ids also arrive from
+    /// stored conversations.
+    #[test]
+    fn an_unknown_agent_id_falls_back_to_a_generic_label() {
+        assert_eq!(agent_label("nobody"), "Assistant");
+        assert_eq!(agent_label("coder"), "Coder");
+    }
+
+    #[test]
+    fn wrap_preserves_explicit_newlines_and_breaks_long_words() {
+        assert_eq!(wrap("a\nb", 10), vec!["a", "b"]);
+        assert_eq!(wrap("hello world", 5), vec!["hello", "world"]);
+        // A path too long to break on spaces still has to fit.
+        let wrapped = wrap("/very/long/path/that/cannot/break", 10);
+        assert!(wrapped.iter().all(|l| l.chars().count() <= 10));
+    }
 }
