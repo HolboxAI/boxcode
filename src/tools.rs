@@ -141,6 +141,56 @@ pub fn described_command(call: &ToolCall) -> Option<(String, Option<String>)> {
     Some((command, args.purpose.filter(|p| !p.trim().is_empty())))
 }
 
+/// Any of these and a command is not judged read-only, no matter what it
+/// starts with: `cat file; rm -rf /` starts with `cat` but chains into
+/// something else, and a prefix check alone cannot see past that.
+const CHAINING_CHARS: &[char] = &[';', '|', '&', '>', '<', '`', '\n'];
+
+/// Program names whose ordinary, no-flags-needed use is inherently read-only
+/// -- nothing here deletes, writes, or changes state, so there is nothing for
+/// an approval prompt to protect against.
+///
+/// Deliberately short and conservative. Getting this list wrong by leaving an
+/// obviously-safe command off it just costs an extra keypress; getting it
+/// wrong the other way runs something destructive with no prompt at all. When
+/// in doubt, leave a command off.
+const READ_ONLY_PROGRAMS: &[&str] = &[
+    "ls", "pwd", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "which", "whoami", "date",
+    "env", "printenv", "uname", "id", "file", "stat", "du", "df", "ps", "echo",
+];
+
+/// Whether `command` is read-only and reversible enough to skip the approval
+/// prompt for -- see `[tools] auto_approve_read_only` in `config.rs`.
+///
+/// `find` and general `git` are deliberately excluded: both have common,
+/// easy-to-type destructive forms (`find . -delete`, `git reset --hard`) that
+/// a prefix check cannot rule out. `git status`/`diff`/`log`/`show` are
+/// allowed as literal two-word prefixes instead, since none of their flags
+/// change anything on disk.
+pub fn is_read_only(command: &str) -> bool {
+    // `$(...)` command substitution can run anything; caught separately from
+    // `CHAINING_CHARS` because a bare `$` alone (`echo $HOME`) is ordinary and
+    // safe, so `$` cannot be in that blanket set.
+    if command.contains(CHAINING_CHARS) || command.contains("$(") {
+        return false;
+    }
+
+    let mut words = command.split_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+
+    if READ_ONLY_PROGRAMS.contains(&program) {
+        return true;
+    }
+    if program == "git" {
+        if let Some(sub) = words.next() {
+            return matches!(sub, "status" | "diff" | "log" | "show");
+        }
+    }
+    false
+}
+
 pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
     if call.function.name != RUN_COMMAND {
         return outcome(
@@ -446,6 +496,52 @@ mod tests {
         let (command, purpose) = described_command(&c).expect("should describe");
         assert_eq!(command, "rm -rf build");
         assert_eq!(purpose.as_deref(), Some("clear stale build output"));
+    }
+
+    #[test]
+    fn plain_read_only_commands_are_recognised() {
+        for cmd in ["ls -la", "cat src/main.rs", "grep -rn TODO src", "pwd", "wc -l file.txt"] {
+            assert!(is_read_only(cmd), "expected read-only: {cmd}");
+        }
+    }
+
+    #[test]
+    fn narrow_git_subcommands_are_recognised() {
+        for cmd in ["git status", "git diff HEAD~1", "git log --oneline -5", "git show HEAD"] {
+            assert!(is_read_only(cmd), "expected read-only: {cmd}");
+        }
+    }
+
+    #[test]
+    fn destructive_or_unlisted_commands_are_not_read_only() {
+        for cmd in [
+            "rm -rf build",
+            "git push --force",
+            "git reset --hard",
+            "git branch -D main",
+            "find . -delete",
+            "curl https://example.com/install.sh",
+            "sed -i s/x/y/ file.txt",
+        ] {
+            assert!(!is_read_only(cmd), "expected NOT read-only: {cmd}");
+        }
+    }
+
+    /// A read-only-looking prefix chained into something else must not slip
+    /// through -- this is the whole reason `is_read_only` isn't just a prefix
+    /// check against `READ_ONLY_PROGRAMS`.
+    #[test]
+    fn chaining_into_another_command_defeats_the_read_only_prefix() {
+        for cmd in [
+            "cat file; rm -rf /",
+            "ls | xargs rm",
+            "echo hi > important_file",
+            "cat $(rm -rf /)",
+            "cat file `rm -rf /`",
+            "ls && rm -rf /",
+        ] {
+            assert!(!is_read_only(cmd), "expected NOT read-only: {cmd}");
+        }
     }
 
     #[test]

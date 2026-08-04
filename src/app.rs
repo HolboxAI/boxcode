@@ -374,7 +374,7 @@ impl App {
     /// answer without it).
     fn advance_approvals(&mut self) {
         while let Some(call) = self.pending_tools.front() {
-            if !self.needs_approval() {
+            if !self.needs_approval(call) {
                 let call = self.pending_tools.pop_front().expect("front just matched");
                 self.approved_tools.push(call);
                 continue;
@@ -407,8 +407,25 @@ impl App {
         };
     }
 
-    fn needs_approval(&self) -> bool {
-        self.config.tools.require_approval && !self.auto_approve
+    /// Whether `call` needs a human decision before it runs.
+    ///
+    /// Order matters: the session-wide escape hatches (`require_approval`,
+    /// `auto_approve`) are checked first since they should short-circuit
+    /// regardless of what the command is, and `auto_approve_read_only` only
+    /// waives the prompt for a narrow, conservative slice of commands (see
+    /// `tools::is_read_only`) -- everything else still asks.
+    fn needs_approval(&self, call: &ToolCall) -> bool {
+        if !self.config.tools.require_approval || self.auto_approve {
+            return false;
+        }
+        if self.config.tools.auto_approve_read_only {
+            if let Some((command, _)) = tools::described_command(call) {
+                if tools::is_read_only(&command) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// y allow · n refuse · a stop asking for this session · Esc refuse.
@@ -934,8 +951,17 @@ mod tests {
     /// config::test_support::HOME_LOCK's reasoning for $HOME).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// The existing approval-flow tests below use `ls`/`cat`/`pwd` purely as
+    /// stand-ins for "some command" and assert every one of them stops for a
+    /// human decision -- that is what they are testing, not read-only
+    /// classification, which gets its own dedicated tests further down. So the
+    /// fixture turns the read-only fast path off by default; those tests would
+    /// otherwise start silently skipping their own approval prompts the moment
+    /// their example command happened to match `tools::is_read_only`.
     fn app() -> App {
-        App::new(Config::default())
+        let mut app = App::new(Config::default());
+        app.config.tools.auto_approve_read_only = false;
+        app
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1309,6 +1335,63 @@ mod tests {
         a.request_tools(vec![command_call("call_1", "ls")]);
         assert_eq!(a.state, AppState::ExecutingTools);
         assert_eq!(a.overlay, None);
+    }
+
+    #[test]
+    fn read_only_commands_skip_the_prompt_when_the_fast_path_is_on() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![command_call("call_1", "cat src/main.rs")]);
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.overlay, None);
+        assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// The fast path is narrow on purpose: it must not become a second way to
+    /// turn approval off entirely.
+    #[test]
+    fn non_read_only_commands_still_ask_even_with_the_fast_path_on() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![command_call("call_1", "rm -rf build")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert!(a.approved_tools.is_empty());
+    }
+
+    /// A read-only call chained into something else (via `;`, `|`, `&&`, ...)
+    /// must not ride the fast path just because it starts with `cat`/`ls`/etc.
+    #[test]
+    fn a_read_only_prefix_chained_into_something_else_still_asks() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![command_call("call_1", "cat file; rm -rf /")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert!(a.approved_tools.is_empty());
+    }
+
+    /// Queued calls are judged independently: the read-only one runs with no
+    /// prompt, the other still stops and asks -- with `remaining` counting only
+    /// what is left in the queue, not what already went straight through.
+    #[test]
+    fn a_read_only_call_and_a_risky_one_in_the_same_queue_are_judged_separately() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![
+            command_call("call_1", "ls"),
+            command_call("call_2", "rm -rf build"),
+        ]);
+
+        assert_eq!(a.approved_tools.len(), 1, "the read-only call ran with no prompt");
+        match &a.overlay {
+            Some(Overlay::CommandApproval { command, remaining, .. }) => {
+                assert_eq!(command, "rm -rf build");
+                assert_eq!(*remaining, 0);
+            }
+            other => panic!("expected a prompt for the risky call, got {other:?}"),
+        }
     }
 
     /// A response carrying tool calls emits ToolCalls and *then* Done. If that
