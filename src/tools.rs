@@ -167,6 +167,12 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
            stdout and stderr.\n\n\
          Rules:\n\
          - {os_hint}\n\
+         - Narrate in plain sentences, not just tool calls. Before acting, say in one short \
+           sentence what you're about to do and why (e.g. \"I'll create hello.py and run it.\"). \
+           After tool results come back, close with one short sentence saying what happened \
+           (e.g. \"Created hello.py and ran it — it printed Hello, World!\"). Never end a turn \
+           with only tool calls and nothing said about them; the tool log is not a substitute \
+           for telling the user what you did.\n\
          - Use {READ_FILE} to read a file and {WRITE_FILE} to create or change one -- not \
            `cat`/`type`/`sed`/shell redirection through {RUN_COMMAND}. Reserve {RUN_COMMAND} for \
            things that are not reading or writing a single file: search, builds, tests, running \
@@ -177,9 +183,9 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
          - The user approves every write and every command before it runs (reads of a short, \
            conservative allowlist may go through without asking). If something is declined, do \
            not retry it — take a different approach or answer without it.\n\
-         - Anything that changes or deletes files is real and immediate. Be conservative, \
-           prefer the narrowest action that does the job, and say what you are about to do.\n\
-         - Answers appear in a terminal: keep them short and concrete.",
+         - Anything that changes or deletes files is real and immediate. Be conservative and \
+           prefer the narrowest action that does the job.\n\
+         - Answers appear in a terminal: keep narration to a sentence or two, not a report.",
         workspace.root().display(),
         config.command_timeout_secs,
     )
@@ -889,6 +895,23 @@ mod tests {
 
         let exhausted = system_prompt(&ws, &cfg, false);
         assert!(exhausted.contains("Answer the user now"), "{exhausted}");
+    }
+
+    /// Regression: without this, a model that only emits tool calls leaves the
+    /// transcript as a bare log of "$ ..."/"📝 ..." lines with nothing said
+    /// about them -- what a user pointed at directly when comparing this to
+    /// Claude Code's narrated "I'll just run it." / "Ran it — output: ...".
+    #[test]
+    fn the_system_prompt_requires_narration_before_and_after_tool_use() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(prompt.contains("Before acting"), "{prompt}");
+        assert!(prompt.contains("After tool results come back"), "{prompt}");
+        assert!(
+            prompt.contains("Never end a turn with only tool calls"),
+            "{prompt}"
+        );
     }
 
     #[test]
