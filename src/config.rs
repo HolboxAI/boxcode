@@ -42,6 +42,15 @@ pub struct ToolsConfig {
     /// model can then delete files with no prompt at all.
     #[serde(default = "yes")]
     pub require_approval: bool,
+    /// Skip the approval prompt for a short allowlist of read-only commands
+    /// (`ls`, `cat`, `grep`, `git status`/`diff`/`log`/`show`, ...) so the
+    /// prompt stays meaningful for the commands that can actually change
+    /// something. See `tools::is_read_only` for exactly what qualifies --
+    /// anything not obviously read-only still asks, `require_approval` still
+    /// governs everything else, and `false` here just means "ask about those
+    /// too."
+    #[serde(default = "yes")]
+    pub auto_approve_read_only: bool,
     /// How long a single command may run before it is killed.
     #[serde(default = "default_command_timeout")]
     pub command_timeout_secs: u64,
@@ -82,6 +91,7 @@ impl Default for ToolsConfig {
             enabled: yes(),
             workspace: dot(),
             require_approval: yes(),
+            auto_approve_read_only: yes(),
             command_timeout_secs: default_command_timeout(),
             max_output_bytes: default_max_output_bytes(),
             max_steps: default_max_steps(),
@@ -329,6 +339,17 @@ mod tests {
         )
         .expect("should parse");
         assert!(parsed.tools.require_approval);
+    }
+
+    /// Same again for `auto_approve_read_only` -- an old table or a hand-edited
+    /// one without the key must still get the safe (and useful) default.
+    #[test]
+    fn a_tools_table_without_auto_approve_read_only_still_defaults_to_true() {
+        let parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"http://x\"\n\n[tools]\nenabled = true\nmax_steps = 3\n",
+        )
+        .expect("should parse");
+        assert!(parsed.tools.auto_approve_read_only);
     }
 
     #[test]

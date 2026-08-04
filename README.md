@@ -142,9 +142,10 @@ interactive (`vim`, a dev server, a REPL) will time out rather than hang.
 
 ```toml
 [tools]
-enabled = true            # false sends no tool schema at all
-workspace = "."           # "." = the directory you launched from
-require_approval = true   # false = the model runs commands unattended
+enabled = true                # false sends no tool schema at all
+workspace = "."                # "." = the directory you launched from
+require_approval = true        # false = the model runs commands unattended
+auto_approve_read_only = true  # skip the prompt for a narrow read-only allowlist
 command_timeout_secs = 60
 max_output_bytes = 65536  # ceiling on one command's output
 max_steps = 10            # command rounds per prompt before the model must answer
@@ -155,6 +156,15 @@ Per-run: `TUISAMPLE_WORKSPACE=/path/to/project`, `TUISAMPLE_TOOLS_ENABLED=0`.
 > **`require_approval = false` hands the model an unattended shell** on your
 > machine. It exists for scripted testing. If you set it, the welcome screen
 > says `UNATTENDED` in red every launch.
+
+`auto_approve_read_only` skips the popup only for a short, conservative
+allowlist of commands that cannot change anything on disk -- `ls`, `cat`,
+`grep`, `git status`/`diff`/`log`/`show`, and similar (see
+`tools::is_read_only`). Anything chained with `;`, `|`, `&&`, `>`, or a
+subshell falls back to asking, even if it starts with one of those. Everything
+else -- writes, deletes, `git push`, `find -delete`, arbitrary other commands
+-- still stops for a decision regardless of this setting. Set it to `false` to
+go back to asking about every command, including reads.
 
 Works on macOS, Linux, and Windows — commands run through `sh -c`, or `cmd /C`
 on Windows, and the model is told which platform it is on so it reaches for
