@@ -257,14 +257,16 @@ CONFIG (environment overrides ~/.tuisample-code/config.toml):
     TUISAMPLE_MODEL       Model name
     TUISAMPLE_API_KEY     Bearer token
 
-COMMANDS (the model can run shell commands, with your approval each time):
-    TUISAMPLE_WORKSPACE       Directory commands run in (default: cwd)
+TOOLS (read_file, write_file, run_command; writes and commands need your
+       approval each time -- see the [tools] table in config.toml):
+    TUISAMPLE_WORKSPACE       Directory these operate in (default: cwd)
     TUISAMPLE_TOOLS_ENABLED   Set to 0 to send no tool schema at all
-    TUISAMPLE_TOOLS_APPROVAL  Set to 0 to stop asking before each command.
+    TUISAMPLE_TOOLS_APPROVAL  Set to 0 to stop asking before each write/command.
                               For scripted testing only -- it hands the model
-                              an unattended shell.
+                              unattended file and shell access.
                               See the [tools] table in config.toml for
-                              command_timeout_secs, max_output_bytes, max_steps.
+                              auto_approve_read_only, command_timeout_secs,
+                              max_output_bytes, max_steps.
 
 UPGRADE:
     TUISAMPLE_UPGRADE_URL_BASE
