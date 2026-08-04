@@ -148,6 +148,42 @@ injected paths, not a sandbox either. Read each prompt before pressing `y`.
 Commands run with **stdin closed** and are killed after a timeout, so anything
 interactive (`vim`, a dev server, a REPL) will time out rather than hang.
 
+### Some things are refused outright
+
+A third tier sits above the prompt. Genuinely catastrophic commands are never
+run and are **never even offered for approval** — offering `rm -rf /` as a y/n
+question is itself the bug, since one mistyped keystroke accepts it and there
+is no undo:
+
+```
+⛔ $ rm -rf / — blocked
+   `rm` aimed at `/`, which is outside the project directory
+```
+
+Refused: deleting anything outside the project directory or the project itself
+(`rm -rf /`, `~`, `/etc`, `../..`, `.`, `*`), `--no-preserve-root`, disk
+formatting (`mkfs`, `fdisk`, `dd of=/dev/sda`), writing to raw devices, fork
+bombs, shutdown/reboot, piping a download into a shell (`curl … | sh`),
+executing base64-decoded data, `kill -9 1`, and recursive `chmod`/`chown` on
+system paths. Every segment of a chained command is checked, so
+`ls && rm -rf /` is caught too.
+
+**No setting or keypress reaches this.** Not `a`, not
+`require_approval = false`, not `auto_approve_read_only`. There is deliberately
+no config option to turn it off.
+
+A middle tier — destructive but legitimate — always stops for an explicit
+decision, *even after you press `a`*: `rm -rf build`, `git reset --hard`,
+`git clean -fd`, force-push, `sudo` anything, `find … -delete`, uninstalls,
+`docker prune`. The prompt shows a red **DESTRUCTIVE** banner and why.
+
+> This is not a sandbox, and no blocklist can be one. A command that builds its
+> argument at runtime (`rm -rf $(printf '\x2f')`) defeats any static check —
+> such commands are forced to the always-ask tier rather than judged safe, but
+> the honest claim is narrow: this catches destructive commands a model
+> produces **by mistake**, which is the realistic failure mode. It does not
+> stop a determined attacker. Real containment needs an OS sandbox.
+
 ### Configuration
 
 ```toml
