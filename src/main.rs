@@ -1,3 +1,7 @@
+/// The loop itself. Nothing drives it until the UI can show tool calls and
+/// ask for approval.
+#[allow(dead_code)]
+mod agent;
 mod app;
 mod config;
 mod llm;
