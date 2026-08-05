@@ -4,34 +4,11 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub llm: LlmConfig,
-    /// Absent from configs written before agent mode existed, hence `default`.
+    /// `default` is load-bearing: every config.toml written before file tools
+    /// existed has no `[tools]` table, and without it those files stop parsing
+    /// the moment a user upgrades.
     #[serde(default)]
-    pub agent: AgentConfig,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AgentConfig {
-    /// How many rounds of "model asks for tools, we run them" one prompt may
-    /// take before giving up. The backstop against a model that never concludes.
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: usize,
-    #[serde(default = "default_shell_timeout")]
-    pub shell_timeout_secs: u64,
-    /// Coding turns carry whole files; the old 4096 truncated them routinely.
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
-}
-
-fn default_max_iterations() -> usize {
-    25
-}
-
-fn default_shell_timeout() -> u64 {
-    120
-}
-
-fn default_max_tokens() -> u32 {
-    8192
+    pub tools: ToolsConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,6 +24,79 @@ pub struct LlmConfig {
     /// which case a standalone `/model` has nothing to scope to.
     #[serde(default)]
     pub provider: String,
+}
+
+/// Settings for the shell command tool.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolsConfig {
+    /// Off means the tool schema is never sent, which is also the escape hatch
+    /// for endpoints that reject requests carrying a `tools` field at all.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Working directory commands run in. "." means the directory the app was
+    /// launched from. Not a sandbox -- a command can `cd` out of it.
+    #[serde(default = "dot")]
+    pub workspace: String,
+    /// Ask before every command. This is the only real control over what the
+    /// model does to the machine, so turning it off is a deliberate act: the
+    /// model can then delete files with no prompt at all.
+    #[serde(default = "yes")]
+    pub require_approval: bool,
+    /// Skip the approval prompt for a short allowlist of read-only commands
+    /// (`ls`, `cat`, `grep`, `git status`/`diff`/`log`/`show`, ...) so the
+    /// prompt stays meaningful for the commands that can actually change
+    /// something. See `tools::is_read_only` for exactly what qualifies --
+    /// anything not obviously read-only still asks, `require_approval` still
+    /// governs everything else, and `false` here just means "ask about those
+    /// too."
+    #[serde(default = "yes")]
+    pub auto_approve_read_only: bool,
+    /// How long a single command may run before it is killed.
+    #[serde(default = "default_command_timeout")]
+    pub command_timeout_secs: u64,
+    /// Ceiling on the output of one command, so `find /` cannot eat the whole
+    /// context window.
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// How many command rounds one prompt may take before the schema is withheld
+    /// and the model is made to answer. Without this a model that keeps running
+    /// commands burns tokens until the user notices.
+    #[serde(default = "default_max_steps")]
+    pub max_steps: usize,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn dot() -> String {
+    ".".to_string()
+}
+
+fn default_command_timeout() -> u64 {
+    60
+}
+
+fn default_max_output_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_max_steps() -> usize {
+    10
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: yes(),
+            workspace: dot(),
+            require_approval: yes(),
+            auto_approve_read_only: yes(),
+            command_timeout_secs: default_command_timeout(),
+            max_output_bytes: default_max_output_bytes(),
+            max_steps: default_max_steps(),
+        }
+    }
 }
 
 impl Config {
@@ -73,6 +123,17 @@ impl Config {
         if let Some(v) = env_var("TUISAMPLE_API_KEY") {
             config.llm.api_key = v;
         }
+        if let Some(v) = env_var("TUISAMPLE_WORKSPACE") {
+            config.tools.workspace = v;
+        }
+        if let Some(v) = env_var("TUISAMPLE_TOOLS_ENABLED") {
+            config.tools.enabled = truthy(&v);
+        }
+        // Exists so an automated test can drive the loop without a human at the
+        // keyboard. Setting it in normal use hands the model an unattended shell.
+        if let Some(v) = env_var("TUISAMPLE_TOOLS_APPROVAL") {
+            config.tools.require_approval = truthy(&v);
+        }
 
         config.normalize();
         Ok(config)
@@ -94,10 +155,16 @@ impl Config {
             self.llm.model = d.model;
         }
 
-        // A hand-edited 0 would make every prompt fail before it started.
-        self.agent.max_iterations = self.agent.max_iterations.clamp(1, 200);
-        self.agent.shell_timeout_secs = self.agent.shell_timeout_secs.clamp(1, 600);
-        self.agent.max_tokens = self.agent.max_tokens.max(256);
+        self.tools.workspace = self.tools.workspace.trim().to_string();
+        if self.tools.workspace.is_empty() {
+            self.tools.workspace = dot();
+        }
+        // A hand-edited `max_output_bytes = 0` would make every command look
+        // like it printed nothing, which reads as a broken tool rather than a
+        // bad setting.
+        self.tools.max_output_bytes = self.tools.max_output_bytes.clamp(1024, 8 * 1024 * 1024);
+        self.tools.command_timeout_secs = self.tools.command_timeout_secs.clamp(1, 3600);
+        self.tools.max_steps = self.tools.max_steps.clamp(1, 50);
     }
 
     /// Human-readable reasons the app cannot talk to an endpoint yet, shown on
@@ -140,20 +207,17 @@ impl Config {
     }
 }
 
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn env_var(name: &str) -> Option<String> {
     match std::env::var(name) {
         Ok(v) if !v.trim().is_empty() => Some(v),
         _ => None,
-    }
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            max_iterations: default_max_iterations(),
-            shell_timeout_secs: default_shell_timeout(),
-            max_tokens: default_max_tokens(),
-        }
     }
 }
 
@@ -222,7 +286,7 @@ mod tests {
                     api_key: "sk-test-key".to_string(),
                     provider: "deepseek".to_string(),
                 },
-                ..Config::default()
+                tools: ToolsConfig::default(),
             };
             config.save().expect("save should succeed");
 
@@ -241,39 +305,66 @@ mod tests {
         });
     }
 
-    /// Configs written by 0.3.0 and earlier have no [agent] table at all.
+    /// Regression guard: every config.toml written before file tools existed has
+    /// no `[tools]` table. If that stops parsing, upgrading bricks the app for
+    /// every existing user.
     #[test]
-    fn a_config_without_an_agent_section_still_loads_with_defaults() {
-        let parsed: Config = toml::from_str(
-            r#"
-            [llm]
-            endpoint = "https://api.deepseek.com"
-            model = "deepseek-v4-pro"
-            "#,
-        )
-        .expect("an [agent]-less config must still parse");
+    fn a_config_written_before_file_tools_existed_still_loads() {
+        with_isolated_home(|| {
+            let path = Config::config_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                "[llm]\nendpoint = \"https://api.deepseek.com\"\nmodel = \"deepseek-chat\"\napi_key = \"sk-old\"\n",
+            )
+            .unwrap();
 
-        assert_eq!(parsed.agent.max_iterations, 25);
-        assert_eq!(parsed.agent.shell_timeout_secs, 120);
-        assert_eq!(parsed.agent.max_tokens, 8192);
+            let loaded = Config::load().expect("a pre-tools config must still load");
+            assert_eq!(loaded.llm.model, "deepseek-chat");
+            assert!(loaded.tools.enabled);
+            assert_eq!(loaded.tools.workspace, ".");
+            assert_eq!(loaded.tools.max_steps, 10);
+            // The safe default has to survive an absent table, or upgrading
+            // silently hands existing users an unattended shell.
+            assert!(loaded.tools.require_approval);
+        });
+    }
+
+    /// Same again for a config that has a `[tools]` table but no
+    /// `require_approval` key -- anyone who edited the table by hand.
+    #[test]
+    fn a_tools_table_without_require_approval_still_defaults_to_asking() {
+        let parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"http://x\"\n\n[tools]\nenabled = true\nmax_steps = 3\n",
+        )
+        .expect("should parse");
+        assert!(parsed.tools.require_approval);
+    }
+
+    /// Same again for `auto_approve_read_only` -- an old table or a hand-edited
+    /// one without the key must still get the safe (and useful) default.
+    #[test]
+    fn a_tools_table_without_auto_approve_read_only_still_defaults_to_true() {
+        let parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"http://x\"\n\n[tools]\nenabled = true\nmax_steps = 3\n",
+        )
+        .expect("should parse");
+        assert!(parsed.tools.auto_approve_read_only);
     }
 
     #[test]
-    fn agent_settings_are_clamped_to_usable_values() {
-        let mut config = Config {
-            agent: AgentConfig {
-                max_iterations: 0,
-                shell_timeout_secs: 100_000,
-                max_tokens: 1,
-            },
-            ..Config::default()
-        };
+    fn nonsense_tool_limits_are_clamped_to_something_usable() {
+        let mut config = Config::default();
+        config.tools.max_output_bytes = 0;
+        config.tools.command_timeout_secs = 0;
+        config.tools.max_steps = 0;
+        config.tools.workspace = "  ".to_string();
         config.normalize();
 
-        // 0 iterations would fail every prompt before it started.
-        assert_eq!(config.agent.max_iterations, 1);
-        assert_eq!(config.agent.shell_timeout_secs, 600);
-        assert_eq!(config.agent.max_tokens, 256);
+        assert_eq!(config.tools.max_output_bytes, 1024);
+        assert_eq!(config.tools.command_timeout_secs, 1);
+        assert_eq!(config.tools.max_steps, 1);
+        assert_eq!(config.tools.workspace, ".");
     }
 
     #[test]

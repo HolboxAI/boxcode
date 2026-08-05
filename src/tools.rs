@@ -1,0 +1,1786 @@
+//! The model's tools: a shell escape hatch, and two typed file operations.
+//!
+//! `run_command` is the general-purpose one -- inspecting a command string
+//! cannot tell you what it will do (`cat $(echo ... | base64 -d)`), so the
+//! only real control is the user approving each one before it runs. That
+//! approval lives in `app.rs`; this module assumes a decision has already
+//! been made.
+//!
+//! `read_file`/`write_file` exist alongside it because routing every file
+//! operation through the shell has real costs: writing more than a line or
+//! two of code means the model hand-encoding it into a heredoc or a quoted
+//! `printf`, which is exactly the kind of string-escaping work models are
+//! worst at, and it hides "create this file" and "run this file" behind one
+//! opaque approval instead of two reviewable ones. A typed `write_file` also
+//! gets a real (if narrow) safety property a shell command cannot: its path
+//! is resolved and checked against the workspace root before anything
+//! happens, see `resolve_in_workspace`.
+//!
+//! Failures come back as results the model can read rather than Rust errors: a
+//! non-zero exit, a missing file, or bad arguments are information, not a
+//! reason to abandon the turn.
+
+use crate::config::ToolsConfig;
+use crate::danger;
+use crate::llm::ToolCall;
+use crate::workspace::Workspace;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+pub const RUN_COMMAND: &str = "run_command";
+pub const READ_FILE: &str = "read_file";
+pub const WRITE_FILE: &str = "write_file";
+pub const LIST_DIR: &str = "list_dir";
+pub const GLOB: &str = "glob";
+pub const EDIT_FILE: &str = "edit_file";
+
+/// Directories whose contents are build output or dependencies rather than the
+/// project. Walking them turns a `glob` into thousands of irrelevant results and
+/// buries whatever the model was looking for.
+pub const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "dist", "build"];
+
+/// Ceiling on `glob` results, so a careless `**/*` cannot fill the context
+/// window with paths.
+const MAX_GLOB_RESULTS: usize = 500;
+/// Ceiling on `list_dir` entries, for the same reason.
+const MAX_DIR_ENTRIES: usize = 300;
+
+fn is_skipped(path: &Path, workspace: &Path) -> bool {
+    path.strip_prefix(workspace)
+        .unwrap_or(path)
+        .components()
+        .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
+}
+
+/// A workspace-relative path for display, falling back to the full path if the
+/// file somehow sits outside (which `resolve_in_workspace` should have caught).
+fn relative_to(workspace: &Workspace, path: &Path) -> String {
+    path.strip_prefix(workspace.root())
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// One executed (or declined) tool call, on its way back to the model.
+#[derive(Debug, Clone)]
+pub struct ToolOutcome {
+    pub call_id: String,
+    /// One line for the transcript.
+    pub display: String,
+    /// What the model receives.
+    pub content: String,
+}
+
+/// The shell used to run a command, per platform.
+///
+/// `cmd /C` on Windows and `sh -c` everywhere else. `sh` rather than the user's
+/// login shell: it exists on every Unix, and a model that has been told "sh"
+/// will not reach for zsh-only or fish-only syntax.
+pub fn shell() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    }
+}
+
+pub fn schemas() -> Vec<Value> {
+    let (shell_name, shell_flag) = shell();
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": RUN_COMMAND,
+                "description": format!(
+                    "Run a shell command in the user's project directory via `{shell_name} {shell_flag}` \
+                     and get back its exit code, stdout and stderr. Use this for things that are not \
+                     reading or writing a single file: searching (grep/findstr), running builds and \
+                     tests, installing packages. Prefer {READ_FILE}/{WRITE_FILE} over this for reading \
+                     or writing files. The user must approve every command before it runs."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command line to run, e.g. `grep -rn TODO src` or `python3 -m pytest`."
+                        },
+                        "purpose": {
+                            "type": "string",
+                            "description": "One short sentence on why you need it. Shown to the user in the approval prompt, so be specific and honest."
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": READ_FILE,
+                "description": "Read a file's contents from the user's project directory. Prefer this \
+                                 over running `cat`/`type` through run_command -- it is not subject to \
+                                 shell quoting.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file, relative to the project directory."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": WRITE_FILE,
+                "description": "Create a file, or overwrite an existing one, with new content. Creates \
+                                 parent directories as needed. Prefer this over shell redirection or \
+                                 `sed` through run_command -- the full new content is one argument, not \
+                                 something to hand-encode into a shell string. The user approves every \
+                                 write before it happens.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to write, relative to the project directory."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The file's full new contents. This replaces the entire file."
+                        }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": LIST_DIR,
+                "description": format!(
+                    "List the files and subdirectories of one directory in the project. \
+                     Cheaper and more predictable than shelling out to `ls`/`dir`, and it \
+                     skips {} automatically. Read-only.",
+                    SKIP_DIRS.join(", ")
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory relative to the project root. Defaults to the root itself."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": GLOB,
+                "description": format!(
+                    "Find files by path pattern, recursively. Use this to locate files when you \
+                     know roughly what they are called or where they live -- it is faster and \
+                     safer than `find`, and it skips {}. Read-only.",
+                    SKIP_DIRS.join(", ")
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob relative to the project root, e.g. 'src/**/*.rs' or '**/Cargo.toml'."
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": EDIT_FILE,
+                "description":
+                    "Replace an exact span of text in an existing file, leaving the rest untouched. \
+                     Prefer this over write_file for changing part of a file: write_file replaces \
+                     the whole thing, so it loses anything you did not reproduce. Read the file \
+                     first -- old_string must match byte for byte, including indentation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to edit, relative to the project directory."
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "Exact text to replace, including indentation. Must be unique unless replace_all is set."
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Text to put in its place."
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace every occurrence instead of requiring a unique match."
+                        }
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }
+            }
+        }),
+    ]
+}
+
+/// What the model is told about its situation.
+///
+/// The operating system is stated outright because the single most common way
+/// this tool fails is a model reaching for `ls` on Windows. `tools_available`
+/// goes false once the step budget is spent.
+pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_available: bool) -> String {
+    if !tools_available {
+        return format!(
+            "You are tuisample-code, a terminal coding assistant working in {}.\n\
+             You have used up this turn's command budget. Answer the user now, in text, \
+             from what you have already seen. Do not ask to run anything else.",
+            workspace.root().display()
+        );
+    }
+
+    let (shell_name, shell_flag) = shell();
+    let os = std::env::consts::OS;
+    let os_hint = if cfg!(windows) {
+        "This is Windows: use `dir`, `type`, `findstr`, `copy`. Do NOT use ls/cat/grep."
+    } else {
+        "This is a Unix-like system: use `ls`, `cat`, `grep`, `find`, `sed`."
+    };
+    // The command that hands a file to whatever app the OS has registered for
+    // it -- `open`/`xdg-open`/`start` all return immediately after launching
+    // that app, they do not block waiting for it to close, so this is safe
+    // under the same non-interactive/timeout rules as any other command.
+    let opener = match os {
+        "macos" => "open",
+        "windows" => "start",
+        _ => "xdg-open",
+    };
+
+    format!(
+        "You are tuisample-code, a terminal coding assistant.\n\n\
+         Working directory: {}\n\
+         Operating system: {os} — shell commands run through `{shell_name} {shell_flag}`\n\n\
+         Tools:\n\
+         - {READ_FILE}(path): read a file's contents.\n\
+         - {WRITE_FILE}(path, content): create a file, or overwrite one, with new content.\n\
+         - {EDIT_FILE}(path, old_string, new_string, replace_all): replace an exact span of \
+           text in an existing file, leaving the rest untouched.\n\
+         - {LIST_DIR}(path): list one directory. Read-only, runs without asking.\n\
+         - {GLOB}(pattern): find files by path pattern, e.g. 'src/**/*.rs'. Read-only, runs \
+           without asking.\n\
+         - {RUN_COMMAND}(command, purpose): run a shell command and get back its exit code, \
+           stdout and stderr.\n\n\
+         Rules:\n\
+         - {os_hint}\n\
+         - Narrate in plain sentences, not just tool calls. Before acting, say in one short \
+           sentence what you're about to do and why (e.g. \"I'll create hello.py and run it.\"). \
+           After tool results come back, close with one short sentence saying what happened \
+           (e.g. \"Created hello.py and ran it — it printed Hello, World!\"). Never end a turn \
+           with only tool calls and nothing said about them; the tool log is not a substitute \
+           for telling the user what you did. When you already know you'll need more than one \
+           call to finish the thought -- write a file, then run it -- request all of them in the \
+           same turn instead of one at a time: one before-sentence and one after-sentence should \
+           cover the whole batch, not a fresh pair around each individual call.\n\
+         - Verify before declaring success: run what you wrote, or run a real check -- the test \
+           suite, a linter, importing the module, curling the endpoint -- and read the actual \
+           output. Do not assume something works because the code looks right. If a command \
+           fails, read the error and fix the real problem before retrying; do not repeat the \
+           same failing command unchanged.\n\
+         - If what you just created or changed is meant to be looked at rather than run for \
+           output -- a webpage, an image, a document -- offer to open it with `{opener}` via \
+           {RUN_COMMAND} instead of only telling the user how. This is still just another \
+           command: it waits for the same approval as everything else, it does not skip the \
+           prompt.\n\
+         - Explore with {LIST_DIR} and {GLOB} before guessing at paths, and prefer them over \
+           `ls`/`find` through {RUN_COMMAND}: they need no approval, so they cost the user \
+           nothing to answer.\n\
+         - To change part of an existing file use {EDIT_FILE}, not {WRITE_FILE}. {WRITE_FILE} \
+           replaces the entire file, so it silently destroys anything you did not reproduce; \
+           reserve it for creating a file or rewriting one wholesale. Read the file first so \
+           old_string matches byte for byte.\n\
+         - Use {READ_FILE} to read a file and {WRITE_FILE} to create or change one -- not \
+           `cat`/`type`/`sed`/shell redirection through {RUN_COMMAND}. Reserve {RUN_COMMAND} for \
+           things that are not reading or writing a single file: search, builds, tests, running \
+           a program. Look at the real project instead of guessing what it contains.\n\
+         - Commands run through {RUN_COMMAND} are NON-INTERACTIVE: stdin is closed. Never run \
+           anything that waits for input, opens an editor (vim, nano), or runs a server in the \
+           foreground. Such a command will simply time out after {} seconds.\n\
+         - The user approves every write and every command before it runs (reads of a short, \
+           conservative allowlist may go through without asking). If something is declined, do \
+           not retry it — take a different approach or answer without it.\n\
+         - Anything that changes or deletes files is real and immediate. Be conservative and \
+           prefer the narrowest action that does the job.\n\
+         - Answers appear in a terminal: keep narration to a sentence or two, not a report.",
+        workspace.root().display(),
+        config.command_timeout_secs,
+    )
+}
+
+#[derive(Deserialize)]
+struct RunArgs {
+    command: String,
+    #[serde(default)]
+    purpose: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReadFileArgs {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct WriteFileArgs {
+    path: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct ListDirArgs {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GlobArgs {
+    pattern: String,
+}
+
+#[derive(Deserialize)]
+struct EditFileArgs {
+    path: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+/// What a call is asking to do, in a form the approval popup and the
+/// transcript can render without knowing which tool produced it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    Command { command: String, purpose: Option<String> },
+    Read { path: String },
+    Write { path: String, content: String },
+    /// Read-only, like `Read`: listing a directory changes nothing.
+    List { path: String },
+    /// Read-only, like `Read`.
+    Glob { pattern: String },
+    /// Changes a file, so it is approved like `Write` -- but shows only the
+    /// span being replaced, which is the whole reason to prefer it.
+    Edit { path: String, old: String, new: String, replace_all: bool },
+}
+
+impl Action {
+    /// One line for `$ ... —` / transcript-style summaries, with a leading
+    /// icon so the three kinds stay visually distinct in a transcript full
+    /// of them.
+    pub fn label(&self) -> String {
+        match self {
+            Action::Command { command, .. } => format!("$ {command}"),
+            Action::Read { path } => format!("📄 read {path}"),
+            Action::Write { path, .. } => format!("📝 write {path}"),
+            Action::List { path } => format!("📁 list {path}"),
+            Action::Glob { pattern } => format!("🔎 find {pattern}"),
+            Action::Edit { path, .. } => format!("✏️ edit {path}"),
+        }
+    }
+}
+
+/// What `call` is asking to do, for the approval prompt. `None` if the model
+/// sent something unusable (unknown tool name, unparseable or empty
+/// arguments), in which case there is nothing to approve -- the runner
+/// reports the malformed arguments back to the model instead.
+pub fn describe_action(call: &ToolCall) -> Option<Action> {
+    match call.function.name.as_str() {
+        RUN_COMMAND => {
+            let args: RunArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let command = args.command.trim().to_string();
+            if command.is_empty() {
+                return None;
+            }
+            Some(Action::Command {
+                command,
+                purpose: args.purpose.filter(|p| !p.trim().is_empty()),
+            })
+        }
+        READ_FILE => {
+            let args: ReadFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            (!path.is_empty()).then_some(Action::Read { path })
+        }
+        WRITE_FILE => {
+            let args: WriteFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            (!path.is_empty()).then_some(Action::Write { path, content: args.content })
+        }
+        LIST_DIR => {
+            // `path` is optional: no argument means the project root, so an
+            // absent or unparseable object still describes a valid action.
+            let args = serde_json::from_str::<ListDirArgs>(&call.function.arguments).ok();
+            let path = args
+                .and_then(|a| a.path)
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| ".".to_string());
+            Some(Action::List { path })
+        }
+        GLOB => {
+            let args: GlobArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let pattern = args.pattern.trim().to_string();
+            (!pattern.is_empty()).then_some(Action::Glob { pattern })
+        }
+        EDIT_FILE => {
+            let args: EditFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            (!path.is_empty() && !args.old_string.is_empty()).then_some(Action::Edit {
+                path,
+                old: args.old_string,
+                new: args.new_string,
+                replace_all: args.replace_all,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Joins `path` onto the workspace root and rejects anything that resolves
+/// outside it, purely by collapsing `..`/`.` components -- no filesystem
+/// access, so this works for a `write_file` target that does not exist yet.
+///
+/// This is a guardrail against typos and prompt-injected paths, not a
+/// sandbox: it does not follow symlinks, so a symlink inside the workspace
+/// pointing outside it is not caught. It is nonetheless a real safety
+/// property `run_command`'s shell cannot offer at all -- see the module doc.
+fn resolve_in_workspace(workspace: &Workspace, path: &str) -> Result<PathBuf, String> {
+    let mut resolved = workspace.root().to_path_buf();
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => resolved.push(part),
+            // An absolute `path` (a leading `/`, or `C:\` on Windows) is
+            // exactly the escape this function exists to catch: replace
+            // rather than join, and let the `starts_with` check below reject it.
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                resolved = PathBuf::from(component.as_os_str());
+            }
+        }
+    }
+    if !resolved.starts_with(workspace.root()) {
+        return Err(format!(
+            "'{path}' resolves outside the workspace ({})",
+            workspace.root().display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Any of these and a command is not judged read-only, no matter what it
+/// starts with: `cat file; rm -rf /` starts with `cat` but chains into
+/// something else, and a prefix check alone cannot see past that.
+const CHAINING_CHARS: &[char] = &[';', '|', '&', '>', '<', '`', '\n'];
+
+/// Program names whose ordinary, no-flags-needed use is inherently read-only
+/// -- nothing here deletes, writes, or changes state, so there is nothing for
+/// an approval prompt to protect against.
+///
+/// Deliberately short and conservative. Getting this list wrong by leaving an
+/// obviously-safe command off it just costs an extra keypress; getting it
+/// wrong the other way runs something destructive with no prompt at all. When
+/// in doubt, leave a command off.
+const READ_ONLY_PROGRAMS: &[&str] = &[
+    "ls", "pwd", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "which", "whoami", "date",
+    "env", "printenv", "uname", "id", "file", "stat", "du", "df", "ps", "echo",
+];
+
+/// Whether `command` is read-only and reversible enough to skip the approval
+/// prompt for -- see `[tools] auto_approve_read_only` in `config.rs`.
+///
+/// `find` and general `git` are deliberately excluded: both have common,
+/// easy-to-type destructive forms (`find . -delete`, `git reset --hard`) that
+/// a prefix check cannot rule out. `git status`/`diff`/`log`/`show` are
+/// allowed as literal two-word prefixes instead, since none of their flags
+/// change anything on disk.
+pub fn is_read_only(command: &str) -> bool {
+    // `$(...)` command substitution can run anything; caught separately from
+    // `CHAINING_CHARS` because a bare `$` alone (`echo $HOME`) is ordinary and
+    // safe, so `$` cannot be in that blanket set.
+    if command.contains(CHAINING_CHARS) || command.contains("$(") {
+        return false;
+    }
+
+    let mut words = command.split_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+
+    if READ_ONLY_PROGRAMS.contains(&program) {
+        return true;
+    }
+    if program == "git" {
+        if let Some(sub) = words.next() {
+            return matches!(sub, "status" | "diff" | "log" | "show");
+        }
+    }
+    false
+}
+
+pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
+    // Belt and braces. `app::advance_approvals` already refuses blocked calls
+    // before they can be queued, so reaching this is a bug -- but the cost of
+    // the check is a string scan and the cost of missing it is an erased disk,
+    // so the runner refuses independently rather than trusting its caller.
+    if let Some(Action::Command { command, .. }) = describe_action(call) {
+        if let danger::Risk::Blocked(reason) = danger::classify(&command, workspace.root()) {
+            return refused_as_dangerous(call, &reason);
+        }
+    }
+
+    match call.function.name.as_str() {
+        RUN_COMMAND => execute_run_command(call, workspace, config).await,
+        READ_FILE => execute_read_file(call, workspace, config).await,
+        WRITE_FILE => execute_write_file(call, workspace).await,
+        LIST_DIR => execute_list_dir(call, workspace),
+        GLOB => execute_glob(call, workspace),
+        EDIT_FILE => execute_edit_file(call, workspace),
+        other => outcome(
+            &call.id,
+            format!("⚙ {other} — unknown tool"),
+            format!(
+                "Error: there is no tool named '{other}'. The tools are {RUN_COMMAND}, \
+                 {READ_FILE}, {WRITE_FILE}, {LIST_DIR}, {GLOB}, {EDIT_FILE}."
+            ),
+        ),
+    }
+}
+
+async fn execute_run_command(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<RunArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "⚙ run_command — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"command": "ls -la"}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+    let command = args.command.trim().to_string();
+    if command.is_empty() {
+        return outcome(
+            &call.id,
+            "⚙ run_command — empty command".to_string(),
+            "Error: the command was empty. Nothing was run.".to_string(),
+        );
+    }
+
+    let (shell_name, shell_flag) = shell();
+    let mut cmd = tokio::process::Command::new(shell_name);
+    cmd.arg(shell_flag)
+        .arg(&command)
+        .current_dir(workspace.root())
+        // Closed stdin, not inherited: the TUI owns the terminal, and a command
+        // that waits for input would otherwise hang forever with no way to type
+        // into it. Timing out is the better failure.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Kills the child when the timeout below drops this future.
+        .kill_on_drop(true);
+
+    let limit = Duration::from_secs(config.command_timeout_secs);
+    let output = match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return outcome(
+                &call.id,
+                format!("$ {} — could not start", clip(&command, 50)),
+                format!("Error: could not run the command: {e}"),
+            )
+        }
+        Err(_) => {
+            return outcome(
+                &call.id,
+                format!("$ {} — timed out", clip(&command, 50)),
+                format!(
+                    "Error: killed after {}s. It was probably waiting for input or would not \
+                     terminate. Try a non-interactive form of the command.",
+                    config.command_timeout_secs
+                ),
+            )
+        }
+    };
+
+    // Lossy on purpose: a command may legitimately print bytes that are not
+    // UTF-8, and replacement characters beat refusing to report anything.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = output.status.code();
+
+    let mut content = match code {
+        Some(code) => format!("exit code: {code}\n"),
+        None => "exit code: killed by a signal\n".to_string(),
+    };
+    let budget = config.max_output_bytes;
+    if !stdout.trim().is_empty() {
+        content.push_str("--- stdout ---\n");
+        content.push_str(&clip(&stdout, budget));
+        content.push('\n');
+    }
+    if !stderr.trim().is_empty() {
+        content.push_str("--- stderr ---\n");
+        content.push_str(&clip(&stderr, budget / 4));
+        content.push('\n');
+    }
+    if stdout.trim().is_empty() && stderr.trim().is_empty() {
+        content.push_str("(no output)\n");
+    }
+
+    let lines = stdout.lines().count() + stderr.lines().count();
+    let status = match code {
+        Some(0) => format!("{lines} line{}", if lines == 1 { "" } else { "s" }),
+        Some(code) => format!("exit {code}"),
+        None => "killed".to_string(),
+    };
+
+    outcome(
+        &call.id,
+        format!("$ {} — {status}", clip(&command, 60)),
+        content,
+    )
+}
+
+async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<ReadFileArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "📄 read_file — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"path": "src/main.rs"}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+    let path = args.path.trim();
+    if path.is_empty() {
+        return outcome(
+            &call.id,
+            "📄 read_file — empty path".to_string(),
+            "Error: the path was empty. Nothing was read.".to_string(),
+        );
+    }
+
+    let resolved = match resolve_in_workspace(workspace, path) {
+        Ok(p) => p,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("📄 read {} — refused", clip(path, 50)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    match tokio::fs::read(&resolved).await {
+        Ok(bytes) => {
+            // Lossy on purpose, matching run_command's stdout/stderr handling:
+            // a source file is not guaranteed valid UTF-8, and replacement
+            // characters beat refusing to report anything.
+            let text = String::from_utf8_lossy(&bytes);
+            let lines = text.lines().count();
+            outcome(
+                &call.id,
+                format!("📄 read {} — {lines} line{}", clip(path, 50), if lines == 1 { "" } else { "s" }),
+                clip(&text, config.max_output_bytes),
+            )
+        }
+        Err(e) => outcome(
+            &call.id,
+            format!("📄 read {} — failed", clip(path, 50)),
+            format!("Error: could not read {path}: {e}"),
+        ),
+    }
+}
+
+async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<WriteFileArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "📝 write_file — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"path": "hello.py", "content": "..."}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+    let path = args.path.trim();
+    if path.is_empty() {
+        return outcome(
+            &call.id,
+            "📝 write_file — empty path".to_string(),
+            "Error: the path was empty. Nothing was written.".to_string(),
+        );
+    }
+
+    let resolved = match resolve_in_workspace(workspace, path) {
+        Ok(p) => p,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("📝 write {} — refused", clip(path, 50)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    if let Some(parent) = resolved.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return outcome(
+                    &call.id,
+                    format!("📝 write {} — failed", clip(path, 50)),
+                    format!("Error: could not create the directory for {path}: {e}"),
+                );
+            }
+        }
+    }
+
+    match tokio::fs::write(&resolved, &args.content).await {
+        Ok(()) => outcome(
+            &call.id,
+            format!("📝 write {} — {} bytes", clip(path, 50), args.content.len()),
+            format!("Wrote {} bytes to {path}", args.content.len()),
+        ),
+        Err(e) => outcome(
+            &call.id,
+            format!("📝 write {} — failed", clip(path, 50)),
+            format!("Error: could not write {path}: {e}"),
+        ),
+    }
+}
+
+/// The result to hand back when the user says no.
+/// `list_dir` -- one directory, sorted, directories first.
+fn execute_list_dir(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+    let requested = serde_json::from_str::<ListDirArgs>(&call.function.arguments)
+        .ok()
+        .and_then(|a| a.path)
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+
+    let dir = match resolve_in_workspace(workspace, &requested) {
+        Ok(p) => p,
+        Err(e) => return outcome(&call.id, format!("📁 list {requested} — {e}"), format!("Error: {e}")),
+    };
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("📁 list {requested} — {e}"),
+                format!("Error: could not list '{requested}': {e}"),
+            )
+        }
+    };
+
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_skipped(&path, workspace.root()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            dirs.push(format!("{name}/"));
+        } else {
+            files.push(name);
+        }
+    }
+    dirs.sort();
+    files.sort();
+
+    let total = dirs.len() + files.len();
+    let mut listing: Vec<String> = dirs.into_iter().chain(files).collect();
+    let truncated = listing.len() > MAX_DIR_ENTRIES;
+    listing.truncate(MAX_DIR_ENTRIES);
+
+    let mut body = if listing.is_empty() {
+        format!("'{requested}' is empty.")
+    } else {
+        listing.join("\n")
+    };
+    if truncated {
+        body.push_str(&format!("\n[{} more entries]", total - MAX_DIR_ENTRIES));
+    }
+
+    outcome(
+        &call.id,
+        format!("📁 list {requested} — {total} entries"),
+        clip(&body, 32_000),
+    )
+}
+
+/// `glob` -- find files by path pattern.
+fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<GlobArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "🔎 glob — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"pattern": "src/**/*.rs"}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+    let pattern = args.pattern.trim();
+    if pattern.is_empty() {
+        return outcome(
+            &call.id,
+            "🔎 glob — empty pattern".to_string(),
+            "Error: pattern must not be empty.".to_string(),
+        );
+    }
+
+    let joined = workspace.root().join(pattern);
+    let Some(joined) = joined.to_str() else {
+        return outcome(
+            &call.id,
+            "🔎 glob — invalid pattern".to_string(),
+            "Error: pattern is not valid UTF-8.".to_string(),
+        );
+    };
+
+    let paths = match glob::glob(joined) {
+        Ok(p) => p,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("🔎 glob {pattern} — invalid"),
+                format!("Error: '{pattern}' is not a valid glob: {e}"),
+            )
+        }
+    };
+
+    let mut files: Vec<String> = paths
+        .flatten()
+        .filter(|p| p.is_file())
+        // Canonicalize *before* the containment check. `starts_with` is lexical,
+        // so `<workspace>/../sibling/x.rs` would otherwise pass it -- a glob is a
+        // path expression like any other and must not read its way out.
+        .filter_map(|p| p.canonicalize().ok())
+        .filter(|p| p.starts_with(workspace.root()))
+        .filter(|p| !is_skipped(p, workspace.root()))
+        .map(|p| relative_to(workspace, &p))
+        .collect();
+    files.sort();
+    files.dedup();
+
+    if files.is_empty() {
+        // Finding nothing is an answer, not a failure -- an error would push the
+        // model toward retrying instead of concluding.
+        return outcome(
+            &call.id,
+            format!("🔎 glob {pattern} — no matches"),
+            format!("No files match '{pattern}'."),
+        );
+    }
+
+    let total = files.len();
+    files.truncate(MAX_GLOB_RESULTS);
+    let mut body = files.join("\n");
+    if total > MAX_GLOB_RESULTS {
+        body.push_str(&format!(
+            "\n[{} more matches; narrow the pattern]",
+            total - MAX_GLOB_RESULTS
+        ));
+    }
+
+    outcome(
+        &call.id,
+        format!("🔎 glob {pattern} — {total} match(es)"),
+        clip(&body, 32_000),
+    )
+}
+
+/// `edit_file` -- replace an exact span, leaving the rest of the file alone.
+fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<EditFileArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "✏️ edit_file — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"path": "src/main.rs", "old_string": "...", "new_string": "..."}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+
+    let requested = args.path.trim().to_string();
+    let fail = |msg: String| outcome(&call.id, format!("✏️ edit {requested} — failed"), msg);
+
+    if requested.is_empty() {
+        return fail("Error: path must not be empty.".to_string());
+    }
+    if args.old_string.is_empty() {
+        return fail(
+            "Error: old_string must not be empty. Use write_file to create a file.".to_string(),
+        );
+    }
+    if args.old_string == args.new_string {
+        return fail("Error: old_string and new_string are identical.".to_string());
+    }
+
+    let path = match resolve_in_workspace(workspace, &requested) {
+        Ok(p) => p,
+        Err(e) => return fail(format!("Error: {e}")),
+    };
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => return fail(format!("Error: could not read '{requested}': {e}")),
+    };
+
+    let matches = contents.matches(&args.old_string).count();
+    match matches {
+        0 => {
+            return fail(format!(
+                "Error: old_string was not found in '{requested}'. It must match byte for byte, \
+                 including indentation. Read the file and copy the text exactly."
+            ))
+        }
+        // Silently editing the wrong one of several identical spans is the most
+        // damaging thing this tool could do, so an ambiguous edit is refused
+        // rather than guessed at.
+        n if n > 1 && !args.replace_all => {
+            return fail(format!(
+                "Error: old_string appears {n} times in '{requested}'. Add surrounding context to \
+                 make it unique, or pass replace_all: true."
+            ))
+        }
+        _ => {}
+    }
+
+    let updated = if args.replace_all {
+        contents.replace(&args.old_string, &args.new_string)
+    } else {
+        contents.replacen(&args.old_string, &args.new_string, 1)
+    };
+
+    if let Err(e) = std::fs::write(&path, &updated) {
+        return fail(format!("Error: could not write '{requested}': {e}"));
+    }
+
+    let replaced = if args.replace_all { matches } else { 1 };
+    outcome(
+        &call.id,
+        format!("✏️ edit {requested} — {replaced} replacement(s)"),
+        format!(
+            "Replaced {replaced} occurrence(s) in '{requested}'. The file is now {} bytes.",
+            updated.len()
+        ),
+    )
+}
+
+pub fn declined(call: &ToolCall) -> ToolOutcome {
+    let label = describe_action(call)
+        .map(|a| a.label())
+        .unwrap_or_else(|| call.function.name.clone());
+    outcome(
+        &call.id,
+        format!("{} — declined", clip(&label, 60)),
+        "The user declined to let this happen. Do not try it again; take a different \
+         approach or answer without it."
+            .to_string(),
+    )
+}
+
+/// The result for a call the guardrails refused outright.
+///
+/// Worded so the model treats it as a settled boundary rather than an obstacle
+/// to route around: without that it tends to retry the same thing spelled
+/// differently, which is exactly what a blocklist is worst at catching.
+pub fn refused_as_dangerous(call: &ToolCall, reason: &str) -> ToolOutcome {
+    let label = describe_action(call)
+        .map(|a| a.label())
+        .unwrap_or_else(|| call.function.name.clone());
+    outcome(
+        &call.id,
+        format!("⛔ {} — blocked", clip(&label, 60)),
+        format!(
+            "Blocked by the safety guardrails and never run: {reason}.\n\
+             This was refused by the tool itself, not by the user, and no setting can permit \
+             it. Do not attempt this again in any form, and do not try to work around it. \
+             Tell the user plainly what you wanted to do and why it was blocked, and let them \
+             run it themselves if they judge it safe."
+        ),
+    )
+}
+
+/// The result for a call abandoned before any decision was made.
+pub fn unanswered(call: &ToolCall, reason: &str) -> ToolOutcome {
+    let label = describe_action(call)
+        .map(|a| a.label())
+        .unwrap_or_else(|| call.function.name.clone());
+    outcome(
+        &call.id,
+        format!("{} — not run", clip(&label, 60)),
+        reason.to_string(),
+    )
+}
+
+fn outcome(call_id: &str, display: String, content: String) -> ToolOutcome {
+    ToolOutcome {
+        call_id: call_id.to_string(),
+        display,
+        content,
+    }
+}
+
+/// Truncate to `max` characters (not bytes -- this must never split a char).
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!("{kept}\n[… truncated at {max} characters]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::FunctionCall;
+
+    fn fixture() -> (tempfile::TempDir, Workspace, ToolsConfig) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("hello.txt"), "one\ntwo\nthree\n").unwrap();
+        let ws = Workspace::new(dir.path()).expect("workspace");
+        (dir, ws, ToolsConfig::default())
+    }
+
+    fn call(command: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: RUN_COMMAND.to_string(),
+                arguments: json!({ "command": command }).to_string(),
+            },
+        }
+    }
+
+    // ---- ported tools: list_dir, glob, edit_file -------------------------------
+
+    fn tool_call(name: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    /// A workspace with a nested source tree and some build output to ignore.
+    fn tree() -> (tempfile::TempDir, Workspace, ToolsConfig) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/ui")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(root.join("src/app.rs"), "let needle = 1;\n").unwrap();
+        std::fs::write(root.join("src/ui/render.rs"), "// ui\n").unwrap();
+        std::fs::write(root.join("target/debug/app.rs"), "// build output\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.rs"), "// dep\n").unwrap();
+        let ws = Workspace::new(root).expect("workspace");
+        (dir, ws, ToolsConfig::default())
+    }
+
+    #[tokio::test]
+    async fn list_dir_lists_directories_first_and_skips_build_output() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(LIST_DIR, json!({})), &ws, &cfg).await;
+        let listing = out.content;
+        assert!(listing.contains("src/"), "{listing}");
+        assert!(listing.contains("Cargo.toml"), "{listing}");
+        // Build output and dependencies are noise, not project structure.
+        assert!(!listing.contains("target"), "{listing}");
+        assert!(!listing.contains("node_modules"), "{listing}");
+        // Directories sort before files.
+        assert!(listing.find("src/").unwrap() < listing.find("Cargo.toml").unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_dir_defaults_to_the_workspace_root() {
+        let (_d, ws, cfg) = tree();
+        let with = execute(&tool_call(LIST_DIR, json!({"path": "."})), &ws, &cfg).await;
+        let without = execute(&tool_call(LIST_DIR, json!({})), &ws, &cfg).await;
+        assert_eq!(with.content, without.content);
+    }
+
+    #[tokio::test]
+    async fn list_dir_cannot_escape_the_workspace() {
+        let (_d, ws, cfg) = tree();
+        for escape in ["..", "../..", "/etc"] {
+            let out = execute(&tool_call(LIST_DIR, json!({"path": escape})), &ws, &cfg).await;
+            assert!(
+                out.content.contains("outside the workspace"),
+                "{escape} must be refused: {}",
+                out.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_matches_recursively_and_returns_relative_paths() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(GLOB, json!({"pattern": "src/**/*.rs"})), &ws, &cfg).await;
+        let mut found: Vec<&str> = out.content.lines().collect();
+        found.sort();
+        assert_eq!(found, vec!["src/app.rs", "src/ui/render.rs"]);
+    }
+
+    #[tokio::test]
+    async fn glob_skips_build_output_and_dependencies() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(GLOB, json!({"pattern": "**/*.rs"})), &ws, &cfg).await;
+        assert!(!out.content.contains("target/"), "{}", out.content);
+        assert!(!out.content.contains("node_modules/"), "{}", out.content);
+    }
+
+    /// Finding nothing is an answer, not a failure -- an error would push the
+    /// model toward retrying instead of concluding.
+    #[tokio::test]
+    async fn glob_reports_no_matches_as_a_normal_result() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(GLOB, json!({"pattern": "**/*.py"})), &ws, &cfg).await;
+        assert!(out.content.contains("No files match"), "{}", out.content);
+    }
+
+    /// A glob is a path expression like any other and must not read its way out
+    /// of the workspace.
+    ///
+    /// `..` is not rejected outright -- it is allowed to *expand*, and then
+    /// every result is canonicalized and dropped unless it is genuinely inside
+    /// the root. That ordering matters: `starts_with` is lexical, so filtering
+    /// before canonicalizing would let `<workspace>/../sibling/x` through.
+    #[tokio::test]
+    async fn glob_cannot_escape_the_workspace() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("inside.rs"), "// in\n").unwrap();
+        // A sibling of the workspace, which no pattern may reach.
+        std::fs::write(dir.path().join("outside.rs"), "// SECRET\n").unwrap();
+        let ws = Workspace::new(&root).expect("workspace");
+        let cfg = ToolsConfig::default();
+
+        for pattern in ["../*.rs", "../**/*.rs", "/etc/*"] {
+            let out = execute(&tool_call(GLOB, json!({"pattern": pattern})), &ws, &cfg).await;
+            assert!(
+                !out.content.contains("outside.rs") && !out.content.contains("SECRET"),
+                "{pattern} escaped the workspace: {}",
+                out.content
+            );
+            for line in out.content.lines().filter(|l| l.ends_with(".rs")) {
+                assert!(
+                    !line.starts_with("..") && !line.starts_with('/'),
+                    "{pattern} returned a path outside the root: {line}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_rejects_an_invalid_pattern_with_an_actionable_message() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(GLOB, json!({"pattern": "src/[unclosed"})), &ws, &cfg).await;
+        assert!(out.content.contains("not a valid glob"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn edit_file_replaces_one_span_and_leaves_the_rest() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "keep\nlet needle = 1;\nkeep too\n").unwrap();
+
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({
+                "path": "src/app.rs", "old_string": "let needle = 1;", "new_string": "let needle = 2;"
+            })),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        assert!(out.content.contains("Replaced 1"), "{}", out.content);
+        let after = std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap();
+        assert_eq!(after, "keep\nlet needle = 2;\nkeep too\n");
+    }
+
+    /// Silently editing the wrong one of several identical spans is the most
+    /// damaging thing this tool could do, so ambiguity is refused not guessed.
+    #[tokio::test]
+    async fn edit_file_refuses_an_ambiguous_match_unless_told_to_replace_all() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "x = 1;\nx = 1;\n").unwrap();
+
+        let ambiguous = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "old_string": "x = 1;", "new_string": "x = 2;"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(ambiguous.content.contains("appears 2 times"), "{}", ambiguous.content);
+        // Nothing was written.
+        assert_eq!(
+            std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap(),
+            "x = 1;\nx = 1;\n"
+        );
+
+        let all = execute(
+            &tool_call(EDIT_FILE, json!({
+                "path": "src/app.rs", "old_string": "x = 1;", "new_string": "x = 2;", "replace_all": true
+            })),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(all.content.contains("Replaced 2"), "{}", all.content);
+        assert_eq!(
+            std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap(),
+            "x = 2;\nx = 2;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_reports_a_missing_span_without_touching_the_file() {
+        let (_d, ws, cfg) = tree();
+        let before = std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap();
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "old_string": "not there", "new_string": "x"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.content.contains("was not found"), "{}", out.content);
+        assert_eq!(std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_an_empty_or_unchanged_span() {
+        let (_d, ws, cfg) = tree();
+        let empty = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "old_string": "", "new_string": "x"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(empty.content.contains("must not be empty"), "{}", empty.content);
+
+        let same = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "old_string": "a", "new_string": "a"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(same.content.contains("identical"), "{}", same.content);
+    }
+
+    #[tokio::test]
+    async fn edit_file_cannot_escape_the_workspace() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({
+                "path": "../outside.txt", "old_string": "a", "new_string": "b"
+            })),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.content.contains("outside the workspace"), "{}", out.content);
+    }
+
+    /// The approval prompt must be able to describe every tool, or a call would
+    /// reach the runner with nothing shown to the user.
+    #[test]
+    fn every_ported_tool_describes_an_action() {
+        assert!(matches!(
+            describe_action(&tool_call(LIST_DIR, json!({"path": "src"}))),
+            Some(Action::List { .. })
+        ));
+        assert!(matches!(
+            describe_action(&tool_call(LIST_DIR, json!({}))),
+            Some(Action::List { .. })
+        ));
+        assert!(matches!(
+            describe_action(&tool_call(GLOB, json!({"pattern": "**/*.rs"}))),
+            Some(Action::Glob { .. })
+        ));
+        assert!(matches!(
+            describe_action(&tool_call(EDIT_FILE, json!({
+                "path": "a.rs", "old_string": "x", "new_string": "y"
+            }))),
+            Some(Action::Edit { .. })
+        ));
+        // Unusable arguments describe nothing, so the runner reports them back
+        // to the model rather than the user being asked to approve a blank.
+        assert!(describe_action(&tool_call(GLOB, json!({"pattern": "  "}))).is_none());
+        assert!(describe_action(&tool_call(EDIT_FILE, json!({"path": "a.rs"}))).is_none());
+    }
+
+    fn read_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: READ_FILE.to_string(),
+                arguments: json!({ "path": path }).to_string(),
+            },
+        }
+    }
+
+    fn write_call(path: &str, content: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: WRITE_FILE.to_string(),
+                arguments: json!({ "path": path, "content": content }).to_string(),
+            },
+        }
+    }
+
+    /// `dir` on Windows, `ls` elsewhere -- the tests have to be as
+    /// platform-honest as the tool claims to be.
+    fn list_command() -> &'static str {
+        if cfg!(windows) {
+            "dir"
+        } else {
+            "ls"
+        }
+    }
+
+    fn print_command() -> &'static str {
+        if cfg!(windows) {
+            "type hello.txt"
+        } else {
+            "cat hello.txt"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_runs_and_reports_its_output() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&call(print_command()), &ws, &cfg).await;
+
+        assert!(out.content.contains("exit code: 0"), "{}", out.content);
+        assert!(out.content.contains("two"), "{}", out.content);
+        assert_eq!(out.call_id, "call_1");
+    }
+
+    /// The working directory is the whole point: a bare `ls` has to see the
+    /// project, not wherever the app happened to be launched from.
+    #[tokio::test]
+    async fn commands_run_in_the_workspace_directory() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&call(list_command()), &ws, &cfg).await;
+        assert!(out.content.contains("hello.txt"), "{}", out.content);
+    }
+
+    /// A non-zero exit is information for the model, not a failure of the tool.
+    #[tokio::test]
+    async fn a_failing_command_reports_its_exit_code_and_stderr() {
+        let (_dir, ws, cfg) = fixture();
+        let command = if cfg!(windows) {
+            "type nope-does-not-exist.txt"
+        } else {
+            "cat nope-does-not-exist.txt"
+        };
+        let out = execute(&call(command), &ws, &cfg).await;
+
+        assert!(!out.content.contains("exit code: 0"), "{}", out.content);
+        assert!(out.content.contains("--- stderr ---"), "{}", out.content);
+        assert!(out.display.contains("exit "), "{}", out.display);
+    }
+
+    /// Without a timeout one bad command freezes the turn forever. Without
+    /// closed stdin, plenty of ordinary commands are that bad command.
+    #[tokio::test]
+    async fn a_command_that_never_finishes_is_killed() {
+        let (_dir, ws, mut cfg) = fixture();
+        cfg.command_timeout_secs = 1;
+        let command = if cfg!(windows) {
+            "ping -n 30 127.0.0.1"
+        } else {
+            "sleep 30"
+        };
+
+        let started = std::time::Instant::now();
+        let out = execute(&call(command), &ws, &cfg).await;
+
+        assert!(out.content.contains("killed after 1s"), "{}", out.content);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "should have been killed promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_reading_stdin_does_not_hang_forever() {
+        let (_dir, ws, mut cfg) = fixture();
+        cfg.command_timeout_secs = 5;
+        // With inherited stdin this blocks; with /dev/null it returns at once.
+        let command = if cfg!(windows) {
+            "more"
+        } else {
+            "cat"
+        };
+        let out = execute(&call(command), &ws, &cfg).await;
+        assert!(out.content.contains("exit code"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn runaway_output_is_capped() {
+        let (_dir, ws, mut cfg) = fixture();
+        cfg.max_output_bytes = 200;
+        let command = if cfg!(windows) {
+            "for /L %i in (1,1,5000) do @echo aaaaaaaaaaaaaaaaaaaa"
+        } else {
+            "for i in $(seq 1 5000); do echo aaaaaaaaaaaaaaaaaaaa; done"
+        };
+        let out = execute(&call(command), &ws, &cfg).await;
+        assert!(out.content.contains("truncated at 200"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn unusable_arguments_are_explained_rather_than_run() {
+        let (_dir, ws, cfg) = fixture();
+        let mut bad = call("");
+        bad.function.arguments = "{not json".to_string();
+        let out = execute(&bad, &ws, &cfg).await;
+        assert!(out.content.contains("could not read the arguments"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn an_empty_command_is_not_run() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&call("   "), &ws, &cfg).await;
+        assert!(out.content.starts_with("Error:"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn a_tool_the_model_invented_is_reported_not_executed() {
+        let (_dir, ws, cfg) = fixture();
+        let mut made_up = call("ls");
+        made_up.function.name = "delete_everything".to_string();
+        let out = execute(&made_up, &ws, &cfg).await;
+        assert!(out.content.contains("no tool named"), "{}", out.content);
+    }
+
+    #[test]
+    fn the_command_and_purpose_are_extracted_for_the_approval_prompt() {
+        let mut c = call("rm -rf build");
+        c.function.arguments = json!({
+            "command": "rm -rf build",
+            "purpose": "clear stale build output"
+        })
+        .to_string();
+
+        match describe_action(&c).expect("should describe") {
+            Action::Command { command, purpose } => {
+                assert_eq!(command, "rm -rf build");
+                assert_eq!(purpose.as_deref(), Some("clear stale build output"));
+            }
+            other => panic!("expected Action::Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_and_write_actions_are_described_for_the_approval_prompt() {
+        match describe_action(&read_call("src/main.rs")).expect("should describe") {
+            Action::Read { path } => assert_eq!(path, "src/main.rs"),
+            other => panic!("expected Action::Read, got {other:?}"),
+        }
+
+        match describe_action(&write_call("hello.py", "print('hi')\n")).expect("should describe") {
+            Action::Write { path, content } => {
+                assert_eq!(path, "hello.py");
+                assert_eq!(content, "print('hi')\n");
+            }
+            other => panic!("expected Action::Write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_call_with_an_unknown_tool_name_has_no_action_to_describe() {
+        let mut c = call("ls");
+        c.function.name = "delete_everything".to_string();
+        assert_eq!(describe_action(&c), None);
+    }
+
+    #[test]
+    fn plain_read_only_commands_are_recognised() {
+        for cmd in ["ls -la", "cat src/main.rs", "grep -rn TODO src", "pwd", "wc -l file.txt"] {
+            assert!(is_read_only(cmd), "expected read-only: {cmd}");
+        }
+    }
+
+    #[test]
+    fn narrow_git_subcommands_are_recognised() {
+        for cmd in ["git status", "git diff HEAD~1", "git log --oneline -5", "git show HEAD"] {
+            assert!(is_read_only(cmd), "expected read-only: {cmd}");
+        }
+    }
+
+    #[test]
+    fn destructive_or_unlisted_commands_are_not_read_only() {
+        for cmd in [
+            "rm -rf build",
+            "git push --force",
+            "git reset --hard",
+            "git branch -D main",
+            "find . -delete",
+            "curl https://example.com/install.sh",
+            "sed -i s/x/y/ file.txt",
+        ] {
+            assert!(!is_read_only(cmd), "expected NOT read-only: {cmd}");
+        }
+    }
+
+    /// A read-only-looking prefix chained into something else must not slip
+    /// through -- this is the whole reason `is_read_only` isn't just a prefix
+    /// check against `READ_ONLY_PROGRAMS`.
+    #[test]
+    fn chaining_into_another_command_defeats_the_read_only_prefix() {
+        for cmd in [
+            "cat file; rm -rf /",
+            "ls | xargs rm",
+            "echo hi > important_file",
+            "cat $(rm -rf /)",
+            "cat file `rm -rf /`",
+            "ls && rm -rf /",
+        ] {
+            assert!(!is_read_only(cmd), "expected NOT read-only: {cmd}");
+        }
+    }
+
+    #[test]
+    fn declining_tells_the_model_not_to_retry() {
+        let out = declined(&call("rm -rf /"));
+        assert!(out.content.contains("declined"), "{}", out.content);
+        assert!(out.content.contains("Do not try it again"), "{}", out.content);
+    }
+
+    /// The most common way this tool fails in the wild is a model using `ls` on
+    /// Windows, so the prompt has to name the platform outright.
+    #[test]
+    fn the_system_prompt_names_the_platform_and_the_shell() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(prompt.contains(std::env::consts::OS), "{prompt}");
+        assert!(prompt.contains(shell().0), "{prompt}");
+        assert!(prompt.contains("NON-INTERACTIVE"), "{prompt}");
+        if cfg!(windows) {
+            assert!(prompt.contains("Do NOT use ls/cat/grep"), "{prompt}");
+        } else {
+            assert!(prompt.contains("Unix-like"), "{prompt}");
+        }
+
+        let exhausted = system_prompt(&ws, &cfg, false);
+        assert!(exhausted.contains("Answer the user now"), "{exhausted}");
+    }
+
+    /// Regression: without this, a model that only emits tool calls leaves the
+    /// transcript as a bare log of "$ ..."/"📝 ..." lines with nothing said
+    /// about them -- what a user pointed at directly when comparing this to
+    /// Claude Code's narrated "I'll just run it." / "Ran it — output: ...".
+    #[test]
+    fn the_system_prompt_requires_narration_before_and_after_tool_use() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(prompt.contains("Before acting"), "{prompt}");
+        assert!(prompt.contains("After tool results come back"), "{prompt}");
+        assert!(
+            prompt.contains("Never end a turn with only tool calls"),
+            "{prompt}"
+        );
+    }
+
+    /// Regression: without this, "narrate before and after" was read as
+    /// per-call rather than per-turn, so a write followed by a run produced
+    /// three separate narrated turns (before the write, before the run, and a
+    /// final summary) instead of one plan sentence and one result sentence --
+    /// the gap a user pointed at directly when comparing this to Claude Code's
+    /// single-summary output for the same two-step task.
+    #[test]
+    fn the_system_prompt_asks_for_multiple_calls_in_one_turn_rather_than_one_narrated_turn_each() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(prompt.contains("request all of them in the same turn"), "{prompt}");
+        assert!(
+            prompt.contains("not a fresh pair around each individual call"),
+            "{prompt}"
+        );
+    }
+
+    /// Without this a model can write code, never run it, and declare success
+    /// on the strength of "it looks right" -- the same class of gap narration
+    /// closed for communication, but for correctness.
+    #[test]
+    fn the_system_prompt_requires_verifying_work_before_declaring_success() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(prompt.contains("Verify before declaring success"), "{prompt}");
+        assert!(
+            prompt.contains("Do not assume something works because the code looks right"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("do not repeat the same failing command unchanged"),
+            "{prompt}"
+        );
+    }
+
+    /// Regression: without this, the model would write something like
+    /// hello.html and only describe how to open it, instead of offering to
+    /// open it itself the way Claude Code does. The nudge must not come at
+    /// the cost of the approval rule -- opening still goes through the same
+    /// prompt as every other command, there is no exception carved out here.
+    #[test]
+    fn the_system_prompt_offers_to_open_viewable_output_without_skipping_approval() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(
+            prompt.contains("offer to open it with"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("it waits for the same approval as everything else, it does not skip the prompt"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn the_schemas_name_exactly_the_tools_that_execute() {
+        let schemas = schemas();
+        let names: Vec<_> = schemas.iter().map(|s| s["function"]["name"].clone()).collect();
+        assert_eq!(
+            names,
+            vec![RUN_COMMAND, READ_FILE, WRITE_FILE, LIST_DIR, GLOB, EDIT_FILE]
+        );
+    }
+
+    #[test]
+    fn clipping_never_splits_a_multibyte_character() {
+        let clipped = clip("héllo wörld→", 4);
+        assert!(clipped.starts_with("héll"), "{clipped}");
+        assert!(clipped.contains("truncated"), "{clipped}");
+    }
+
+    // ---- read_file / write_file --------------------------------------------
+
+    #[tokio::test]
+    async fn write_file_creates_parent_directories_and_writes_content() {
+        let (dir, ws, cfg) = fixture();
+        let out = execute(&write_call("nested/hello.py", "print('hi')\n"), &ws, &cfg).await;
+
+        assert!(out.content.contains("Wrote"), "{}", out.content);
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("nested/hello.py")).await.unwrap(),
+            "print('hi')\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_overwrites_an_existing_file() {
+        let (_dir, ws, cfg) = fixture();
+        execute(&write_call("hello.txt", "new content\n"), &ws, &cfg).await;
+        let out = execute(&read_call("hello.txt"), &ws, &cfg).await;
+        assert_eq!(out.content, "new content\n");
+    }
+
+    #[tokio::test]
+    async fn read_file_reports_the_content_and_line_count() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&read_call("hello.txt"), &ws, &cfg).await;
+
+        assert_eq!(out.content, "one\ntwo\nthree\n");
+        assert!(out.display.contains("3 lines"), "{}", out.display);
+    }
+
+    #[tokio::test]
+    async fn reading_a_missing_file_is_reported_not_a_panic() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&read_call("does-not-exist.txt"), &ws, &cfg).await;
+        assert!(out.content.starts_with("Error:"), "{}", out.content);
+    }
+
+    /// The one safety property a typed file tool has that the shell tool
+    /// cannot: the path is checked before anything happens, not merely hoped
+    /// to be well-behaved.
+    #[tokio::test]
+    async fn a_path_that_escapes_the_workspace_is_refused() {
+        let (_dir, ws, cfg) = fixture();
+        for escaping in ["../outside.txt", "../../etc/passwd", "/etc/passwd"] {
+            let out = execute(&write_call(escaping, "pwned"), &ws, &cfg).await;
+            assert!(
+                out.content.contains("outside the workspace"),
+                "{escaping}: {}",
+                out.content
+            );
+
+            let out = execute(&read_call(escaping), &ws, &cfg).await;
+            assert!(
+                out.content.contains("outside the workspace"),
+                "{escaping}: {}",
+                out.content
+            );
+        }
+    }
+
+    /// `..` that nets out *inside* the workspace must still work -- the guard
+    /// is about where a path ends up, not whether it merely contains `..`.
+    #[tokio::test]
+    async fn a_path_using_dotdot_that_stays_inside_the_workspace_is_allowed() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&read_call("subdir/../hello.txt"), &ws, &cfg).await;
+        assert_eq!(out.content, "one\ntwo\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn read_output_is_capped_like_command_output() {
+        let (dir, ws, mut cfg) = fixture();
+        cfg.max_output_bytes = 10;
+        std::fs::write(dir.path().join("big.txt"), "a".repeat(1000)).unwrap();
+        let out = execute(&read_call("big.txt"), &ws, &cfg).await;
+        assert!(out.content.contains("truncated at 10"), "{}", out.content);
+    }
+}

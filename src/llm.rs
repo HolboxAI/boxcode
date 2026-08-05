@@ -1,16 +1,8 @@
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc;
-
-/// Where to send a turn, and how big an answer to allow.
-#[derive(Clone, Debug)]
-pub struct Target {
-    pub endpoint: String,
-    pub model: String,
-    pub api_key: String,
-    pub max_tokens: u32,
-}
 
 #[derive(Serialize)]
 pub struct ChatRequest {
@@ -18,147 +10,67 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub stream: bool,
     pub max_tokens: u32,
-    /// Omitted entirely when the agent has no tools, so a plain chat turn is
-    /// byte-for-byte the request this crate sent before tool calling existed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ToolDef>>,
+    /// Omitted entirely when empty: an endpoint that has never heard of tool
+    /// calling should see exactly the request it saw before this feature landed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<Value>,
 }
 
-/// One message in the conversation. `content` is optional because an assistant
-/// turn that only calls tools legitimately carries `content: null`.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `Option`, not `String`: an assistant message that only carries tool calls
+    /// has no content, and several providers reject `""` where they expect null
+    /// or an absent field.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
-    /// Set only on `role: "tool"` messages, tying a result back to its call.
+    /// Which call a `role: "tool"` message is answering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
-    pub fn system(content: impl Into<String>) -> Self {
+    pub fn text(role: &str, content: impl Into<String>) -> Self {
         Self {
-            role: "system".to_string(),
+            role: role.to_string(),
             content: Some(content.into()),
-            ..Default::default()
-        }
-    }
-
-    pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: "user".to_string(),
-            content: Some(content.into()),
-            ..Default::default()
-        }
-    }
-
-    pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        let text = text.into();
-        Self {
-            role: "assistant".to_string(),
-            content: (!text.is_empty()).then_some(text),
-            tool_calls,
+            tool_calls: Vec::new(),
             tool_call_id: None,
         }
     }
-
-    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            role: "tool".to_string(),
-            content: Some(content.into()),
-            tool_calls: Vec::new(),
-            tool_call_id: Some(tool_call_id.into()),
-        }
-    }
-
-    pub fn text(&self) -> &str {
-        self.content.as_deref().unwrap_or_default()
-    }
 }
 
-/// A tool as advertised to the model in the request's `tools` array.
-#[derive(Serialize, Clone, Debug)]
-pub struct ToolDef {
-    #[serde(rename = "type")]
-    pub kind: &'static str,
-    pub function: FunctionDef,
-}
-
-#[derive(Serialize, Clone, Debug)]
-pub struct FunctionDef {
-    pub name: String,
-    pub description: String,
-    /// JSON Schema for the arguments object.
-    pub parameters: serde_json::Value,
-}
-
-impl ToolDef {
-    pub fn function(name: &str, description: &str, parameters: serde_json::Value) -> Self {
-        Self {
-            kind: "function",
-            function: FunctionDef {
-                name: name.to_string(),
-                description: description.to_string(),
-                parameters,
-            },
-        }
-    }
-}
-
-/// A tool call the model wants executed.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ToolCall {
     pub id: String,
-    #[serde(rename = "type", default = "function_kind")]
+    #[serde(rename = "type")]
     pub kind: String,
     pub function: FunctionCall,
 }
 
-fn function_kind() -> String {
-    "function".to_string()
+impl Default for ToolCall {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: "function".to_string(),
+            function: FunctionCall::default(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct FunctionCall {
     pub name: String,
-    /// A JSON *string*, not an object -- that is the wire format. It may be
-    /// malformed if the model was cut off mid-call; callers must handle that.
+    /// Raw JSON, as the model produced it. Kept as a string because that is what
+    /// the wire format uses, and because it may be malformed -- which is the
+    /// tool's problem to report, not this layer's.
     pub arguments: String,
-}
-
-impl ToolCall {
-    /// Parse `arguments` into a JSON object. An absent/blank argument string is
-    /// treated as `{}` -- models routinely omit it for zero-argument tools.
-    pub fn parsed_arguments(&self) -> Result<serde_json::Value, String> {
-        let raw = self.function.arguments.trim();
-        if raw.is_empty() {
-            return Ok(serde_json::json!({}));
-        }
-        serde_json::from_str(raw)
-            .map_err(|e| format!("arguments were not valid JSON: {e}\nreceived: {raw}"))
-    }
-}
-
-/// The result of one assistant turn: any prose it produced, plus any tool calls
-/// it wants run before it can continue.
-#[derive(Clone, Debug, Default)]
-pub struct AssistantTurn {
-    pub text: String,
-    pub tool_calls: Vec<ToolCall>,
-}
-
-impl AssistantTurn {
-    pub fn into_message(self) -> ChatMessage {
-        ChatMessage::assistant(self.text, self.tool_calls)
-    }
 }
 
 #[derive(Deserialize)]
 pub struct StreamDelta {
-    #[serde(default)]
     pub choices: Vec<Choice>,
 }
 
@@ -170,8 +82,6 @@ pub struct Choice {
     /// (non-SSE) completion body.
     #[serde(default)]
     pub message: Option<ChatMessage>,
-    #[serde(default)]
-    pub finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -182,74 +92,43 @@ pub struct Delta {
     pub tool_calls: Vec<ToolCallDelta>,
 }
 
-/// One fragment of a streamed tool call. `id` and `function.name` arrive on the
-/// first fragment only; `function.arguments` dribbles in across many. `index` is
-/// the only field that reliably says which call a fragment belongs to.
-#[derive(Deserialize, Clone, Debug, Default)]
+/// One fragment of a tool call. See `accumulate_tool_call`.
+#[derive(Deserialize, Default)]
 pub struct ToolCallDelta {
     #[serde(default)]
     pub index: usize,
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
     #[serde(default)]
-    pub function: Option<FunctionCallDelta>,
+    pub function: Option<FunctionDelta>,
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
-pub struct FunctionCallDelta {
+#[derive(Deserialize, Default)]
+pub struct FunctionDelta {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub arguments: Option<String>,
 }
 
-/// Reassembles streamed tool-call fragments into whole `ToolCall`s.
-#[derive(Default)]
-struct ToolCallAccumulator {
-    calls: Vec<ToolCall>,
-}
-
-impl ToolCallAccumulator {
-    fn apply(&mut self, delta: &ToolCallDelta) {
-        // Grow to cover `index`: providers may stream call 1's fragments before
-        // call 0 is complete, so this cannot assume calls arrive in order.
-        while self.calls.len() <= delta.index {
-            self.calls.push(ToolCall::default());
-        }
-        let call = &mut self.calls[delta.index];
-
-        if let Some(id) = delta.id.as_deref().filter(|s| !s.is_empty()) {
-            call.id.push_str(id);
-        }
-        if let Some(function) = &delta.function {
-            if let Some(name) = function.name.as_deref().filter(|s| !s.is_empty()) {
-                call.function.name.push_str(name);
-            }
-            if let Some(arguments) = &function.arguments {
-                call.function.arguments.push_str(arguments);
-            }
-        }
-    }
-
-    /// Drop slots that never received a name (a provider quirk: an empty
-    /// trailing delta), and synthesize ids for endpoints that omit them --
-    /// results are matched back by id, so a blank one would be unroutable.
-    fn finish(self) -> Vec<ToolCall> {
-        self.calls
-            .into_iter()
-            .enumerate()
-            .filter(|(_, c)| !c.function.name.is_empty())
-            .map(|(i, mut c)| {
-                if c.id.is_empty() {
-                    c.id = format!("call_{i}");
-                }
-                if c.kind.is_empty() {
-                    c.kind = function_kind();
-                }
-                c
-            })
-            .collect()
-    }
+/// What the request task reports back to the event loop. Every request ends with
+/// exactly one `Done` or `Error`, so the UI can never get stuck on "Streaming…".
+///
+/// `ToolCalls` always arrives *before* the terminating `Done`, which is what lets
+/// the app switch out of `Streaming` and have the trailing `Done` fall through
+/// its own state guard.
+#[derive(Debug)]
+pub enum StreamEvent {
+    Token(String),
+    ToolCalls(Vec<ToolCall>),
+    /// Not from the endpoint: the local command runner reports back on the same
+    /// channel, so the event loop has one place to drain and one stale-id guard
+    /// covering both sources.
+    ToolsFinished(Vec<crate::tools::ToolOutcome>),
+    Done,
+    Error(String),
 }
 
 /// Build the chat-completions URL, tolerating the shapes people actually paste in:
@@ -265,44 +144,56 @@ pub fn chat_completions_url(endpoint: &str) -> String {
     }
 }
 
-pub fn build_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("Could not create HTTP client: {e}"))
+pub async fn stream_chat(
+    endpoint: &str,
+    model: &str,
+    api_key: &str,
+    messages: Vec<ChatMessage>,
+    tools: Vec<Value>,
+    request_id: u64,
+    tx: mpsc::Sender<(u64, StreamEvent)>,
+) {
+    let result = run(endpoint, model, api_key, messages, tools, request_id, &tx).await;
+    let event = match result {
+        Ok(()) => StreamEvent::Done,
+        Err(e) => StreamEvent::Error(e),
+    };
+    let _ = tx.send((request_id, event)).await;
 }
 
-/// Run one assistant turn. Prose is pushed through `tx` as it streams (so the UI
-/// stays live); the assembled turn -- including tool calls -- is returned to the
-/// caller, which is what the agent loop needs to decide what happens next.
-pub async fn stream_turn<E, F>(
-    client: &reqwest::Client,
-    target: &Target,
-    messages: &[ChatMessage],
-    tools: &[ToolDef],
-    tx: &mpsc::Sender<E>,
-    on_token: F,
-) -> Result<AssistantTurn, String>
-where
-    F: Fn(String) -> E,
-{
-    if messages.is_empty() {
+async fn run(
+    endpoint: &str,
+    model: &str,
+    api_key: &str,
+    messages: Vec<ChatMessage>,
+    tools: Vec<Value>,
+    request_id: u64,
+    tx: &mpsc::Sender<(u64, StreamEvent)>,
+) -> Result<(), String> {
+    // A lone system prompt is not a conversation.
+    if messages.iter().all(|m| m.role == "system") {
         return Err("Nothing to send.".to_string());
     }
 
+    let sent_tools = !tools.is_empty();
     let request = ChatRequest {
-        model: target.model.clone(),
-        messages: messages.to_vec(),
+        model: model.to_string(),
+        messages,
         stream: true,
-        max_tokens: target.max_tokens,
-        tools: (!tools.is_empty()).then(|| tools.to_vec()),
+        max_tokens: 4096,
+        tools,
     };
 
-    let url = chat_completions_url(&target.endpoint);
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Could not create HTTP client: {e}"))?;
+
+    let url = chat_completions_url(endpoint);
 
     let mut req = client.post(&url).json(&request);
-    if !target.api_key.is_empty() {
-        req = req.bearer_auth(&target.api_key);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
     }
 
     let response = req.send().await.map_err(|e| {
@@ -324,7 +215,14 @@ where
         } else {
             format!("\n{}", truncate(detail, 800))
         };
-        return Err(format!("HTTP {status} from {url}{detail}"));
+        // The most likely cause of a 400 the moment file tools ship is an
+        // endpoint that does not implement tool calling, so name the fix.
+        let hint = if status == reqwest::StatusCode::BAD_REQUEST && sent_tools {
+            "\n\nIf this endpoint does not support tool calling, disable file tools:\nset `enabled = false` under [tools] in ~/.tuisample-code/config.toml."
+        } else {
+            ""
+        };
+        return Err(format!("HTTP {status} from {url}{detail}{hint}"));
     }
 
     let streaming = response
@@ -335,20 +233,32 @@ where
         .unwrap_or(true);
 
     if !streaming {
-        return non_streaming_turn(response, &url, tx, &on_token).await;
+        // Endpoint ignored `stream: true` and returned one JSON object.
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Could not read response body: {e}"))?;
+        let parsed: StreamDelta = serde_json::from_str(&body)
+            .map_err(|e| format!("Unexpected response from {url}: {e}\n{}", truncate(&body, 800)))?;
+        if let Some(message) = parsed.choices.into_iter().next().and_then(|c| c.message) {
+            if let Some(text) = message.content.filter(|t| !t.is_empty()) {
+                let _ = tx.send((request_id, StreamEvent::Token(text))).await;
+            }
+            let calls = finalize_tool_calls(message.tool_calls);
+            if !calls.is_empty() {
+                let _ = tx.send((request_id, StreamEvent::ToolCalls(calls))).await;
+            }
+        }
+        return Ok(());
     }
-
-    let mut turn = AssistantTurn::default();
-    let mut calls = ToolCallAccumulator::default();
-    let mut finish_reason: Option<String> = None;
 
     let mut stream = response.bytes_stream();
     // Chunks split arbitrarily: mid-UTF-8-sequence and mid-SSE-line. Buffer bytes
     // and only consume whole lines, otherwise tokens get dropped or decoding fails.
     let mut buf: Vec<u8> = Vec::new();
-    let mut done = false;
+    let mut pending: Vec<ToolCall> = Vec::new();
 
-    'outer: while let Some(chunk) = stream.next().await {
+    'read: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Stream interrupted: {e}"))?;
         buf.extend_from_slice(&chunk);
 
@@ -356,24 +266,10 @@ where
             let line: Vec<u8> = buf.drain(..=nl).collect();
             let line = String::from_utf8_lossy(&line[..line.len() - 1]);
             match parse_sse_line(line.trim_end_matches('\r')) {
-                SseLine::Done => {
-                    done = true;
-                    break 'outer;
-                }
-                SseLine::Delta(delta, reason) => {
-                    if reason.is_some() {
-                        finish_reason = reason;
-                    }
-                    if let Some(text) = delta.content.filter(|s| !s.is_empty()) {
-                        turn.text.push_str(&text);
-                        if tx.send(on_token(text)).await.is_err() {
-                            // Receiver gone; the app is shutting down.
-                            done = true;
-                            break 'outer;
-                        }
-                    }
-                    for d in &delta.tool_calls {
-                        calls.apply(d);
+                SseLine::Done => break 'read,
+                SseLine::Delta(delta) => {
+                    if !apply_delta(delta, &mut pending, request_id, tx).await {
+                        return Ok(()); // receiver gone; app is shutting down
                     }
                 }
                 SseLine::Ignore => {}
@@ -382,67 +278,91 @@ where
     }
 
     // Trailing line without a final newline.
-    if !done && !buf.is_empty() {
+    if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf).to_string();
-        if let SseLine::Delta(delta, reason) = parse_sse_line(line.trim()) {
-            if reason.is_some() {
-                finish_reason = reason;
-            }
-            if let Some(text) = delta.content.filter(|s| !s.is_empty()) {
-                turn.text.push_str(&text);
-                let _ = tx.send(on_token(text)).await;
-            }
-            for d in &delta.tool_calls {
-                calls.apply(d);
-            }
+        if let SseLine::Delta(delta) = parse_sse_line(line.trim()) {
+            apply_delta(delta, &mut pending, request_id, tx).await;
         }
     }
 
-    turn.tool_calls = calls.finish();
-
-    // A turn cut off at max_tokens leaves truncated prose and, worse, tool-call
-    // arguments that are invalid JSON. Say so rather than letting it look like
-    // the model simply stopped.
-    if finish_reason.as_deref() == Some("length") {
-        turn.text
-            .push_str("\n\n[truncated: hit max_tokens; raise it in config.toml]");
+    // Tool calls are only complete once the stream is, since `arguments` is
+    // assembled from fragments and is not valid JSON before then.
+    let calls = finalize_tool_calls(pending);
+    if !calls.is_empty() {
+        let _ = tx.send((request_id, StreamEvent::ToolCalls(calls))).await;
     }
 
-    Ok(turn)
+    Ok(())
 }
 
-/// Endpoint ignored `stream: true` and returned one JSON object.
-async fn non_streaming_turn<E, F>(
-    response: reqwest::Response,
-    url: &str,
-    tx: &mpsc::Sender<E>,
-    on_token: &F,
-) -> Result<AssistantTurn, String>
-where
-    F: Fn(String) -> E,
-{
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("Could not read response body: {e}"))?;
-    let parsed: StreamDelta = serde_json::from_str(&body).map_err(|e| {
-        format!("Unexpected response from {url}: {e}\n{}", truncate(&body, 800))
-    })?;
-
-    let mut turn = AssistantTurn::default();
-    if let Some(message) = parsed.choices.first().and_then(|c| c.message.as_ref()) {
-        turn.text = message.text().to_string();
-        turn.tool_calls = message.tool_calls.clone();
-        if !turn.text.is_empty() {
-            let _ = tx.send(on_token(turn.text.clone())).await;
+/// Returns false if the receiver is gone.
+async fn apply_delta(
+    delta: Delta,
+    pending: &mut Vec<ToolCall>,
+    request_id: u64,
+    tx: &mpsc::Sender<(u64, StreamEvent)>,
+) -> bool {
+    if let Some(text) = delta.content.filter(|s| !s.is_empty()) {
+        if tx.send((request_id, StreamEvent::Token(text))).await.is_err() {
+            return false;
         }
     }
-    Ok(turn)
+    for fragment in delta.tool_calls {
+        accumulate_tool_call(pending, fragment);
+    }
+    true
+}
+
+/// Tool calls do not arrive whole. The id and function name come in one delta,
+/// then `arguments` dribbles out a few characters at a time across many more --
+/// all correlated only by `index`, and not parseable as JSON until the last
+/// fragment lands. Reassembling them is this function's whole job.
+fn accumulate_tool_call(pending: &mut Vec<ToolCall>, fragment: ToolCallDelta) {
+    if pending.len() <= fragment.index {
+        pending.resize_with(fragment.index + 1, ToolCall::default);
+    }
+    let slot = &mut pending[fragment.index];
+
+    if let Some(id) = fragment.id.filter(|s| !s.is_empty()) {
+        slot.id = id;
+    }
+    if let Some(kind) = fragment.kind.filter(|s| !s.is_empty()) {
+        slot.kind = kind;
+    }
+    if let Some(function) = fragment.function {
+        if let Some(name) = function.name {
+            slot.function.name.push_str(&name);
+        }
+        if let Some(arguments) = function.arguments {
+            slot.function.arguments.push_str(&arguments);
+        }
+    }
+}
+
+/// Drop half-formed calls and give every survivor an id.
+///
+/// An id is mandatory: the `tool` message answering a call has to quote it back,
+/// and providers reject the conversation if it does not match. Some endpoints
+/// still omit it, so synthesize one rather than send an empty string.
+fn finalize_tool_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    calls
+        .into_iter()
+        .filter(|c| !c.function.name.is_empty())
+        .enumerate()
+        .map(|(i, mut c)| {
+            if c.id.is_empty() {
+                c.id = format!("call_{i}");
+            }
+            if c.function.arguments.trim().is_empty() {
+                c.function.arguments = "{}".to_string();
+            }
+            c
+        })
+        .collect()
 }
 
 pub enum SseLine {
-    /// A content and/or tool-call fragment, plus this chunk's `finish_reason`.
-    Delta(Delta, Option<String>),
+    Delta(Delta),
     Done,
     Ignore,
 }
@@ -460,13 +380,12 @@ pub fn parse_sse_line(line: &str) -> SseLine {
     }
 
     match serde_json::from_str::<StreamDelta>(payload) {
-        Ok(mut parsed) => match parsed.choices.first_mut() {
-            Some(choice) => SseLine::Delta(
-                std::mem::take(&mut choice.delta),
-                choice.finish_reason.take(),
-            ),
-            None => SseLine::Ignore,
-        },
+        Ok(parsed) => parsed
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| SseLine::Delta(c.delta))
+            .unwrap_or(SseLine::Ignore),
         Err(_) => SseLine::Ignore,
     }
 }
@@ -487,7 +406,7 @@ mod tests {
 
     fn token(line: &str) -> Option<String> {
         match parse_sse_line(line) {
-            SseLine::Delta(d, _) => d.content.filter(|s| !s.is_empty()),
+            SseLine::Delta(delta) => delta.content.filter(|s| !s.is_empty()),
             _ => None,
         }
     }
@@ -526,161 +445,106 @@ mod tests {
         assert!(matches!(parse_sse_line(": keep-alive"), SseLine::Ignore));
         assert!(matches!(parse_sse_line(""), SseLine::Ignore));
         // Role-only opening delta carries no content.
-        assert_eq!(
-            token(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#),
-            None
-        );
+        assert!(token(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#).is_none());
     }
 
-    /// A tool-only turn carries `content: null`, which must not be mistaken for
-    /// a parse failure.
+    /// The reassembly this whole feature rests on: name and id once, arguments
+    /// smeared across five fragments, none of them valid JSON alone.
     #[test]
-    fn a_tool_call_delta_parses_without_content() {
-        let line = r#"data: {"choices":[{"delta":{"content":null,"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file","arguments":""}}]}}]}"#;
-        match parse_sse_line(line) {
-            SseLine::Delta(d, _) => {
-                assert!(d.content.is_none());
-                assert_eq!(d.tool_calls.len(), 1);
-                assert_eq!(d.tool_calls[0].id.as_deref(), Some("call_a"));
-            }
-            _ => panic!("expected a Delta"),
-        }
-    }
-
-    #[test]
-    fn accumulator_reassembles_arguments_split_across_fragments() {
-        let mut acc = ToolCallAccumulator::default();
-        for (index, id, name, args) in [
-            (0usize, Some("call_a"), Some("read_file"), Some(r#"{"pa"#)),
-            (0, None, None, Some(r#"th": "src/"#)),
-            (0, None, None, Some(r#"app.rs"}"#)),
+    fn tool_call_fragments_reassemble_into_one_call() {
+        let mut pending = Vec::new();
+        for line in [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\": \"sr"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"c/main"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":".rs\"}"}}]}}]}"#,
         ] {
-            acc.apply(&ToolCallDelta {
-                index,
-                id: id.map(str::to_string),
-                function: Some(FunctionCallDelta {
-                    name: name.map(str::to_string),
-                    arguments: args.map(str::to_string),
-                }),
-            });
+            if let SseLine::Delta(delta) = parse_sse_line(line) {
+                for fragment in delta.tool_calls {
+                    accumulate_tool_call(&mut pending, fragment);
+                }
+            }
         }
 
-        let calls = acc.finish();
+        let calls = finalize_tool_calls(pending);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].id, "call_abc");
         assert_eq!(calls[0].function.name, "read_file");
-        assert_eq!(
-            calls[0].parsed_arguments().unwrap(),
-            serde_json::json!({"path": "src/app.rs"})
-        );
+        assert_eq!(calls[0].function.arguments, r#"{"path": "src/main.rs"}"#);
+        // Must be parseable, or the tool layer has nothing to work with.
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["path"], "src/main.rs");
     }
 
-    /// Two calls in one turn, interleaved -- `index`, not arrival order, decides
-    /// which fragment belongs to which call.
     #[test]
-    fn accumulator_keeps_interleaved_parallel_calls_apart() {
-        let mut acc = ToolCallAccumulator::default();
-        let frag = |index, id: Option<&str>, name: Option<&str>, args: &str| ToolCallDelta {
-            index,
-            id: id.map(str::to_string),
-            function: Some(FunctionCallDelta {
-                name: name.map(str::to_string),
-                arguments: Some(args.to_string()),
-            }),
-        };
-        acc.apply(&frag(0, Some("a"), Some("read_file"), r#"{"path":"#));
-        acc.apply(&frag(1, Some("b"), Some("list_dir"), r#"{"path":"#));
-        acc.apply(&frag(0, None, None, r#""one.rs"}"#));
-        acc.apply(&frag(1, None, None, r#""src"}"#));
+    fn parallel_tool_calls_are_kept_apart_by_index() {
+        let mut pending = Vec::new();
+        for line in [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"list_dir","arguments":"{\"path\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"src\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+        ] {
+            if let SseLine::Delta(delta) = parse_sse_line(line) {
+                for fragment in delta.tool_calls {
+                    accumulate_tool_call(&mut pending, fragment);
+                }
+            }
+        }
 
-        let calls = acc.finish();
+        let calls = finalize_tool_calls(pending);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].function.name, "read_file");
-        assert_eq!(
-            calls[0].parsed_arguments().unwrap(),
-            serde_json::json!({"path": "one.rs"})
-        );
+        assert_eq!(calls[0].function.arguments, r#"{"path":"a.rs"}"#);
         assert_eq!(calls[1].function.name, "list_dir");
-        assert_eq!(
-            calls[1].parsed_arguments().unwrap(),
-            serde_json::json!({"path": "src"})
-        );
+        assert_eq!(calls[1].function.arguments, r#"{"path":"src"}"#);
     }
 
     #[test]
-    fn accumulator_synthesizes_ids_and_drops_nameless_slots() {
-        let mut acc = ToolCallAccumulator::default();
-        acc.apply(&ToolCallDelta {
-            index: 0,
-            id: None,
-            function: Some(FunctionCallDelta {
-                name: Some("list_dir".to_string()),
-                arguments: Some("{}".to_string()),
-            }),
-        });
-        // A trailing fragment that never names a tool is not a call.
-        acc.apply(&ToolCallDelta {
-            index: 1,
-            id: Some("orphan".to_string()),
-            function: None,
-        });
-
-        let calls = acc.finish();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "call_0");
-        assert_eq!(calls[0].kind, "function");
-    }
-
-    #[test]
-    fn blank_arguments_parse_as_an_empty_object() {
-        let call = ToolCall {
-            id: "x".to_string(),
-            kind: "function".to_string(),
-            function: FunctionCall {
-                name: "list_dir".to_string(),
-                arguments: "  ".to_string(),
-            },
-        };
-        assert_eq!(call.parsed_arguments().unwrap(), serde_json::json!({}));
-    }
-
-    #[test]
-    fn malformed_arguments_report_an_error_rather_than_panicking() {
-        let call = ToolCall {
-            id: "x".to_string(),
-            kind: "function".to_string(),
-            function: FunctionCall {
-                name: "read_file".to_string(),
-                arguments: r#"{"path": "unterminated"#.to_string(),
-            },
-        };
-        assert!(call.parsed_arguments().is_err());
-    }
-
-    /// Tool-free turns must serialize exactly as they did before tool calling
-    /// existed -- some endpoints reject unknown/null fields.
-    #[test]
-    fn a_plain_message_serializes_without_tool_fields() {
-        let json = serde_json::to_string(&ChatMessage::user("hi")).unwrap();
-        assert_eq!(json, r#"{"role":"user","content":"hi"}"#);
-    }
-
-    #[test]
-    fn a_tool_only_assistant_turn_serializes_with_null_content_omitted() {
-        let message = ChatMessage::assistant(
-            "",
-            vec![ToolCall {
-                id: "call_a".to_string(),
+    fn calls_missing_an_id_or_arguments_are_repaired_and_nameless_ones_dropped() {
+        let calls = finalize_tool_calls(vec![
+            ToolCall {
+                id: String::new(),
                 kind: "function".to_string(),
                 function: FunctionCall {
                     name: "list_dir".to_string(),
-                    arguments: "{}".to_string(),
+                    arguments: String::new(),
+                },
+            },
+            ToolCall::default(), // no name: never happened, drop it
+        ]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_0");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    /// An assistant message carrying only tool calls must serialize without a
+    /// `content` key at all -- several providers reject `"content": ""` there.
+    #[test]
+    fn a_tool_call_message_serializes_without_a_content_field() {
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"a.rs"}"#.to_string(),
                 },
             }],
-        );
-        let json = serde_json::to_value(&message).unwrap();
-        assert!(json.get("content").is_none());
-        assert_eq!(json["tool_calls"][0]["type"], "function");
+            tool_call_id: None,
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(!json.contains("content"), "{json}");
+        assert!(json.contains(r#""tool_calls""#), "{json}");
+    }
+
+    #[test]
+    fn an_ordinary_message_carries_no_tool_fields() {
+        let json = serde_json::to_string(&ChatMessage::text("user", "hi")).unwrap();
+        assert_eq!(json, r#"{"role":"user","content":"hi"}"#);
     }
 
     /// Serve one canned HTTP response on an ephemeral port and return its address.
@@ -702,37 +566,44 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn sse(body: &str) -> Vec<u8> {
-        format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
-            .into_bytes()
-    }
-
-    pub(crate) fn target(endpoint: &str) -> Target {
-        Target {
-            endpoint: endpoint.to_string(),
-            model: "test-model".to_string(),
-            api_key: "sk-test".to_string(),
-            max_tokens: 4096,
-        }
-    }
-
-    async fn run(endpoint: &str) -> (Result<AssistantTurn, String>, Vec<String>) {
+    async fn collect(endpoint: &str) -> Vec<StreamEvent> {
         let (tx, mut rx) = mpsc::channel(64);
-        let client = build_client().unwrap();
-        let result = stream_turn(
-            &client,
-            &target(endpoint),
-            &[ChatMessage::user("hi")],
-            &[],
-            &tx,
-            |t| t,
+        stream_chat(
+            endpoint,
+            "test-model",
+            "sk-test",
+            vec![ChatMessage::text("user", "hi")],
+            Vec::new(),
+            1,
+            tx,
         )
         .await;
-        let mut tokens = Vec::new();
-        while let Ok(t) = rx.try_recv() {
-            tokens.push(t);
+        let mut events = Vec::new();
+        while let Ok((_, e)) = rx.try_recv() {
+            events.push(e);
         }
-        (result, tokens)
+        events
+    }
+
+    fn text_of(events: &[StreamEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Token(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_calls_of(events: &[StreamEvent]) -> Vec<ToolCall> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCalls(calls) => Some(calls.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
     }
 
     /// End-to-end against a live socket, delivered 7 bytes at a time so SSE lines
@@ -746,58 +617,53 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\" wörld→\"}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let addr = serve(sse(body), 7).await;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        let addr = serve(response.into_bytes(), 7).await;
 
-        let (turn, tokens) = run(&addr).await;
-        let turn = turn.expect("the turn should succeed");
-        assert_eq!(turn.text, "Hello wörld→");
-        assert!(turn.tool_calls.is_empty());
-        assert_eq!(tokens.concat(), "Hello wörld→");
+        let events = collect(&addr).await;
+        assert_eq!(text_of(&events), "Hello wörld→");
+        assert!(matches!(events.last(), Some(StreamEvent::Done)));
     }
 
-    /// The same 7-byte split, but over a tool call -- the JSON arguments are torn
-    /// apart mid-string and must still reassemble.
+    /// The same 7-byte splitting applied to tool calls, where a fragment boundary
+    /// can land in the middle of an escaped JSON string.
     #[tokio::test]
-    async fn reassembles_a_tool_call_split_across_chunks() {
+    async fn streams_a_tool_call_across_split_chunks() {
         let body = concat!(
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\": \"src/app.rs\"}"}}]}}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
-            "\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Let me look.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\": \\\"src/main.rs\\\"}\"}}]}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let addr = serve(sse(body), 7).await;
-
-        let (turn, _) = run(&addr).await;
-        let turn = turn.expect("the turn should succeed");
-        assert_eq!(turn.tool_calls.len(), 1);
-        assert_eq!(turn.tool_calls[0].id, "call_x");
-        assert_eq!(turn.tool_calls[0].function.name, "read_file");
-        assert_eq!(
-            turn.tool_calls[0].parsed_arguments().unwrap(),
-            serde_json::json!({"path": "src/app.rs"})
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
         );
-    }
+        let addr = serve(response.into_bytes(), 7).await;
 
-    #[tokio::test]
-    async fn a_turn_cut_off_at_max_tokens_says_so() {
-        let body = concat!(
-            r#"data: {"choices":[{"delta":{"content":"half an ans"}}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
-            "\n\n",
-            "data: [DONE]\n\n",
-        );
-        let addr = serve(sse(body), 4096).await;
+        let events = collect(&addr).await;
+        assert_eq!(text_of(&events), "Let me look.");
 
-        let (turn, _) = run(&addr).await;
-        let turn = turn.expect("the turn should succeed");
-        assert!(turn.text.starts_with("half an ans"));
-        assert!(turn.text.contains("max_tokens"), "{}", turn.text);
+        let calls = tool_calls_of(&events);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"path": "src/main.rs"}"#);
+
+        // Ordering matters: the app leaves `Streaming` on ToolCalls, and relies on
+        // the trailing Done arriving afterwards to be ignored.
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                StreamEvent::Token(_) => "token",
+                StreamEvent::ToolCalls(_) => "tools",
+                StreamEvent::ToolsFinished(_) => "finished",
+                StreamEvent::Done => "done",
+                StreamEvent::Error(_) => "error",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["token", "tools", "done"]);
     }
 
     /// Endpoints that ignore `stream: true` must still produce an answer.
@@ -810,26 +676,25 @@ mod tests {
         );
         let addr = serve(response.into_bytes(), 4096).await;
 
-        let (turn, tokens) = run(&addr).await;
-        assert_eq!(turn.expect("the turn should succeed").text, "Plain reply");
-        assert_eq!(tokens.concat(), "Plain reply");
+        let events = collect(&addr).await;
+        assert_eq!(text_of(&events), "Plain reply");
+        assert!(matches!(events.last(), Some(StreamEvent::Done)));
     }
 
-    /// Tool calls also have to survive the non-streaming path.
+    /// ...including when that non-streaming answer is a tool call.
     #[tokio::test]
-    async fn a_non_streaming_response_carries_tool_calls() {
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"list_dir","arguments":"{\"path\":\".\"}"}}]}}]}"#;
+    async fn a_non_streaming_response_can_also_carry_tool_calls() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"list_dir","arguments":"{\"path\":\"src\"}"}}]}}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         let addr = serve(response.into_bytes(), 4096).await;
 
-        let (turn, _) = run(&addr).await;
-        let turn = turn.expect("the turn should succeed");
-        assert!(turn.text.is_empty());
-        assert_eq!(turn.tool_calls.len(), 1);
-        assert_eq!(turn.tool_calls[0].function.name, "list_dir");
+        let calls = tool_calls_of(&collect(&addr).await);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_9");
+        assert_eq!(calls[0].function.name, "list_dir");
     }
 
     #[tokio::test]
@@ -841,21 +706,56 @@ mod tests {
         );
         let addr = serve(response.into_bytes(), 4096).await;
 
-        match run(&addr).await.0 {
-            Err(e) => {
+        let events = collect(&addr).await;
+        match events.last() {
+            Some(StreamEvent::Error(e)) => {
                 assert!(e.contains("401"), "{e}");
                 assert!(e.contains("Invalid API key"), "{e}");
             }
-            Ok(_) => panic!("expected an error"),
+            other => panic!("expected an Error event, got {other:?}"),
+        }
+    }
+
+    /// A 400 on a request that carried tool schemas is most likely an endpoint
+    /// that cannot do tool calling, so the error has to say how to turn them off.
+    #[tokio::test]
+    async fn a_400_while_sending_tools_explains_how_to_disable_them() {
+        let body = r#"{"error":"unknown field: tools"}"#;
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+
+        let (tx, mut rx) = mpsc::channel(64);
+        stream_chat(
+            &addr,
+            "m",
+            "k",
+            vec![ChatMessage::text("user", "hi")],
+            vec![serde_json::json!({"type": "function"})],
+            1,
+            tx,
+        )
+        .await;
+
+        let mut last = None;
+        while let Ok((_, e)) = rx.try_recv() {
+            last = Some(e);
+        }
+        match last {
+            Some(StreamEvent::Error(e)) => assert!(e.contains("enabled = false"), "{e}"),
+            other => panic!("expected an Error event, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn unreachable_endpoints_report_an_error_rather_than_hanging() {
         // Port 1 on loopback refuses connections immediately.
-        match run("http://127.0.0.1:1").await.0 {
-            Err(e) => assert!(e.contains("Could not reach"), "{e}"),
-            Ok(_) => panic!("expected an error"),
+        let events = collect("http://127.0.0.1:1").await;
+        match events.last() {
+            Some(StreamEvent::Error(e)) => assert!(e.contains("Could not reach"), "{e}"),
+            other => panic!("expected an Error event, got {other:?}"),
         }
     }
 }

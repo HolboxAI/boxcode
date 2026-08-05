@@ -1,53 +1,86 @@
-use crate::agent::{AgentEvent, PermissionRequest};
 use crate::config::Config;
-use crate::llm::ChatMessage;
-use crate::permission::{Allowlist, Decision};
+use crate::danger;
+use crate::llm::{ChatMessage, ToolCall};
 use crate::providers;
+use crate::tools::{self, ToolOutcome};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::oneshot;
+use std::collections::{HashSet, VecDeque};
+use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppState {
     AwaitingInput,
-    /// Transient: the event loop picks this up, starts the run, and moves to `Working`.
-    Sending { prompt: String },
-    /// An agent is running: thinking, calling tools, or waiting on approval.
-    Working,
+    /// Transient: the event loop picks this up, fires the request, and moves to `Streaming`.
+    Sending,
+    Streaming,
+    /// A command is on screen waiting for the user to allow or refuse it. The
+    /// only thing standing between the model and the machine, so the turn stops
+    /// dead here until a key is pressed.
+    AwaitingApproval,
+    /// Commands are running in a spawned task; results arrive on the channel.
+    ExecutingTools,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ToolStatus {
-    Running,
-    Ok,
-    Failed,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+    Error,
+    /// Confirmations from `/provider` and `/model`, e.g. "Switched to deepseek /
+    /// deepseek-v4-flash." Distinct from Assistant (would wrongly imply the
+    /// model said it) and Error (wrong tone/color for a success message).
+    System,
+    /// The result of one tool call, sent back to the model as `role: "tool"`.
+    Tool,
 }
 
-/// One thing that happened, in order. Unlike the old flat transcript this
-/// distinguishes what the model *said* from what it *did*, which is most of what
-/// makes an agent run readable.
 #[derive(Clone)]
-pub enum Entry {
-    User(String),
-    Agent {
-        agent: &'static str,
-        text: String,
-    },
-    Tool {
-        call_id: String,
-        summary: String,
-        status: ToolStatus,
-        detail: String,
-    },
-    /// Confirmations from `/provider` and `/model`.
-    System(String),
-    Error(String),
+pub struct Message {
+    pub role: Role,
+    /// What goes on the wire. For a tool result this is the entire file, which is
+    /// why it is not what gets drawn.
+    pub content: String,
+    /// What the transcript shows, when that differs from `content`.
+    pub display: Option<String>,
+    /// Tool calls the assistant asked for. Only ever set on `Role::Assistant`.
+    pub tool_calls: Vec<ToolCall>,
+    /// Which call this message answers. Only ever set on `Role::Tool`.
+    pub tool_call_id: Option<String>,
 }
 
-/// State of the overlays. `None` means the normal input box is active; every
-/// other variant intercepts all keyboard input in `handle_key` before it reaches
-/// the normal editing logic.
+impl Message {
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            display: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// The text to draw, which for a tool result is a one-line summary rather
+    /// than the file it fetched.
+    pub fn body(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.content)
+    }
+}
+
+impl Role {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Role::User => "You",
+            Role::Assistant => "Assistant",
+            Role::Error => "Error",
+            Role::System => "System",
+            Role::Tool => "Tool",
+        }
+    }
+}
+
+/// State of the `/provider` and `/model` overlays. `None` means the normal input
+/// box is active; every other variant intercepts all keyboard input in
+/// `handle_key` before it reaches the normal editing logic.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Overlay {
     ProviderPicker {
@@ -62,12 +95,12 @@ pub enum Overlay {
         model: String,
     },
     CustomEndpoint(CustomStep),
-    /// An agent is blocked waiting for this answer.
-    Permission {
-        summary: String,
-        /// `None` when the call is not safe to grant for a whole session, in
-        /// which case the "allow for session" option is not offered at all.
-        grant: Option<String>,
+    /// Asks about `pending_tools.front()`. Unlike the other overlays this one
+    /// appears while the app is busy, mid-turn.
+    ToolApproval {
+        action: tools::Action,
+        /// How many more calls are queued behind this one.
+        remaining: usize,
     },
 }
 
@@ -83,30 +116,17 @@ pub enum CustomStep {
 
 pub struct App {
     pub state: AppState,
-    pub entries: Vec<Entry>,
-    /// The conversation as the model sees it, including tool calls and results.
-    /// Distinct from `entries`: tool results belong here and not on screen, and
-    /// `/provider` confirmations belong on screen and not here.
-    pub session_messages: Vec<ChatMessage>,
+    pub messages: Vec<Message>,
     /// Raw text of the prompt box. May contain '\n' (Alt/Shift-Enter inserts one).
     pub input_buffer: String,
     /// Cursor position as a *byte* index into `input_buffer`. Always on a char boundary.
     pub cursor: usize,
-    /// Prose from the turn in flight, not yet committed to an `Entry`.
+    /// Text accumulated from the in-flight response.
     pub streaming_response: String,
-    /// Which agent is currently talking, for the streaming label.
-    pub active_agent: &'static str,
-    /// Incremented per run so events from a cancelled run are ignored.
+    /// Incremented per request so tokens from a cancelled request are ignored.
     pub request_id: u64,
-    /// Abort handle for the in-flight run task, used by Esc.
+    /// Abort handle for the in-flight request task, used by Esc.
     pub abort: Option<tokio::task::AbortHandle>,
-    /// Checked by the agent loop between steps so cancellation is cooperative as
-    /// well as abrupt -- an aborted task cannot answer its outstanding tool calls.
-    pub cancel: Arc<AtomicBool>,
-    /// Session grants, shared with every agent task.
-    pub allowlist: Allowlist,
-    /// Held while a permission overlay is up; answering it resolves the agent.
-    pub pending_permission: Option<oneshot::Sender<Decision>>,
     pub scroll: u16,
     /// While true the message pane sticks to the bottom as new text arrives.
     pub follow_tail: bool,
@@ -114,7 +134,7 @@ pub struct App {
     pub should_exit: bool,
     /// Set once the user has interacted, so the welcome panel gives way to the transcript.
     pub greeted: bool,
-    /// `Some` while an overlay is active; see `Overlay`.
+    /// `Some` while `/provider` or `/model` is active; see `Overlay`.
     pub overlay: Option<Overlay>,
     /// Single-line buffer for overlay text entry (API key, custom endpoint/model).
     /// Kept separate from `input_buffer` so the (possibly masked) overlay text
@@ -122,23 +142,59 @@ pub struct App {
     /// never fight over `f.set_cursor(...)` in the same frame.
     pub overlay_input: String,
     pub overlay_cursor: usize,
+    /// Calls still awaiting a yes or no, front first.
+    pub pending_tools: VecDeque<ToolCall>,
+    /// Calls the user allowed, waiting for the event loop to spawn them.
+    pub approved_tools: Vec<ToolCall>,
+    /// A snapshot of `approved_tools` taken the moment execution starts, kept
+    /// around purely for display. `main.rs` drains `approved_tools` as soon as
+    /// it spawns the runner task, so by the next frame that list is empty --
+    /// without this copy "Running N commands…" would show N for one frame and
+    /// then silently go blank while the commands were still running.
+    pub running_tools: Vec<ToolCall>,
+    /// Tool rounds spent on the current prompt, reset by `submit`. Once this hits
+    /// the configured ceiling the schemas stop being sent, which is what makes a
+    /// model that will not stop calling tools produce an answer instead.
+    pub tool_steps: usize,
+    /// When the current turn started, for the elapsed-time shown in the
+    /// footer. `None` while idle; set once in `submit`, cleared on every path
+    /// back to `AwaitingInput` (`finish_stream`, `fail_stream`, `cancel`).
+    pub busy_started: Option<std::time::Instant>,
+    /// Characters streamed so far this turn. There is no authoritative token
+    /// count until the endpoint's final usage field (most don't send one by
+    /// default), so the footer shows `streamed_chars / 4` as a rough live
+    /// estimate -- the same kind of approximation Claude Code's own live
+    /// counter is understood to show mid-stream.
+    pub streamed_chars: usize,
+    /// One line for the welcome screen describing where commands will run, or
+    /// why the tool is off. Set by `main` once the workspace has been resolved.
+    pub workspace_status: String,
+    /// The resolved working directory, shown on the approval prompt so it is
+    /// always clear *where* a command is about to run.
+    pub workspace_root: String,
+    /// Prompts already sent this session, oldest first, for ↑/↓ recall.
+    pub prompt_history: Vec<String>,
+    /// Where ↑/↓ currently sit in `prompt_history`. `None` means "not
+    /// browsing" -- the input box holds whatever was typed rather than a
+    /// recalled entry, which is what makes the first ↑ land on the most recent
+    /// prompt instead of the second-most-recent.
+    pub history_index: Option<usize>,
+    /// What was in the input box when browsing started, restored by pressing ↓
+    /// past the newest entry. Without it, reaching for an old prompt and
+    /// changing your mind silently eats a half-written one.
+    pub history_draft: String,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
         Self {
             state: AppState::AwaitingInput,
-            entries: Vec::new(),
-            session_messages: Vec::new(),
+            messages: Vec::new(),
             input_buffer: String::new(),
             cursor: 0,
             streaming_response: String::new(),
-            active_agent: crate::agent::DEFAULT_AGENT,
             request_id: 0,
             abort: None,
-            cancel: Arc::new(AtomicBool::new(false)),
-            allowlist: Allowlist::new(),
-            pending_permission: None,
             scroll: 0,
             follow_tail: true,
             config,
@@ -147,17 +203,22 @@ impl App {
             overlay: None,
             overlay_input: String::new(),
             overlay_cursor: 0,
+            pending_tools: VecDeque::new(),
+            approved_tools: Vec::new(),
+            running_tools: Vec::new(),
+            tool_steps: 0,
+            busy_started: None,
+            streamed_chars: 0,
+            workspace_status: String::new(),
+            workspace_root: String::new(),
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
         }
     }
 
     pub fn is_busy(&self) -> bool {
         !matches!(self.state, AppState::AwaitingInput)
-    }
-
-    /// True while an agent is blocked on the user's answer, which the footer
-    /// shows differently from ordinary work.
-    pub fn awaiting_permission(&self) -> bool {
-        self.pending_permission.is_some()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -201,7 +262,7 @@ impl App {
                         "/new" if !self.is_busy() => {
                             self.input_buffer.clear();
                             self.cursor = 0;
-                            self.reset_session();
+                            self.start_new_conversation();
                         }
                         _ => self.submit(),
                     }
@@ -234,16 +295,32 @@ impl App {
             KeyCode::Home => self.cursor = self.line_start(),
             KeyCode::End => self.cursor = self.line_end(),
 
-            KeyCode::Up | KeyCode::PageUp => {
-                self.follow_tail = false;
-                self.scroll = self
-                    .scroll
-                    .saturating_sub(if key.code == KeyCode::Up { 1 } else { 10 });
+            // Up/Down recall previous prompts rather than scrolling the
+            // transcript -- the arrows are next to the thing you are typing, so
+            // that is what they should act on. PgUp/PgDn keep the transcript.
+            // Inside a multi-line prompt they move between its lines first,
+            // because losing a half-written paragraph to a stray Up is worse
+            // than having to press PgUp to scroll.
+            KeyCode::Up => {
+                if self.cursor_line() > 0 {
+                    self.move_cursor_line(-1);
+                } else {
+                    self.recall_previous();
+                }
             }
-            KeyCode::Down | KeyCode::PageDown => {
-                self.scroll = self
-                    .scroll
-                    .saturating_add(if key.code == KeyCode::Down { 1 } else { 10 });
+            KeyCode::PageUp => {
+                self.follow_tail = false;
+                self.scroll = self.scroll.saturating_sub(10);
+            }
+            KeyCode::Down => {
+                if self.cursor_line() + 1 < self.input_buffer.split('\n').count() {
+                    self.move_cursor_line(1);
+                } else {
+                    self.recall_next();
+                }
+            }
+            KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_add(10);
             }
 
             KeyCode::Esc => self.cancel(),
@@ -255,8 +332,8 @@ impl App {
     /// Bracketed paste — a multi-line paste must land in the buffer verbatim,
     /// not be interpreted as a series of Enter presses. Routed into the overlay's
     /// text field while a text-entry overlay is active (pasting an API key is
-    /// the realistic common case), and ignored while a list-picker or permission
-    /// overlay is active (nothing to paste into).
+    /// the realistic common case), and ignored while a list-picker overlay is
+    /// active (nothing to paste into).
     pub fn handle_paste(&mut self, text: String) {
         let cleaned = text.replace("\r\n", "\n").replace('\r', "\n");
         match &self.overlay {
@@ -285,176 +362,374 @@ impl App {
         self.greeted = true;
         self.follow_tail = true;
         self.streaming_response.clear();
-        self.cancel.store(false, Ordering::Relaxed);
-        self.entries.push(Entry::User(prompt.clone()));
-        self.state = AppState::Sending { prompt };
-    }
+        self.tool_steps = 0;
+        self.busy_started = Some(std::time::Instant::now());
+        self.streamed_chars = 0;
+        // Recall skips consecutive duplicates: pressing Enter twice on the same
+        // prompt should not mean pressing Up twice to get past it.
+        if self.prompt_history.last().map(String::as_str) != Some(prompt.as_str()) {
+            self.prompt_history.push(prompt.clone());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
 
-    /// Drop the conversation but keep the transcript on screen, so a long session
-    /// can be cleared without restarting the process.
-    fn reset_session(&mut self) {
-        self.session_messages.clear();
-        self.entries.push(Entry::System(
-            "Started a new conversation. The agent no longer remembers earlier turns.".to_string(),
-        ));
-        self.greeted = true;
-        self.follow_tail = true;
+        self.messages.push(Message::new(Role::User, prompt));
+        self.state = AppState::Sending;
     }
 
     fn cancel(&mut self) {
         if !self.is_busy() {
             return;
         }
-        // Cooperative first: the loop checks this between steps and unwinds
-        // cleanly, answering any tool calls it is abandoning.
-        self.cancel.store(true, Ordering::Relaxed);
         if let Some(handle) = self.abort.take() {
             handle.abort();
         }
-        // Bump the id so events already in flight on the channel are discarded.
+        // Bump the id so any tokens already in flight on the channel are discarded.
         self.request_id += 1;
-
-        // An agent blocked on a permission prompt would otherwise wait forever.
-        if let Some(respond) = self.pending_permission.take() {
-            let _ = respond.send(Decision::Deny);
-        }
+        self.pending_tools.clear();
+        self.approved_tools.clear();
+        self.running_tools.clear();
         self.overlay = None;
 
-        self.flush_streaming();
-        self.entries.push(Entry::Error("Cancelled.".to_string()));
-        self.mark_running_tools_cancelled();
+        // Before anything else is appended: synthetic results have to sit
+        // directly after the calls they answer.
+        self.settle_unanswered_tool_calls("The user cancelled before this command ran.");
+
+        let partial = std::mem::take(&mut self.streaming_response);
+        if !partial.trim().is_empty() {
+            self.messages.push(Message::new(
+                Role::Assistant,
+                format!("{partial}\n[cancelled]"),
+            ));
+        } else {
+            self.messages
+                .push(Message::new(Role::Error, "Request cancelled."));
+        }
+        self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
 
-    // ---- agent events ---------------------------------------------------------
+    /// The model asked to run something. Commit whatever prose it streamed
+    /// alongside the request, then start asking the user about each command.
+    pub fn request_tools(&mut self, calls: Vec<ToolCall>) {
+        if self.state != AppState::Streaming || calls.is_empty() {
+            return;
+        }
+        self.abort = None;
+        self.follow_tail = true;
+        let content = std::mem::take(&mut self.streaming_response);
+        self.messages.push(Message {
+            role: Role::Assistant,
+            content: content.trim().to_string(),
+            display: None,
+            tool_calls: calls.clone(),
+            tool_call_id: None,
+        });
+        self.pending_tools = calls.into();
+        self.tool_steps += 1;
+        self.advance_approvals();
+    }
 
-    /// Route one event from the run. Returns false if the event was stale (it
-    /// belonged to a cancelled run) and should be ignored.
-    pub fn handle_agent_event(&mut self, id: u64, event: AgentEvent) -> bool {
-        if id != self.request_id {
-            // Still answer a stale permission request, or its agent task never
-            // unblocks and the process cannot exit.
-            if let AgentEvent::NeedsPermission(request) = event {
-                let _ = request.respond.send(Decision::Deny);
+    /// Walk the queue until something needs a decision, or it is empty.
+    ///
+    /// Called once when the calls arrive and again after every keypress, so the
+    /// prompt advances one command at a time. When the queue empties, the turn
+    /// moves on: to `ExecutingTools` if anything was allowed, or straight back to
+    /// `Sending` if everything was refused (the model still gets told, and can
+    /// answer without it).
+    fn advance_approvals(&mut self) {
+        while let Some(call) = self.pending_tools.front() {
+            // Refused outright, and never put in front of the user at all.
+            // Offering `rm -rf /` as a y/n question is itself the bug: it takes
+            // one mistyped keystroke to accept, and there is no undo. There is
+            // deliberately no key, flag, or config value that reaches this.
+            if let danger::Risk::Blocked(reason) = self.risk_of(call) {
+                let call = self.pending_tools.pop_front().expect("front just matched");
+                let label = tools::describe_action(&call)
+                    .map(|a| a.label())
+                    .unwrap_or_else(|| call.function.name.clone());
+                self.messages.push(Message::new(
+                    Role::Error,
+                    format!("Blocked: {label}\n{reason}"),
+                ));
+                self.push_tool_outcome(tools::refused_as_dangerous(&call, &reason));
+                self.follow_tail = true;
+                continue;
             }
-            return false;
+            if !self.needs_approval(call) {
+                let call = self.pending_tools.pop_front().expect("front just matched");
+                self.approved_tools.push(call);
+                continue;
+            }
+            match tools::describe_action(call) {
+                Some(action) => {
+                    self.overlay = Some(Overlay::ToolApproval {
+                        action,
+                        remaining: self.pending_tools.len().saturating_sub(1),
+                    });
+                    self.state = AppState::AwaitingApproval;
+                    return;
+                }
+                // Nothing coherent to show, so nothing to approve. Let it through
+                // to the runner, which reports the malformed arguments back to
+                // the model rather than asking the user about gibberish.
+                None => {
+                    let call = self.pending_tools.pop_front().expect("front just matched");
+                    self.approved_tools.push(call);
+                }
+            }
         }
 
-        match event {
-            AgentEvent::Token { agent, text } => {
-                self.active_agent = agent;
-                self.streaming_response.push_str(&text);
+        self.overlay = None;
+        self.state = if self.approved_tools.is_empty() {
+            AppState::Sending
+        } else {
+            // Snapshot for display: `main.rs` takes `approved_tools` the
+            // moment it spawns the runner, so this copy is what stays on
+            // screen for the rest of the run -- see the field doc.
+            self.running_tools = self.approved_tools.clone();
+            AppState::ExecutingTools
+        };
+    }
+
+    /// What the guardrails make of this call, judged against the directory it
+    /// would actually run in.
+    pub fn risk_of(&self, call: &ToolCall) -> danger::Risk {
+        match tools::describe_action(call) {
+            Some(tools::Action::Command { command, .. }) => {
+                danger::classify(&command, Path::new(&self.workspace_root))
             }
-            AgentEvent::ToolStarted {
-                agent,
-                call_id,
-                summary,
-            } => {
-                self.active_agent = agent;
-                // Commit whatever the model said before reaching for the tool, so
-                // the reasoning reads above the action rather than after it.
-                self.flush_streaming();
-                self.entries.push(Entry::Tool {
-                    call_id,
-                    summary,
-                    status: ToolStatus::Running,
-                    detail: String::new(),
-                });
-            }
-            AgentEvent::ToolFinished {
-                call_id,
-                ok,
-                detail,
-            } => {
-                self.finish_tool(&call_id, ok, detail);
-            }
-            AgentEvent::NeedsPermission(request) => {
-                self.begin_permission(request);
-            }
-            AgentEvent::Finished { result, messages } => {
-                self.finish_run(result, messages);
+            // Reads and writes are already confined to the workspace by
+            // `tools::resolve_in_workspace`, and cannot invoke a shell.
+            _ => danger::Risk::Normal,
+        }
+    }
+
+    /// Whether `call` needs a human decision before it runs.
+    ///
+    /// Order matters, and the destructive check comes first *because* it must
+    /// outrank the session-wide escape hatches: "yes to everything this
+    /// session" and `require_approval = false` must not silently cover
+    /// `rm -rf build` an hour later. Below that, the hatches short-circuit
+    /// regardless of the call, and `auto_approve_read_only` waives the prompt
+    /// only for a narrow slice -- `read_file` unconditionally (it cannot write
+    /// anything), and shell commands via `tools::is_read_only`. `write_file`
+    /// never qualifies: unlike a shell command's read-only-ness, which has to
+    /// be inferred, "this writes a file" is certain, so it always asks.
+    /// `/new` -- forget the conversation and start fresh.
+    ///
+    /// A long session is what makes a request expensive: the whole transcript is
+    /// resent every turn, so cost grows with the square of the conversation.
+    /// Starting a new topic in a new conversation is the cheapest optimisation
+    /// available, and it needs a command rather than a restart because the
+    /// alternative is losing the configured provider and model too.
+    ///
+    /// Only the conversation is cleared. Config, provider and workspace are
+    /// deliberately untouched -- this is "forget what we discussed", not "reset
+    /// the app".
+    fn start_new_conversation(&mut self) {
+        self.messages.clear();
+        self.streaming_response.clear();
+        self.pending_tools.clear();
+        self.approved_tools.clear();
+        self.tool_steps = 0;
+        self.scroll = 0;
+        self.follow_tail = true;
+        self.greeted = true;
+        self.messages.push(Message::new(
+            Role::System,
+            "Started a new conversation. The model no longer remembers anything above this line.",
+        ));
+    }
+
+    fn needs_approval(&self, call: &ToolCall) -> bool {
+        if self.risk_of(call).is_dangerous() {
+            return true;
+        }
+        if !self.config.tools.require_approval {
+            return false;
+        }
+        if self.config.tools.auto_approve_read_only {
+            match tools::describe_action(call) {
+                // Reading, listing and searching change nothing on disk, so
+                // there is nothing for an approval prompt to protect against --
+                // and prompting for them is what trains people to stop reading
+                // the prompts that matter. `edit_file` is deliberately absent:
+                // it modifies a file and is approved like a write.
+                Some(tools::Action::Read { .. })
+                | Some(tools::Action::List { .. })
+                | Some(tools::Action::Glob { .. }) => return false,
+                Some(tools::Action::Command { command, .. }) if tools::is_read_only(&command) => {
+                    return false;
+                }
+                _ => {}
             }
         }
         true
     }
 
-    fn finish_tool(&mut self, call_id: &str, ok: bool, detail: String) {
-        for entry in self.entries.iter_mut().rev() {
-            if let Entry::Tool {
-                call_id: id,
-                status,
-                detail: slot,
-                ..
-            } = entry
-            {
-                if id == call_id {
-                    *status = if ok { ToolStatus::Ok } else { ToolStatus::Failed };
-                    *slot = detail;
-                    return;
-                }
-            }
-        }
-    }
+    /// y allow · n refuse · Esc refuse.
+    ///
+    /// Esc means refuse rather than cancel-the-turn: at a prompt asking whether
+    /// to run something, the reflexive keypress has to be the safe one.
+    ///
+    /// There is deliberately no "allow everything from now on" key. A decision
+    /// made once, while impatient, would otherwise silently cover every command
+    /// for the rest of the session -- including ones the model had not thought
+    /// of yet. `[tools] require_approval = false` still exists for scripted
+    /// runs, where turning it off is an explicit, visible act rather than a
+    /// keystroke.
+    fn handle_command_approval_key(&mut self, key: KeyEvent) {
+        let decision = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+            _ => None,
+        };
 
-    fn begin_permission(&mut self, request: PermissionRequest) {
-        let PermissionRequest {
-            summary,
-            grant,
-            respond,
-        } = request;
-        self.pending_permission = Some(respond);
-        self.overlay = Some(Overlay::Permission { summary, grant });
+        let Some(allowed) = decision else {
+            return; // unrecognised key: leave the prompt exactly as it was
+        };
+        let Some(call) = self.pending_tools.pop_front() else {
+            return;
+        };
+
+        if allowed {
+            self.approved_tools.push(call);
+        } else {
+            self.push_tool_outcome(tools::declined(&call));
+        }
         self.follow_tail = true;
+        self.advance_approvals();
     }
 
-    fn finish_run(&mut self, result: Result<String, String>, messages: Vec<ChatMessage>) {
-        self.abort = None;
-        self.session_messages = messages;
-        self.flush_streaming();
-        match result {
-            Ok(text) if text.trim().is_empty() => {
-                // The agent may legitimately end with no closing prose if its last
-                // word already streamed out; only complain when nothing landed.
-                if !matches!(self.entries.last(), Some(Entry::Agent { .. }) | Some(Entry::Tool { .. }))
-                {
-                    self.entries.push(Entry::Error(
-                        "The endpoint returned an empty response.".to_string(),
-                    ));
-                }
-            }
-            Ok(_) => {}
-            Err(e) => self.entries.push(Entry::Error(e)),
+    /// Results of the commands that ran, from the spawned runner.
+    pub fn finish_tools(&mut self, outcomes: Vec<ToolOutcome>) {
+        if self.state != AppState::ExecutingTools {
+            return;
         }
-        self.mark_running_tools_cancelled();
+        for outcome in outcomes {
+            self.push_tool_outcome(outcome);
+        }
+        self.running_tools.clear();
+        self.follow_tail = true;
+        // Back around: the model needs a turn to use what it just got.
+        self.state = AppState::Sending;
+    }
+
+    pub fn push_tool_outcome(&mut self, outcome: ToolOutcome) {
+        self.messages.push(Message {
+            role: Role::Tool,
+            content: outcome.content,
+            display: Some(outcome.display),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(outcome.call_id),
+        });
+    }
+
+    /// Answer every tool call that never got a result.
+    ///
+    /// Providers require each `tool_calls` entry to be matched by a `tool` message
+    /// quoting its id. A turn abandoned mid-loop -- Esc, or a failed request --
+    /// otherwise leaves a hole, and the resulting 400 lands on the user's *next*
+    /// prompt, where it looks like an unrelated failure. So the hole gets filled
+    /// rather than left.
+    fn settle_unanswered_tool_calls(&mut self, reason: &str) {
+        let answered: HashSet<&str> = self
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+
+        let unanswered: Vec<ToolCall> = self
+            .messages
+            .iter()
+            .flat_map(|m| m.tool_calls.iter())
+            .filter(|call| !answered.contains(call.id.as_str()))
+            .cloned()
+            .collect();
+
+        for call in unanswered {
+            self.push_tool_outcome(tools::unanswered(&call, reason));
+        }
+    }
+
+    pub fn append_token(&mut self, token: &str) {
+        if self.state == AppState::Streaming {
+            self.streaming_response.push_str(token);
+            self.streamed_chars += token.chars().count();
+        }
+    }
+
+    /// Terminates the turn. Deliberately a no-op unless still `Streaming`: a
+    /// response carrying tool calls sends `ToolCalls` and *then* `Done`, and by
+    /// the time `Done` arrives the turn has moved on to `ExecutingTools`.
+    pub fn finish_stream(&mut self) {
+        if self.state != AppState::Streaming {
+            return;
+        }
+        self.abort = None;
+        let response = std::mem::take(&mut self.streaming_response);
+        if response.trim().is_empty() {
+            self.messages.push(Message::new(
+                Role::Error,
+                "The endpoint returned an empty response.",
+            ));
+        } else {
+            self.messages.push(Message::new(Role::Assistant, response));
+        }
+        self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
 
-    /// Commit streamed prose into an entry. Tokens already accumulated in
-    /// `streaming_response` are the same text the final turn carries, so this is
-    /// the only place an `Agent` entry is created.
-    fn flush_streaming(&mut self) {
-        let text = std::mem::take(&mut self.streaming_response);
-        if !text.trim().is_empty() {
-            self.entries.push(Entry::Agent {
-                agent: self.active_agent,
-                text: text.trim_end().to_string(),
-            });
+    pub fn fail_stream(&mut self, error: String) {
+        self.abort = None;
+        self.pending_tools.clear();
+        self.approved_tools.clear();
+        self.running_tools.clear();
+        self.overlay = None;
+        // First, so the results land against the calls they belong to.
+        self.settle_unanswered_tool_calls("The request failed before this command ran.");
+
+        let partial = std::mem::take(&mut self.streaming_response);
+        if !partial.trim().is_empty() {
+            self.messages.push(Message::new(Role::Assistant, partial));
         }
+        self.messages.push(Message::new(Role::Error, error));
+        self.busy_started = None;
+        self.state = AppState::AwaitingInput;
     }
 
-    /// A run that ends while a tool is still Running would leave a spinner on
-    /// screen forever.
-    fn mark_running_tools_cancelled(&mut self) {
-        for entry in self.entries.iter_mut() {
-            if let Entry::Tool { status, detail, .. } = entry {
-                if *status == ToolStatus::Running {
-                    *status = ToolStatus::Failed;
-                    if detail.is_empty() {
-                        *detail = "Cancelled.".to_string();
-                    }
-                }
+    /// Conversation so far, in wire form.
+    ///
+    /// Error and System messages are local commentary and never sent. Everything
+    /// else must survive intact, tool calls included -- an assistant message whose
+    /// `tool_calls` were dropped here would leave the following `tool` messages
+    /// answering nothing.
+    pub fn history(&self, system: Option<&str>) -> Vec<ChatMessage> {
+        let mut out = Vec::new();
+        if let Some(system) = system {
+            out.push(ChatMessage::text("system", system));
+        }
+        for message in &self.messages {
+            match message.role {
+                Role::User => out.push(ChatMessage::text("user", message.content.clone())),
+                Role::Assistant => out.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    // None rather than "" when the model only asked for tools.
+                    content: Some(message.content.clone()).filter(|c| !c.trim().is_empty()),
+                    tool_calls: message.tool_calls.clone(),
+                    tool_call_id: None,
+                }),
+                Role::Tool => out.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(message.content.clone()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: message.tool_call_id.clone(),
+                }),
+                Role::Error | Role::System => {}
             }
         }
+        out
     }
 
     // ---- input buffer editing -------------------------------------------------
@@ -495,6 +770,76 @@ impl App {
         next_char_boundary(&self.input_buffer, self.cursor)
     }
 
+    /// Which line of a multi-line prompt the caret is on.
+    fn cursor_line(&self) -> usize {
+        self.cursor_position().0
+    }
+
+    /// Move the caret one line up or down inside the prompt, keeping its column
+    /// where it can. Only called when such a line exists, so `delta` never runs
+    /// off either end.
+    fn move_cursor_line(&mut self, delta: isize) {
+        let (row, col) = self.cursor_position();
+        let target = if delta < 0 { row.saturating_sub(1) } else { row + 1 };
+
+        let lines: Vec<&str> = self.input_buffer.split('\n').collect();
+        let Some(line) = lines.get(target) else { return };
+
+        // Byte offset of the target line, plus `col` characters into it (or the
+        // end of it, when the target line is shorter than the current column).
+        let mut offset = 0usize;
+        for l in &lines[..target] {
+            offset += l.len() + 1; // +1 for the '\n'
+        }
+        let within: usize = line
+            .char_indices()
+            .nth(col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+        self.cursor = offset + within;
+    }
+
+    /// ↑ -- step back through prompts already sent.
+    fn recall_previous(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let next = match self.history_index {
+            // First press: remember what was being typed, then jump to the
+            // newest entry.
+            None => {
+                self.history_draft = self.input_buffer.clone();
+                self.prompt_history.len() - 1
+            }
+            Some(0) => return, // already at the oldest
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(next);
+        self.set_input(self.prompt_history[next].clone());
+    }
+
+    /// ↓ -- step forward, ending back at whatever was being typed.
+    fn recall_next(&mut self) {
+        let Some(current) = self.history_index else {
+            return;
+        };
+        if current + 1 < self.prompt_history.len() {
+            self.history_index = Some(current + 1);
+            self.set_input(self.prompt_history[current + 1].clone());
+        } else {
+            self.history_index = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.set_input(draft);
+        }
+    }
+
+    /// Replace the prompt, caret at the end -- where you want it when a
+    /// recalled prompt is about to be edited or resent.
+    fn set_input(&mut self, text: String) {
+        self.cursor = text.len();
+        self.input_buffer = text;
+    }
+
     fn line_start(&self) -> usize {
         self.input_buffer[..self.cursor]
             .rfind('\n')
@@ -515,7 +860,7 @@ impl App {
         (row, col)
     }
 
-    // ---- overlays --------------------------------------------------------------
+    // ---- /provider and /model overlays -----------------------------------------
 
     fn open_provider_picker(&mut self) {
         self.overlay = Some(Overlay::ProviderPicker { selected: 0 });
@@ -532,8 +877,9 @@ impl App {
                 });
             }
             None => {
-                self.entries.push(Entry::Error(
-                    "No provider configured yet. Run /provider first.".to_string(),
+                self.messages.push(Message::new(
+                    Role::Error,
+                    "No provider configured yet. Run /provider first.",
                 ));
             }
         }
@@ -554,45 +900,13 @@ impl App {
                 self.handle_api_key_prompt_key(key, provider_id, model)
             }
             Overlay::CustomEndpoint(step) => self.handle_custom_endpoint_key(key, step),
-            Overlay::Permission { summary, grant } => {
-                self.handle_permission_key(key, summary, grant)
+            // Put back first: an unrecognised key must leave the prompt standing
+            // rather than silently dismissing it, and `handle_overlay_key` took
+            // the overlay before dispatching here.
+            approval @ Overlay::ToolApproval { .. } => {
+                self.overlay = Some(approval);
+                self.handle_command_approval_key(key);
             }
-        }
-    }
-
-    /// Answers the blocked agent. Every path through here either resolves
-    /// `pending_permission` or puts the overlay back -- leaving both cleared
-    /// would hang the run.
-    fn handle_permission_key(&mut self, key: KeyEvent, summary: String, grant: Option<String>) {
-        let decision = match key.code {
-            KeyCode::Char('a') | KeyCode::Char('y') | KeyCode::Enter => Some(Decision::AllowOnce),
-            KeyCode::Char('s') if grant.is_some() => Some(Decision::AllowSession),
-            KeyCode::Char('d') | KeyCode::Char('n') => Some(Decision::Deny),
-            // Esc is a denial *and* a cancellation: the user wants out, not just
-            // this one command refused.
-            KeyCode::Esc => {
-                if let Some(respond) = self.pending_permission.take() {
-                    let _ = respond.send(Decision::Deny);
-                }
-                self.cancel();
-                return;
-            }
-            _ => None,
-        };
-
-        match decision {
-            Some(decision) => {
-                if let Some(respond) = self.pending_permission.take() {
-                    let _ = respond.send(decision);
-                }
-                if decision == Decision::AllowSession {
-                    if let Some(key) = grant {
-                        self.allowlist.allow(key);
-                    }
-                }
-            }
-            // An unrecognised key must not dismiss the prompt.
-            None => self.overlay = Some(Overlay::Permission { summary, grant }),
         }
     }
 
@@ -628,12 +942,7 @@ impl App {
         }
     }
 
-    fn handle_model_picker_key(
-        &mut self,
-        key: KeyEvent,
-        provider_id: &'static str,
-        selected: usize,
-    ) {
+    fn handle_model_picker_key(&mut self, key: KeyEvent, provider_id: &'static str, selected: usize) {
         let provider = providers::find_provider(provider_id)
             .expect("provider_id on a ModelPicker overlay always names a registry entry");
         let last = provider.models.len().saturating_sub(1);
@@ -671,20 +980,12 @@ impl App {
                 }
             }
             _ => {
-                self.overlay = Some(Overlay::ModelPicker {
-                    provider_id,
-                    selected,
-                });
+                self.overlay = Some(Overlay::ModelPicker { provider_id, selected });
             }
         }
     }
 
-    fn handle_api_key_prompt_key(
-        &mut self,
-        key: KeyEvent,
-        provider_id: &'static str,
-        model: String,
-    ) {
+    fn handle_api_key_prompt_key(&mut self, key: KeyEvent, provider_id: &'static str, model: String) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
@@ -698,8 +999,8 @@ impl App {
                 self.overlay_input.clear();
                 self.overlay_cursor = 0;
                 if api_key.is_empty() {
-                    self.entries
-                        .push(Entry::Error("No API key entered; cancelled.".to_string()));
+                    self.messages
+                        .push(Message::new(Role::Error, "No API key entered; cancelled."));
                     return;
                 }
                 self.apply_llm_config(
@@ -714,11 +1015,7 @@ impl App {
                 self.overlay = Some(Overlay::ApiKeyPrompt { provider_id, model });
             }
             KeyCode::Char(c) if !ctrl => {
-                insert_into(
-                    &mut self.overlay_input,
-                    &mut self.overlay_cursor,
-                    &c.to_string(),
-                );
+                insert_into(&mut self.overlay_input, &mut self.overlay_cursor, &c.to_string());
                 self.overlay = Some(Overlay::ApiKeyPrompt { provider_id, model });
             }
             _ => {
@@ -741,19 +1038,20 @@ impl App {
                 match step {
                     CustomStep::Endpoint => {
                         if value.is_empty() {
-                            self.entries.push(Entry::Error(
-                                "Endpoint cannot be empty; cancelled.".to_string(),
+                            self.messages.push(Message::new(
+                                Role::Error,
+                                "Endpoint cannot be empty; cancelled.",
                             ));
                             return;
                         }
-                        self.overlay = Some(Overlay::CustomEndpoint(CustomStep::Model {
-                            endpoint: value,
-                        }));
+                        self.overlay = Some(Overlay::CustomEndpoint(CustomStep::Model { endpoint: value }));
                     }
                     CustomStep::Model { endpoint } => {
                         if value.is_empty() {
-                            self.entries
-                                .push(Entry::Error("Model cannot be empty; cancelled.".to_string()));
+                            self.messages.push(Message::new(
+                                Role::Error,
+                                "Model cannot be empty; cancelled.",
+                            ));
                             return;
                         }
                         self.overlay = Some(Overlay::CustomEndpoint(CustomStep::ApiKey {
@@ -772,11 +1070,7 @@ impl App {
                 self.overlay = Some(Overlay::CustomEndpoint(step));
             }
             KeyCode::Char(c) if !ctrl => {
-                insert_into(
-                    &mut self.overlay_input,
-                    &mut self.overlay_cursor,
-                    &c.to_string(),
-                );
+                insert_into(&mut self.overlay_input, &mut self.overlay_cursor, &c.to_string());
                 self.overlay = Some(Overlay::CustomEndpoint(step));
             }
             _ => {
@@ -785,22 +1079,15 @@ impl App {
         }
     }
 
-    /// Single completion path for every provider overlay flow (env-var shortcut,
-    /// masked prompt, custom wizard). Updates the in-memory config -- which
-    /// `main.rs`'s event loop re-reads fresh on every `Sending` transition, so
-    /// this takes effect on the very next request with no restart needed -- and
-    /// persists it.
+    /// Single completion path for every overlay flow (env-var shortcut, masked
+    /// prompt, custom wizard). Updates the in-memory config -- which `main.rs`'s
+    /// event loop re-reads fresh on every `Sending` transition, so this takes
+    /// effect on the very next request with no restart needed -- and persists it.
     ///
     /// Any test that reaches this function MUST wrap the call in
     /// `config::test_support::with_isolated_home`, or it will write to the real
     /// developer/CI `~/.tuisample-code/config.toml`.
-    fn apply_llm_config(
-        &mut self,
-        provider: String,
-        endpoint: String,
-        model: String,
-        api_key: String,
-    ) {
+    fn apply_llm_config(&mut self, provider: String, endpoint: String, model: String, api_key: String) {
         self.config.llm.provider = provider;
         self.config.llm.endpoint = endpoint;
         self.config.llm.model = model;
@@ -811,16 +1098,17 @@ impl App {
         } else {
             self.config.llm.provider.as_str()
         };
-        let entry = match self.config.save() {
-            Ok(()) => Entry::System(format!(
-                "Switched to {label} / {}.",
-                self.config.llm.model
-            )),
-            Err(e) => Entry::Error(format!(
-                "Using it for this session, but failed to save to config.toml: {e}"
-            )),
+        let message = match self.config.save() {
+            Ok(()) => Message::new(
+                Role::System,
+                format!("Switched to {label} / {}.", self.config.llm.model),
+            ),
+            Err(e) => Message::new(
+                Role::Error,
+                format!("Using it for this session, but failed to save to config.toml: {e}"),
+            ),
         };
-        self.entries.push(entry);
+        self.messages.push(message);
         self.overlay = None;
         self.overlay_input.clear();
         self.overlay_cursor = 0;
@@ -877,8 +1165,17 @@ mod tests {
     /// config::test_support::HOME_LOCK's reasoning for $HOME).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// The existing approval-flow tests below use `ls`/`cat`/`pwd` purely as
+    /// stand-ins for "some command" and assert every one of them stops for a
+    /// human decision -- that is what they are testing, not read-only
+    /// classification, which gets its own dedicated tests further down. So the
+    /// fixture turns the read-only fast path off by default; those tests would
+    /// otherwise start silently skipping their own approval prompts the moment
+    /// their example command happened to match `tools::is_read_only`.
     fn app() -> App {
-        App::new(Config::default())
+        let mut app = App::new(Config::default());
+        app.config.tools.auto_approve_read_only = false;
+        app
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -891,31 +1188,59 @@ mod tests {
         }
     }
 
-    fn entry_text(entry: &Entry) -> String {
-        match entry {
-            Entry::User(t) | Entry::System(t) | Entry::Error(t) => t.clone(),
-            Entry::Agent { text, .. } => text.clone(),
-            Entry::Tool { summary, .. } => summary.clone(),
-        }
+    // ---- /new ------------------------------------------------------------------
+
+    #[test]
+    fn slash_new_forgets_the_conversation() {
+        let mut a = app();
+        a.messages.push(Message::new(Role::User, "first question"));
+        a.messages.push(Message::new(Role::Assistant, "an answer"));
+        a.tool_steps = 4;
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        // Nothing from before survives into what the model is sent.
+        let history = a.history(None);
+        assert!(
+            !history.iter().any(|m| m.content.as_deref().unwrap_or("").contains("first question")),
+            "the old conversation must not be resent"
+        );
+        assert_eq!(a.tool_steps, 0);
+        assert_eq!(a.state, AppState::AwaitingInput);
+        // ...and the user is told, rather than the transcript just emptying.
+        assert!(a.messages.iter().any(|m| m.role == Role::System
+            && m.content.contains("new conversation")));
     }
 
-    /// Drive a run the way `main.rs` does: bump the id, then feed events.
-    fn start_run(app: &mut App) -> u64 {
-        app.request_id += 1;
-        app.state = AppState::Working;
-        app.request_id
+    /// `/new` is about the conversation, not the app: losing the configured
+    /// provider and model would make it useless as a cheap reset.
+    #[test]
+    fn slash_new_keeps_the_configuration() {
+        let mut a = app();
+        a.config.llm.model = "some-model".to_string();
+        a.config.llm.provider = "deepseek".to_string();
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.config.llm.model, "some-model");
+        assert_eq!(a.config.llm.provider, "deepseek");
     }
 
-    fn permission_request(summary: &str, grant: Option<&str>) -> (AgentEvent, oneshot::Receiver<Decision>) {
-        let (respond, receive) = oneshot::channel();
-        (
-            AgentEvent::NeedsPermission(PermissionRequest {
-                summary: summary.to_string(),
-                grant: grant.map(str::to_string),
-                respond,
-            }),
-            receive,
-        )
+    #[test]
+    fn slash_new_is_ignored_mid_turn() {
+        let mut a = app();
+        a.messages.push(Message::new(Role::User, "keep me"));
+        a.state = AppState::Streaming;
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        // Treated as ordinary input, not executed: clearing history underneath a
+        // request in flight would strand its tool calls.
+        assert_eq!(a.state, AppState::Streaming);
+        assert!(a.messages.iter().any(|m| m.content == "keep me"));
     }
 
     /// The reported bug: typing a prompt and pressing Enter did nothing, because
@@ -928,15 +1253,50 @@ mod tests {
 
         a.handle_key(key(KeyCode::Enter));
 
-        assert_eq!(
-            a.state,
-            AppState::Sending {
-                prompt: "hello world".to_string()
-            }
-        );
+        assert_eq!(a.state, AppState::Sending);
         assert!(a.input_buffer.is_empty());
-        assert_eq!(a.entries.len(), 1);
-        assert_eq!(entry_text(&a.entries[0]), "hello world");
+        assert_eq!(a.messages.len(), 1);
+        assert_eq!(a.messages[0].content, "hello world");
+    }
+
+    /// The footer's elapsed-time display reads `busy_started`; it must be set
+    /// the moment a turn begins and cleared on every path back to idle, or
+    /// the clock would either never start or keep running after the turn
+    /// that started it is long over.
+    #[test]
+    fn submitting_a_prompt_starts_the_busy_timer_and_resets_the_token_estimate() {
+        let mut a = app();
+        assert!(a.busy_started.is_none());
+
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(a.busy_started.is_some());
+        assert_eq!(a.streamed_chars, 0);
+    }
+
+    #[test]
+    fn streaming_tokens_accumulate_the_character_count() {
+        let mut a = streaming_app();
+        a.append_token("Hello, ");
+        a.append_token("world!");
+        assert_eq!(a.streamed_chars, "Hello, world!".chars().count());
+    }
+
+    #[test]
+    fn the_busy_timer_clears_when_a_turn_ends_however_it_ends() {
+        let mut finished = streaming_app();
+        finished.append_token("hi");
+        finished.finish_stream();
+        assert!(finished.busy_started.is_none());
+
+        let mut failed = streaming_app();
+        failed.fail_stream("boom".to_string());
+        assert!(failed.busy_started.is_none());
+
+        let mut cancelled = streaming_app();
+        cancelled.cancel();
+        assert!(cancelled.busy_started.is_none());
     }
 
     #[test]
@@ -944,7 +1304,7 @@ mod tests {
         let mut a = app();
         type_str(&mut a, "hi");
         a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
-        assert!(matches!(a.state, AppState::Sending { .. }));
+        assert_eq!(a.state, AppState::Sending);
     }
 
     #[test]
@@ -958,12 +1318,8 @@ mod tests {
         assert_eq!(a.state, AppState::AwaitingInput);
 
         a.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            a.state,
-            AppState::Sending {
-                prompt: "line1\nline2".to_string()
-            }
-        );
+        assert_eq!(a.state, AppState::Sending);
+        assert_eq!(a.messages[0].content, "line1\nline2");
     }
 
     #[test]
@@ -975,7 +1331,7 @@ mod tests {
         type_str(&mut a, "   ");
         a.handle_key(key(KeyCode::Enter));
         assert_eq!(a.state, AppState::AwaitingInput);
-        assert!(a.entries.is_empty());
+        assert!(a.messages.is_empty());
     }
 
     #[test]
@@ -1035,17 +1391,653 @@ mod tests {
     }
 
     #[test]
-    fn cannot_submit_a_second_prompt_while_an_agent_is_working() {
+    fn cannot_submit_a_second_prompt_while_streaming() {
         let mut a = app();
         type_str(&mut a, "one");
         a.handle_key(key(KeyCode::Enter));
-        a.state = AppState::Working;
+        a.state = AppState::Streaming;
 
         type_str(&mut a, "two");
         a.handle_key(key(KeyCode::Enter));
 
-        assert_eq!(a.state, AppState::Working);
-        assert_eq!(a.entries.len(), 1);
+        assert_eq!(a.state, AppState::Streaming);
+        assert_eq!(a.messages.len(), 1);
+    }
+
+    #[test]
+    fn stream_completion_commits_the_response_and_returns_to_ready() {
+        let mut a = app();
+        type_str(&mut a, "hi");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::Streaming;
+
+        a.append_token("Hel");
+        a.append_token("lo!");
+        a.finish_stream();
+
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert_eq!(a.messages.len(), 2);
+        assert_eq!(a.messages[1].content, "Hello!");
+        assert!(a.messages[1].role == Role::Assistant);
+    }
+
+    #[test]
+    fn errors_surface_in_the_transcript_and_unblock_input() {
+        let mut a = app();
+        type_str(&mut a, "hi");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::Streaming;
+
+        a.fail_stream("HTTP 401 Unauthorized".to_string());
+
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert!(a.messages.iter().any(|m| m.role == Role::Error
+            && m.content.contains("401")));
+
+        // The user can immediately try again.
+        type_str(&mut a, "retry");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+    }
+
+    #[test]
+    fn esc_cancels_and_keeps_partial_output() {
+        let mut a = app();
+        type_str(&mut a, "hi");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::Streaming;
+        a.append_token("partial");
+
+        a.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert!(a.messages.last().unwrap().content.contains("partial"));
+    }
+
+    #[test]
+    fn history_carries_the_conversation_and_drops_errors() {
+        let mut a = app();
+        type_str(&mut a, "first");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::Streaming;
+        a.append_token("answer");
+        a.finish_stream();
+        a.fail_stream("boom".to_string());
+
+        type_str(&mut a, "second");
+        a.handle_key(key(KeyCode::Enter));
+
+        let history = a.history(None);
+        assert_eq!(
+            history,
+            vec![
+                ChatMessage::text("user", "first"),
+                ChatMessage::text("assistant", "answer"),
+                ChatMessage::text("user", "second"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_system_prompt_is_prepended_when_one_is_given() {
+        let mut a = app();
+        type_str(&mut a, "hi");
+        a.handle_key(key(KeyCode::Enter));
+
+        let history = a.history(Some("you are a robot"));
+        assert_eq!(history[0], ChatMessage::text("system", "you are a robot"));
+        assert_eq!(history[1].role, "user");
+    }
+
+    // ---- commands and approval -----------------------------------------------
+
+    fn command_call(id: &str, command: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::RUN_COMMAND.to_string(),
+                arguments: serde_json::json!({ "command": command }).to_string(),
+            },
+        }
+    }
+
+    fn read_file_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::READ_FILE.to_string(),
+                arguments: serde_json::json!({ "path": path }).to_string(),
+            },
+        }
+    }
+
+    fn write_file_call(id: &str, path: &str, content: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::WRITE_FILE.to_string(),
+                arguments: serde_json::json!({ "path": path, "content": content }).to_string(),
+            },
+        }
+    }
+
+    fn outcome(call_id: &str, content: &str) -> ToolOutcome {
+        ToolOutcome {
+            call_id: call_id.to_string(),
+            display: format!("$ … — {content}"),
+            content: content.to_string(),
+        }
+    }
+
+    fn streaming_app() -> App {
+        let mut a = app();
+        a.workspace_root = "/tmp/project".to_string();
+        type_str(&mut a, "what does main.rs do?");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::Streaming;
+        a
+    }
+
+    /// Nothing runs until a human says so. If this ever regresses, the model has
+    /// an unattended shell.
+    #[test]
+    fn a_command_is_not_runnable_until_it_is_approved() {
+        let mut a = streaming_app();
+        a.append_token("Let me look.");
+        a.request_tools(vec![command_call("call_1", "cat src/main.rs")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert!(
+            a.approved_tools.is_empty(),
+            "nothing may reach the runner before approval"
+        );
+        assert_eq!(a.tool_steps, 1);
+
+        match &a.overlay {
+            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, .. }) => {
+                assert_eq!(command, "cat src/main.rs")
+            }
+            other => panic!("expected an approval prompt, got {other:?}"),
+        }
+        // The prose streamed alongside the call is kept.
+        assert_eq!(a.messages.last().unwrap().content, "Let me look.");
+    }
+
+    #[test]
+    fn pressing_y_releases_the_command_to_the_runner() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.approved_tools.len(), 1);
+        assert_eq!(a.overlay, None);
+    }
+
+    /// Regression: `main.rs` takes `approved_tools` (empties it) the instant
+    /// it spawns the runner task, so a "Running N commands…" display reading
+    /// straight off `approved_tools` would show N for one frame and then
+    /// nothing for the rest of the run, while commands were still executing.
+    /// `running_tools` is the snapshot that stays put until the run finishes.
+    #[test]
+    fn approving_a_command_snapshots_it_for_display_independent_of_approved_tools() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(a.running_tools.len(), 1);
+
+        // Simulate what main.rs does the moment it spawns the runner.
+        a.approved_tools.clear();
+        assert_eq!(a.running_tools.len(), 1, "the snapshot must survive approved_tools being taken");
+
+        a.finish_tools(vec![outcome("call_1", "ok")]);
+        assert!(a.running_tools.is_empty(), "the snapshot must clear once the run is over");
+    }
+
+    /// Esc at an approval prompt means "no", not "cancel the turn": the
+    /// reflexive keypress has to be the safe one.
+    #[test]
+    fn esc_refuses_the_command_rather_than_cancelling_the_turn() {
+        for refuse in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut a = streaming_app();
+            // Dangerous but not blocked: this test is about the *prompt*, and a
+            // blocked command never reaches one.
+            a.request_tools(vec![command_call("call_1", "rm -rf build")]);
+            a.handle_key(key(refuse));
+
+            assert!(a.approved_tools.is_empty(), "{refuse:?} must not run anything");
+            // The model is told, so it can take another route.
+            let told = a.messages.last().unwrap();
+            assert_eq!(told.tool_call_id.as_deref(), Some("call_1"));
+            assert!(told.content.contains("declined"), "{}", told.content);
+            assert_eq!(a.state, AppState::Sending);
+            assert_history_is_well_formed(&a.history(None));
+        }
+    }
+
+    #[test]
+    fn each_queued_command_is_asked_about_separately() {
+        let mut a = streaming_app();
+        a.request_tools(vec![
+            command_call("call_1", "ls"),
+            command_call("call_2", "cat Cargo.toml"),
+        ]);
+
+        match &a.overlay {
+            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, remaining }) => {
+                assert_eq!(command, "ls");
+                assert_eq!(*remaining, 1);
+            }
+            other => panic!("expected the first prompt, got {other:?}"),
+        }
+
+        a.handle_key(key(KeyCode::Char('y')));
+        match &a.overlay {
+            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, remaining }) => {
+                assert_eq!(command, "cat Cargo.toml");
+                assert_eq!(*remaining, 0);
+            }
+            other => panic!("expected the second prompt, got {other:?}"),
+        }
+
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.approved_tools.len(), 1); // only `ls`
+    }
+
+    #[test]
+    fn a_stray_keypress_leaves_the_prompt_standing() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+
+        for stray in [KeyCode::Char('q'), KeyCode::Down, KeyCode::Backspace] {
+            a.handle_key(key(stray));
+            assert_eq!(a.state, AppState::AwaitingApproval, "{stray:?} dismissed the prompt");
+            assert!(a.overlay.is_some(), "{stray:?} dismissed the prompt");
+        }
+    }
+
+    // ---- destructive-command guardrails -------------------------------------
+
+    /// The whole point of the blocked tier: it is never put in front of the
+    /// user as a y/n question, because one mistyped keystroke would accept it.
+    #[test]
+    fn a_catastrophic_command_is_refused_without_ever_prompting() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "rm -rf /")]);
+
+        assert_eq!(a.overlay, None, "must never be offered for approval");
+        assert!(a.approved_tools.is_empty(), "must never reach the runner");
+        assert_eq!(a.state, AppState::Sending);
+
+        let told = a.messages.last().unwrap();
+        assert_eq!(told.tool_call_id.as_deref(), Some("call_1"));
+        assert!(told.content.contains("Blocked"), "{}", told.content);
+        assert!(
+            told.content.contains("no setting can permit it"),
+            "the model must be told this is settled: {}",
+            told.content
+        );
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    /// The bypasses are the reason this feature exists. Before it,
+    /// `require_approval = false` made `needs_approval` return false for
+    /// *everything*, `rm -rf /` included.
+    #[test]
+    fn no_setting_can_unblock_a_catastrophic_command() {
+        type Bypass = (&'static str, fn(&mut App));
+        let bypasses: [Bypass; 3] = [
+            ("unattended mode", |a| {
+                a.config.tools.require_approval = false
+            }),
+            ("read-only fast path", |a| {
+                a.config.tools.auto_approve_read_only = true
+            }),
+            ("both at once", |a| {
+                a.config.tools.require_approval = false;
+                a.config.tools.auto_approve_read_only = true;
+            }),
+        ];
+
+        for (label, setup) in bypasses {
+            let mut a = streaming_app();
+            setup(&mut a);
+            a.request_tools(vec![command_call("call_1", "sudo rm -rf /")]);
+
+            assert!(
+                a.approved_tools.is_empty(),
+                "{label} let a blocked command through"
+            );
+            assert_eq!(a.overlay, None, "{label} turned it into a prompt");
+        }
+    }
+
+    /// The other half: a destructive-but-legitimate command must still stop,
+    /// even with approval switched off entirely.
+    #[test]
+    fn dangerous_commands_still_ask_in_unattended_mode() {
+        let mut a = streaming_app();
+        a.config.tools.require_approval = false;
+
+        a.request_tools(vec![command_call("call_1", "rm -rf build")]);
+
+        assert_eq!(
+            a.state,
+            AppState::AwaitingApproval,
+            "`rm -rf build` must not ride the unattended fast path"
+        );
+        assert!(a.overlay.is_some());
+    }
+
+    /// ...while ordinary work is untouched by any of this.
+    #[test]
+    fn ordinary_commands_are_unaffected_by_the_guardrails() {
+        let mut a = streaming_app();
+        a.config.tools.require_approval = false;
+        a.request_tools(vec![command_call("call_1", "cargo build")]);
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// A blocked call still has to be answered, or the next prompt 400s.
+    #[test]
+    fn a_blocked_call_mixed_with_a_normal_one_leaves_a_valid_history() {
+        let mut a = streaming_app();
+        a.config.tools.require_approval = false;
+        a.request_tools(vec![
+            command_call("call_1", "rm -rf /"),
+            command_call("call_2", "ls"),
+        ]);
+
+        assert_eq!(a.approved_tools.len(), 1, "only `ls` may run");
+        a.state = AppState::ExecutingTools;
+        a.finish_tools(vec![outcome("call_2", "ok")]);
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    /// "Allow everything from now on" was removed deliberately. `a` is now an
+    /// ordinary unrecognised key, which means the prompt stays up rather than
+    /// being dismissed -- a stray keystroke must never be read as consent.
+    #[test]
+    fn there_is_no_key_that_approves_everything_for_the_session() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+
+        for stray in [KeyCode::Char('a'), KeyCode::Char('A')] {
+            a.handle_key(key(stray));
+            assert_eq!(
+                a.state,
+                AppState::AwaitingApproval,
+                "{stray:?} approved something"
+            );
+            assert!(a.approved_tools.is_empty(), "{stray:?} approved something");
+            assert!(a.overlay.is_some(), "{stray:?} dismissed the prompt");
+        }
+
+        // Each later command is asked about on its own, with no memory of past
+        // answers.
+        a.handle_key(key(KeyCode::Char('y')));
+        a.finish_tools(vec![outcome("call_1", "ok")]);
+        a.state = AppState::Streaming;
+        a.request_tools(vec![command_call("call_2", "cat Cargo.toml")]);
+        assert_eq!(a.state, AppState::AwaitingApproval, "the second command must ask too");
+    }
+
+    #[test]
+    fn approval_is_skipped_entirely_when_the_config_turns_it_off() {
+        let mut a = app();
+        a.config.tools.require_approval = false;
+        type_str(&mut a, "go");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::Streaming;
+
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.overlay, None);
+    }
+
+    #[test]
+    fn read_only_commands_skip_the_prompt_when_the_fast_path_is_on() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![command_call("call_1", "cat src/main.rs")]);
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.overlay, None);
+        assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// The fast path is narrow on purpose: it must not become a second way to
+    /// turn approval off entirely.
+    #[test]
+    fn non_read_only_commands_still_ask_even_with_the_fast_path_on() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![command_call("call_1", "rm -rf build")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert!(a.approved_tools.is_empty());
+    }
+
+    /// A read-only call chained into something else (via `;`, `|`, `&&`, ...)
+    /// must not ride the fast path just because it starts with `cat`/`ls`/etc.
+    #[test]
+    fn a_read_only_prefix_chained_into_something_else_still_asks() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        // Chained into a *dangerous* second command rather than a blocked one:
+        // blocking is a separate mechanism, and this test is about the fast path
+        // not being fooled by the `cat` prefix.
+        a.request_tools(vec![command_call("call_1", "cat file; rm -rf build")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert!(a.approved_tools.is_empty());
+    }
+
+    /// Queued calls are judged independently: the read-only one runs with no
+    /// prompt, the other still stops and asks -- with `remaining` counting only
+    /// what is left in the queue, not what already went straight through.
+    #[test]
+    fn a_read_only_call_and_a_risky_one_in_the_same_queue_are_judged_separately() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![
+            command_call("call_1", "ls"),
+            command_call("call_2", "rm -rf build"),
+        ]);
+
+        assert_eq!(a.approved_tools.len(), 1, "the read-only call ran with no prompt");
+        match &a.overlay {
+            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, remaining }) => {
+                assert_eq!(command, "rm -rf build");
+                assert_eq!(*remaining, 0);
+            }
+            other => panic!("expected a prompt for the risky call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_file_skips_the_prompt_when_the_fast_path_is_on() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![read_file_call("call_1", "src/main.rs")]);
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.overlay, None);
+        assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// Unlike a shell command's read-only-ness, "this writes a file" is
+    /// certain rather than inferred -- so it must never ride the fast path,
+    /// no matter how permissive `auto_approve_read_only` is.
+    #[test]
+    fn write_file_always_asks_even_with_the_fast_path_on() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![write_file_call("call_1", "hello.py", "print('hi')\n")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert!(a.approved_tools.is_empty());
+        match &a.overlay {
+            Some(Overlay::ToolApproval { action: tools::Action::Write { path, content }, .. }) => {
+                assert_eq!(path, "hello.py");
+                assert_eq!(content, "print('hi')\n");
+            }
+            other => panic!("expected a write approval prompt, got {other:?}"),
+        }
+    }
+
+    /// A response carrying tool calls emits ToolCalls and *then* Done. If that
+    /// trailing Done were honoured it would end the turn before anything ran.
+    #[test]
+    fn the_done_that_follows_tool_calls_does_not_end_the_turn() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.finish_stream();
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert_eq!(a.pending_tools.len(), 1);
+    }
+
+    #[test]
+    fn results_go_back_as_tool_messages_and_are_summarised_on_screen() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "cat a.rs")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        a.finish_tools(vec![ToolOutcome {
+            call_id: "call_1".to_string(),
+            display: "$ cat a.rs — 3 lines".to_string(),
+            content: "exit code: 0\n--- stdout ---\nfn main() {}\n".to_string(),
+        }]);
+
+        assert_eq!(a.state, AppState::Sending);
+        let wire = a.history(None);
+        let tool = wire.last().unwrap();
+        assert_eq!(tool.role, "tool");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
+        assert!(tool.content.as_deref().unwrap().contains("fn main"));
+
+        // The transcript shows the summary, never the whole output.
+        assert_eq!(a.messages.last().unwrap().body(), "$ cat a.rs — 3 lines");
+    }
+
+    /// An assistant turn that is nothing but tool calls must serialize with no
+    /// content field at all; `""` is rejected by several providers.
+    #[test]
+    fn an_assistant_turn_of_pure_tool_calls_carries_no_content() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+
+        let assistant = a
+            .history(None)
+            .into_iter()
+            .find(|m| m.role == "assistant")
+            .expect("the assistant turn must be in the history");
+        assert_eq!(assistant.content, None);
+        assert_eq!(assistant.tool_calls.len(), 1);
+    }
+
+    /// The subtle one. Abandoning a turn between "the model asked" and "we ran
+    /// it" leaves a tool_calls entry with no answer. Providers 400 on that -- and
+    /// the 400 surfaces on the *next* prompt, looking unrelated.
+    #[test]
+    fn cancelling_mid_tool_loop_leaves_a_history_the_endpoint_will_accept() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls"), command_call("call_2", "pwd")]);
+        a.handle_key(key(KeyCode::Char('y'))); // allow the first
+        a.handle_key(key(KeyCode::Char('y'))); // allow the second, now ExecutingTools
+        a.cancel();
+
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert!(a.pending_tools.is_empty());
+        assert!(a.approved_tools.is_empty());
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    #[test]
+    fn a_failure_mid_tool_loop_also_leaves_a_valid_history() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.fail_stream("HTTP 500".to_string());
+
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert_eq!(a.overlay, None);
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    /// A call already answered must not be answered twice -- duplicate
+    /// tool_call_ids are just as invalid as missing ones.
+    #[test]
+    fn already_answered_calls_are_not_settled_again() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls"), command_call("call_2", "pwd")]);
+        a.handle_key(key(KeyCode::Char('n'))); // call_1 declined, already answered
+        a.handle_key(key(KeyCode::Char('y'))); // call_2 approved, still unanswered
+        a.cancel();
+
+        let answers: Vec<&str> = a
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(answers, vec!["call_1", "call_2"]);
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    #[test]
+    fn a_new_prompt_resets_the_step_budget() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        a.finish_tools(vec![outcome("call_1", "ok")]);
+        assert_eq!(a.tool_steps, 1);
+
+        a.state = AppState::AwaitingInput;
+        type_str(&mut a, "another question");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.tool_steps, 0);
+    }
+
+    /// Results from a turn the user already abandoned must not be spliced into
+    /// the next one -- the runner is spawned, so it can land late.
+    #[test]
+    fn late_results_from_an_abandoned_turn_are_ignored() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "sleep 30")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        a.cancel();
+
+        let before = a.messages.len();
+        a.finish_tools(vec![outcome("call_1", "too late")]);
+        assert_eq!(a.messages.len(), before, "a late result was appended anyway");
+    }
+
+    /// Every `tool_calls` entry answered exactly once, by a `tool` message, and
+    /// no `tool` message answering a call that was never made.
+    fn assert_history_is_well_formed(history: &[ChatMessage]) {
+        let requested: Vec<&str> = history
+            .iter()
+            .flat_map(|m| m.tool_calls.iter())
+            .map(|c| c.id.as_str())
+            .collect();
+        let mut answered: Vec<&str> = history
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+
+        let mut expected = requested.clone();
+        expected.sort_unstable();
+        answered.sort_unstable();
+        assert_eq!(
+            answered, expected,
+            "every tool call must be answered exactly once\nhistory: {history:#?}"
+        );
     }
 
     #[test]
@@ -1058,359 +2050,6 @@ mod tests {
 
         a.handle_key(key(KeyCode::Home));
         assert_eq!(a.cursor_position(), (1, 0));
-    }
-
-    // ---- agent events -----------------------------------------------------------
-
-    #[test]
-    fn streamed_prose_commits_to_one_entry_when_the_run_ends() {
-        let mut a = app();
-        type_str(&mut a, "hi");
-        a.handle_key(key(KeyCode::Enter));
-        let id = start_run(&mut a);
-
-        a.handle_agent_event(
-            id,
-            AgentEvent::Token {
-                agent: "coder",
-                text: "Hel".to_string(),
-            },
-        );
-        a.handle_agent_event(
-            id,
-            AgentEvent::Token {
-                agent: "coder",
-                text: "lo!".to_string(),
-            },
-        );
-        a.handle_agent_event(
-            id,
-            AgentEvent::Finished {
-                result: Ok("Hello!".to_string()),
-                messages: vec![ChatMessage::user("hi")],
-            },
-        );
-
-        assert_eq!(a.state, AppState::AwaitingInput);
-        assert_eq!(a.entries.len(), 2);
-        assert!(matches!(a.entries[1], Entry::Agent { .. }));
-        assert_eq!(entry_text(&a.entries[1]), "Hello!");
-        // The conversation is kept for the next prompt.
-        assert_eq!(a.session_messages.len(), 1);
-    }
-
-    /// Reasoning must read above the action it led to, not after it.
-    #[test]
-    fn prose_is_committed_before_the_tool_entry_it_precedes() {
-        let mut a = app();
-        type_str(&mut a, "hi");
-        a.handle_key(key(KeyCode::Enter));
-        let id = start_run(&mut a);
-
-        a.handle_agent_event(
-            id,
-            AgentEvent::Token {
-                agent: "coder",
-                text: "Let me look.".to_string(),
-            },
-        );
-        a.handle_agent_event(
-            id,
-            AgentEvent::ToolStarted {
-                agent: "coder",
-                call_id: "c1".to_string(),
-                summary: "read_file(a.rs)".to_string(),
-            },
-        );
-
-        assert!(matches!(a.entries[1], Entry::Agent { .. }));
-        assert_eq!(entry_text(&a.entries[1]), "Let me look.");
-        assert!(matches!(
-            a.entries[2],
-            Entry::Tool {
-                status: ToolStatus::Running,
-                ..
-            }
-        ));
-        assert!(a.streaming_response.is_empty());
-    }
-
-    #[test]
-    fn a_tool_entry_resolves_to_ok_or_failed_by_call_id() {
-        let mut a = app();
-        let id = start_run(&mut a);
-
-        for call in ["c1", "c2"] {
-            a.handle_agent_event(
-                id,
-                AgentEvent::ToolStarted {
-                    agent: "coder",
-                    call_id: call.to_string(),
-                    summary: format!("read_file({call})"),
-                },
-            );
-        }
-        a.handle_agent_event(
-            id,
-            AgentEvent::ToolFinished {
-                call_id: "c2".to_string(),
-                ok: false,
-                detail: "no such file".to_string(),
-            },
-        );
-
-        match (&a.entries[0], &a.entries[1]) {
-            (
-                Entry::Tool { status: first, .. },
-                Entry::Tool {
-                    status: second,
-                    detail,
-                    ..
-                },
-            ) => {
-                assert_eq!(*first, ToolStatus::Running, "c1 is still going");
-                assert_eq!(*second, ToolStatus::Failed);
-                assert_eq!(detail, "no such file");
-            }
-            _ => panic!("expected two tool entries"),
-        }
-    }
-
-    #[test]
-    fn stale_events_from_a_cancelled_run_are_ignored() {
-        let mut a = app();
-        let id = start_run(&mut a);
-        a.request_id += 1; // as if cancelled and restarted
-
-        let accepted = a.handle_agent_event(
-            id,
-            AgentEvent::Token {
-                agent: "coder",
-                text: "ghost".to_string(),
-            },
-        );
-        assert!(!accepted);
-        assert!(a.streaming_response.is_empty());
-    }
-
-    /// A stale permission request still has an agent task blocked behind it.
-    #[test]
-    fn a_stale_permission_request_is_denied_rather_than_dropped() {
-        let mut a = app();
-        let id = start_run(&mut a);
-        a.request_id += 1;
-
-        let (event, receive) = permission_request("run_shell(rm -rf /)", None);
-        assert!(!a.handle_agent_event(id, event));
-        assert_eq!(receive.blocking_recv().unwrap(), Decision::Deny);
-        assert!(a.overlay.is_none());
-    }
-
-    #[test]
-    fn errors_surface_in_the_transcript_and_unblock_input() {
-        let mut a = app();
-        type_str(&mut a, "hi");
-        a.handle_key(key(KeyCode::Enter));
-        let id = start_run(&mut a);
-
-        a.handle_agent_event(
-            id,
-            AgentEvent::Finished {
-                result: Err("HTTP 401 Unauthorized".to_string()),
-                messages: Vec::new(),
-            },
-        );
-
-        assert_eq!(a.state, AppState::AwaitingInput);
-        assert!(a
-            .entries
-            .iter()
-            .any(|e| matches!(e, Entry::Error(t) if t.contains("401"))));
-
-        // The user can immediately try again.
-        type_str(&mut a, "retry");
-        a.handle_key(key(KeyCode::Enter));
-        assert!(matches!(a.state, AppState::Sending { .. }));
-    }
-
-    #[test]
-    fn esc_cancels_and_keeps_partial_output() {
-        let mut a = app();
-        type_str(&mut a, "hi");
-        a.handle_key(key(KeyCode::Enter));
-        let id = start_run(&mut a);
-        a.handle_agent_event(
-            id,
-            AgentEvent::Token {
-                agent: "coder",
-                text: "partial".to_string(),
-            },
-        );
-
-        a.handle_key(key(KeyCode::Esc));
-
-        assert_eq!(a.state, AppState::AwaitingInput);
-        assert!(a.cancel.load(Ordering::Relaxed));
-        assert!(a
-            .entries
-            .iter()
-            .any(|e| entry_text(e).contains("partial")));
-    }
-
-    /// A run that dies mid-tool must not leave a spinner on screen forever.
-    #[test]
-    fn cancelling_resolves_a_still_running_tool_entry() {
-        let mut a = app();
-        type_str(&mut a, "hi");
-        a.handle_key(key(KeyCode::Enter));
-        let id = start_run(&mut a);
-        a.handle_agent_event(
-            id,
-            AgentEvent::ToolStarted {
-                agent: "coder",
-                call_id: "c1".to_string(),
-                summary: "run_shell(sleep 100)".to_string(),
-            },
-        );
-
-        a.handle_key(key(KeyCode::Esc));
-
-        assert!(!a
-            .entries
-            .iter()
-            .any(|e| matches!(e, Entry::Tool { status: ToolStatus::Running, .. })));
-    }
-
-    #[test]
-    fn slash_new_clears_the_conversation_but_keeps_the_transcript() {
-        let mut a = app();
-        a.session_messages = vec![ChatMessage::user("old")];
-        a.entries.push(Entry::User("old".to_string()));
-
-        type_str(&mut a, "/new");
-        a.handle_key(key(KeyCode::Enter));
-
-        assert!(a.session_messages.is_empty());
-        assert_eq!(a.entries.len(), 2);
-        assert!(matches!(a.entries[1], Entry::System(_)));
-    }
-
-    // ---- permission overlay ------------------------------------------------------
-
-    #[test]
-    fn a_permission_request_opens_an_overlay_and_blocks_the_agent() {
-        let mut a = app();
-        let id = start_run(&mut a);
-        let (event, mut receive) = permission_request("run_shell(cargo test)", Some("run_shell:cargo"));
-
-        a.handle_agent_event(id, event);
-
-        assert!(a.awaiting_permission());
-        assert!(matches!(a.overlay, Some(Overlay::Permission { .. })));
-        assert!(receive.try_recv().is_err(), "the agent must still be waiting");
-    }
-
-    #[test]
-    fn allow_once_answers_without_recording_a_grant() {
-        let mut a = app();
-        let id = start_run(&mut a);
-        let (event, receive) = permission_request("write_file(a.rs)", Some("write_file"));
-        a.handle_agent_event(id, event);
-
-        a.handle_key(key(KeyCode::Char('a')));
-
-        assert_eq!(receive.blocking_recv().unwrap(), Decision::AllowOnce);
-        assert!(a.overlay.is_none());
-        assert!(!a.awaiting_permission());
-        assert!(!a.allowlist.allows("write_file"));
-    }
-
-    #[test]
-    fn allow_for_session_records_the_grant() {
-        let mut a = app();
-        let id = start_run(&mut a);
-        let (event, receive) = permission_request("run_shell(cargo test)", Some("run_shell:cargo"));
-        a.handle_agent_event(id, event);
-
-        a.handle_key(key(KeyCode::Char('s')));
-
-        assert_eq!(receive.blocking_recv().unwrap(), Decision::AllowSession);
-        assert!(a.allowlist.allows("run_shell:cargo"));
-    }
-
-    /// A compound command carries no grant key, so 's' must do nothing at all
-    /// rather than silently granting something broader than it looks.
-    #[test]
-    fn allow_for_session_is_inert_when_the_call_is_not_grantable() {
-        let mut a = app();
-        let id = start_run(&mut a);
-        let (event, mut receive) = permission_request("run_shell(cd x && rm -rf /)", None);
-        a.handle_agent_event(id, event);
-
-        a.handle_key(key(KeyCode::Char('s')));
-
-        assert!(receive.try_recv().is_err(), "the prompt must still be open");
-        assert!(matches!(a.overlay, Some(Overlay::Permission { .. })));
-    }
-
-    #[test]
-    fn deny_answers_the_agent_and_leaves_the_run_going() {
-        let mut a = app();
-        type_str(&mut a, "hi");
-        a.handle_key(key(KeyCode::Enter));
-        let id = start_run(&mut a);
-        let (event, receive) = permission_request("write_file(a.rs)", Some("write_file"));
-        a.handle_agent_event(id, event);
-
-        a.handle_key(key(KeyCode::Char('d')));
-
-        assert_eq!(receive.blocking_recv().unwrap(), Decision::Deny);
-        assert_eq!(a.state, AppState::Working, "denial is not cancellation");
-        assert!(!a.cancel.load(Ordering::Relaxed));
-    }
-
-    /// Esc means "get me out", not "refuse this one thing".
-    #[test]
-    fn esc_at_a_permission_prompt_denies_and_cancels_the_run() {
-        let mut a = app();
-        type_str(&mut a, "hi");
-        a.handle_key(key(KeyCode::Enter));
-        let id = start_run(&mut a);
-        let (event, receive) = permission_request("run_shell(rm -rf /)", None);
-        a.handle_agent_event(id, event);
-
-        a.handle_key(key(KeyCode::Esc));
-
-        assert_eq!(receive.blocking_recv().unwrap(), Decision::Deny);
-        assert_eq!(a.state, AppState::AwaitingInput);
-        assert!(a.cancel.load(Ordering::Relaxed));
-        assert!(a.overlay.is_none());
-    }
-
-    #[test]
-    fn an_unrecognised_key_does_not_dismiss_the_permission_prompt() {
-        let mut a = app();
-        let id = start_run(&mut a);
-        let (event, mut receive) = permission_request("write_file(a.rs)", Some("write_file"));
-        a.handle_agent_event(id, event);
-
-        a.handle_key(key(KeyCode::Char('q')));
-        a.handle_key(key(KeyCode::Up));
-
-        assert!(matches!(a.overlay, Some(Overlay::Permission { .. })));
-        assert!(a.awaiting_permission());
-        assert!(receive.try_recv().is_err());
-    }
-
-    #[test]
-    fn typing_while_a_permission_prompt_is_up_never_reaches_the_input_box() {
-        let mut a = app();
-        let id = start_run(&mut a);
-        let (event, _receive) = permission_request("write_file(a.rs)", Some("write_file"));
-        a.handle_agent_event(id, event);
-
-        type_str(&mut a, "q");
-        assert!(a.input_buffer.is_empty());
     }
 
     // ---- /provider and /model overlays -----------------------------------------
@@ -1427,6 +2066,96 @@ mod tests {
             a.handle_key(key(KeyCode::Down));
         }
         a.handle_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    fn up_and_down_walk_back_through_previous_prompts() {
+        let mut a = app();
+        for prompt in ["first", "second", "third"] {
+            type_str(&mut a, prompt);
+            a.handle_key(key(KeyCode::Enter));
+            a.state = AppState::AwaitingInput; // pretend the turn finished
+        }
+
+        // Newest first, then further back, clamping at the oldest.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "third");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "second");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "first");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "first", "must clamp at the oldest entry");
+
+        // And forwards again.
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(a.input_buffer, "second");
+        // The caret sits at the end, ready to edit or resend.
+        assert_eq!(a.cursor, "second".len());
+    }
+
+    /// Reaching for an old prompt and changing your mind must not eat the
+    /// half-written one that was already in the box.
+    #[test]
+    fn stepping_forward_past_the_newest_entry_restores_the_draft() {
+        let mut a = app();
+        type_str(&mut a, "sent");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::AwaitingInput;
+
+        type_str(&mut a, "half writ");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "sent");
+
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(a.input_buffer, "half writ", "the draft must come back");
+    }
+
+    /// Inside a multi-line prompt the arrows belong to the text, not to
+    /// history -- losing a paragraph to a stray Up is worse than pressing PgUp.
+    #[test]
+    fn arrows_move_between_lines_of_a_multi_line_prompt_before_touching_history() {
+        let mut a = app();
+        type_str(&mut a, "old one");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::AwaitingInput;
+
+        type_str(&mut a, "alpha");
+        a.insert_str("\n");
+        type_str(&mut a, "beta");
+        assert_eq!(a.cursor_position(), (1, 4));
+
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.cursor_position().0, 0, "should move within the prompt");
+        assert_eq!(a.input_buffer, "alpha\nbeta", "history must not have fired");
+
+        // Only once the caret is on the first line does Up reach history.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "old one");
+    }
+
+    #[test]
+    fn page_up_and_page_down_still_scroll_the_transcript() {
+        let mut a = app();
+        a.scroll = 20;
+        a.handle_key(key(KeyCode::PageUp));
+        assert_eq!(a.scroll, 10);
+        assert!(!a.follow_tail);
+        a.handle_key(key(KeyCode::PageDown));
+        assert_eq!(a.scroll, 20);
+    }
+
+    /// Pressing Enter twice on the same prompt should not mean pressing Up
+    /// twice to get past it.
+    #[test]
+    fn resending_the_same_prompt_does_not_duplicate_it_in_history() {
+        let mut a = app();
+        for _ in 0..3 {
+            type_str(&mut a, "same");
+            a.handle_key(key(KeyCode::Enter));
+            a.state = AppState::AwaitingInput;
+        }
+        assert_eq!(a.prompt_history, vec!["same".to_string()]);
     }
 
     #[test]
@@ -1516,7 +2245,7 @@ mod tests {
             assert_eq!(a.overlay, None);
             assert_eq!(a.config.llm.provider, "deepseek");
             assert_eq!(a.config.llm.api_key, "sk-from-env");
-            assert!(a.entries.iter().any(|e| matches!(e, Entry::System(_))));
+            assert!(a.messages.iter().any(|m| m.role == Role::System));
         });
 
         match prev {
@@ -1588,7 +2317,7 @@ mod tests {
             assert_eq!(a.config.llm.provider, "deepseek");
             assert_eq!(a.config.llm.api_key, "sk-typed-key");
             assert!(a.overlay_input.is_empty());
-            assert!(a.entries.iter().any(|e| matches!(e, Entry::System(_))));
+            assert!(a.messages.iter().any(|m| m.role == Role::System));
 
             let reloaded = Config::load().expect("load should succeed");
             assert_eq!(reloaded.llm.api_key, "sk-typed-key");
@@ -1607,9 +2336,9 @@ mod tests {
 
         assert_eq!(a.overlay, None);
         assert!(a
-            .entries
+            .messages
             .iter()
-            .any(|e| matches!(e, Entry::Error(t) if t.contains("/provider"))));
+            .any(|m| m.role == Role::Error && m.content.contains("/provider")));
     }
 
     #[test]

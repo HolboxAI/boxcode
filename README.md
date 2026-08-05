@@ -1,51 +1,46 @@
 # tuisample-code
 
-Agentic coding assistant in your terminal, on any OpenAI-compatible LLM endpoint.
-
-It doesn't just answer — it reads your files, searches the repo, edits code and runs
-your build. Launch it from the root of the project you want it to work on; that
-directory is its workspace, and it cannot read or write outside it.
+Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-compatible LLM endpoint.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ tuisample-code | llm.company.internal | model: company-70b   │
-├──────────────────────────────────────────────────────────────┤
-│ You: add a --json flag to the CLI and a test for it          │
-│                                                              │
-│ Coder: Let me see how flags are parsed today.                │
-│ ● grep(--\w+ in src/main.rs)                                 │
-│   │ src/main.rs:41:            "-V" | "--version" => {       │
-│ ● read_file(src/main.rs)                                     │
-│   │      1  mod agent;                                       │
-│   │      2  mod app;                                         │
-│   │ … 224 more lines                                         │
-│ ● edit_file(src/main.rs)                                     │
-│   │ Replaced 1 occurrence in src/main.rs.                    │
-│ ● run_shell(cargo test --all)                                │
-│   │ test result: ok. 156 passed; 0 failed                    │
-│                                                              │
-│ Coder: Added --json to the flag match and a test covering    │
-│ it. cargo test --all passes.                                 │
-├──────────────────────────────────────────────────────────────┤
-│ What should I change? (Enter to send, Ctrl-C to exit)        │
-├──────────────────────────────────────────────────────────────┤
-│ Status: Ready | Enter send · Esc cancel · /new reset         │
-└──────────────────────────────────────────────────────────────┘
+ ◈
+
+  ▟█▙       ▟█▙    tuisample-code  v0.8.0
+  ▜███████████▛    a terminal coding assistant
+  ██  █████  ██
+  ▜███████████▛    Welcome back, you!
+    ▜█▛   ▜█▛
+
+  ────────────────────────────────────────────────────────────────
+
+  model     deepseek-chat
+  endpoint  https://api.deepseek.com
+  cwd       ~/Desktop/HolboxAI/tuisample-code
+
+  /provider switch provider or endpoint
+  /model    switch model
+
+  Ask about this project — it can read files and run commands.
+  Every command and every write waits for your approval.
+
+╭──────────────────────────────────────────────────────────────────────╮
+│❯ add a health check endpoint                                         │
+╰──────────────────────────────────────────────────────────────────────╯
+  ↵ send  ·  ⌥↵ newline  ·  ↑↓ history  ·  ^c exit
 ```
 
-Reads and searches run on their own. Before it writes a file or runs a command,
-it asks:
+While a turn runs, a spinner sits at the end of the transcript — right above
+the prompt, where you're already looking:
 
 ```
-┌ Approve action ──────────────────────────────────┐
-│ The agent wants to:                              │
-│ run_shell(cargo test --all)                      │
-│                                                  │
-│ [a] allow once   [d] deny                        │
-│ [s] allow every `cargo` command for this session │
-│ Esc cancels the whole run.                       │
-└──────────────────────────────────────────────────┘
+  ❯ add a health check endpoint
+
+  I'll add it to the router and run the tests.
+  · $ cargo test — 42 lines
+
+  ⠹ Responding… (4s · ~120 tokens · esc to interrupt)
 ```
+
 
 ## Quick Start
 
@@ -92,19 +87,9 @@ export TUISAMPLE_MODEL=company-llm-70b-v1.2
 export TUISAMPLE_API_KEY=sk_company_xxx
 ```
 
-Agent behaviour can be tuned in the same file. All three are optional:
-
-```toml
-[agent]
-max_iterations = 25      # tool rounds one prompt may take before giving up
-shell_timeout_secs = 120 # per command, capped at 600
-max_tokens = 8192        # per turn; coding turns carry whole files
-```
-
 ### 3. Run
 
 ```bash
-cd ~/code/my-project     # this becomes the workspace
 tuisample-code
 ```
 
@@ -132,51 +117,150 @@ internal mirror serving the same `Cargo.toml` and `install.sh`:
 export TUISAMPLE_UPGRADE_URL_BASE=https://git.company.internal/tuisample-code/raw/main
 ```
 
+## Running commands, and reading/writing files
+
+The model has three tools in the directory you launched from, so you can ask
+about the actual project instead of pasting code in, and have it create or
+change files directly instead of hand-encoding writes into shell commands:
+
+```
+> create hello.py and run it
+📝 /Users/you/project/hello.py
+Created it — printing "Hello, World!" and running it now.
+$ python3 hello.py — 1 line
+```
+
+`read_file`/`write_file` handle reading and creating/overwriting a single
+file. `run_command` is for everything else — search (`grep`), builds, tests,
+running a program, listing an archive (`unzip -l`), extracting a PDF
+(`pdftotext`) — anything installed on your machine.
+
+### You approve every write and every command
+
+Each one stops and waits for you — a write shows the file's full new content,
+not a shell string:
+
+```
+╭ Write this file? ────────────────────────────╮
+│  📝 hello.py                                  │
+│                                              │
+│  print("Hello, World!")                      │
+│                                              │
+│  in /Users/you/project                       │
+│                                              │
+│  y write  ·  n skip  ·  esc skip             │
+╰──────────────────────────────────────────────╯
+```
+
+**`y`** does it · **`n`** or **Esc** skips it and tells the model to try
+something else. Every action is asked about individually — there is
+deliberately no "allow everything from now on" key, so one impatient keystroke
+can never cover commands the model has not thought of yet. Reads of a short,
+conservative allowlist (`ls`, `cat`, `grep`, `git status`/`diff`, ...) skip the
+prompt by default — see `auto_approve_read_only` below.
+
+These prompts are the *only* thing limiting what the model can do. `run_command`
+can read any file your user can read, write anywhere, and delete anything —
+there is no sandbox, and there is no honest way to build one by inspecting
+command strings. `write_file`/`read_file` are checked against the project
+directory before anything happens (see `tools::resolve_in_workspace`), which
+a raw shell command cannot offer, but that is a guardrail against typos and
+injected paths, not a sandbox either. Read each prompt before pressing `y`.
+
+Commands run with **stdin closed** and are killed after a timeout, so anything
+interactive (`vim`, a dev server, a REPL) will time out rather than hang.
+
+### Some things are refused outright
+
+A third tier sits above the prompt. Genuinely catastrophic commands are never
+run and are **never even offered for approval** — offering `rm -rf /` as a y/n
+question is itself the bug, since one mistyped keystroke accepts it and there
+is no undo:
+
+```
+⛔ $ rm -rf / — blocked
+   `rm` aimed at `/`, which is outside the project directory
+```
+
+Refused: deleting anything outside the project directory or the project itself
+(`rm -rf /`, `~`, `/etc`, `../..`, `.`, `*`), `--no-preserve-root`, disk
+formatting (`mkfs`, `fdisk`, `dd of=/dev/sda`), writing to raw devices, fork
+bombs, shutdown/reboot, piping a download into a shell (`curl … | sh`),
+executing base64-decoded data, `kill -9 1`, and recursive `chmod`/`chown` on
+system paths. Every segment of a chained command is checked, so
+`ls && rm -rf /` is caught too.
+
+Windows and PowerShell are covered by the same rules: `del /f /s /q C:\`,
+`rd /s /q C:\`, `Remove-Item -Recurse -Force C:\`, `format`, `diskpart`,
+`cipher /w`, `bcdedit`, `reg delete HKLM`, `Clear-Disk`, and
+`vssadmin delete shadows` (which destroys the backups that would let you
+recover).
+
+**No setting reaches this.** Not `require_approval = false`, not
+`auto_approve_read_only`. There is deliberately no config option to turn it off.
+
+A middle tier — destructive but legitimate — always stops for an explicit
+decision, *even with approval switched off entirely*: `rm -rf build`,
+`git reset --hard`,
+`git clean -fd`, force-push, `sudo` anything, `find … -delete`, uninstalls,
+`docker prune`. The prompt shows a red **DESTRUCTIVE** banner and why.
+
+> This is not a sandbox, and no blocklist can be one. A command that builds its
+> argument at runtime (`rm -rf $(printf '\x2f')`) defeats any static check —
+> such commands are forced to the always-ask tier rather than judged safe, but
+> the honest claim is narrow: this catches destructive commands a model
+> produces **by mistake**, which is the realistic failure mode. It does not
+> stop a determined attacker. Real containment needs an OS sandbox.
+
+### Configuration
+
+```toml
+[tools]
+enabled = true                # false sends no tool schema at all
+workspace = "."                # "." = the directory you launched from
+require_approval = true        # false = the model runs commands unattended
+auto_approve_read_only = true  # skip the prompt for a narrow read-only allowlist
+command_timeout_secs = 60
+max_output_bytes = 65536  # ceiling on one command's output
+max_steps = 10            # command rounds per prompt before the model must answer
+```
+
+Per-run: `TUISAMPLE_WORKSPACE=/path/to/project`, `TUISAMPLE_TOOLS_ENABLED=0`.
+
+> **`require_approval = false` hands the model an unattended shell** on your
+> machine. It exists for scripted testing. If you set it, the welcome screen
+> says `UNATTENDED` in red every launch.
+
+`auto_approve_read_only` skips the popup only for a short, conservative
+allowlist of commands that cannot change anything on disk -- `ls`, `cat`,
+`grep`, `git status`/`diff`/`log`/`show`, and similar (see
+`tools::is_read_only`). Anything chained with `;`, `|`, `&&`, `>`, or a
+subshell falls back to asking, even if it starts with one of those. Everything
+else -- writes, deletes, `git push`, `find -delete`, arbitrary other commands
+-- still stops for a decision regardless of this setting. Set it to `false` to
+go back to asking about every command, including reads.
+
+Works on macOS, Linux, and Windows — commands run through `sh -c`, or `cmd /C`
+on Windows, and the model is told which platform it is on so it reaches for
+`dir`/`type`/`findstr` rather than `ls`/`cat`/`grep`.
+
+> Your endpoint needs to support OpenAI-style tool calling. If it doesn't, the
+> request comes back as `HTTP 400` — set `enabled = false` under `[tools]` and
+> everything else keeps working as before.
+
 ## Usage
-
-Ask for a change, not just an answer:
-
-- *"add a `--json` flag to the CLI and a test for it"*
-- *"why does the auth test fail on CI but not locally?"*
-- *"this function is doing three things — split it up"*
-
-### Keys
 
 - **Type prompt** — Bottom input line (paste works too)
 - **Enter** — Send prompt
 - **Alt-Enter** / **Shift-Enter** — Insert a newline for multi-line prompts
-- **Esc** — Cancel the run
-- **↑ / ↓ / PgUp / PgDn** — Scroll the transcript
+- **Esc** — Cancel ongoing request
+- **↑ / ↓** — Recall previous prompts. Inside a multi-line prompt they move
+  between its lines first, so a stray ↑ can't swallow what you were writing
+- **PgUp / PgDn** — Scroll the transcript
 - **Ctrl-A / Ctrl-E** — Jump to start / end of line
 - **Ctrl-W** — Delete previous word
 - **Ctrl-U / Ctrl-K** — Delete to start / end of line
 - **Ctrl-C** — Exit
-
-### At an approval prompt
-
-- **a** — allow once
-- **s** — allow for the rest of the session (only offered when it's safe to
-  generalise; see below)
-- **d** — deny. The agent is told, and adapts rather than failing.
-- **Esc** — deny *and* cancel the whole run
-
-## What the agent can do
-
-| Tool | Approval |
-|---|---|
-| `read_file`, `list_dir`, `glob`, `grep` | Runs on its own |
-| `write_file`, `edit_file` | Asks |
-| `run_shell` — builds, tests, `git`, `gh` | Asks |
-
-Two limits are enforced regardless of what the model asks for:
-
-- **Nothing outside the workspace.** Paths are resolved through symlinks before
-  the check, so neither `../../etc/passwd` nor a symlink pointing out of the tree
-  gets through.
-- **Session grants are scoped.** Allowing `cargo test` for the session covers
-  `cargo build` too, but not `rm`. A command combining several programs
-  (`cd x && rm -rf /`) can't be granted for a session at all — it's asked every
-  time, because the first word doesn't tell you what it does.
 
 `endpoint` may be given as `https://host`, `https://host/v1`, or the full
 `https://host/v1/chat/completions` — all three resolve correctly. Environment
@@ -193,49 +277,33 @@ variables override values in `config.toml`.
   configured, without going through `/provider` again. If no provider has been
   set yet (e.g. you're only using `TUISAMPLE_*` env vars or a custom endpoint),
   this shows an inline error telling you to run `/provider` first.
-- **`/new`** — Forgets the conversation and starts fresh, without restarting the
-  process. The transcript stays on screen; the agent just stops carrying it.
 
-`/provider` and `/model` write the result to `~/.tuisample-code/config.toml` and
-apply it immediately — no restart needed, even mid-session.
-
-## Requirements
-
-The endpoint must support OpenAI-style function calling (a `tools` array and
-`tool_calls` in the response). DeepSeek and OpenAI both do, as do most current
-self-hosted servers (vLLM, llama.cpp, Ollama, TGI). Without it the model can
-still talk, but it can't touch your code.
+Both write the result to `~/.tuisample-code/config.toml` and apply it
+immediately — no restart needed, even mid-session.
 
 ## Architecture
 
 - **Rust + Ratatui** — Terminal UI framework
-- **tokio** — Async event loop (keyboard, streaming and tool execution at once)
+- **tokio** — Async event loop (handles keyboard + streaming simultaneously)
 - **OpenAI-compatible API** — Works with any endpoint (self-hosted, Bedrock, etc.)
 
-```
-prompt ─▶ agent loop ─▶ model asks for tools ─▶ permission gate ─▶ tools run
-             ▲                                                        │
-             └──────────────── results fed back ──────────────────────┘
-```
-
-- `src/main.rs` — Event loop; starts a run, routes agent events to the UI
-- `src/agent/` — Agent registry and system prompts (`mod.rs`), the loop (`run.rs`)
-- `src/tools/` — What the model can do: `fs.rs`, `search.rs`, `shell.rs`
-- `src/permission.rs` — What runs unattended, and how session grants are scoped
-- `src/app.rs` — UI state: the timeline, overlays, input editing
+Clean, modular structure for easy feature additions:
+- `src/main.rs` — Event loop
+- `src/app.rs` — State machine
 - `src/ui.rs` — Terminal rendering
-- `src/llm.rs` — Streaming client, tool-call protocol
+- `src/theme.rs` — Colours, glyphs, and the spinner, in one place
+- `src/llm.rs` — LLM client + streaming
 - `src/config.rs` — Configuration loading
 - `src/providers.rs` — Built-in provider/model registry for `/provider` and `/model`
+- `src/tools.rs` — The model's tools (`run_command`, `read_file`, `write_file`): schemas, execution, timeouts
+- `src/workspace.rs` — The working directory commands run in
 
 ## What's Next
 
-The agent registry in `src/agent/mod.rs` currently holds one general-purpose
-`coder`. It's shaped for several: the next step splits it into specialists —
-planner, investigator, coder, fixer, test-writer, and a merge/CI integrator —
-with a lead agent that picks who to hand each piece to via a `delegate` tool.
-Each specialist gets its own system prompt and its own subset of the tool
-registry; the loop and the permission gate stay exactly as they are.
+- A diff preview when a command is about to modify tracked files
+- Remembering per-command approvals across a session
+- GitHub integration (VPC-only)
+- Test generation
 
 ## Development
 

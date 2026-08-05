@@ -1,16 +1,17 @@
-mod agent;
 mod app;
 mod config;
+mod danger;
 mod llm;
-mod permission;
 mod providers;
 mod tools;
+mod theme;
 mod ui;
 mod upgrade;
+mod workspace;
 
-use agent::{AgentEvent, RunCtx};
 use app::{App, AppState};
 use config::Config;
+use workspace::Workspace;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -19,11 +20,11 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
     LeaveAlternateScreen,
 };
+use llm::StreamEvent;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::error::Error;
 use std::io;
-use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -72,9 +73,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let config = Config::load()?;
-    // The directory the tool was launched from is the workspace. Everything the
-    // agent reads or writes has to resolve inside it.
-    let workspace = std::env::current_dir()?;
+    let (workspace, workspace_status) = open_workspace(&config);
 
     let enhanced = setup_terminal()?;
     install_panic_hook(enhanced);
@@ -83,9 +82,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config);
-    let (tx, mut rx) = mpsc::channel::<(u64, AgentEvent)>(512);
+    app.workspace_status = workspace_status;
+    app.workspace_root = workspace
+        .as_ref()
+        .map(|ws| ws.root().display().to_string())
+        .unwrap_or_default();
+    let (tx, mut rx) = mpsc::channel::<(u64, StreamEvent)>(256);
 
-    let result = run_app(&mut terminal, &mut app, workspace, tx, &mut rx).await;
+    let result = run_app(&mut terminal, &mut app, workspace.as_ref(), tx, &mut rx).await;
 
     restore_terminal(enhanced)?;
     if let Err(e) = &result {
@@ -95,17 +99,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
     result
 }
 
+/// Resolve the root the model is confined to, and a line describing the outcome.
+///
+/// A workspace that cannot be opened must not stop the app: it still works as a
+/// plain chat client, just without file access, so the failure degrades to a
+/// notice on the welcome screen instead of a startup error.
+fn open_workspace(config: &Config) -> (Option<Workspace>, String) {
+    if !config.tools.enabled {
+        return (None, "off (enabled = false in config.toml)".to_string());
+    }
+    match Workspace::new(&config.tools.workspace) {
+        Ok(workspace) => {
+            let root = workspace.root().display().to_string();
+            // Every one of these is worth seeing before typing the first prompt:
+            // a shell tool can change anything, and unattended mode means it can
+            // do so without asking.
+            let mut status = format!("commands run in {root}");
+            if !config.tools.require_approval {
+                status.push_str(" — UNATTENDED, no approval prompt");
+            }
+            if workspace.is_broad() {
+                status.push_str(" — this is a very broad directory");
+            }
+            (Some(workspace), status)
+        }
+        Err(e) => (None, format!("off — {e}")),
+    }
+}
+
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    workspace: PathBuf,
-    tx: mpsc::Sender<(u64, AgentEvent)>,
-    rx: &mut mpsc::Receiver<(u64, AgentEvent)>,
+    workspace: Option<&Workspace>,
+    tx: mpsc::Sender<(u64, StreamEvent)>,
+    rx: &mut mpsc::Receiver<(u64, StreamEvent)>,
 ) -> Result<(), Box<dyn Error>> {
-    // One client for the whole session: a fresh one per turn would pay for a TLS
-    // handshake on every step of every run.
-    let client = llm::build_client()?;
-
     loop {
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -124,52 +152,84 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
-        // Drain every event that has arrived; doing only one per frame caps
+        // Drain every token that has arrived; doing only one per frame caps
         // throughput at ~60 tokens/sec and looks like the app is stalling.
         while let Ok((id, event)) = rx.try_recv() {
-            app.handle_agent_event(id, event);
+            if id != app.request_id {
+                continue; // stale: belongs to a cancelled request
+            }
+            match event {
+                StreamEvent::Token(token) => app.append_token(&token),
+                StreamEvent::ToolCalls(calls) => app.request_tools(calls),
+                StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
+                StreamEvent::Done => app.finish_stream(),
+                StreamEvent::Error(err) => app.fail_stream(err),
+            }
         }
 
-        // Start a pending run.
-        if let AppState::Sending { prompt } = &app.state {
-            let prompt = prompt.clone();
+        // Fire a pending request.
+        if app.state == AppState::Sending {
             app.request_id += 1;
             let id = app.request_id;
+            let endpoint = app.config.llm.endpoint.clone();
+            let model = app.config.llm.model.clone();
+            let api_key = app.config.llm.api_key.clone();
 
-            let ctx = RunCtx {
-                run_id: id,
-                client: client.clone(),
-                // Re-read from config every time, so `/provider` mid-session
-                // takes effect on the very next prompt.
-                target: llm::Target {
-                    endpoint: app.config.llm.endpoint.clone(),
-                    model: app.config.llm.model.clone(),
-                    api_key: app.config.llm.api_key.clone(),
-                    max_tokens: app.config.agent.max_tokens,
-                },
-                tools: tools::ToolCtx::new(
-                    workspace.clone(),
-                    Duration::from_secs(app.config.agent.shell_timeout_secs),
+            // Withholding the schemas once the budget is spent is what actually
+            // stops a runaway loop: the model has nothing left to call, so it
+            // answers. Saying "stop" in the prompt alone would only be a request.
+            let budget_left = app.tool_steps < app.config.tools.max_steps;
+            let (schemas, system) = match workspace {
+                Some(ws) => (
+                    if budget_left { tools::schemas() } else { Vec::new() },
+                    Some(tools::system_prompt(ws, &app.config.tools, budget_left)),
                 ),
-                allowlist: app.allowlist.clone(),
-                max_iterations: app.config.agent.max_iterations,
-                cancel: app.cancel.clone(),
-                tx: tx.clone(),
+                None => (Vec::new(), None),
             };
-
-            let spec = agent::default_agent();
-            let messages = app.session_messages.clone();
-            let done = tx.clone();
+            let history = app.history(system.as_deref());
+            let tx_clone = tx.clone();
 
             let handle = tokio::spawn(async move {
-                let (result, messages) = agent::run::run(spec, prompt, messages, ctx).await;
-                let _ = done
-                    .send((id, AgentEvent::Finished { result, messages }))
-                    .await;
+                llm::stream_chat(&endpoint, &model, &api_key, history, schemas, id, tx_clone).await;
             });
 
             app.abort = Some(handle.abort_handle());
-            app.state = AppState::Working;
+            app.state = AppState::Streaming;
+        }
+
+        // Run the commands the user allowed.
+        //
+        // Spawned rather than run inline: a command may take a minute, and doing
+        // it on the event loop would freeze the whole UI -- no redraw, no Esc, no
+        // way to tell a slow build from a hang. Results come back on the same
+        // channel as tokens, so the stale-request-id guard covers them too.
+        if app.state == AppState::ExecutingTools && !app.approved_tools.is_empty() {
+            let calls = std::mem::take(&mut app.approved_tools);
+            let tools_config = app.config.tools.clone();
+            match workspace {
+                Some(ws) => {
+                    let ws = ws.clone();
+                    let id = app.request_id;
+                    let tx_clone = tx.clone();
+                    let handle = tokio::spawn(async move {
+                        let mut outcomes = Vec::with_capacity(calls.len());
+                        for call in &calls {
+                            outcomes.push(tools::execute(call, &ws, &tools_config).await);
+                        }
+                        let _ = tx_clone
+                            .send((id, StreamEvent::ToolsFinished(outcomes)))
+                            .await;
+                    });
+                    app.abort = Some(handle.abort_handle());
+                }
+                // Only reachable if a model invents tool calls for a schema it
+                // was never sent. Answer them anyway, or the history is left
+                // invalid and the next prompt fails instead of this one.
+                None => app.fail_stream(
+                    "The model asked to run a command, but the command tool is not enabled."
+                        .to_string(),
+                ),
+            }
         }
 
         if app.should_exit {
@@ -183,10 +243,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 fn print_help() {
     println!(
         "tuisample-code {VERSION}
-Agentic coding assistant in your terminal, on any OpenAI-compatible endpoint.
-
-Run it from the root of the project you want it to work on -- that directory is
-the workspace, and the agent cannot read or write outside it.
+Terminal UI for an OpenAI-compatible LLM endpoint.
 
 USAGE:
     tuisample-code [FLAGS]
@@ -202,8 +259,16 @@ CONFIG (environment overrides ~/.tuisample-code/config.toml):
     TUISAMPLE_MODEL       Model name
     TUISAMPLE_API_KEY     Bearer token
 
-    [agent] in config.toml also takes max_iterations, shell_timeout_secs and
-    max_tokens.
+TOOLS (read_file, write_file, run_command; writes and commands need your
+       approval each time -- see the [tools] table in config.toml):
+    TUISAMPLE_WORKSPACE       Directory these operate in (default: cwd)
+    TUISAMPLE_TOOLS_ENABLED   Set to 0 to send no tool schema at all
+    TUISAMPLE_TOOLS_APPROVAL  Set to 0 to stop asking before each write/command.
+                              For scripted testing only -- it hands the model
+                              unattended file and shell access.
+                              See the [tools] table in config.toml for
+                              auto_approve_read_only, command_timeout_secs,
+                              max_output_bytes, max_steps.
 
 UPGRADE:
     TUISAMPLE_UPGRADE_URL_BASE
@@ -215,14 +280,10 @@ COMMANDS (type in the input box, press Enter):
     /model                Pick a model for the currently configured provider
     /new                  Forget the conversation and start fresh
 
-APPROVALS:
-    Reads and searches run on their own. Before writing a file or running a
-    command the agent asks: [a] allow once, [s] allow for the session, [d] deny.
-
 KEYS:
     Enter                 Send prompt
     Alt/Shift-Enter       New line
-    Esc                   Cancel the run
+    Esc                   Cancel request
     Ctrl-C                Exit"
     );
 }
