@@ -303,8 +303,16 @@ things, and only these two things, ever leave your machine:
 Each ping carries only `{anon_id, event, version, os, date}` — no prompts, no
 file paths, no command text, no conversation content. Both are silent,
 best-effort, and never block startup or fail an install: see `src/telemetry.rs`
-and the `ping_install` function in `install.sh`. Disabled by default until an
-endpoint is configured (`TUISAMPLE_TELEMETRY_URL`).
+and the `ping_install` function in `install.sh`.
+
+**The aggregate counts are public**: [tui-telemetry.dhruvm307.workers.dev](https://tui-telemetry.dhruvm307.workers.dev)
+shows total installs, distinct anonymous devices seen, and daily-active counts,
+live. That page is also the entire ingestion endpoint (see
+`telemetry-worker.js` in the repo root) — it's as publicly *writable* as it is
+readable, so treat the numbers as self-reported, not verified.
+
+Set `TUISAMPLE_TELEMETRY_URL=""` (explicitly blank, not just unset) before
+installing or running the binary to opt out entirely.
 
 This is entirely separate from `/usage` above, which never leaves your
 machine at all.
@@ -328,6 +336,7 @@ Clean, modular structure for easy feature additions:
 - `src/usage.rs` — Local per-install token usage log (`/usage`), never transmitted
 - `src/telemetry.rs` — Anonymous install/daily-active pings, disabled by default
 - `src/dateutil.rs` — Calendar-date helpers shared by the two above
+- `telemetry-worker.js` — The Cloudflare Worker that `telemetry.rs`/`install.sh` ping and that serves the public view
 
 ## What's Next
 

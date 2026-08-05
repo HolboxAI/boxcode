@@ -35,14 +35,20 @@ sweep_path_for_stale_copies() {
 # telemetry.rs reads and reuses on later runs rather than generating a second,
 # conflicting ID. No other data leaves this machine from here.
 #
-# Disabled by default (empty TUISAMPLE_TELEMETRY_URL, matching telemetry.rs's
-# own DEFAULT_TELEMETRY_URL), and every failure mode -- no uuidgen, no curl,
-# network down, endpoint unset or unreachable -- is swallowed. This must never
-# be able to fail the install itself, so it always backgrounds the request and
-# never lets a failure here reach `set -e`.
+# Defaults to the same endpoint telemetry.rs's DEFAULT_TELEMETRY_URL points
+# at -- keep the two in sync if that ever changes. TUISAMPLE_TELEMETRY_URL
+# overrides it; note the missing ":" in the substitution below is deliberate,
+# not a typo -- "${VAR-default}" falls back only when the variable is unset,
+# so an explicit TUISAMPLE_TELEMETRY_URL="" still disables sending rather than
+# silently reverting to the default, matching telemetry.rs's own handling of
+# an explicit blank override. Every failure mode -- no uuidgen, no curl,
+# network down, endpoint unreachable -- is swallowed either way. This must
+# never be able to fail the install itself, so it always backgrounds the
+# request and never lets a failure here reach `set -e`.
 ping_install() {
   local binary="$1"
-  local url="${TUISAMPLE_TELEMETRY_URL:-}"
+  local default_url="https://tui-telemetry.dhruvm307.workers.dev"
+  local url="${TUISAMPLE_TELEMETRY_URL-$default_url}"
   [ -n "$url" ] || return 0
 
   local state_dir="$HOME/.tuisample-code"

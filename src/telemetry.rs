@@ -16,27 +16,45 @@
 //! file paths, no command text, no prompts. See `usage.rs` for the separate,
 //! purely local (never transmitted) per-install usage log.
 //!
-//! Disabled by default. `telemetry_url()` returns `None` -- and every
-//! function here silently does nothing -- until either `DEFAULT_TELEMETRY_URL`
-//! is filled in at build time or `TUISAMPLE_TELEMETRY_URL` is set at runtime.
+//! Points at a Cloudflare Worker (see `telemetry-worker.js` in the repo root)
+//! that logs each ping to Workers KV and serves a public HTML view of the
+//! aggregate counts at the same URL over GET -- no login collects it, so
+//! nothing here is more sensitive than what that page already shows anyone.
+//! `TUISAMPLE_TELEMETRY_URL` overrides `DEFAULT_TELEMETRY_URL` below, e.g. to
+//! point a fork or a local test run at a different endpoint. A blank value
+//! either way disables sending entirely -- every function in this module is a
+//! silent no-op in that case, by construction, not by remembering to check a
+//! flag.
 
 use crate::dateutil;
 use std::path::PathBuf;
 use std::time::Duration;
 
 const TELEMETRY_URL_ENV: &str = "TUISAMPLE_TELEMETRY_URL";
-/// Filled in once a real endpoint exists. Blank means disabled: every
-/// caller in this module treats "unset env var and blank default" as "don't
-/// send anything", so builds before an endpoint exists are silent by
-/// construction, not by remembering to flip a flag.
-const DEFAULT_TELEMETRY_URL: &str = "";
+const DEFAULT_TELEMETRY_URL: &str = "https://tui-telemetry.dhruvm307.workers.dev";
 
 fn telemetry_url() -> Option<String> {
-    let from_env = std::env::var(TELEMETRY_URL_ENV).ok();
-    from_env
-        .filter(|u| !u.trim().is_empty())
-        .or_else(|| Some(DEFAULT_TELEMETRY_URL.to_string()))
-        .filter(|u| !u.trim().is_empty())
+    telemetry_url_given(std::env::var(TELEMETRY_URL_ENV).ok().as_deref())
+}
+
+/// The actual decision, taking the env override as a plain `Option<&str>`
+/// rather than reading the environment directly so it's testable without
+/// mutating real process state -- same reasoning as `theme.rs`'s
+/// `supports_truecolor_given`.
+///
+/// `None` (the env var was never set) and `Some("")` (it was set, but
+/// blank) must be handled differently: only the former falls back to
+/// `DEFAULT_TELEMETRY_URL`. An explicit blank override is a deliberate
+/// "disable this," and must win even over a non-blank default -- a `.filter`
+/// after a single `.or_else` can't tell those two cases apart, which is
+/// exactly the bug this match avoids.
+fn telemetry_url_given(env_override: Option<&str>) -> Option<String> {
+    let candidate = match env_override {
+        Some(url) => url,
+        None => DEFAULT_TELEMETRY_URL,
+    };
+    let trimmed = candidate.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn state_dir() -> Option<PathBuf> {
@@ -151,11 +169,29 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_default_and_unset_env_var_means_disabled() {
-        // This is the state every build ships in until DEFAULT_TELEMETRY_URL
-        // is filled in -- locking it in as a test, not just a doc comment,
-        // so a future accidental non-empty default gets caught by CI rather
-        // than silently starting to send pings.
-        assert!(DEFAULT_TELEMETRY_URL.trim().is_empty());
+    fn the_default_endpoint_is_a_well_formed_https_url() {
+        assert!(DEFAULT_TELEMETRY_URL.starts_with("https://"), "{DEFAULT_TELEMETRY_URL}");
+    }
+
+    #[test]
+    fn with_no_env_override_the_default_endpoint_is_used() {
+        assert_eq!(telemetry_url_given(None), Some(DEFAULT_TELEMETRY_URL.to_string()));
+    }
+
+    #[test]
+    fn an_env_override_takes_precedence_over_the_default() {
+        assert_eq!(
+            telemetry_url_given(Some("https://example.test/other")),
+            Some("https://example.test/other".to_string())
+        );
+    }
+
+    /// A fork or a local test run has to be able to turn this off even
+    /// though the shipped default is now a real endpoint -- an explicitly
+    /// blank override must win, not fall back to the default.
+    #[test]
+    fn an_explicit_blank_env_override_disables_sending_despite_a_real_default() {
+        assert_eq!(telemetry_url_given(Some("")), None);
+        assert_eq!(telemetry_url_given(Some("   ")), None);
     }
 }
