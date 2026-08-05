@@ -115,7 +115,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// a working app. An empty string means there is nothing worth saying.
 async fn enrol_free_tier(config: &mut Config) -> String {
     if freetier::is_free_tier(config) {
-        return format!("free tier — {} (type /usage for today's budget)", config.llm.model);
+        // Ask the gateway rather than guess. The budget is enforced server-side
+        // and can be changed there at any time, so anything remembered locally
+        // from enrolment would be a number that only looks authoritative.
+        return match freetier::fetch_budget(config).await {
+            Ok(budget) => format!("{} · resets at UTC midnight", budget.summary()),
+            // Not an error worth blocking on: the app works, and the limit is
+            // simply not known this second.
+            Err(_) => format!("free tier — {} (type /usage for today's budget)", config.llm.model),
+        };
     }
     if !freetier::should_register(config) {
         return String::new();

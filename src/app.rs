@@ -496,6 +496,14 @@ impl App {
             usage::time_until_local_midnight()
         ));
 
+        // The free-tier budget is a different meter entirely -- enforced by the
+        // gateway, on a UTC day, and not editable here. Showing them side by
+        // side stops the local numbers being mistaken for the ones that bind.
+        if !self.free_tier_status.is_empty() && !self.free_tier_status.starts_with("unavailable") {
+            lines.push(String::new());
+            lines.push(format!("Free tier (enforced by the gateway)\n  {}", self.free_tier_status));
+        }
+
         self.greeted = true;
         self.follow_tail = true;
         self.messages

@@ -121,6 +121,71 @@ pub async fn register(config: &mut Config) -> Result<Enrolment, String> {
     })
 }
 
+/// This device's live free-tier budget, as the gateway sees it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Budget {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub daily_limit_usd: f64,
+    #[serde(default)]
+    pub spent_usd: f64,
+    #[serde(default)]
+    pub requests: u64,
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default)]
+    pub resets_at: String,
+    #[serde(default)]
+    pub exhausted: bool,
+}
+
+impl Budget {
+    /// One line for the welcome screen and `/usage`.
+    pub fn summary(&self) -> String {
+        if self.daily_limit_usd <= 0.0 {
+            return format!("free tier — {} · no daily limit", self.model);
+        }
+        format!(
+            "free tier — {} · ${:.4} of ${:.2} used today ({} requests)",
+            self.model, self.spent_usd, self.daily_limit_usd, self.requests
+        )
+    }
+}
+
+/// Ask the gateway what this device has spent today.
+///
+/// The budget is enforced server-side, so the client cannot compute it: without
+/// asking, a user learns their limit once at enrolment and thereafter only by
+/// hitting it. Deliberately best-effort -- a failure here must never stop the
+/// app starting, so callers fall back to a plainer status line.
+pub async fn fetch_budget(config: &Config) -> Result<Budget, String> {
+    let gateway = config.free_tier.gateway.trim_end_matches('/');
+    if gateway.is_empty() || config.free_tier.device_token.is_empty() {
+        return Err("Not enrolled in the free tier.".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Could not create HTTP client: {e}"))?;
+
+    let response = client
+        .get(format!("{gateway}/me"))
+        .bearer_auth(&config.free_tier.device_token)
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach the gateway: {e}"))?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("Gateway returned {status}. {}", summarise_error(&body)));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("Unexpected response from the gateway: {e}"))
+}
+
 /// Pull the human-readable part out of an OpenAI-shaped error body.
 pub fn summarise_error(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
