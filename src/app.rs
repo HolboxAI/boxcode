@@ -615,6 +615,15 @@ impl App {
         }
     }
 
+    /// A note from the transport that is neither the model talking nor a
+    /// failure -- currently only "your answer was truncated". Pushed as a
+    /// System message so it reads as status, and kept out of `history` so the
+    /// model is never told about our own plumbing.
+    pub fn note(&mut self, note: String) {
+        self.messages.push(Message::new(Role::System, note));
+        self.follow_tail = true;
+    }
+
     pub fn append_token(&mut self, token: &str) {
         if self.state == AppState::Streaming {
             self.streaming_response.push_str(token);
