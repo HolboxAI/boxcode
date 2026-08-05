@@ -2407,6 +2407,39 @@ mod tests {
         assert_eq!(a.state, AppState::AwaitingInput);
     }
 
+    /// The free-tier budget is the one that actually refuses requests, so it has
+    /// to appear in `/usage` alongside the local counters -- otherwise a user
+    /// reads "no limit set" three times and concludes there is no limit.
+    #[test]
+    fn the_usage_report_shows_the_free_tier_budget_when_enrolled() {
+        let mut a = app();
+        a.free_tier_status =
+            "free tier — deepseek-v4-flash · $0.0021 of $0.25 used today (3 requests)".to_string();
+
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+
+        let report = a
+            .messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .expect("a report must be shown");
+        assert!(report.content.contains("Free tier"), "{}", report.content);
+        assert!(report.content.contains("$0.25"), "{}", report.content);
+        // ...and it must be labelled as the gateway's, not confused with the
+        // local counters directly above it.
+        assert!(report.content.contains("gateway"), "{}", report.content);
+    }
+
+    #[test]
+    fn the_usage_report_omits_the_free_tier_block_for_a_byok_user() {
+        let mut a = app(); // free_tier_status empty: user brought their own key
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+        let report = a.messages.iter().find(|m| m.role == Role::System).unwrap();
+        assert!(!report.content.contains("Free tier"), "{}", report.content);
+    }
+
     #[test]
     fn the_usage_report_names_requests_it_could_not_price() {
         let mut a = app();
