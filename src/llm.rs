@@ -78,6 +78,11 @@ pub struct StreamDelta {
 pub struct Choice {
     #[serde(default)]
     pub delta: Delta,
+    /// Why the endpoint stopped. `"length"` means it hit the output cap and the
+    /// answer is cut off mid-thought -- the difference between a short reply and
+    /// a truncated one, which is invisible without this.
+    #[serde(default)]
+    pub finish_reason: Option<String>,
     /// Present when the endpoint ignores `stream: true` and answers with a plain
     /// (non-SSE) completion body.
     #[serde(default)]
@@ -128,6 +133,9 @@ pub enum StreamEvent {
     /// covering both sources.
     ToolsFinished(Vec<crate::tools::ToolOutcome>),
     Done,
+    /// Something the user should know that is not the model talking and not a
+    /// failure -- currently only "your answer was truncated".
+    Notice(String),
     Error(String),
 }
 
@@ -144,16 +152,24 @@ pub fn chat_completions_url(endpoint: &str) -> String {
     }
 }
 
+/// Where a request goes and how it is bounded. Grouped so the two entry points
+/// below take a handful of arguments rather than a dozen positional strings
+/// that are trivial to transpose.
+pub struct Target<'a> {
+    pub endpoint: &'a str,
+    pub model: &'a str,
+    pub api_key: &'a str,
+    pub max_tokens: u32,
+}
+
 pub async fn stream_chat(
-    endpoint: &str,
-    model: &str,
-    api_key: &str,
+    target: Target<'_>,
     messages: Vec<ChatMessage>,
     tools: Vec<Value>,
     request_id: u64,
     tx: mpsc::Sender<(u64, StreamEvent)>,
 ) {
-    let result = run(endpoint, model, api_key, messages, tools, request_id, &tx).await;
+    let result = run(target, messages, tools, request_id, &tx).await;
     let event = match result {
         Ok(()) => StreamEvent::Done,
         Err(e) => StreamEvent::Error(e),
@@ -162,14 +178,13 @@ pub async fn stream_chat(
 }
 
 async fn run(
-    endpoint: &str,
-    model: &str,
-    api_key: &str,
+    target: Target<'_>,
     messages: Vec<ChatMessage>,
     tools: Vec<Value>,
     request_id: u64,
     tx: &mpsc::Sender<(u64, StreamEvent)>,
 ) -> Result<(), String> {
+    let Target { endpoint, model, api_key, max_tokens } = target;
     // A lone system prompt is not a conversation.
     if messages.iter().all(|m| m.role == "system") {
         return Err("Nothing to send.".to_string());
@@ -180,7 +195,7 @@ async fn run(
         model: model.to_string(),
         messages,
         stream: true,
-        max_tokens: 4096,
+        max_tokens,
         tools,
     };
 
@@ -257,6 +272,7 @@ async fn run(
     // and only consume whole lines, otherwise tokens get dropped or decoding fails.
     let mut buf: Vec<u8> = Vec::new();
     let mut pending: Vec<ToolCall> = Vec::new();
+    let mut finish_reason: Option<String> = None;
 
     'read: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Stream interrupted: {e}"))?;
@@ -267,7 +283,10 @@ async fn run(
             let line = String::from_utf8_lossy(&line[..line.len() - 1]);
             match parse_sse_line(line.trim_end_matches('\r')) {
                 SseLine::Done => break 'read,
-                SseLine::Delta(delta) => {
+                SseLine::Delta(delta, reason) => {
+                    if reason.is_some() {
+                        finish_reason = reason;
+                    }
                     if !apply_delta(delta, &mut pending, request_id, tx).await {
                         return Ok(()); // receiver gone; app is shutting down
                     }
@@ -280,7 +299,10 @@ async fn run(
     // Trailing line without a final newline.
     if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf).to_string();
-        if let SseLine::Delta(delta) = parse_sse_line(line.trim()) {
+        if let SseLine::Delta(delta, reason) = parse_sse_line(line.trim()) {
+            if reason.is_some() {
+                finish_reason = reason;
+            }
             apply_delta(delta, &mut pending, request_id, tx).await;
         }
     }
@@ -290,6 +312,22 @@ async fn run(
     let calls = finalize_tool_calls(pending);
     if !calls.is_empty() {
         let _ = tx.send((request_id, StreamEvent::ToolCalls(calls))).await;
+    }
+
+    // Truncation is otherwise silent: a cut-off answer looks like a finished
+    // one, and a cut that lands before any content at all looks like the
+    // endpoint returned nothing. Both send you looking at the wrong thing.
+    if finish_reason.as_deref() == Some("length") {
+        let _ = tx
+            .send((
+                request_id,
+                StreamEvent::Notice(format!(
+                    "The reply hit the {max_tokens}-token output cap and was cut off. \
+                     Raise `max_tokens` under [llm] in ~/.tuisample-code/config.toml, \
+                     or ask for the work in smaller pieces."
+                )),
+            ))
+            .await;
     }
 
     Ok(())
@@ -362,7 +400,7 @@ fn finalize_tool_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
 }
 
 pub enum SseLine {
-    Delta(Delta),
+    Delta(Delta, Option<String>),
     Done,
     Ignore,
 }
@@ -384,7 +422,7 @@ pub fn parse_sse_line(line: &str) -> SseLine {
             .choices
             .into_iter()
             .next()
-            .map(|c| SseLine::Delta(c.delta))
+            .map(|c| SseLine::Delta(c.delta, c.finish_reason))
             .unwrap_or(SseLine::Ignore),
         Err(_) => SseLine::Ignore,
     }
@@ -406,7 +444,7 @@ mod tests {
 
     fn token(line: &str) -> Option<String> {
         match parse_sse_line(line) {
-            SseLine::Delta(delta) => delta.content.filter(|s| !s.is_empty()),
+            SseLine::Delta(delta, _) => delta.content.filter(|s| !s.is_empty()),
             _ => None,
         }
     }
@@ -460,7 +498,7 @@ mod tests {
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"c/main"}}]}}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":".rs\"}"}}]}}]}"#,
         ] {
-            if let SseLine::Delta(delta) = parse_sse_line(line) {
+            if let SseLine::Delta(delta, _) = parse_sse_line(line) {
                 for fragment in delta.tool_calls {
                     accumulate_tool_call(&mut pending, fragment);
                 }
@@ -486,7 +524,7 @@ mod tests {
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"src\"}"}}]}}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
         ] {
-            if let SseLine::Delta(delta) = parse_sse_line(line) {
+            if let SseLine::Delta(delta, _) = parse_sse_line(line) {
                 for fragment in delta.tool_calls {
                     accumulate_tool_call(&mut pending, fragment);
                 }
@@ -569,9 +607,7 @@ mod tests {
     async fn collect(endpoint: &str) -> Vec<StreamEvent> {
         let (tx, mut rx) = mpsc::channel(64);
         stream_chat(
-            endpoint,
-            "test-model",
-            "sk-test",
+            Target { endpoint, model: "test-model", api_key: "sk-test", max_tokens: 4096 },
             vec![ChatMessage::text("user", "hi")],
             Vec::new(),
             1,
@@ -627,6 +663,54 @@ mod tests {
         assert!(matches!(events.last(), Some(StreamEvent::Done)));
     }
 
+    /// Regression: a reply cut off by the output cap arrived looking exactly
+    /// like a finished one, and when the cut landed before any content the app
+    /// said "the endpoint returned an empty response" -- blaming the endpoint
+    /// for our own 4096-token ceiling. `finish_reason` has to be read and said
+    /// out loud.
+    #[tokio::test]
+    async fn a_reply_truncated_by_the_output_cap_is_reported() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"half a sen\"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                    data: [DONE]\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+        let events = collect(&addr).await;
+
+        let notice = events.iter().find_map(|e| match e {
+            StreamEvent::Notice(n) => Some(n.clone()),
+            _ => None,
+        });
+        let notice = notice.expect("a truncated reply must say so");
+        assert!(notice.contains("cut off"), "{notice}");
+        assert!(notice.contains("max_tokens"), "it must name the setting: {notice}");
+
+        // The partial text still arrives -- half an answer beats none.
+        assert_eq!(text_of(&events), "half a sen");
+    }
+
+    /// The ordinary case must stay quiet: a reply that simply ended has nothing
+    /// to warn about.
+    #[tokio::test]
+    async fn a_reply_that_ends_normally_produces_no_notice() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n\
+                    data: [DONE]\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+        let events = collect(&addr).await;
+
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Notice(_))),
+            "a normal reply must not warn"
+        );
+    }
+
     /// The same 7-byte splitting applied to tool calls, where a fragment boundary
     /// can land in the middle of an escaped JSON string.
     #[tokio::test]
@@ -660,6 +744,7 @@ mod tests {
                 StreamEvent::ToolCalls(_) => "tools",
                 StreamEvent::ToolsFinished(_) => "finished",
                 StreamEvent::Done => "done",
+                StreamEvent::Notice(_) => "notice",
                 StreamEvent::Error(_) => "error",
             })
             .collect();
@@ -729,9 +814,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(64);
         stream_chat(
-            &addr,
-            "m",
-            "k",
+            Target { endpoint: &addr, model: "m", api_key: "k", max_tokens: 4096 },
             vec![ChatMessage::text("user", "hi")],
             vec![serde_json::json!({"type": "function"})],
             1,
