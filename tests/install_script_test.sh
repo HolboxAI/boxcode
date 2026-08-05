@@ -83,3 +83,48 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "PASS: install_binary replaces a running binary by rename and cleans up on failure"
+
+# --- ping_install -------------------------------------------------------------
+# Anonymous install ping. Must be silent and safe by default (no telemetry URL
+# configured, the state every build ships in), and must never fail the install
+# itself even when a URL is configured but nothing is listening -- see the
+# function's own doc comment for the full reasoning.
+
+fake_home=$(mktemp -d)
+fake_bin="$workdir/fake-binary"
+cat > "$fake_bin" <<'EOF'
+#!/bin/bash
+echo "tuisample-code 9.9.9"
+EOF
+chmod +x "$fake_bin"
+
+# Disabled by default: no TUISAMPLE_TELEMETRY_URL set.
+unset TUISAMPLE_TELEMETRY_URL
+HOME="$fake_home" ping_install "$fake_bin" || fail "ping_install must return 0 even when disabled"
+[ -f "$fake_home/.tuisample-code/device_id" ] &&
+  fail "a disabled ping must not even generate a device id"
+
+echo "PASS: ping_install does nothing with no telemetry URL configured"
+
+# Enabled, but pointing at nothing reachable: must still return success and
+# must still create the device id (idempotently, for install.sh's own use and
+# for the app binary to reuse on first launch), without ever blocking on the
+# network -- ping_install backgrounds the curl itself, so this call returns
+# long before any 3s curl timeout could.
+rm -rf "$fake_home"
+mkdir -p "$fake_home"
+start=$(date +%s)
+TUISAMPLE_TELEMETRY_URL="http://127.0.0.1:1/nowhere" HOME="$fake_home" ping_install "$fake_bin" ||
+  fail "ping_install must return 0 even when the endpoint is unreachable"
+elapsed=$(( $(date +%s) - start ))
+[ -f "$fake_home/.tuisample-code/device_id" ] || fail "device id must be created once enabled"
+[ -s "$fake_home/.tuisample-code/device_id" ] || fail "device id file must not be empty"
+[ "$elapsed" -lt 2 ] || fail "ping_install must not block on the network (took ${elapsed}s)"
+
+first_id=$(cat "$fake_home/.tuisample-code/device_id")
+TUISAMPLE_TELEMETRY_URL="http://127.0.0.1:1/nowhere" HOME="$fake_home" ping_install "$fake_bin"
+second_id=$(cat "$fake_home/.tuisample-code/device_id")
+[ "$first_id" = "$second_id" ] || fail "an existing device id must be reused, not regenerated"
+
+rm -rf "$fake_home"
+echo "PASS: ping_install is non-blocking, creates a stable device id once enabled, and never fails the install"

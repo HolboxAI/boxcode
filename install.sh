@@ -28,6 +28,51 @@ sweep_path_for_stale_copies() {
   return 0
 }
 
+# Fire a single, best-effort "an install happened" ping -- the bash-side
+# counterpart to telemetry.rs's `active` ping, which this binary hasn't run
+# yet to send. Anonymous: a random ID written to $HOME/.tuisample-code/device_id
+# that labels this machine, not the person running it -- the same file
+# telemetry.rs reads and reuses on later runs rather than generating a second,
+# conflicting ID. No other data leaves this machine from here.
+#
+# Disabled by default (empty TUISAMPLE_TELEMETRY_URL, matching telemetry.rs's
+# own DEFAULT_TELEMETRY_URL), and every failure mode -- no uuidgen, no curl,
+# network down, endpoint unset or unreachable -- is swallowed. This must never
+# be able to fail the install itself, so it always backgrounds the request and
+# never lets a failure here reach `set -e`.
+ping_install() {
+  local binary="$1"
+  local url="${TUISAMPLE_TELEMETRY_URL:-}"
+  [ -n "$url" ] || return 0
+
+  local state_dir="$HOME/.tuisample-code"
+  local id_file="$state_dir/device_id"
+  mkdir -p "$state_dir" 2>/dev/null || return 0
+
+  if [ ! -s "$id_file" ]; then
+    if command -v uuidgen &> /dev/null; then
+      uuidgen > "$id_file" 2>/dev/null || return 0
+    else
+      # No uuidgen (rare, mainly minimal Linux images): unique enough to
+      # count installs by is all this needs to be, not cryptographically
+      # random -- see telemetry.rs's own fallback for the same reasoning.
+      echo "$(date +%s%N)-$$-$RANDOM" > "$id_file" 2>/dev/null || return 0
+    fi
+  fi
+  local device_id
+  device_id=$(cat "$id_file" 2>/dev/null) || return 0
+  [ -n "$device_id" ] || return 0
+
+  local version
+  version=$("$binary" --version 2>/dev/null | awk '{print $2}')
+
+  ( curl -s -m 3 -X POST "$url" \
+      -H "Content-Type: application/json" \
+      -d "{\"anon_id\":\"$device_id\",\"event\":\"install\",\"version\":\"${version:-unknown}\",\"os\":\"$(uname -s)\"}" \
+      >/dev/null 2>&1 & ) || true
+  return 0
+}
+
 # Put a binary at $dest, replacing whatever is there.
 #
 # Writing straight over the destination breaks `tuisample-code --upgrade`: that
@@ -154,6 +199,9 @@ elif [ "$RESOLVED" != "$INSTALLED_AT" ]; then
 else
   echo "✓ Verified: $RESOLVED ($("$RESOLVED" --version 2>/dev/null || echo 'version unknown'))"
 fi
+
+# Best-effort and silent either way -- see ping_install's own doc comment.
+ping_install "$INSTALLED_AT"
 
 echo ""
 echo "✅ Installation complete!"

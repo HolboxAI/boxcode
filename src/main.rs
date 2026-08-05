@@ -1,12 +1,15 @@
 mod app;
 mod config;
 mod danger;
+mod dateutil;
 mod llm;
 mod providers;
+mod telemetry;
 mod tools;
 mod theme;
 mod ui;
 mod upgrade;
+mod usage;
 mod workspace;
 
 use app::{App, AppState};
@@ -74,6 +77,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = Config::load()?;
     let (workspace, workspace_status) = open_workspace(&config);
+
+    // Detached, not awaited: a slow or unreachable telemetry endpoint must
+    // never delay the terminal coming up. See telemetry.rs -- this is a
+    // no-op until a real endpoint is configured, and every failure inside it
+    // is already silent.
+    tokio::spawn(telemetry::ping_active_if_new_day(VERSION));
 
     let enhanced = setup_terminal()?;
     install_panic_hook(enhanced);
