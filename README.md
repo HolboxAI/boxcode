@@ -3,24 +3,44 @@
 Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-compatible LLM endpoint.
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ tuisample-code | llm.company.internal | model: company-70b │
-├──────────────────────────────────────────────────────────┤
-│                                                           │
-│ > write a hello world function                          │
-│                                                           │
-│ Here's the function...                                   │
-│ def hello_world():                                       │
-│   return "Hello, World!"                                │
-│                                                           │
-│ ✓ Generated 120 tokens in 1.2s                          │
-│                                                           │
-├──────────────────────────────────────────────────────────┤
-│ > your prompt here... (Enter to send, Esc cancel)        │
-├──────────────────────────────────────────────────────────┤
-│ Status: Ready | Press Ctrl-C to exit                    │
-└──────────────────────────────────────────────────────────┘
+ ◈
+
+  ▟█▙       ▟█▙    tuisample-code  v0.7.0
+  ▜███████████▛    a terminal coding assistant
+  ██  █████  ██
+  ▜███████████▛    Welcome back, you!
+    ▜█▛   ▜█▛
+
+  ────────────────────────────────────────────────────────────────
+
+  model     deepseek-chat
+  endpoint  https://api.deepseek.com
+  cwd       ~/Desktop/HolboxAI/tuisample-code
+
+  /provider switch provider or endpoint
+  /model    switch model
+
+  Ask about this project — it can read files and run commands.
+  Every command and every write waits for your approval.
+
+╭──────────────────────────────────────────────────────────────────────╮
+│❯ add a health check endpoint                                         │
+╰──────────────────────────────────────────────────────────────────────╯
+  ↵ send  ·  ⌥↵ newline  ·  ↑↓ history  ·  ^c exit
 ```
+
+While a turn runs, a spinner sits at the end of the transcript — right above
+the prompt, where you're already looking:
+
+```
+  ❯ add a health check endpoint
+
+  I'll add it to the router and run the tests.
+  · $ cargo test — 42 lines
+
+  ⠹ Responding… (4s · ~120 tokens · esc to interrupt)
+```
+
 
 ## Quick Start
 
@@ -121,15 +141,15 @@ Each one stops and waits for you — a write shows the file's full new content,
 not a shell string:
 
 ```
-┌ Write this file? ────────────────────────────┐
-│ 📝 hello.py                                   │
+╭ Write this file? ────────────────────────────╮
+│  📝 hello.py                                  │
 │                                              │
-│ print("Hello, World!")                       │
+│  print("Hello, World!")                      │
 │                                              │
-│ in /Users/you/project                        │
+│  in /Users/you/project                       │
 │                                              │
-│ y write   n skip   Esc skip                  │
-└──────────────────────────────────────────────┘
+│  y write  ·  n skip  ·  esc skip             │
+╰──────────────────────────────────────────────╯
 ```
 
 **`y`** does it · **`n`** or **Esc** skips it and tells the model to try
@@ -234,7 +254,9 @@ on Windows, and the model is told which platform it is on so it reaches for
 - **Enter** — Send prompt
 - **Alt-Enter** / **Shift-Enter** — Insert a newline for multi-line prompts
 - **Esc** — Cancel ongoing request
-- **↑ / ↓ / PgUp / PgDn** — Scroll the transcript
+- **↑ / ↓** — Recall previous prompts. Inside a multi-line prompt they move
+  between its lines first, so a stray ↑ can't swallow what you were writing
+- **PgUp / PgDn** — Scroll the transcript
 - **Ctrl-A / Ctrl-E** — Jump to start / end of line
 - **Ctrl-W** — Delete previous word
 - **Ctrl-U / Ctrl-K** — Delete to start / end of line
@@ -269,6 +291,7 @@ Clean, modular structure for easy feature additions:
 - `src/main.rs` — Event loop
 - `src/app.rs` — State machine
 - `src/ui.rs` — Terminal rendering
+- `src/theme.rs` — Colours, glyphs, and the spinner, in one place
 - `src/llm.rs` — LLM client + streaming
 - `src/config.rs` — Configuration loading
 - `src/providers.rs` — Built-in provider/model registry for `/provider` and `/model`
