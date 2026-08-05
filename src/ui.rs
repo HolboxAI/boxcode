@@ -781,31 +781,45 @@ fn tool_approval_lines(
         )));
     }
     lines.push(Line::from(""));
+
+    // Two choices, one highlighted -- Up/Down move the cursor between them,
+    // Enter confirms whichever one it is on, and y/n/esc still work directly
+    // for anyone who already knows which they want. The highlighted key stays
+    // bold and in its own colour either way, so a fast glance at the colour
+    // alone (not just the cursor) still tells you which one is live.
+    let cursor = |on: bool| if on { "❯ " } else { "  " };
+    let dim_unless = |on: bool, base: Style| if on { base } else { theme::faint() };
+
     lines.push(Line::from(vec![
+        Span::styled(cursor(app.approval_selected), theme::accent()),
         Span::styled(
             "y",
-            Style::default()
-                .fg(theme::SUCCESS)
-                .add_modifier(Modifier::BOLD),
+            dim_unless(
+                app.approval_selected,
+                Style::default()
+                    .fg(theme::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ),
         Span::styled(format!(" {verb}"), theme::faint()),
-        Span::styled("  ·  ", theme::faint()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(cursor(!app.approval_selected), theme::accent()),
         Span::styled(
             "n",
-            Style::default()
-                .fg(theme::DANGER)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" skip", theme::faint()),
-        Span::styled("  ·  ", theme::faint()),
-        Span::styled(
-            "esc",
-            Style::default()
-                .fg(theme::DANGER)
-                .add_modifier(Modifier::BOLD),
+            dim_unless(
+                !app.approval_selected,
+                Style::default()
+                    .fg(theme::DANGER)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ),
         Span::styled(" skip", theme::faint()),
     ]));
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ choose · enter confirm · esc skip",
+        theme::faint(),
+    )));
 
     (title, lines)
 }
@@ -1020,6 +1034,29 @@ mod tests {
                 arguments: serde_json::json!({ "command": command }).to_string(),
             },
         }
+    }
+
+    fn rendered_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer.get(x, y).symbol()).collect())
+            .collect()
+    }
+
+    /// The one row (as rendered text) that contains `needle`. Panics if none
+    /// or more than one row does -- both mean the assertion that follows
+    /// can't mean what it says.
+    fn row_containing(rows: &[String], needle: &str) -> String {
+        let matches: Vec<&String> = rows.iter().filter(|r| r.contains(needle)).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one row containing {needle:?}, found {}: {rows:?}",
+            matches.len()
+        );
+        matches[0].clone()
     }
 
     fn rendered_text(app: &mut App, w: u16, h: u16) -> String {
@@ -1294,6 +1331,41 @@ mod tests {
             .count();
 
         assert_eq!(rows_with_keys, 1, "the y/n/esc bar must be drawn once, not twice");
+    }
+
+    /// Regression: Up/Down had no effect at an approval prompt, so the only
+    /// way to answer it was typing y/n even though the rest of the app (the
+    /// provider/model pickers, prompt history) already used arrow navigation.
+    /// The cursor ("❯") must actually move between "y" and "n" as the
+    /// highlight changes, not just the underlying state.
+    #[test]
+    fn the_cursor_moves_between_yes_and_no_as_the_highlight_changes() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::AwaitingApproval;
+        app.workspace_root = "/tmp/project".to_string();
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Command { command: "ls -la".to_string(), purpose: None },
+            remaining: 0,
+        });
+
+        app.approval_selected = true;
+        let on_yes = rendered_rows(&mut app, 80, 24);
+        let yes_row = row_containing(&on_yes, "y run");
+        let no_row = row_containing(&on_yes, "n skip");
+        assert!(yes_row.contains('❯'), "cursor should be on \"yes\": {yes_row}");
+        assert!(!no_row.contains('❯'), "cursor should not be on \"no\": {no_row}");
+
+        app.approval_selected = false;
+        let on_no = rendered_rows(&mut app, 80, 24);
+        let yes_row = row_containing(&on_no, "y run");
+        let no_row = row_containing(&on_no, "n skip");
+        assert!(!yes_row.contains('❯'), "cursor should have moved off \"yes\": {yes_row}");
+        assert!(no_row.contains('❯'), "cursor should be on \"no\": {no_row}");
+
+        let joined = on_no.concat();
+        assert!(joined.contains("↑↓ choose"), "{joined}");
+        assert!(joined.contains("enter confirm"), "{joined}");
     }
 
     /// The spinner is the only thing that says a turn is still alive, and it
