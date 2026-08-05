@@ -69,12 +69,37 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
                 continue;
             }
 
-            lines.push(Line::from(vec![Span::styled(
-                format!("{}: ", msg.role.label()),
-                role_style(msg.role),
-            )]));
-            for wrapped in wrap(msg.body(), width) {
-                lines.push(Line::from(wrapped));
+            // A user turn keeps a marker -- it's the one place the human's own
+            // words appear verbatim, and a "> " quote prefix reads as "you typed
+            // this" without naming a speaker. The assistant's prose gets none:
+            // narration and tool activity share one continuous stream, the way
+            // Claude Code renders a turn, rather than a labelled reply to a
+            // labelled question. System/Error stay labelled -- they're status
+            // events, not a side of the conversation.
+            match msg.role {
+                Role::User => {
+                    for wrapped in wrap(msg.body(), width) {
+                        lines.push(Line::from(vec![
+                            Span::styled("> ", role_style(Role::User)),
+                            Span::raw(wrapped),
+                        ]));
+                    }
+                }
+                Role::Assistant => {
+                    for wrapped in wrap(msg.body(), width) {
+                        lines.push(Line::from(wrapped));
+                    }
+                }
+                Role::Error | Role::System => {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("{}: ", msg.role.label()),
+                        role_style(msg.role),
+                    )]));
+                    for wrapped in wrap(msg.body(), width) {
+                        lines.push(Line::from(wrapped));
+                    }
+                }
+                Role::Tool => unreachable!("handled above"),
             }
             lines.push(Line::from(""));
         }
@@ -92,10 +117,6 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
         }
 
         if app.state == AppState::Streaming {
-            lines.push(Line::from(vec![Span::styled(
-                "Assistant: ",
-                role_style(Role::Assistant),
-            )]));
             let body = if app.streaming_response.is_empty() {
                 "…".to_string()
             } else {
@@ -650,6 +671,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Message;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -696,6 +718,33 @@ mod tests {
                 .draw(|f| render(f, &mut app))
                 .unwrap_or_else(|e| panic!("{w}x{h} failed to render: {e}"));
         }
+    }
+
+    /// Regression: labelling every line "You: " / "Assistant: " was what made
+    /// this read as a Q&A chat log instead of one continuous stream, the thing
+    /// a user compared unfavourably to Claude Code's transcript. The user's own
+    /// words still get a "> " quote marker; the assistant's prose gets nothing.
+    #[test]
+    fn the_transcript_reads_as_a_continuous_stream_not_a_labelled_chat_log() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages.push(Message::new(Role::User, "write a hello world function"));
+        app.messages.push(Message::new(Role::Assistant, "Here's the function..."));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(rendered.contains("> write a hello world function"), "{rendered}");
+        assert!(rendered.contains("Here's the function"), "{rendered}");
+        assert!(!rendered.contains("You:"), "{rendered}");
+        assert!(!rendered.contains("Assistant:"), "{rendered}");
     }
 
     /// The command must appear verbatim: approving something you cannot read is
