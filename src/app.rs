@@ -115,6 +115,18 @@ pub enum CustomStep {
     ApiKey { endpoint: String, model: String },
 }
 
+/// Every slash command, in one place -- the single source of truth for both
+/// dispatch (`App::selected_command`) and what the autocomplete menu /
+/// welcome screen list. Adding a command means adding it here and to the
+/// `match` in `selected_command`'s caller; nowhere else should name a
+/// command as a string literal.
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/provider", "switch provider or endpoint"),
+    ("/model", "switch model"),
+    ("/new", "forget the current conversation"),
+    ("/usage", "show local token usage"),
+];
+
 pub struct App {
     pub state: AppState,
     pub messages: Vec<Message>,
@@ -201,6 +213,12 @@ pub struct App {
     /// past the newest entry. Without it, reaching for an old prompt and
     /// changing your mind silently eats a half-written one.
     pub history_draft: String,
+    /// Which entry of `matching_commands()`'s current result Up/Down has
+    /// landed on. Not reset explicitly on every keystroke -- `matching_commands`
+    /// clamps this to the filtered list's length wherever it's read, which
+    /// handles the list shrinking as more is typed without needing a reset
+    /// call at every mutation site.
+    pub command_menu_selected: usize,
 }
 
 impl App {
@@ -234,11 +252,52 @@ impl App {
             prompt_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
+            command_menu_selected: 0,
         }
     }
 
     pub fn is_busy(&self) -> bool {
         !matches!(self.state, AppState::AwaitingInput)
+    }
+
+    /// The menu is "active" -- worth computing matches for at all -- only
+    /// while the buffer, trimmed, is still just a bare `/word` being typed:
+    /// no internal space (that would mean the command word is finished and
+    /// what follows is an argument or an ordinary message that happens to
+    /// start with `/`), and not while busy, since none of these commands run
+    /// mid-turn anyway. Trimmed so incidental leading/trailing whitespace --
+    /// e.g. a trailing space after finishing "/provider" -- doesn't change
+    /// the answer, matching how the old exact-match dispatch trimmed too.
+    fn command_menu_active(&self) -> bool {
+        let trimmed = self.input_buffer.trim();
+        trimmed.starts_with('/') && !trimmed.contains(char::is_whitespace) && !self.is_busy()
+    }
+
+    /// Every command whose name starts with whatever's typed so far, in
+    /// `COMMANDS`' order. Empty (not just while inactive) means "nothing to
+    /// show" -- the caller doesn't need to check `command_menu_active`
+    /// separately, an empty result already means don't render anything.
+    pub fn matching_commands(&self) -> Vec<(&'static str, &'static str)> {
+        if !self.command_menu_active() {
+            return Vec::new();
+        }
+        let typed = self.input_buffer.trim();
+        COMMANDS
+            .iter()
+            .filter(|(name, _)| name.starts_with(typed))
+            .copied()
+            .collect()
+    }
+
+    /// The command Enter would run right now, if any -- whichever one is
+    /// highlighted in the (possibly single-entry) matching list. `None` means
+    /// Enter should fall through to `submit()` instead, which covers both
+    /// "menu inactive" and "typed a `/word` that matches nothing" (e.g. a
+    /// typo, or a message that just happens to start with `/`).
+    fn selected_command(&self) -> Option<&'static str> {
+        let matches = self.matching_commands();
+        let index = self.command_menu_selected.min(matches.len().checked_sub(1)?);
+        Some(matches[index].0)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -260,37 +319,29 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match key.code {
-            // Enter submits, unless the buffer holds exactly a known command, in
-            // which case it opens the matching overlay instead. Alt/Shift-Enter
-            // (and Ctrl-Enter, on terminals that can distinguish it) insert a
+            // Enter submits, unless the autocomplete menu has a command
+            // highlighted, in which case it runs that command instead --
+            // whatever's highlighted, not just an exact full-string match, so
+            // "/pro" + Enter runs /provider the moment it's the only match,
+            // the same as finishing typing it out would. Alt/Shift-Enter (and
+            // Ctrl-Enter, on terminals that can distinguish it) insert a
             // newline instead of either.
             KeyCode::Enter => {
                 if alt || shift {
                     self.insert_str("\n");
-                } else {
-                    match self.input_buffer.trim() {
-                        "/provider" if !self.is_busy() => {
-                            self.input_buffer.clear();
-                            self.cursor = 0;
-                            self.open_provider_picker();
-                        }
-                        "/model" if !self.is_busy() => {
-                            self.input_buffer.clear();
-                            self.cursor = 0;
-                            self.open_model_picker_from_config();
-                        }
-                        "/new" if !self.is_busy() => {
-                            self.input_buffer.clear();
-                            self.cursor = 0;
-                            self.start_new_conversation();
-                        }
-                        "/usage" if !self.is_busy() => {
-                            self.input_buffer.clear();
-                            self.cursor = 0;
-                            self.show_usage();
-                        }
-                        _ => self.submit(),
+                } else if let Some(cmd) = self.selected_command() {
+                    self.input_buffer.clear();
+                    self.cursor = 0;
+                    self.command_menu_selected = 0;
+                    match cmd {
+                        "/provider" => self.open_provider_picker(),
+                        "/model" => self.open_model_picker_from_config(),
+                        "/new" => self.start_new_conversation(),
+                        "/usage" => self.show_usage(),
+                        other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
                     }
+                } else {
+                    self.submit();
                 }
             }
 
@@ -309,10 +360,26 @@ impl App {
             // Any other Ctrl-chord is a command, not text: never let it reach the buffer.
             KeyCode::Char(_) if ctrl => {}
 
-            KeyCode::Char(c) => self.insert_str(&c.to_string()),
-            KeyCode::Tab => self.insert_str("    "),
+            KeyCode::Char(c) => {
+                self.insert_str(&c.to_string());
+                self.command_menu_selected = 0;
+            }
+            // Completes to the highlighted command's full name without
+            // running it, so there's still a chance to review before Enter --
+            // only while the menu actually has something to complete to;
+            // otherwise Tab keeps its ordinary meaning of inserting a stop.
+            KeyCode::Tab => {
+                if let Some(cmd) = self.selected_command() {
+                    self.set_input(cmd.to_string());
+                } else {
+                    self.insert_str("    ");
+                }
+            }
 
-            KeyCode::Backspace => self.delete_before(),
+            KeyCode::Backspace => {
+                self.delete_before();
+                self.command_menu_selected = 0;
+            }
             KeyCode::Delete => self.delete_after(),
 
             KeyCode::Left => self.cursor = self.prev_boundary(),
@@ -320,14 +387,20 @@ impl App {
             KeyCode::Home => self.cursor = self.line_start(),
             KeyCode::End => self.cursor = self.line_end(),
 
-            // Up/Down recall previous prompts rather than scrolling the
-            // transcript -- the arrows are next to the thing you are typing, so
-            // that is what they should act on. PgUp/PgDn keep the transcript.
-            // Inside a multi-line prompt they move between its lines first,
-            // because losing a half-written paragraph to a stray Up is worse
-            // than having to press PgUp to scroll.
+            // Up/Down move the autocomplete menu's highlight while it's
+            // showing; otherwise they recall previous prompts rather than
+            // scrolling the transcript, since the arrows are next to the
+            // thing you are typing. PgUp/PgDn keep the transcript. Inside a
+            // multi-line prompt (menu inactive by definition -- it requires a
+            // single bare `/word`) they move between lines first, because
+            // losing a half-written paragraph to a stray Up is worse than
+            // having to press PgUp to scroll.
             KeyCode::Up => {
-                if self.cursor_line() > 0 {
+                let matches = self.matching_commands();
+                if !matches.is_empty() {
+                    self.command_menu_selected =
+                        (self.command_menu_selected + matches.len() - 1) % matches.len();
+                } else if self.cursor_line() > 0 {
                     self.move_cursor_line(-1);
                 } else {
                     self.recall_previous();
@@ -338,7 +411,10 @@ impl App {
                 self.scroll = self.scroll.saturating_sub(10);
             }
             KeyCode::Down => {
-                if self.cursor_line() + 1 < self.input_buffer.split('\n').count() {
+                let matches = self.matching_commands();
+                if !matches.is_empty() {
+                    self.command_menu_selected = (self.command_menu_selected + 1) % matches.len();
+                } else if self.cursor_line() + 1 < self.input_buffer.split('\n').count() {
                     self.move_cursor_line(1);
                 } else {
                     self.recall_next();
@@ -1359,6 +1435,124 @@ mod tests {
             assert_eq!(a.state, AppState::Streaming);
             assert!(a.input_buffer.contains("/usage"));
         });
+    }
+
+    // ---- slash-command autocomplete ------------------------------------------
+
+    /// The reported bug: no live suggestions existed at all, for any command
+    /// -- you had to already know and type the exact full name before Enter
+    /// did anything. A single "/" should immediately narrow to every command.
+    #[test]
+    fn a_bare_slash_matches_every_command() {
+        let mut a = app();
+        type_str(&mut a, "/");
+        assert_eq!(a.matching_commands().len(), COMMANDS.len());
+    }
+
+    #[test]
+    fn typing_narrows_the_matches_to_a_shared_prefix() {
+        let mut a = app();
+        type_str(&mut a, "/p");
+        let names: Vec<&str> = a.matching_commands().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["/provider"]);
+    }
+
+    #[test]
+    fn a_prefix_matching_nothing_shows_no_menu() {
+        let mut a = app();
+        type_str(&mut a, "/xyz");
+        assert!(a.matching_commands().is_empty());
+    }
+
+    /// Once a space is typed, the "/word" is finished -- what follows is an
+    /// argument or just an ordinary message that happens to start with "/",
+    /// not more of the command name. The menu must not keep showing.
+    #[test]
+    fn a_space_after_the_command_word_closes_the_menu() {
+        let mut a = app();
+        type_str(&mut a, "/provider is my favourite word");
+        assert!(a.matching_commands().is_empty());
+    }
+
+    #[test]
+    fn up_and_down_cycle_the_highlighted_match_and_wrap() {
+        let mut a = app();
+        type_str(&mut a, "/");
+        assert_eq!(a.command_menu_selected, 0);
+
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(a.command_menu_selected, 1);
+
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.command_menu_selected, 0);
+
+        // Wraps rather than stopping at the ends.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.command_menu_selected, COMMANDS.len() - 1);
+    }
+
+    /// Typing more must not leave the highlight pointing past the end of a
+    /// now-shorter list -- e.g. having Down'd to the last of four matches,
+    /// then typing a character that narrows it to one.
+    #[test]
+    fn the_highlight_is_clamped_when_typing_shrinks_the_match_list() {
+        let mut a = app();
+        type_str(&mut a, "/");
+        a.command_menu_selected = COMMANDS.len() - 1;
+
+        type_str(&mut a, "p");
+        assert_eq!(a.matching_commands().len(), 1);
+        assert_eq!(a.selected_command(), Some("/provider"));
+    }
+
+    /// Enter runs the highlighted command as soon as it's the only match --
+    /// it does not require the full name to be typed out first.
+    #[test]
+    fn enter_runs_the_highlighted_command_without_the_full_name_typed() {
+        let mut a = app();
+        a.config.llm.provider = "deepseek".to_string();
+        type_str(&mut a, "/mod");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(a.input_buffer.is_empty(), "the command word should be cleared");
+        assert!(matches!(a.overlay, Some(Overlay::ModelPicker { .. })), "{:?}", a.overlay);
+    }
+
+    /// Tab completes the visible text to the full command name but does not
+    /// run it -- a chance to see what's about to happen before committing.
+    #[test]
+    fn tab_completes_without_running_the_command() {
+        let mut a = app();
+        type_str(&mut a, "/pro");
+        a.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(a.input_buffer, "/provider");
+        assert_eq!(a.overlay, None, "Tab must not have opened anything");
+    }
+
+    /// Tab's ordinary meaning (insert a stop) must survive everywhere the
+    /// menu isn't showing -- plain text, and a command word with an argument
+    /// already started.
+    #[test]
+    fn tab_still_inserts_a_stop_when_there_is_nothing_to_complete() {
+        let mut a = app();
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Tab));
+        assert_eq!(a.input_buffer, "hello    ");
+    }
+
+    /// Prompt history recall must still work exactly as before once the
+    /// buffer isn't a bare "/word" -- the new Up/Down branch must only ever
+    /// intercept the keys while the menu itself has matches.
+    #[test]
+    fn up_down_history_recall_is_unaffected_when_the_menu_is_not_showing() {
+        let mut a = app();
+        type_str(&mut a, "earlier prompt");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::AwaitingInput; // pretend the turn finished
+
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "earlier prompt");
     }
 
     /// A completed turn's tokens end up in the local log that `/usage` reads
