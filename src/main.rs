@@ -163,6 +163,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 StreamEvent::ToolCalls(calls) => app.request_tools(calls),
                 StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
                 StreamEvent::Done => app.finish_stream(),
+                StreamEvent::Notice(note) => app.note(note),
                 StreamEvent::Error(err) => app.fail_stream(err),
             }
         }
@@ -174,6 +175,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             let endpoint = app.config.llm.endpoint.clone();
             let model = app.config.llm.model.clone();
             let api_key = app.config.llm.api_key.clone();
+            let max_tokens = app.config.llm.max_tokens;
 
             // Withholding the schemas once the budget is spent is what actually
             // stops a runaway loop: the model has nothing left to call, so it
@@ -190,7 +192,14 @@ async fn run_app<B: ratatui::backend::Backend>(
             let tx_clone = tx.clone();
 
             let handle = tokio::spawn(async move {
-                llm::stream_chat(&endpoint, &model, &api_key, history, schemas, id, tx_clone).await;
+                llm::stream_chat(
+                    llm::Target { endpoint: &endpoint, model: &model, api_key: &api_key, max_tokens },
+                    history,
+                    schemas,
+                    id,
+                    tx_clone,
+                )
+                .await;
             });
 
             app.abort = Some(handle.abort_handle());

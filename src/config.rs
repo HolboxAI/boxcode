@@ -19,6 +19,12 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(default)]
     pub api_key: String,
+    /// Ceiling on one reply's length. The old hard-coded 4096 was fine for chat
+    /// and far too small the moment the model started producing whole files: a
+    /// long write is simply cut off mid-token, and the endpoint reports that as
+    /// a finished reply.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
     /// Registry id from `providers::PROVIDERS` (e.g. "deepseek"), set by the
     /// `/provider` overlay. Empty means a custom/manually-entered endpoint, in
     /// which case a standalone `/model` has nothing to scope to.
@@ -71,6 +77,10 @@ fn yes() -> bool {
 
 fn dot() -> String {
     ".".to_string()
+}
+
+fn default_max_tokens() -> u32 {
+    16384
 }
 
 fn default_command_timeout() -> u64 {
@@ -146,6 +156,9 @@ impl Config {
         self.llm.model = self.llm.model.trim().to_string();
         self.llm.api_key = self.llm.api_key.trim().to_string();
         self.llm.provider = self.llm.provider.trim().to_string();
+        // 0 would make every reply empty; the ceiling is a sanity bound, not a
+        // claim about what any particular endpoint accepts.
+        self.llm.max_tokens = self.llm.max_tokens.clamp(256, 200_000);
 
         let d = LlmConfig::default();
         if self.llm.endpoint.is_empty() {
@@ -227,6 +240,7 @@ impl Default for LlmConfig {
             endpoint: "http://localhost:8000".to_string(),
             model: "gpt-3.5-turbo".to_string(),
             api_key: String::new(),
+            max_tokens: default_max_tokens(),
             provider: String::new(),
         }
     }
@@ -284,6 +298,7 @@ mod tests {
                     endpoint: "https://api.deepseek.com".to_string(),
                     model: "deepseek-v4-pro".to_string(),
                     api_key: "sk-test-key".to_string(),
+                    max_tokens: 8192,
                     provider: "deepseek".to_string(),
                 },
                 tools: ToolsConfig::default(),

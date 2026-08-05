@@ -130,6 +130,13 @@ pub struct App {
     pub scroll: u16,
     /// While true the message pane sticks to the bottom as new text arrives.
     pub follow_tail: bool,
+    /// Which choice is highlighted at a `ToolApproval` prompt: `true` for
+    /// "yes", `false` for "no". A plain `App` field rather than a variant on
+    /// `Overlay::ToolApproval` itself so it resets independently of the
+    /// action/remaining-count data -- Up/Down toggles it, Enter reads it, and
+    /// every new prompt starts back on "yes" to match bare-Enter's long-
+    /// standing meaning.
+    pub approval_selected: bool,
     pub config: Config,
     pub should_exit: bool,
     /// Set once the user has interacted, so the welcome panel gives way to the transcript.
@@ -197,6 +204,7 @@ impl App {
             abort: None,
             scroll: 0,
             follow_tail: true,
+            approval_selected: true,
             config,
             should_exit: false,
             greeted: false,
@@ -467,6 +475,7 @@ impl App {
                         action,
                         remaining: self.pending_tools.len().saturating_sub(1),
                     });
+                    self.approval_selected = true;
                     self.state = AppState::AwaitingApproval;
                     return;
                 }
@@ -568,10 +577,14 @@ impl App {
         true
     }
 
-    /// y allow · n refuse · Esc refuse.
+    /// y allow · n refuse · Esc refuse · Up/Down choose · Enter confirms the
+    /// highlighted choice.
     ///
     /// Esc means refuse rather than cancel-the-turn: at a prompt asking whether
-    /// to run something, the reflexive keypress has to be the safe one.
+    /// to run something, the reflexive keypress has to be the safe one. y/n
+    /// stay as direct shortcuts alongside arrow navigation -- picking is fine
+    /// for someone reading the prompt for the first time, but a fast typist
+    /// answering the tenth one in a row shouldn't be made to arrow over.
     ///
     /// There is deliberately no "allow everything from now on" key. A decision
     /// made once, while impatient, would otherwise silently cover every command
@@ -580,9 +593,15 @@ impl App {
     /// runs, where turning it off is an explicit, visible act rather than a
     /// keystroke.
     fn handle_command_approval_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            self.approval_selected = !self.approval_selected;
+            return;
+        }
+
         let decision = match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(true),
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+            KeyCode::Enter => Some(self.approval_selected),
             _ => None,
         };
 
@@ -651,6 +670,15 @@ impl App {
         for call in unanswered {
             self.push_tool_outcome(tools::unanswered(&call, reason));
         }
+    }
+
+    /// A note from the transport that is neither the model talking nor a
+    /// failure -- currently only "your answer was truncated". Pushed as a
+    /// System message so it reads as status, and kept out of `history` so the
+    /// model is never told about our own plumbing.
+    pub fn note(&mut self, note: String) {
+        self.messages.push(Message::new(Role::System, note));
+        self.follow_tail = true;
     }
 
     pub fn append_token(&mut self, token: &str) {
@@ -1575,6 +1603,77 @@ mod tests {
         assert_eq!(a.state, AppState::ExecutingTools);
         assert_eq!(a.approved_tools.len(), 1);
         assert_eq!(a.overlay, None);
+    }
+
+    /// A fresh prompt starts on "yes" so bare Enter keeps its long-standing
+    /// meaning; Down moves the highlight to "no" without deciding anything.
+    #[test]
+    fn a_fresh_approval_prompt_starts_selected_on_yes() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        assert!(a.approval_selected);
+
+        a.handle_key(key(KeyCode::Down));
+        assert!(!a.approval_selected, "Down must move the highlight");
+        assert_eq!(a.state, AppState::AwaitingApproval, "arrows alone must not decide anything");
+        assert_eq!(a.pending_tools.len(), 1, "nothing should have been popped yet");
+    }
+
+    /// Enter confirms whichever choice is currently highlighted -- not always
+    /// "yes" -- once Up/Down has moved off the default.
+    #[test]
+    fn enter_confirms_the_highlighted_choice_not_always_yes() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "rm -rf build")]);
+        a.handle_key(key(KeyCode::Down)); // move to "no"
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(a.approved_tools.is_empty(), "Enter on \"no\" must decline, not approve");
+        let told = a.messages.last().unwrap();
+        assert!(told.content.contains("declined"), "{}", told.content);
+    }
+
+    /// Up and Down only ever move between the two choices here -- there's
+    /// nothing to wrap past -- so either key from either state lands on the
+    /// other choice.
+    #[test]
+    fn up_and_down_both_toggle_between_the_two_choices() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+
+        a.handle_key(key(KeyCode::Up));
+        assert!(!a.approval_selected);
+        a.handle_key(key(KeyCode::Up));
+        assert!(a.approval_selected);
+        a.handle_key(key(KeyCode::Down));
+        assert!(!a.approval_selected);
+    }
+
+    /// y/n remain direct shortcuts regardless of where the highlight is --
+    /// someone who already knows their answer shouldn't have to arrow over.
+    #[test]
+    fn y_and_n_still_work_directly_regardless_of_the_highlight() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Down)); // highlight is now on "no"
+        a.handle_key(key(KeyCode::Char('y'))); // but 'y' still means yes
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// Each new prompt resets to "yes", regardless of where the previous one
+    /// was left -- a run of approvals shouldn't inherit a stale highlight.
+    #[test]
+    fn a_new_prompt_resets_the_highlight_even_if_the_previous_one_left_it_on_no() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Down));
+        a.handle_key(key(KeyCode::Char('n')));
+
+        a.state = AppState::Streaming;
+        a.request_tools(vec![command_call("call_2", "pwd")]);
+        assert!(a.approval_selected, "the new prompt must start back on \"yes\"");
     }
 
     /// Regression: `main.rs` takes `approved_tools` (empties it) the instant
