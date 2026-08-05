@@ -10,28 +10,53 @@ use std::path::Path;
 
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MAX_INPUT_HEIGHT: u16 = 10;
+const MAX_APPROVAL_HEIGHT: u16 = 24;
 const MIN_POPUP_WIDTH: u16 = 40;
 const MIN_POPUP_HEIGHT: u16 = 6;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let size = f.size();
-    let input_height = input_height(app, size.width);
+
+    // A tool approval takes the input box's spot at the bottom instead of
+    // floating a popup over the transcript above it -- it answers "what do
+    // you want to do about the thing just proposed", which is exactly what
+    // that spot is for. The transcript stays fully visible and in place, the
+    // way it does for every other kind of turn.
+    let approval = match &app.overlay {
+        Some(Overlay::ToolApproval { action, remaining }) => Some((action.clone(), *remaining)),
+        _ => None,
+    };
+
+    let bottom_height = match &approval {
+        Some((action, remaining)) => {
+            let inner_width = size.width.saturating_sub(4).max(1) as usize;
+            let (_, lines) = tool_approval_lines(app, action, *remaining, inner_width);
+            (lines.len() as u16 + 2).clamp(MIN_INPUT_HEIGHT, MAX_APPROVAL_HEIGHT)
+        }
+        None => input_height(app, size.width),
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(5),
-            Constraint::Length(input_height),
+            Constraint::Length(bottom_height),
             Constraint::Length(1),
         ])
         .split(size);
 
     render_header(f, chunks[0], app);
     render_messages(f, chunks[1], app);
-    render_input(f, chunks[2], app);
+    match &approval {
+        Some((action, remaining)) => render_tool_approval_inline(f, chunks[2], app, action, *remaining),
+        None => render_input(f, chunks[2], app),
+    }
     render_footer(f, chunks[3], app);
-    // Last, so it draws over everything already painted this frame.
+
+    // Everything else here (pickers, text prompts) is a one-shot choice made
+    // before a turn even starts, with no transcript underneath it yet to stay
+    // faithful to -- floating and centered is fine for those.
     render_overlay(f, size, app);
 }
 
@@ -394,9 +419,9 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
             };
             render_text_prompt(f, area, title, hint, &app.overlay_input, masked);
         }
-        Some(Overlay::ToolApproval { action, remaining }) => {
-            render_tool_approval(f, area, app, action, *remaining)
-        }
+        // Drawn inline at the bottom of the frame by `render`, not as a
+        // floating overlay -- see the comment there.
+        Some(Overlay::ToolApproval { .. }) => {}
     }
 }
 
@@ -405,15 +430,19 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
 /// written; this only bounds how tall the popup gets.
 const WRITE_PREVIEW_LINES: usize = 20;
 
-/// The approval prompt. This is the only thing standing between the model and
-/// the machine, so a command or a write's content is shown verbatim and in
-/// full -- never elided, never summarised (`write_file` content is capped at
-/// `WRITE_PREVIEW_LINES` purely so one huge file cannot produce an unusable
-/// popup). Approving something you cannot fully see is not approval.
-fn render_tool_approval(f: &mut Frame, area: Rect, app: &App, action: &Action, remaining: usize) {
-    let width = area.width.saturating_sub(10).clamp(MIN_POPUP_WIDTH, 90);
-    let inner = width.saturating_sub(4).max(1) as usize;
-
+/// The approval prompt's content, shared by sizing (`render` needs the line
+/// count before it can lay out the frame) and drawing. This is the only thing
+/// standing between the model and the machine, so a command or a write's
+/// content is shown verbatim and in full -- never elided, never summarised
+/// (`write_file` content is capped at `WRITE_PREVIEW_LINES` purely so one huge
+/// file cannot produce an unusably tall prompt). Approving something you
+/// cannot fully see is not approval.
+fn tool_approval_lines(
+    app: &App,
+    action: &Action,
+    remaining: usize,
+    inner: usize,
+) -> (&'static str, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
 
     // A destructive command gets a banner before anything else. The prompt for
@@ -513,14 +542,22 @@ fn render_tool_approval(f: &mut Frame, area: Rect, app: &App, action: &Action, r
         Span::styled(" skip", Style::default().fg(Color::DarkGray)),
     ]));
 
-    let popup = centered_rect(width, lines.len() as u16 + 2, area);
-    f.render_widget(Clear, popup);
+    (title, lines)
+}
+
+/// Draws the approval prompt into its reserved region at the bottom of the
+/// frame -- see the placement comment on `render`. No `Clear` and no
+/// centering: unlike a floating popup, this area belongs to the prompt alone,
+/// so there is nothing underneath it to protect or re-center against.
+fn render_tool_approval_inline(f: &mut Frame, area: Rect, app: &App, action: &Action, remaining: usize) {
+    let inner = area.width.saturating_sub(4).max(1) as usize;
+    let (title, lines) = tool_approval_lines(app, action, remaining, inner);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta))
         .title(title);
-    f.render_widget(Paragraph::new(lines).block(block), popup);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Centers a popup sized to its content within `area`, clamped so it never
@@ -718,6 +755,64 @@ mod tests {
                 .draw(|f| render(f, &mut app))
                 .unwrap_or_else(|e| panic!("{w}x{h} failed to render: {e}"));
         }
+    }
+
+    /// Regression: a tool approval used to float as a centered popup that
+    /// `Clear`ed and covered whatever transcript was underneath it -- the
+    /// "separate popup" a user compared unfavourably to Claude Code's inline
+    /// confirmation. It must now sit in its own reserved region at the bottom,
+    /// leaving the transcript above it fully intact and visible.
+    #[test]
+    fn a_tool_approval_leaves_the_transcript_visible_above_it() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages.push(Message::new(Role::User, "delete the build directory"));
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Command {
+                command: "rm -rf build".to_string(),
+                purpose: Some("clear stale output".to_string()),
+            },
+            remaining: 0,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+
+        assert!(
+            rendered.contains("delete the build directory"),
+            "the transcript must still be visible: {rendered}"
+        );
+        assert!(rendered.contains("rm -rf build"), "{rendered}");
+        assert!(rendered.contains("Run this command?"), "{rendered}");
+
+        // The prompt must sit flush against the footer -- no gap below it the
+        // way a centered floating popup would leave -- and the transcript line
+        // must be above the prompt, not swallowed by it.
+        let area = buffer.area();
+        let row_text = |y: u16| -> String {
+            (0..area.width).map(|x| buffer.get(x, y).symbol()).collect()
+        };
+        let transcript_row = (0..area.height)
+            .find(|&y| row_text(y).contains("delete the build directory"))
+            .expect("the earlier message must still be on screen");
+        let prompt_bottom_row = (0..area.height)
+            .rev()
+            .find(|&y| row_text(y).contains("skip"))
+            .expect("the y/n key hint must be on screen");
+
+        assert!(
+            transcript_row < prompt_bottom_row,
+            "transcript (row {transcript_row}) must be above the prompt (row {prompt_bottom_row})"
+        );
+        // Row height-1 is the footer, height-2 is the prompt box's bottom
+        // border: it must be non-blank, i.e. the box sits flush against the
+        // footer with no gap -- a floating centered popup would leave one.
+        assert!(
+            !row_text(area.height - 2).trim().is_empty(),
+            "the prompt's border should be flush against the footer, not floating mid-screen with a gap"
+        );
     }
 
     /// Regression: labelling every line "You: " / "Assistant: " was what made
