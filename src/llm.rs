@@ -373,6 +373,11 @@ async fn run(
             if let Some(reason) = finish_reason_of(line) {
                 finish_reason = Some(reason);
             }
+            // Checked for every line, not just the ones with no choices: some
+            // endpoints attach usage to the final content chunk.
+            if let Some(u) = usage_of(line) {
+                reported = Some(u);
+            }
             match parse_sse_line(line) {
                 SseLine::Done => break 'read,
                 SseLine::Usage(usage) => reported = Some(usage),
@@ -393,7 +398,11 @@ async fn run(
     // Trailing line without a final newline.
     if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf).to_string();
-        match parse_sse_line(line.trim()) {
+        let line = line.trim();
+        if let Some(u) = usage_of(line) {
+            reported = Some(u);
+        }
+        match parse_sse_line(line) {
             SseLine::Usage(usage) => reported = Some(usage),
             SseLine::Delta(delta) => {
                 completion_chars += delta_chars(&delta);
@@ -547,6 +556,25 @@ pub enum SseLine {
     Usage(ApiUsage),
     Done,
     Ignore,
+}
+
+/// Token counts carried by a line, wherever they appear.
+///
+/// Read independently of `parse_sse_line` because the two are not mutually
+/// exclusive on the wire. The OpenAI reference implementation puts usage in a
+/// final chunk with `"choices": []`, but DeepSeek attaches it to the same chunk
+/// that carries `finish_reason` -- a chunk which therefore has a choices entry
+/// too. Matching on choices first, as `parse_sse_line` must, silently discards
+/// those counts and sends the whole quota system back to estimating.
+pub fn usage_of(line: &str) -> Option<ApiUsage> {
+    let payload = line.trim_end().strip_prefix("data:")?.trim_start();
+    if payload == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str::<StreamDelta>(payload)
+        .ok()?
+        .usage
+        .filter(|u| u.prompt_tokens > 0 || u.completion_tokens > 0)
 }
 
 /// Why a response stopped, when the endpoint says.
@@ -944,6 +972,42 @@ mod tests {
         assert_eq!(usage.prompt, 11);
         assert_eq!(usage.completion, 22);
         assert!(!usage.estimated);
+    }
+
+    /// Regression, captured verbatim from deepseek-v4-flash.
+    ///
+    /// The OpenAI reference puts usage in a final chunk with `"choices": []`.
+    /// DeepSeek attaches it to the chunk carrying `finish_reason`, which
+    /// therefore *has* a choices entry -- so matching on choices first threw the
+    /// counts away and sent the whole quota system back to estimating, while the
+    /// gateway logged the exact numbers it had received.
+    #[tokio::test]
+    async fn usage_is_read_even_when_it_rides_along_with_a_choices_entry() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":null},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":118,\"completion_tokens\":33406}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        let addr = serve(response.into_bytes(), 7).await;
+
+        let usage = usage_of(&collect(&addr).await).expect("a usage event must be sent");
+        assert_eq!(usage.prompt, 118);
+        assert_eq!(usage.completion, 33_406);
+        assert!(!usage.estimated, "these are reported counts, not a guess");
+    }
+
+    #[test]
+    fn usage_is_extracted_from_a_line_that_also_carries_a_delta() {
+        let line = r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":8}}"#;
+        let u = super::usage_of(line).expect("must find usage alongside a choice");
+        assert_eq!(u.prompt_tokens, 7);
+        assert_eq!(u.completion_tokens, 8);
+        // A chunk with no usage at all yields nothing, rather than zeroes.
+        assert!(super::usage_of(r#"data: {"choices":[{"delta":{"content":"x"}}]}"#).is_none());
+        assert!(super::usage_of("data: [DONE]").is_none());
     }
 
     #[test]
