@@ -63,6 +63,23 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // before a turn even starts, with no transcript underneath it yet to stay
     // faithful to -- floating and centered is fine for those.
     render_overlay(f, size, app);
+
+    // Last: rewrite every cell's colours in place if this terminal can't be
+    // trusted with the 24-bit RGB the rest of this file draws in -- see
+    // `theme::supports_truecolor`. Everything above stays written in terms of
+    // `theme`'s real palette either way; this is the one place that acts on
+    // whether the terminal can actually show it.
+    adapt_colors_for_terminal(f);
+}
+
+fn adapt_colors_for_terminal(f: &mut Frame) {
+    if theme::supports_truecolor() {
+        return;
+    }
+    for cell in f.buffer_mut().content.iter_mut() {
+        cell.fg = theme::adapt(cell.fg);
+        cell.bg = theme::adapt(cell.bg);
+    }
 }
 
 /// A single quiet line: the mark on the left, the model on the right.
@@ -398,7 +415,14 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         Span::styled("switch model", theme::muted()),
     ]));
 
-    let warnings = app.config.warnings();
+    let mut warnings = app.config.warnings();
+    if !theme::supports_truecolor() {
+        warnings.push(
+            "This terminal doesn't report reliable 24-bit colour support, so colours are \
+             approximated to a close 256-colour palette instead of the exact theme."
+                .to_string(),
+        );
+    }
     if !warnings.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1314,8 +1338,13 @@ mod tests {
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
+        // `render` adapts every colour for this machine's actual terminal
+        // (see `theme::adapt`), so the block's background may already be a
+        // downgraded 256-colour index here rather than raw SURFACE -- compare
+        // against the same adaptation, not the pre-adaptation constant.
+        let surface = theme::adapt(theme::SURFACE);
         let highlighted: Vec<usize> = (0..h)
-            .filter(|&y| (0..w).any(|x| buffer.get(x, y).bg == theme::SURFACE))
+            .filter(|&y| (0..w).any(|x| buffer.get(x, y).bg == surface))
             .map(|y| y as usize)
             .collect();
 
@@ -1330,7 +1359,7 @@ mod tests {
         let right_edge = |y: usize| -> u16 {
             (0..w)
                 .rev()
-                .find(|&x| buffer.get(x, y as u16).bg == theme::SURFACE)
+                .find(|&x| buffer.get(x, y as u16).bg == surface)
                 .expect("row is highlighted")
         };
         assert_eq!(right_edge(highlighted[0]), right_edge(highlighted[1]));
@@ -1345,7 +1374,7 @@ mod tests {
             })
             .expect("the reply must be on screen");
         assert!(
-            (0..w).all(|x| buffer.get(x, reply_row).bg != theme::SURFACE),
+            (0..w).all(|x| buffer.get(x, reply_row).bg != surface),
             "the assistant's prose must not be highlighted"
         );
     }
