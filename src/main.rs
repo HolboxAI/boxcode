@@ -177,6 +177,15 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
+        // The only place `finish_stream`/`fail_stream`/`cancel`'s queued
+        // usage actually reaches disk -- see `App::pending_usage`'s doc
+        // comment on why `app.rs` itself never writes this directly. Catches
+        // both this loop's own draining above and anything `handle_key`
+        // queued earlier this same iteration (a cancel via Esc).
+        for (tokens, model) in app.pending_usage.drain(..) {
+            usage::record_turn(tokens, &model);
+        }
+
         // Fire a pending request.
         if app.state == AppState::Sending {
             app.request_id += 1;

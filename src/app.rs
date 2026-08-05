@@ -174,6 +174,16 @@ pub struct App {
     /// estimate -- the same kind of approximation Claude Code's own live
     /// counter is understood to show mid-stream.
     pub streamed_chars: usize,
+    /// Completed turns' usage, queued for `main.rs` to persist to
+    /// `usage.jsonl` and drain. Deliberately not written to disk from in
+    /// here: `App`'s methods are exercised directly by a few hundred unit
+    /// tests, and a hidden filesystem write inside `finish_stream`/
+    /// `fail_stream`/`cancel` would make every one of them touch the real
+    /// developer machine's `$HOME` unless each was individually wrapped in
+    /// the isolated-`$HOME` test helper. An in-memory queue keeps `App`
+    /// itself side-effect-free; only `main.rs`'s runtime loop -- which is
+    /// what actually runs against a real `$HOME` -- ever calls `usage::record_turn`.
+    pub pending_usage: Vec<(usize, String)>,
     /// One line for the welcome screen describing where commands will run, or
     /// why the tool is off. Set by `main` once the workspace has been resolved.
     pub workspace_status: String,
@@ -218,6 +228,7 @@ impl App {
             tool_steps: 0,
             busy_started: None,
             streamed_chars: 0,
+            pending_usage: Vec::new(),
             workspace_status: String::new(),
             workspace_root: String::new(),
             prompt_history: Vec::new(),
@@ -420,7 +431,8 @@ impl App {
                 .push(Message::new(Role::Error, "Request cancelled."));
         }
         // Whatever streamed before the cancel was still real usage.
-        usage::record_turn(self.approx_tokens_this_turn(), &self.config.llm.model);
+        self.pending_usage
+            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -746,7 +758,8 @@ impl App {
         } else {
             self.messages.push(Message::new(Role::Assistant, response));
         }
-        usage::record_turn(self.approx_tokens_this_turn(), &self.config.llm.model);
+        self.pending_usage
+            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -765,7 +778,8 @@ impl App {
             self.messages.push(Message::new(Role::Assistant, partial));
         }
         self.messages.push(Message::new(Role::Error, error));
-        usage::record_turn(self.approx_tokens_this_turn(), &self.config.llm.model);
+        self.pending_usage
+            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -1357,12 +1371,45 @@ mod tests {
             a.streamed_chars = 400; // -> 100 approx tokens
             a.finish_stream();
 
+            // `finish_stream` only queues -- see `pending_usage`'s doc comment
+            // on why `App` itself never touches the filesystem. Draining the
+            // queue into the real usage log is what `main.rs`'s runtime loop
+            // does after every event batch; simulate that one step here.
+            for (tokens, model) in a.pending_usage.drain(..) {
+                crate::usage::record_turn(tokens, &model);
+            }
+
             type_str(&mut a, "/usage");
             a.handle_key(key(KeyCode::Enter));
 
             let shown = a.messages.last().expect("a summary must be printed");
             assert!(shown.content.contains("~100 tokens"), "{}", shown.content);
         });
+    }
+
+    /// The bug this module exists to prevent: `App`'s state-machine methods
+    /// must never touch the filesystem directly, since a few hundred other
+    /// tests call `finish_stream`/`fail_stream`/`cancel` without expecting
+    /// (or being isolated against) a real `$HOME` side effect. This test
+    /// deliberately does NOT use `with_isolated_home` -- if any of these
+    /// three ever regress back to writing directly, this is the test that
+    /// would need it and doesn't, which is the point.
+    #[test]
+    fn finishing_failing_or_cancelling_a_turn_only_queues_never_writes_a_file() {
+        let mut finished = streaming_app();
+        finished.streamed_chars = 40;
+        finished.finish_stream();
+        assert_eq!(finished.pending_usage, vec![(10, "gpt-3.5-turbo".to_string())]);
+
+        let mut failed = streaming_app();
+        failed.streamed_chars = 40;
+        failed.fail_stream("boom".to_string());
+        assert_eq!(failed.pending_usage, vec![(10, "gpt-3.5-turbo".to_string())]);
+
+        let mut cancelled = streaming_app();
+        cancelled.streamed_chars = 40;
+        cancelled.cancel();
+        assert_eq!(cancelled.pending_usage, vec![(10, "gpt-3.5-turbo".to_string())]);
     }
 
     /// The reported bug: typing a prompt and pressing Enter did nothing, because
