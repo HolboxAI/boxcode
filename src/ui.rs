@@ -10,28 +10,53 @@ use std::path::Path;
 
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MAX_INPUT_HEIGHT: u16 = 10;
+const MAX_APPROVAL_HEIGHT: u16 = 24;
 const MIN_POPUP_WIDTH: u16 = 40;
 const MIN_POPUP_HEIGHT: u16 = 6;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let size = f.size();
-    let input_height = input_height(app, size.width);
+
+    // A tool approval takes the input box's spot at the bottom instead of
+    // floating a popup over the transcript above it -- it answers "what do
+    // you want to do about the thing just proposed", which is exactly what
+    // that spot is for. The transcript stays fully visible and in place, the
+    // way it does for every other kind of turn.
+    let approval = match &app.overlay {
+        Some(Overlay::ToolApproval { action, remaining }) => Some((action.clone(), *remaining)),
+        _ => None,
+    };
+
+    let bottom_height = match &approval {
+        Some((action, remaining)) => {
+            let inner_width = size.width.saturating_sub(4).max(1) as usize;
+            let (_, lines) = tool_approval_lines(app, action, *remaining, inner_width);
+            (lines.len() as u16 + 2).clamp(MIN_INPUT_HEIGHT, MAX_APPROVAL_HEIGHT)
+        }
+        None => input_height(app, size.width),
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(5),
-            Constraint::Length(input_height),
+            Constraint::Length(bottom_height),
             Constraint::Length(1),
         ])
         .split(size);
 
     render_header(f, chunks[0], app);
     render_messages(f, chunks[1], app);
-    render_input(f, chunks[2], app);
+    match &approval {
+        Some((action, remaining)) => render_tool_approval_inline(f, chunks[2], app, action, *remaining),
+        None => render_input(f, chunks[2], app),
+    }
     render_footer(f, chunks[3], app);
-    // Last, so it draws over everything already painted this frame.
+
+    // Everything else here (pickers, text prompts) is a one-shot choice made
+    // before a turn even starts, with no transcript underneath it yet to stay
+    // faithful to -- floating and centered is fine for those.
     render_overlay(f, size, app);
 }
 
@@ -69,18 +94,43 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
                 continue;
             }
 
-            lines.push(Line::from(vec![Span::styled(
-                format!("{}: ", msg.role.label()),
-                role_style(msg.role),
-            )]));
-            for wrapped in wrap(msg.body(), width) {
-                lines.push(Line::from(wrapped));
+            // A user turn keeps a marker -- it's the one place the human's own
+            // words appear verbatim, and a "> " quote prefix reads as "you typed
+            // this" without naming a speaker. The assistant's prose gets none:
+            // narration and tool activity share one continuous stream, the way
+            // Claude Code renders a turn, rather than a labelled reply to a
+            // labelled question. System/Error stay labelled -- they're status
+            // events, not a side of the conversation.
+            match msg.role {
+                Role::User => {
+                    for wrapped in wrap(msg.body(), width) {
+                        lines.push(Line::from(vec![
+                            Span::styled("> ", role_style(Role::User)),
+                            Span::raw(wrapped),
+                        ]));
+                    }
+                }
+                Role::Assistant => {
+                    for wrapped in wrap(msg.body(), width) {
+                        lines.push(Line::from(wrapped));
+                    }
+                }
+                Role::Error | Role::System => {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("{}: ", msg.role.label()),
+                        role_style(msg.role),
+                    )]));
+                    for wrapped in wrap(msg.body(), width) {
+                        lines.push(Line::from(wrapped));
+                    }
+                }
+                Role::Tool => unreachable!("handled above"),
             }
             lines.push(Line::from(""));
         }
 
         if app.state == AppState::ExecutingTools {
-            for call in &app.approved_tools {
+            for call in &app.running_tools {
                 let label = crate::tools::describe_action(call)
                     .map(|a| a.label())
                     .unwrap_or_else(|| call.function.name.clone());
@@ -92,10 +142,6 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
         }
 
         if app.state == AppState::Streaming {
-            lines.push(Line::from(vec![Span::styled(
-                "Assistant: ",
-                role_style(Role::Assistant),
-            )]));
             let body = if app.streaming_response.is_empty() {
                 "…".to_string()
             } else {
@@ -287,13 +333,40 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// Appends `(Ns)` when a turn is running, e.g. "Streaming…" -> "Streaming… (3s)".
+/// `None` (idle, or `AwaitingApproval` where the clock isn't the point) leaves
+/// the label bare.
+fn with_elapsed(label: &str, elapsed_secs: Option<u64>) -> String {
+    match elapsed_secs {
+        Some(s) => format!("{label} ({s}s)"),
+        None => label.to_string(),
+    }
+}
+
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let (status, color) = match &app.state {
-        AppState::AwaitingInput => ("Ready", Color::Green),
-        AppState::Sending => ("Sending…", Color::Yellow),
-        AppState::Streaming => ("Streaming…", Color::Yellow),
-        AppState::AwaitingApproval => ("Waiting for you", Color::Magenta),
-        AppState::ExecutingTools => ("Running command…", Color::Blue),
+    let elapsed_secs = app.busy_started.map(|t| t.elapsed().as_secs());
+    // No endpoint used here sends a token count mid-stream -- that only ever
+    // arrives, if at all, on the final chunk. This is the same rough
+    // characters-per-token estimate a live counter has to use before that
+    // arrives, so it is always labelled "~", never a bare number.
+    let approx_tokens = app.streamed_chars / 4;
+
+    let (status, color): (String, Color) = match &app.state {
+        AppState::AwaitingInput => ("Ready".to_string(), Color::Green),
+        AppState::Sending => (with_elapsed("Sending…", elapsed_secs), Color::Yellow),
+        AppState::Streaming => {
+            let mut s = with_elapsed("Streaming…", elapsed_secs);
+            if approx_tokens > 0 {
+                s.push_str(&format!(" · ~{approx_tokens} tokens"));
+            }
+            (s, Color::Yellow)
+        }
+        AppState::AwaitingApproval => ("Waiting for you".to_string(), Color::Magenta),
+        AppState::ExecutingTools => {
+            let n = app.running_tools.len();
+            let label = format!("Running {n} command{}…", if n == 1 { "" } else { "s" });
+            (with_elapsed(&label, elapsed_secs), Color::Blue)
+        }
     };
 
     let keys = match &app.state {
@@ -373,9 +446,9 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
             };
             render_text_prompt(f, area, title, hint, &app.overlay_input, masked);
         }
-        Some(Overlay::ToolApproval { action, remaining }) => {
-            render_tool_approval(f, area, app, action, *remaining)
-        }
+        // Drawn inline at the bottom of the frame by `render`, not as a
+        // floating overlay -- see the comment there.
+        Some(Overlay::ToolApproval { .. }) => {}
     }
 }
 
@@ -384,15 +457,19 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
 /// written; this only bounds how tall the popup gets.
 const WRITE_PREVIEW_LINES: usize = 20;
 
-/// The approval prompt. This is the only thing standing between the model and
-/// the machine, so a command or a write's content is shown verbatim and in
-/// full -- never elided, never summarised (`write_file` content is capped at
-/// `WRITE_PREVIEW_LINES` purely so one huge file cannot produce an unusable
-/// popup). Approving something you cannot fully see is not approval.
-fn render_tool_approval(f: &mut Frame, area: Rect, app: &App, action: &Action, remaining: usize) {
-    let width = area.width.saturating_sub(10).clamp(MIN_POPUP_WIDTH, 90);
-    let inner = width.saturating_sub(4).max(1) as usize;
-
+/// The approval prompt's content, shared by sizing (`render` needs the line
+/// count before it can lay out the frame) and drawing. This is the only thing
+/// standing between the model and the machine, so a command or a write's
+/// content is shown verbatim and in full -- never elided, never summarised
+/// (`write_file` content is capped at `WRITE_PREVIEW_LINES` purely so one huge
+/// file cannot produce an unusably tall prompt). Approving something you
+/// cannot fully see is not approval.
+fn tool_approval_lines(
+    app: &App,
+    action: &Action,
+    remaining: usize,
+    inner: usize,
+) -> (&'static str, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
 
     // A destructive command gets a banner before anything else. The prompt for
@@ -492,14 +569,22 @@ fn render_tool_approval(f: &mut Frame, area: Rect, app: &App, action: &Action, r
         Span::styled(" skip", Style::default().fg(Color::DarkGray)),
     ]));
 
-    let popup = centered_rect(width, lines.len() as u16 + 2, area);
-    f.render_widget(Clear, popup);
+    (title, lines)
+}
+
+/// Draws the approval prompt into its reserved region at the bottom of the
+/// frame -- see the placement comment on `render`. No `Clear` and no
+/// centering: unlike a floating popup, this area belongs to the prompt alone,
+/// so there is nothing underneath it to protect or re-center against.
+fn render_tool_approval_inline(f: &mut Frame, area: Rect, app: &App, action: &Action, remaining: usize) {
+    let inner = area.width.saturating_sub(4).max(1) as usize;
+    let (title, lines) = tool_approval_lines(app, action, remaining, inner);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta))
         .title(title);
-    f.render_widget(Paragraph::new(lines).block(block), popup);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Centers a popup sized to its content within `area`, clamped so it never
@@ -650,8 +735,27 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Message;
+    use crate::llm::{FunctionCall, ToolCall};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    fn command_call(id: &str, command: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: crate::tools::RUN_COMMAND.to_string(),
+                arguments: serde_json::json!({ "command": command }).to_string(),
+            },
+        }
+    }
+
+    fn rendered_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    }
 
     fn frame(width: u16, height: u16) -> Rect {
         Rect { x: 0, y: 0, width, height }
@@ -696,6 +800,129 @@ mod tests {
                 .draw(|f| render(f, &mut app))
                 .unwrap_or_else(|e| panic!("{w}x{h} failed to render: {e}"));
         }
+    }
+
+    /// Regression: a tool approval used to float as a centered popup that
+    /// `Clear`ed and covered whatever transcript was underneath it -- the
+    /// "separate popup" a user compared unfavourably to Claude Code's inline
+    /// confirmation. It must now sit in its own reserved region at the bottom,
+    /// leaving the transcript above it fully intact and visible.
+    #[test]
+    fn a_tool_approval_leaves_the_transcript_visible_above_it() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages.push(Message::new(Role::User, "delete the build directory"));
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Command {
+                command: "rm -rf build".to_string(),
+                purpose: Some("clear stale output".to_string()),
+            },
+            remaining: 0,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+
+        assert!(
+            rendered.contains("delete the build directory"),
+            "the transcript must still be visible: {rendered}"
+        );
+        assert!(rendered.contains("rm -rf build"), "{rendered}");
+        assert!(rendered.contains("Run this command?"), "{rendered}");
+
+        // The prompt must sit flush against the footer -- no gap below it the
+        // way a centered floating popup would leave -- and the transcript line
+        // must be above the prompt, not swallowed by it.
+        let area = buffer.area();
+        let row_text = |y: u16| -> String {
+            (0..area.width).map(|x| buffer.get(x, y).symbol()).collect()
+        };
+        let transcript_row = (0..area.height)
+            .find(|&y| row_text(y).contains("delete the build directory"))
+            .expect("the earlier message must still be on screen");
+        let prompt_bottom_row = (0..area.height)
+            .rev()
+            .find(|&y| row_text(y).contains("skip"))
+            .expect("the y/n key hint must be on screen");
+
+        assert!(
+            transcript_row < prompt_bottom_row,
+            "transcript (row {transcript_row}) must be above the prompt (row {prompt_bottom_row})"
+        );
+        // Row height-1 is the footer, height-2 is the prompt box's bottom
+        // border: it must be non-blank, i.e. the box sits flush against the
+        // footer with no gap -- a floating centered popup would leave one.
+        assert!(
+            !row_text(area.height - 2).trim().is_empty(),
+            "the prompt's border should be flush against the footer, not floating mid-screen with a gap"
+        );
+    }
+
+    /// Regression: `ExecutingTools` used to draw straight from
+    /// `app.approved_tools`, which `main.rs` empties the instant it spawns the
+    /// runner -- so the on-screen "N commands" count went stale after one
+    /// frame even though the run was still going. It must read `running_tools`
+    /// (the snapshot) instead, and the footer must show a live command count
+    /// and elapsed time the way "Running 5 shell commands · 42s…" does.
+    #[test]
+    fn the_footer_shows_a_live_running_command_count_while_tools_execute() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::ExecutingTools;
+        app.busy_started = Some(std::time::Instant::now());
+        app.running_tools = vec![command_call("call_1", "ls"), command_call("call_2", "cat Cargo.toml")];
+        // The queue `main.rs` would already have taken by this point -- the
+        // footer and transcript must not depend on it still being populated.
+        app.approved_tools.clear();
+
+        let rendered = rendered_text(&mut app, 80, 24);
+
+        assert!(rendered.contains("Running 2 commands"), "{rendered}");
+        assert!(rendered.contains("(0s)") || rendered.contains("(1s)"), "{rendered}");
+    }
+
+    /// The token count is a live estimate, so it must read as one ("~N
+    /// tokens") rather than a bare number that looks authoritative.
+    #[test]
+    fn the_footer_shows_an_approximate_token_count_while_streaming() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::Streaming;
+        app.busy_started = Some(std::time::Instant::now());
+        app.streamed_chars = 400; // -> ~100 tokens at the chars/4 estimate
+
+        let rendered = rendered_text(&mut app, 80, 24);
+
+        assert!(rendered.contains("~100 tokens"), "{rendered}");
+    }
+
+    /// Regression: labelling every line "You: " / "Assistant: " was what made
+    /// this read as a Q&A chat log instead of one continuous stream, the thing
+    /// a user compared unfavourably to Claude Code's transcript. The user's own
+    /// words still get a "> " quote marker; the assistant's prose gets nothing.
+    #[test]
+    fn the_transcript_reads_as_a_continuous_stream_not_a_labelled_chat_log() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages.push(Message::new(Role::User, "write a hello world function"));
+        app.messages.push(Message::new(Role::Assistant, "Here's the function..."));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(rendered.contains("> write a hello world function"), "{rendered}");
+        assert!(rendered.contains("Here's the function"), "{rendered}");
+        assert!(!rendered.contains("You:"), "{rendered}");
+        assert!(!rendered.contains("Assistant:"), "{rendered}");
     }
 
     /// The command must appear verbatim: approving something you cannot read is

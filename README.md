@@ -7,13 +7,13 @@ Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-
 │ tuisample-code | llm.company.internal | model: company-70b │
 ├──────────────────────────────────────────────────────────┤
 │                                                           │
-│ Assistant: Here's the function...                        │
+│ > write a hello world function                          │
+│                                                           │
+│ Here's the function...                                   │
 │ def hello_world():                                       │
 │   return "Hello, World!"                                │
 │                                                           │
 │ ✓ Generated 120 tokens in 1.2s                          │
-│                                                           │
-│ You: > write a hello world function                     │
 │                                                           │
 ├──────────────────────────────────────────────────────────┤
 │ > your prompt here... (Enter to send, Esc cancel)        │
@@ -106,7 +106,7 @@ change files directly instead of hand-encoding writes into shell commands:
 ```
 > create hello.py and run it
 📝 /Users/you/project/hello.py
-Assistant: Created it — printing "Hello, World!" and running it now.
+Created it — printing "Hello, World!" and running it now.
 $ python3 hello.py — 1 line
 ```
 
