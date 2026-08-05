@@ -267,6 +267,11 @@ impl App {
                             self.cursor = 0;
                             self.open_model_picker_from_config();
                         }
+                        "/new" if !self.is_busy() => {
+                            self.input_buffer.clear();
+                            self.cursor = 0;
+                            self.start_new_conversation();
+                        }
                         _ => self.submit(),
                     }
                 }
@@ -520,6 +525,32 @@ impl App {
     /// anything), and shell commands via `tools::is_read_only`. `write_file`
     /// never qualifies: unlike a shell command's read-only-ness, which has to
     /// be inferred, "this writes a file" is certain, so it always asks.
+    /// `/new` -- forget the conversation and start fresh.
+    ///
+    /// A long session is what makes a request expensive: the whole transcript is
+    /// resent every turn, so cost grows with the square of the conversation.
+    /// Starting a new topic in a new conversation is the cheapest optimisation
+    /// available, and it needs a command rather than a restart because the
+    /// alternative is losing the configured provider and model too.
+    ///
+    /// Only the conversation is cleared. Config, provider and workspace are
+    /// deliberately untouched -- this is "forget what we discussed", not "reset
+    /// the app".
+    fn start_new_conversation(&mut self) {
+        self.messages.clear();
+        self.streaming_response.clear();
+        self.pending_tools.clear();
+        self.approved_tools.clear();
+        self.tool_steps = 0;
+        self.scroll = 0;
+        self.follow_tail = true;
+        self.greeted = true;
+        self.messages.push(Message::new(
+            Role::System,
+            "Started a new conversation. The model no longer remembers anything above this line.",
+        ));
+    }
+
     fn needs_approval(&self, call: &ToolCall) -> bool {
         if self.risk_of(call).is_dangerous() {
             return true;
@@ -529,7 +560,14 @@ impl App {
         }
         if self.config.tools.auto_approve_read_only {
             match tools::describe_action(call) {
-                Some(tools::Action::Read { .. }) => return false,
+                // Reading, listing and searching change nothing on disk, so
+                // there is nothing for an approval prompt to protect against --
+                // and prompting for them is what trains people to stop reading
+                // the prompts that matter. `edit_file` is deliberately absent:
+                // it modifies a file and is approved like a write.
+                Some(tools::Action::Read { .. })
+                | Some(tools::Action::List { .. })
+                | Some(tools::Action::Glob { .. }) => return false,
                 Some(tools::Action::Command { command, .. }) if tools::is_read_only(&command) => {
                     return false;
                 }
@@ -1176,6 +1214,61 @@ mod tests {
         for c in s.chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
+    }
+
+    // ---- /new ------------------------------------------------------------------
+
+    #[test]
+    fn slash_new_forgets_the_conversation() {
+        let mut a = app();
+        a.messages.push(Message::new(Role::User, "first question"));
+        a.messages.push(Message::new(Role::Assistant, "an answer"));
+        a.tool_steps = 4;
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        // Nothing from before survives into what the model is sent.
+        let history = a.history(None);
+        assert!(
+            !history.iter().any(|m| m.content.as_deref().unwrap_or("").contains("first question")),
+            "the old conversation must not be resent"
+        );
+        assert_eq!(a.tool_steps, 0);
+        assert_eq!(a.state, AppState::AwaitingInput);
+        // ...and the user is told, rather than the transcript just emptying.
+        assert!(a.messages.iter().any(|m| m.role == Role::System
+            && m.content.contains("new conversation")));
+    }
+
+    /// `/new` is about the conversation, not the app: losing the configured
+    /// provider and model would make it useless as a cheap reset.
+    #[test]
+    fn slash_new_keeps_the_configuration() {
+        let mut a = app();
+        a.config.llm.model = "some-model".to_string();
+        a.config.llm.provider = "deepseek".to_string();
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.config.llm.model, "some-model");
+        assert_eq!(a.config.llm.provider, "deepseek");
+    }
+
+    #[test]
+    fn slash_new_is_ignored_mid_turn() {
+        let mut a = app();
+        a.messages.push(Message::new(Role::User, "keep me"));
+        a.state = AppState::Streaming;
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        // Treated as ordinary input, not executed: clearing history underneath a
+        // request in flight would strand its tool calls.
+        assert_eq!(a.state, AppState::Streaming);
+        assert!(a.messages.iter().any(|m| m.content == "keep me"));
     }
 
     /// The reported bug: typing a prompt and pressing Enter did nothing, because

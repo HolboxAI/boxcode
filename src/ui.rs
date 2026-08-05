@@ -767,6 +767,56 @@ fn tool_approval_lines(
             }
             (" Write this file? ", "write")
         }
+        Action::List { path } => {
+            lines.push(Line::from(Span::styled(
+                format!("📁 {path}"),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            (" List this directory? ", "list")
+        }
+        Action::Glob { pattern } => {
+            lines.push(Line::from(Span::styled(
+                format!("🔎 {pattern}"),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            (" Search for these files? ", "search")
+        }
+        // An edit shows both spans, because approving a replacement you cannot
+        // see is not approval. Unlike a write it does not need the whole file --
+        // showing only what changes is the reason to prefer this tool.
+        Action::Edit { path, old, new, replace_all } => {
+            lines.push(Line::from(Span::styled(
+                format!("✏️ {path}{}", if *replace_all { "  (all occurrences)" } else { "" }),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            let mut span = |label: &str, body: &str, colour| {
+                lines.push(Line::from(Span::styled(label.to_string(), theme::faint())));
+                let total = body.lines().count();
+                for (i, line) in body.lines().enumerate() {
+                    if i >= WRITE_PREVIEW_LINES {
+                        lines.push(Line::from(Span::styled(
+                            format!("… {} more line(s)", total - i),
+                            theme::faint(),
+                        )));
+                        break;
+                    }
+                    for wrapped in wrap(line, inner) {
+                        lines.push(Line::from(Span::styled(wrapped, Style::default().fg(colour))));
+                    }
+                }
+                lines.push(Line::from(""));
+            };
+            span("replace:", old, theme::DANGER);
+            span("with:", new, theme::SUCCESS);
+            (" Apply this edit? ", "edit")
+        }
     };
 
     lines.push(Line::from(""));

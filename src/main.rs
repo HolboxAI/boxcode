@@ -287,6 +287,7 @@ UPGRADE:
 COMMANDS (type in the input box, press Enter):
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider
+    /new                  Forget the conversation and start fresh
 
 KEYS:
     Enter                 Send prompt
