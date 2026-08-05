@@ -5,7 +5,7 @@ Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-
 ```
  ◈
 
-  ▟█▙       ▟█▙    tuisample-code  v0.7.0
+  ▟█▙       ▟█▙    tuisample-code  v0.8.0
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
