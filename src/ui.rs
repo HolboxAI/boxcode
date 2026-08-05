@@ -130,7 +130,7 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
         }
 
         if app.state == AppState::ExecutingTools {
-            for call in &app.approved_tools {
+            for call in &app.running_tools {
                 let label = crate::tools::describe_action(call)
                     .map(|a| a.label())
                     .unwrap_or_else(|| call.function.name.clone());
@@ -333,13 +333,40 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// Appends `(Ns)` when a turn is running, e.g. "Streaming…" -> "Streaming… (3s)".
+/// `None` (idle, or `AwaitingApproval` where the clock isn't the point) leaves
+/// the label bare.
+fn with_elapsed(label: &str, elapsed_secs: Option<u64>) -> String {
+    match elapsed_secs {
+        Some(s) => format!("{label} ({s}s)"),
+        None => label.to_string(),
+    }
+}
+
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let (status, color) = match &app.state {
-        AppState::AwaitingInput => ("Ready", Color::Green),
-        AppState::Sending => ("Sending…", Color::Yellow),
-        AppState::Streaming => ("Streaming…", Color::Yellow),
-        AppState::AwaitingApproval => ("Waiting for you", Color::Magenta),
-        AppState::ExecutingTools => ("Running command…", Color::Blue),
+    let elapsed_secs = app.busy_started.map(|t| t.elapsed().as_secs());
+    // No endpoint used here sends a token count mid-stream -- that only ever
+    // arrives, if at all, on the final chunk. This is the same rough
+    // characters-per-token estimate a live counter has to use before that
+    // arrives, so it is always labelled "~", never a bare number.
+    let approx_tokens = app.streamed_chars / 4;
+
+    let (status, color): (String, Color) = match &app.state {
+        AppState::AwaitingInput => ("Ready".to_string(), Color::Green),
+        AppState::Sending => (with_elapsed("Sending…", elapsed_secs), Color::Yellow),
+        AppState::Streaming => {
+            let mut s = with_elapsed("Streaming…", elapsed_secs);
+            if approx_tokens > 0 {
+                s.push_str(&format!(" · ~{approx_tokens} tokens"));
+            }
+            (s, Color::Yellow)
+        }
+        AppState::AwaitingApproval => ("Waiting for you".to_string(), Color::Magenta),
+        AppState::ExecutingTools => {
+            let n = app.running_tools.len();
+            let label = format!("Running {n} command{}…", if n == 1 { "" } else { "s" });
+            (with_elapsed(&label, elapsed_secs), Color::Blue)
+        }
     };
 
     let keys = match &app.state {
@@ -709,8 +736,26 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::app::Message;
+    use crate::llm::{FunctionCall, ToolCall};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    fn command_call(id: &str, command: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: crate::tools::RUN_COMMAND.to_string(),
+                arguments: serde_json::json!({ "command": command }).to_string(),
+            },
+        }
+    }
+
+    fn rendered_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    }
 
     fn frame(width: u16, height: u16) -> Rect {
         Rect { x: 0, y: 0, width, height }
@@ -813,6 +858,44 @@ mod tests {
             !row_text(area.height - 2).trim().is_empty(),
             "the prompt's border should be flush against the footer, not floating mid-screen with a gap"
         );
+    }
+
+    /// Regression: `ExecutingTools` used to draw straight from
+    /// `app.approved_tools`, which `main.rs` empties the instant it spawns the
+    /// runner -- so the on-screen "N commands" count went stale after one
+    /// frame even though the run was still going. It must read `running_tools`
+    /// (the snapshot) instead, and the footer must show a live command count
+    /// and elapsed time the way "Running 5 shell commands · 42s…" does.
+    #[test]
+    fn the_footer_shows_a_live_running_command_count_while_tools_execute() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::ExecutingTools;
+        app.busy_started = Some(std::time::Instant::now());
+        app.running_tools = vec![command_call("call_1", "ls"), command_call("call_2", "cat Cargo.toml")];
+        // The queue `main.rs` would already have taken by this point -- the
+        // footer and transcript must not depend on it still being populated.
+        app.approved_tools.clear();
+
+        let rendered = rendered_text(&mut app, 80, 24);
+
+        assert!(rendered.contains("Running 2 commands"), "{rendered}");
+        assert!(rendered.contains("(0s)") || rendered.contains("(1s)"), "{rendered}");
+    }
+
+    /// The token count is a live estimate, so it must read as one ("~N
+    /// tokens") rather than a bare number that looks authoritative.
+    #[test]
+    fn the_footer_shows_an_approximate_token_count_while_streaming() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::Streaming;
+        app.busy_started = Some(std::time::Instant::now());
+        app.streamed_chars = 400; // -> ~100 tokens at the chars/4 estimate
+
+        let rendered = rendered_text(&mut app, 80, 24);
+
+        assert!(rendered.contains("~100 tokens"), "{rendered}");
     }
 
     /// Regression: labelling every line "You: " / "Assistant: " was what made

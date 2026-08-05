@@ -146,10 +146,26 @@ pub struct App {
     pub pending_tools: VecDeque<ToolCall>,
     /// Calls the user allowed, waiting for the event loop to spawn them.
     pub approved_tools: Vec<ToolCall>,
+    /// A snapshot of `approved_tools` taken the moment execution starts, kept
+    /// around purely for display. `main.rs` drains `approved_tools` as soon as
+    /// it spawns the runner task, so by the next frame that list is empty --
+    /// without this copy "Running N commands…" would show N for one frame and
+    /// then silently go blank while the commands were still running.
+    pub running_tools: Vec<ToolCall>,
     /// Tool rounds spent on the current prompt, reset by `submit`. Once this hits
     /// the configured ceiling the schemas stop being sent, which is what makes a
     /// model that will not stop calling tools produce an answer instead.
     pub tool_steps: usize,
+    /// When the current turn started, for the elapsed-time shown in the
+    /// footer. `None` while idle; set once in `submit`, cleared on every path
+    /// back to `AwaitingInput` (`finish_stream`, `fail_stream`, `cancel`).
+    pub busy_started: Option<std::time::Instant>,
+    /// Characters streamed so far this turn. There is no authoritative token
+    /// count until the endpoint's final usage field (most don't send one by
+    /// default), so the footer shows `streamed_chars / 4` as a rough live
+    /// estimate -- the same kind of approximation Claude Code's own live
+    /// counter is understood to show mid-stream.
+    pub streamed_chars: usize,
     /// One line for the welcome screen describing where commands will run, or
     /// why the tool is off. Set by `main` once the workspace has been resolved.
     pub workspace_status: String,
@@ -178,7 +194,10 @@ impl App {
             overlay_cursor: 0,
             pending_tools: VecDeque::new(),
             approved_tools: Vec::new(),
+            running_tools: Vec::new(),
             tool_steps: 0,
+            busy_started: None,
+            streamed_chars: 0,
             workspace_status: String::new(),
             workspace_root: String::new(),
         }
@@ -305,6 +324,8 @@ impl App {
         self.follow_tail = true;
         self.streaming_response.clear();
         self.tool_steps = 0;
+        self.busy_started = Some(std::time::Instant::now());
+        self.streamed_chars = 0;
         self.messages.push(Message::new(Role::User, prompt));
         self.state = AppState::Sending;
     }
@@ -320,6 +341,7 @@ impl App {
         self.request_id += 1;
         self.pending_tools.clear();
         self.approved_tools.clear();
+        self.running_tools.clear();
         self.overlay = None;
 
         // Before anything else is appended: synthetic results have to sit
@@ -336,6 +358,7 @@ impl App {
             self.messages
                 .push(Message::new(Role::Error, "Request cancelled."));
         }
+        self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
 
@@ -414,6 +437,10 @@ impl App {
         self.state = if self.approved_tools.is_empty() {
             AppState::Sending
         } else {
+            // Snapshot for display: `main.rs` takes `approved_tools` the
+            // moment it spawns the runner, so this copy is what stays on
+            // screen for the rest of the run -- see the field doc.
+            self.running_tools = self.approved_tools.clone();
             AppState::ExecutingTools
         };
     }
@@ -503,6 +530,7 @@ impl App {
         for outcome in outcomes {
             self.push_tool_outcome(outcome);
         }
+        self.running_tools.clear();
         self.follow_tail = true;
         // Back around: the model needs a turn to use what it just got.
         self.state = AppState::Sending;
@@ -548,6 +576,7 @@ impl App {
     pub fn append_token(&mut self, token: &str) {
         if self.state == AppState::Streaming {
             self.streaming_response.push_str(token);
+            self.streamed_chars += token.chars().count();
         }
     }
 
@@ -568,6 +597,7 @@ impl App {
         } else {
             self.messages.push(Message::new(Role::Assistant, response));
         }
+        self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
 
@@ -575,6 +605,7 @@ impl App {
         self.abort = None;
         self.pending_tools.clear();
         self.approved_tools.clear();
+        self.running_tools.clear();
         self.overlay = None;
         // First, so the results land against the calls they belong to.
         self.settle_unanswered_tool_calls("The request failed before this command ran.");
@@ -584,6 +615,7 @@ impl App {
             self.messages.push(Message::new(Role::Assistant, partial));
         }
         self.messages.push(Message::new(Role::Error, error));
+        self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
 
@@ -1022,6 +1054,46 @@ mod tests {
         assert_eq!(a.messages[0].content, "hello world");
     }
 
+    /// The footer's elapsed-time display reads `busy_started`; it must be set
+    /// the moment a turn begins and cleared on every path back to idle, or
+    /// the clock would either never start or keep running after the turn
+    /// that started it is long over.
+    #[test]
+    fn submitting_a_prompt_starts_the_busy_timer_and_resets_the_token_estimate() {
+        let mut a = app();
+        assert!(a.busy_started.is_none());
+
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(a.busy_started.is_some());
+        assert_eq!(a.streamed_chars, 0);
+    }
+
+    #[test]
+    fn streaming_tokens_accumulate_the_character_count() {
+        let mut a = streaming_app();
+        a.append_token("Hello, ");
+        a.append_token("world!");
+        assert_eq!(a.streamed_chars, "Hello, world!".chars().count());
+    }
+
+    #[test]
+    fn the_busy_timer_clears_when_a_turn_ends_however_it_ends() {
+        let mut finished = streaming_app();
+        finished.append_token("hi");
+        finished.finish_stream();
+        assert!(finished.busy_started.is_none());
+
+        let mut failed = streaming_app();
+        failed.fail_stream("boom".to_string());
+        assert!(failed.busy_started.is_none());
+
+        let mut cancelled = streaming_app();
+        cancelled.cancel();
+        assert!(cancelled.busy_started.is_none());
+    }
+
     #[test]
     fn ctrl_enter_still_submits_where_the_terminal_reports_it() {
         let mut a = app();
@@ -1298,6 +1370,26 @@ mod tests {
         assert_eq!(a.state, AppState::ExecutingTools);
         assert_eq!(a.approved_tools.len(), 1);
         assert_eq!(a.overlay, None);
+    }
+
+    /// Regression: `main.rs` takes `approved_tools` (empties it) the instant
+    /// it spawns the runner task, so a "Running N commands…" display reading
+    /// straight off `approved_tools` would show N for one frame and then
+    /// nothing for the rest of the run, while commands were still executing.
+    /// `running_tools` is the snapshot that stays put until the run finishes.
+    #[test]
+    fn approving_a_command_snapshots_it_for_display_independent_of_approved_tools() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(a.running_tools.len(), 1);
+
+        // Simulate what main.rs does the moment it spawns the runner.
+        a.approved_tools.clear();
+        assert_eq!(a.running_tools.len(), 1, "the snapshot must survive approved_tools being taken");
+
+        a.finish_tools(vec![outcome("call_1", "ok")]);
+        assert!(a.running_tools.is_empty(), "the snapshot must clear once the run is over");
     }
 
     /// Esc at an approval prompt means "no", not "cancel the turn": the
