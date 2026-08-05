@@ -71,6 +71,22 @@ pub struct LlmConfig {
     /// which case a standalone `/model` has nothing to scope to.
     #[serde(default)]
     pub provider: String,
+    /// Ceiling on one response. **0 means no cap**, which is the default.
+    ///
+    /// A fixed cap protects nothing the daily budget does not already protect --
+    /// spend is the same whether it goes on one response or fifty -- and it
+    /// truncates long answers, which for coding means half a patch. It also
+    /// interacts badly with reasoning models, which spend this budget thinking
+    /// before they write anything: run out mid-thought and the response contains
+    /// no answer at all. At 4096 a coding prompt on deepseek-v4-flash used the
+    /// entire allowance reasoning (9337 reasoning tokens) and returned nothing.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+}
+
+/// 0 = no client-imposed cap; the provider's model limit applies.
+fn default_max_tokens() -> u32 {
+    0
 }
 
 /// Settings for the shell command tool.
@@ -321,6 +337,12 @@ impl Config {
         // A warn threshold of 0 would fire a warning on the very first request;
         // above 100 it could never fire at all. Both read as a broken feature
         // rather than a setting, so pull them back to something meaningful.
+        // 0 is meaningful (no cap). Anything positive but tiny would make every
+        // response useless, so nudge it to a floor instead.
+        if self.llm.max_tokens > 0 {
+            self.llm.max_tokens = self.llm.max_tokens.clamp(256, 200_000);
+        }
+
         self.quota.warn_at_percent = self.quota.warn_at_percent.clamp(1, 100);
         // A negative price would credit the user for using the model.
         if self.quota.max_usd_per_day < 0.0 {
@@ -404,6 +426,7 @@ impl Default for LlmConfig {
             model: "gpt-3.5-turbo".to_string(),
             api_key: String::new(),
             provider: String::new(),
+            max_tokens: default_max_tokens(),
         }
     }
 }
@@ -461,6 +484,7 @@ mod tests {
                     model: "deepseek-v4-pro".to_string(),
                     api_key: "sk-test-key".to_string(),
                     provider: "deepseek".to_string(),
+                    max_tokens: default_max_tokens(),
                 },
                 tools: ToolsConfig::default(),
                 quota: QuotaConfig::default(),

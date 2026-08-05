@@ -225,6 +225,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             let history = app.history(system.as_deref());
             let tx_clone = tx.clone();
             let include_usage = app.config.quota.enabled && app.config.quota.include_usage;
+            let max_tokens = app.config.llm.max_tokens;
 
             let handle = tokio::spawn(async move {
                 llm::stream_chat(
@@ -234,6 +235,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     history,
                     schemas,
                     include_usage,
+                    max_tokens,
                     id,
                     tx_clone,
                 )

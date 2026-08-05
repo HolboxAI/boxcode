@@ -9,7 +9,11 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub stream: bool,
-    pub max_tokens: u32,
+    /// Omitted when the user has not set a bound, so the provider's own model
+    /// limit applies. A fixed cap does not protect anything the daily budget
+    /// does not already protect; it only truncates long answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
     /// Omitted entirely when empty: an endpoint that has never heard of tool
     /// calling should see exactly the request it saw before this feature landed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -107,6 +111,11 @@ pub struct Choice {
     /// (non-SSE) completion body.
     #[serde(default)]
     pub message: Option<ChatMessage>,
+    /// `"stop"`, `"length"`, `"tool_calls"`. Needed to tell a model that finished
+    /// from one that ran out of room, which look identical from the content
+    /// alone -- both simply stop arriving.
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -182,6 +191,7 @@ pub async fn stream_chat(
     messages: Vec<ChatMessage>,
     tools: Vec<Value>,
     include_usage: bool,
+    max_tokens: u32,
     request_id: u64,
     tx: mpsc::Sender<(u64, StreamEvent)>,
 ) {
@@ -192,6 +202,7 @@ pub async fn stream_chat(
         messages,
         tools,
         include_usage,
+        max_tokens,
         request_id,
         &tx,
     )
@@ -211,6 +222,7 @@ async fn run(
     messages: Vec<ChatMessage>,
     tools: Vec<Value>,
     include_usage: bool,
+    max_tokens: u32,
     request_id: u64,
     tx: &mpsc::Sender<(u64, StreamEvent)>,
 ) -> Result<(), String> {
@@ -231,7 +243,7 @@ async fn run(
         model: model.to_string(),
         messages,
         stream: true,
-        max_tokens: 4096,
+        max_tokens: (max_tokens > 0).then_some(max_tokens),
         tools,
         stream_options: include_usage.then_some(StreamOptions { include_usage: true }),
     };
@@ -347,6 +359,8 @@ async fn run(
     let mut pending: Vec<ToolCall> = Vec::new();
     let mut reported: Option<ApiUsage> = None;
     let mut completion_chars = 0usize;
+    let mut finish_reason: Option<String> = None;
+    let mut emitted_content = false;
 
     'read: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Stream interrupted: {e}"))?;
@@ -355,11 +369,18 @@ async fn run(
         while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=nl).collect();
             let line = String::from_utf8_lossy(&line[..line.len() - 1]);
-            match parse_sse_line(line.trim_end_matches('\r')) {
+            let line = line.trim_end_matches('\r');
+            if let Some(reason) = finish_reason_of(line) {
+                finish_reason = Some(reason);
+            }
+            match parse_sse_line(line) {
                 SseLine::Done => break 'read,
                 SseLine::Usage(usage) => reported = Some(usage),
                 SseLine::Delta(delta) => {
                     completion_chars += delta_chars(&delta);
+                    if delta.content.as_deref().is_some_and(|c| !c.is_empty()) {
+                        emitted_content = true;
+                    }
                     if !apply_delta(delta, &mut pending, request_id, tx).await {
                         return Ok(()); // receiver gone; app is shutting down
                     }
@@ -385,13 +406,29 @@ async fn run(
     // Tool calls are only complete once the stream is, since `arguments` is
     // assembled from fragments and is not valid JSON before then.
     let calls = finalize_tool_calls(pending);
-    if !calls.is_empty() {
+    let produced_tool_calls = !calls.is_empty();
+    if produced_tool_calls {
         let _ = tx.send((request_id, StreamEvent::ToolCalls(calls))).await;
     }
 
     // After ToolCalls, so the ordering the app relies on (tools before the
-    // terminating event) is undisturbed.
+    // terminating event) is undisturbed. Sent even on the truncation path below,
+    // because those tokens were generated and are billed.
     send_usage(reported, prompt_chars, completion_chars, request_id, tx).await;
+
+    // A reasoning model emits its reasoning before its answer. If `max_tokens`
+    // runs out while it is still reasoning, the response carries no `content` at
+    // all -- indistinguishable, from the content alone, from an endpoint that
+    // returned nothing. Saying "the endpoint returned an empty response" blames
+    // the wrong thing and leaves the user with no idea what to change.
+    if !emitted_content && !produced_tool_calls && finish_reason.as_deref() == Some("length") {
+        return Err(format!(
+            "The model ran out of room while still thinking, so it never produced an answer.\n\n\
+             Raise `max_tokens` under [llm] in ~/.tuisample-code/config.toml (currently {max_tokens}, \
+             where 0 means no limit), or ask for something smaller.\n\
+             These tokens were still generated and are still billed."
+        ));
+    }
 
     Ok(())
 }
@@ -510,6 +547,21 @@ pub enum SseLine {
     Usage(ApiUsage),
     Done,
     Ignore,
+}
+
+/// Why a response stopped, when the endpoint says.
+pub fn finish_reason_of(line: &str) -> Option<String> {
+    let payload = line.trim_end().strip_prefix("data:")?.trim_start();
+    if payload == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str::<StreamDelta>(payload)
+        .ok()?
+        .choices
+        .into_iter()
+        .next()?
+        .finish_reason
+        .filter(|r| !r.is_empty())
 }
 
 /// Parse one SSE line. Accepts `data: {...}` and `data:{...}` (both are legal).
@@ -720,6 +772,7 @@ mod tests {
             vec![ChatMessage::text("user", "hi")],
             Vec::new(),
             true,
+            4096,
             1,
             tx,
         )
@@ -906,13 +959,32 @@ mod tests {
 
     /// `stream_options` is the field most likely to be rejected by a minimal
     /// OpenAI-compatible server, so it must be absent unless asked for.
+    /// A cap of 0 must not travel as `"max_tokens": 0`, which every provider
+    /// reads as "generate nothing".
+    #[test]
+    fn max_tokens_is_omitted_from_the_wire_when_uncapped() {
+        let base = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            stream: true,
+            max_tokens: None,
+            tools: Vec::new(),
+            stream_options: None,
+        };
+        let json = serde_json::to_string(&base).unwrap();
+        assert!(!json.contains("max_tokens"), "{json}");
+
+        let bounded = ChatRequest { max_tokens: Some(8192), ..base };
+        assert!(serde_json::to_string(&bounded).unwrap().contains(r#""max_tokens":8192"#));
+    }
+
     #[test]
     fn stream_options_is_omitted_entirely_when_usage_reporting_is_off() {
         let without = ChatRequest {
             model: "m".to_string(),
             messages: vec![ChatMessage::text("user", "hi")],
             stream: true,
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             tools: Vec::new(),
             stream_options: None,
         };
@@ -996,6 +1068,7 @@ mod tests {
             vec![ChatMessage::text("user", "hi")],
             vec![serde_json::json!({"type": "function"})],
             true,
+            4096,
             1,
             tx,
         )
@@ -1061,6 +1134,59 @@ mod tests {
             assert_eq!(reloaded.requests, 1);
             assert_eq!(reloaded.total_tokens(), 1_500_000);
         });
+    }
+
+    /// Regression, observed against deepseek-v4-flash on a real coding task.
+    ///
+    /// A reasoning model emits `reasoning_content` before `content`. With
+    /// max_tokens at 4096 it spent the entire allowance thinking (9337 reasoning
+    /// tokens were needed) and produced no `content` at all. The client saw an
+    /// empty buffer and reported "the endpoint returned an empty response",
+    /// which blames the endpoint and tells the user nothing they can act on.
+    #[tokio::test]
+    async fn running_out_of_room_while_reasoning_explains_itself() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":null,\"reasoning_content\":\"thinking…\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+
+        let events = collect(&addr).await;
+        match events.last() {
+            Some(StreamEvent::Error(e)) => {
+                assert!(e.contains("still thinking"), "{e}");
+                assert!(e.contains("max_tokens"), "must name the setting to change: {e}");
+            }
+            other => panic!("expected a truncation error, got {other:?}"),
+        }
+        // The tokens were generated, so they are still counted and still billed.
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::Usage(_))),
+            "a truncated turn must still report usage"
+        );
+    }
+
+    /// The same shape, but the model actually answered before running out --
+    /// a truncated *answer* is still an answer and must not become an error.
+    #[tokio::test]
+    async fn a_truncated_but_non_empty_answer_is_kept_rather_than_replaced() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Here is the start\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+
+        let events = collect(&addr).await;
+        assert_eq!(text_of(&events), "Here is the start");
+        assert!(matches!(events.last(), Some(StreamEvent::Done)), "{events:?}");
     }
 
     #[tokio::test]
