@@ -39,11 +39,23 @@ pub fn render(f: &mut Frame, app: &mut App) {
         None => input_height(app, size.width),
     };
 
+    // Slash-command autocomplete: `matching_commands` is already empty
+    // whenever a tool approval is showing (that requires `is_busy()`, which
+    // the menu also refuses to be active under), so no extra guard is needed
+    // to keep the two from appearing at once.
+    let command_matches = app.matching_commands();
+    let menu_height: u16 = if command_matches.is_empty() {
+        0
+    } else {
+        (command_matches.len() as u16 + 2).min(8)
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(5),
+            Constraint::Length(menu_height),
             Constraint::Length(bottom_height),
             Constraint::Length(1),
         ])
@@ -51,13 +63,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     render_header(f, chunks[0], app);
     render_messages(f, chunks[1], app);
+    if !command_matches.is_empty() {
+        render_command_menu(f, chunks[2], app, &command_matches);
+    }
     match &approval {
         Some((action, remaining)) => {
-            render_tool_approval_inline(f, chunks[2], app, action, *remaining)
+            render_tool_approval_inline(f, chunks[3], app, action, *remaining)
         }
-        None => render_input(f, chunks[2], app),
+        None => render_input(f, chunks[3], app),
     }
-    render_footer(f, chunks[3], app);
+    render_footer(f, chunks[4], app);
 
     // Everything else here (pickers, text prompts) is a one-shot choice made
     // before a turn even starts, with no transcript underneath it yet to stay
@@ -122,10 +137,36 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
 
     if !app.greeted && app.messages.is_empty() {
         lines.extend(welcome_lines(app, width));
+
+        // Unlike the transcript below, this never sticks to the bottom --
+        // the mascot and identity fields belong on screen first, not
+        // whatever happens to be last. But it does need to be reachable at
+        // all: on a short terminal (or once enough commands/warnings
+        // accumulate that the content no longer fits, which is exactly what
+        // adding /new and /usage here did to a 22-row test terminal), the
+        // unscrolled tail -- including "no API key configured" -- was
+        // silently clipped with no way to see it. PageDown already sets
+        // app.scroll generically; this just has to honour and clamp it.
+        let viewport = area.height as usize;
+        let max_scroll = lines.len().saturating_sub(viewport) as u16;
+        app.scroll = app.scroll.min(max_scroll);
+
         f.render_widget(
-            Paragraph::new(lines).block(Block::default().padding(Padding::new(GUTTER as u16, 1, 0, 0))),
+            Paragraph::new(lines)
+                .block(Block::default().padding(Padding::new(GUTTER as u16, 1, 0, 0)))
+                .scroll((app.scroll, 0)),
             area,
         );
+        if app.scroll < max_scroll && area.height > 0 {
+            let more = Line::from(Span::styled(" ↓ more ", theme::faint()));
+            let hint_area = Rect {
+                x: area.x,
+                y: area.bottom().saturating_sub(1),
+                width: area.width,
+                height: 1,
+            };
+            f.render_widget(Paragraph::new(more).alignment(Alignment::Right), hint_area);
+        }
         return;
     }
 
@@ -404,14 +445,12 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(format!("{:<10}", "/provider"), theme::key()),
-        Span::styled("switch provider or endpoint", theme::muted()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(format!("{:<10}", "/model"), theme::key()),
-        Span::styled("switch model", theme::muted()),
-    ]));
+    for (name, desc) in crate::app::COMMANDS {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{name:<10}"), theme::key()),
+            Span::styled(*desc, theme::muted()),
+        ]));
+    }
 
     let mut warnings = app.config.warnings();
     if !theme::supports_truecolor() {
@@ -505,6 +544,39 @@ fn input_height(app: &App, total_width: u16) -> u16 {
         .map(|l| hard_wrap_rows(l.chars().count(), width))
         .sum();
     ((rows as u16) + 2).clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT)
+}
+
+/// The slash-command autocomplete list, shown directly above the input box
+/// while the buffer is a bare "/word" matching at least one command -- see
+/// `App::matching_commands`. Highlights whichever entry Up/Down has landed on
+/// with the same "❯" cursor style the approval prompt uses, so the two menus
+/// in this app read as the same kind of thing rather than two different ones.
+fn render_command_menu(f: &mut Frame, area: Rect, app: &App, matches: &[(&str, &str)]) {
+    let selected = app.command_menu_selected.min(matches.len().saturating_sub(1));
+    let lines: Vec<Line> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, (name, desc))| {
+            let on = i == selected;
+            let marker = if on { "❯ " } else { "  " };
+            let name_style = if on {
+                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT)
+            };
+            Line::from(vec![
+                Span::styled(marker, theme::accent()),
+                Span::styled(format!("{name:<11}"), name_style),
+                Span::styled(*desc, theme::faint()),
+            ])
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::BORDER));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// The prompt box: a rounded rule with a `❯` marker on the first row.
@@ -1094,6 +1166,7 @@ mod tests {
     use super::*;
     use crate::app::Message;
     use crate::llm::{FunctionCall, ToolCall};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1306,14 +1379,39 @@ mod tests {
     }
 
     /// An unconfigured setup has to say so on the launch screen, not fail on
-    /// the first prompt.
+    /// the first prompt. 30 rows, not 22: with four commands listed now
+    /// instead of two, 22 rows clips the warning below the fold on this
+    /// content -- still reachable by scrolling (see the dedicated test for
+    /// that), but this test is about the content existing at all, on a
+    /// terminal height realistic enough not to need scrolling for it.
     #[test]
     fn a_missing_api_key_is_reported_on_the_welcome_screen() {
         let mut app = App::new(crate::config::Config::default());
-        let rendered = rendered_text(&mut app, 100, 22);
+        let rendered = rendered_text(&mut app, 100, 30);
 
         assert!(rendered.contains("Before you start"), "{rendered}");
         assert!(rendered.contains("TUISAMPLE_API_KEY"), "{rendered}");
+    }
+
+    /// Regression: the welcome screen used to render with no scroll applied
+    /// at all, so on a short terminal (or once enough content accumulated,
+    /// which is exactly what adding /new and /usage to the command list
+    /// did) the tail -- including the API-key warning -- was silently
+    /// clipped with no way to reach it. It must now be reachable via the
+    /// same PageDown that already scrolls the ordinary transcript.
+    #[test]
+    fn a_clipped_welcome_screen_warning_is_reachable_by_scrolling() {
+        let mut app = App::new(crate::config::Config::default());
+        let short = rendered_text(&mut app, 100, 22);
+        assert!(
+            !short.contains("TUISAMPLE_API_KEY"),
+            "this test's premise is that 22 rows clips the warning -- it didn't: {short}"
+        );
+        assert!(short.contains("more"), "a hint that there's more below should show: {short}");
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        let scrolled = rendered_text(&mut app, 100, 22);
+        assert!(scrolled.contains("TUISAMPLE_API_KEY"), "{scrolled}");
     }
 
     /// The user's own turns sit on a raised block so scrolling back finds
@@ -1408,6 +1506,36 @@ mod tests {
             .count();
 
         assert_eq!(rows_with_keys, 1, "the y/n/esc bar must be drawn once, not twice");
+    }
+
+    /// Regression: no live suggestions existed at all -- typing "/" showed
+    /// nothing, and the exact full command had to be typed before Enter did
+    /// anything. Confirms the menu actually renders (not just that the
+    /// underlying `matching_commands()` logic is right, which app.rs's own
+    /// tests already cover) and that the highlighted entry is visually
+    /// distinguishable from the rest.
+    #[test]
+    fn the_slash_command_menu_renders_with_the_highlighted_entry_marked() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.input_buffer = "/".to_string();
+        app.cursor = 1;
+
+        let rows = rendered_rows(&mut app, 80, 24);
+        let joined = rows.concat();
+
+        for (name, _) in crate::app::COMMANDS {
+            assert!(joined.contains(name), "{name} missing from menu: {joined}");
+        }
+
+        // Two "❯"s are expected on screen at once: the menu's cursor and the
+        // input box's own separate prompt marker (visible around the typed
+        // "/") -- so this looks specifically for the menu's, not just any.
+        let highlighted_provider_row = rows
+            .iter()
+            .find(|r| r.contains('❯') && r.contains("/provider"))
+            .expect("the menu's cursor should be on /provider, the first match");
+        assert!(highlighted_provider_row.contains("switch provider"), "{highlighted_provider_row}");
     }
 
     /// Regression: Up/Down had no effect at an approval prompt, so the only
