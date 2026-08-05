@@ -173,7 +173,10 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
            After tool results come back, close with one short sentence saying what happened \
            (e.g. \"Created hello.py and ran it — it printed Hello, World!\"). Never end a turn \
            with only tool calls and nothing said about them; the tool log is not a substitute \
-           for telling the user what you did.\n\
+           for telling the user what you did. When you already know you'll need more than one \
+           call to finish the thought -- write a file, then run it -- request all of them in the \
+           same turn instead of one at a time: one before-sentence and one after-sentence should \
+           cover the whole batch, not a fresh pair around each individual call.\n\
          - Verify before declaring success: run what you wrote, or run a real check -- the test \
            suite, a linter, importing the module, curling the endpoint -- and read the actual \
            output. Do not assume something works because the code looks right. If a command \
@@ -948,6 +951,24 @@ mod tests {
         assert!(prompt.contains("After tool results come back"), "{prompt}");
         assert!(
             prompt.contains("Never end a turn with only tool calls"),
+            "{prompt}"
+        );
+    }
+
+    /// Regression: without this, "narrate before and after" was read as
+    /// per-call rather than per-turn, so a write followed by a run produced
+    /// three separate narrated turns (before the write, before the run, and a
+    /// final summary) instead of one plan sentence and one result sentence --
+    /// the gap a user pointed at directly when comparing this to Claude Code's
+    /// single-summary output for the same two-step task.
+    #[test]
+    fn the_system_prompt_asks_for_multiple_calls_in_one_turn_rather_than_one_narrated_turn_each() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(prompt.contains("request all of them in the same turn"), "{prompt}");
+        assert!(
+            prompt.contains("not a fresh pair around each individual call"),
             "{prompt}"
         );
     }
