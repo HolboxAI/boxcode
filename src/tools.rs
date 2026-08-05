@@ -156,6 +156,15 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
     } else {
         "This is a Unix-like system: use `ls`, `cat`, `grep`, `find`, `sed`."
     };
+    // The command that hands a file to whatever app the OS has registered for
+    // it -- `open`/`xdg-open`/`start` all return immediately after launching
+    // that app, they do not block waiting for it to close, so this is safe
+    // under the same non-interactive/timeout rules as any other command.
+    let opener = match os {
+        "macos" => "open",
+        "windows" => "start",
+        _ => "xdg-open",
+    };
 
     format!(
         "You are tuisample-code, a terminal coding assistant.\n\n\
@@ -182,6 +191,11 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
            output. Do not assume something works because the code looks right. If a command \
            fails, read the error and fix the real problem before retrying; do not repeat the \
            same failing command unchanged.\n\
+         - If what you just created or changed is meant to be looked at rather than run for \
+           output -- a webpage, an image, a document -- offer to open it with `{opener}` via \
+           {RUN_COMMAND} instead of only telling the user how. This is still just another \
+           command: it waits for the same approval as everything else, it does not skip the \
+           prompt.\n\
          - Use {READ_FILE} to read a file and {WRITE_FILE} to create or change one -- not \
            `cat`/`type`/`sed`/shell redirection through {RUN_COMMAND}. Reserve {RUN_COMMAND} for \
            things that are not reading or writing a single file: search, builds, tests, running \
@@ -988,6 +1002,26 @@ mod tests {
         );
         assert!(
             prompt.contains("do not repeat the same failing command unchanged"),
+            "{prompt}"
+        );
+    }
+
+    /// Regression: without this, the model would write something like
+    /// hello.html and only describe how to open it, instead of offering to
+    /// open it itself the way Claude Code does. The nudge must not come at
+    /// the cost of the approval rule -- opening still goes through the same
+    /// prompt as every other command, there is no exception carved out here.
+    #[test]
+    fn the_system_prompt_offers_to_open_viewable_output_without_skipping_approval() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(
+            prompt.contains("offer to open it with"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("it waits for the same approval as everything else, it does not skip the prompt"),
             "{prompt}"
         );
     }
