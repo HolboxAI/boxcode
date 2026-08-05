@@ -281,11 +281,9 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
         AppState::AwaitingApproval => return None,
         AppState::Sending => ("Thinking".to_string(), String::new()),
         AppState::Streaming => {
-            // No endpoint used here sends a token count mid-stream -- that only
-            // ever arrives, if at all, on the final chunk. This is the same
-            // rough characters-per-token estimate a live counter has to use
-            // before that arrives, so it is always labelled "~".
-            let approx_tokens = app.streamed_chars / 4;
+            // See App::approx_tokens_this_turn -- the same estimate the
+            // persisted usage log uses, always labelled "~" since it is one.
+            let approx_tokens = app.approx_tokens_this_turn();
             let detail = if approx_tokens > 0 {
                 format!(" · ~{approx_tokens} tokens")
             } else {

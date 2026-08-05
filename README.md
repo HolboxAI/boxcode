@@ -277,9 +277,37 @@ variables override values in `config.toml`.
   configured, without going through `/provider` again. If no provider has been
   set yet (e.g. you're only using `TUISAMPLE_*` env vars or a custom endpoint),
   this shows an inline error telling you to run `/provider` first.
+- **`/new`** — Forgets the current conversation. The configured provider and
+  model are untouched; only the message history and tool-step count reset.
+- **`/usage`** — Prints your token usage from `~/.tuisample-code/usage.jsonl`:
+  today, the last 7 days, and all time. This is local and per-install only —
+  there is no login, so it is the only place this number exists; nothing here
+  is ever sent anywhere (see "Anonymous usage pings" below for the one thing
+  that is).
 
-Both write the result to `~/.tuisample-code/config.toml` and apply it
-immediately — no restart needed, even mid-session.
+`/provider` and `/model` write the result to `~/.tuisample-code/config.toml`
+and apply it immediately — no restart needed, even mid-session.
+
+### Anonymous usage pings
+
+There is no login, so there is no way to attribute usage to a person — what
+this app can see instead is a random ID generated once per install
+(`~/.tuisample-code/device_id`), which labels a machine, not a person. Two
+things, and only these two things, ever leave your machine:
+
+- `install.sh` sends one `install` ping on a fresh install or an `--upgrade`.
+- The app itself sends one `active` ping per calendar day (UTC) it's actually
+  used, checked against `~/.tuisample-code/last_active` so a long session
+  doesn't send more than one.
+
+Each ping carries only `{anon_id, event, version, os, date}` — no prompts, no
+file paths, no command text, no conversation content. Both are silent,
+best-effort, and never block startup or fail an install: see `src/telemetry.rs`
+and the `ping_install` function in `install.sh`. Disabled by default until an
+endpoint is configured (`TUISAMPLE_TELEMETRY_URL`).
+
+This is entirely separate from `/usage` above, which never leaves your
+machine at all.
 
 ## Architecture
 
@@ -297,6 +325,9 @@ Clean, modular structure for easy feature additions:
 - `src/providers.rs` — Built-in provider/model registry for `/provider` and `/model`
 - `src/tools.rs` — The model's tools (`run_command`, `read_file`, `write_file`): schemas, execution, timeouts
 - `src/workspace.rs` — The working directory commands run in
+- `src/usage.rs` — Local per-install token usage log (`/usage`), never transmitted
+- `src/telemetry.rs` — Anonymous install/daily-active pings, disabled by default
+- `src/dateutil.rs` — Calendar-date helpers shared by the two above
 
 ## What's Next
 

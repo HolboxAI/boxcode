@@ -3,6 +3,7 @@ use crate::danger;
 use crate::llm::{ChatMessage, ToolCall};
 use crate::providers;
 use crate::tools::{self, ToolOutcome};
+use crate::usage;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -272,6 +273,11 @@ impl App {
                             self.cursor = 0;
                             self.start_new_conversation();
                         }
+                        "/usage" if !self.is_busy() => {
+                            self.input_buffer.clear();
+                            self.cursor = 0;
+                            self.show_usage();
+                        }
                         _ => self.submit(),
                     }
                 }
@@ -413,8 +419,21 @@ impl App {
             self.messages
                 .push(Message::new(Role::Error, "Request cancelled."));
         }
+        // Whatever streamed before the cancel was still real usage.
+        usage::record_turn(self.approx_tokens_this_turn(), &self.config.llm.model);
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
+    }
+
+    /// `streamed_chars` is a character count, not a token count. No endpoint
+    /// used here sends a real count mid-stream -- that only ever arrives, if
+    /// at all, on the final chunk -- so this rough characters-per-token
+    /// estimate is what both the live spinner (`ui.rs`) and the persisted
+    /// usage log (`usage.rs`) show. Centralised here so both use the same
+    /// approximation rather than two copies of "divide by four" drifting
+    /// apart.
+    pub fn approx_tokens_this_turn(&self) -> usize {
+        self.streamed_chars / 4
     }
 
     /// The model asked to run something. Commit whatever prose it streamed
@@ -548,6 +567,28 @@ impl App {
         self.messages.push(Message::new(
             Role::System,
             "Started a new conversation. The model no longer remembers anything above this line.",
+        ));
+    }
+
+    /// Reads the local usage log (see `usage.rs`) and prints a summary --
+    /// this never leaves the machine, and works with no login and no server,
+    /// since the file it reads is the only copy of this data that exists.
+    fn show_usage(&mut self) {
+        let s = usage::summary();
+        self.messages.push(Message::new(
+            Role::System,
+            format!(
+                "Usage (local, this machine only):\n\
+                 Today:      ~{} tokens\n\
+                 Last 7 days: ~{} tokens\n\
+                 All time:   ~{} tokens, {} day{} used\n\
+                 (estimated from characters streamed, not an exact count from the endpoint)",
+                s.today_tokens,
+                s.week_tokens,
+                s.all_time_tokens,
+                s.days_active,
+                if s.days_active == 1 { "" } else { "s" },
+            ),
         ));
     }
 
@@ -705,6 +746,7 @@ impl App {
         } else {
             self.messages.push(Message::new(Role::Assistant, response));
         }
+        usage::record_turn(self.approx_tokens_this_turn(), &self.config.llm.model);
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -723,6 +765,7 @@ impl App {
             self.messages.push(Message::new(Role::Assistant, partial));
         }
         self.messages.push(Message::new(Role::Error, error));
+        usage::record_turn(self.approx_tokens_this_turn(), &self.config.llm.model);
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -1269,6 +1312,57 @@ mod tests {
         // request in flight would strand its tool calls.
         assert_eq!(a.state, AppState::Streaming);
         assert!(a.messages.iter().any(|m| m.content == "keep me"));
+    }
+
+    // ---- /usage ------------------------------------------------------------------
+
+    #[test]
+    fn slash_usage_prints_a_local_summary() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            type_str(&mut a, "/usage");
+            a.handle_key(key(KeyCode::Enter));
+
+            assert_eq!(a.state, AppState::AwaitingInput);
+            let shown = a.messages.last().expect("a summary must be printed");
+            assert!(shown.role == Role::System, "expected a System message");
+            assert!(shown.content.contains("Today"), "{}", shown.content);
+            assert!(shown.content.contains("All time"), "{}", shown.content);
+        });
+    }
+
+    #[test]
+    fn slash_usage_is_ignored_mid_turn() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            a.state = AppState::Streaming;
+
+            type_str(&mut a, "/usage");
+            a.handle_key(key(KeyCode::Enter));
+
+            // Treated as ordinary input, same as /new mid-turn: it becomes
+            // part of the in-flight prompt rather than executing.
+            assert_eq!(a.state, AppState::Streaming);
+            assert!(a.input_buffer.contains("/usage"));
+        });
+    }
+
+    /// A completed turn's tokens end up in the local log that `/usage` reads
+    /// -- the whole point of tracking this locally instead of only showing a
+    /// live estimate that vanishes once the turn ends.
+    #[test]
+    fn a_completed_turn_is_reflected_in_the_next_usage_summary() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = streaming_app();
+            a.streamed_chars = 400; // -> 100 approx tokens
+            a.finish_stream();
+
+            type_str(&mut a, "/usage");
+            a.handle_key(key(KeyCode::Enter));
+
+            let shown = a.messages.last().expect("a summary must be printed");
+            assert!(shown.content.contains("~100 tokens"), "{}", shown.content);
+        });
     }
 
     /// The reported bug: typing a prompt and pressing Enter did nothing, because
