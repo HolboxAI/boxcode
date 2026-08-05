@@ -4,6 +4,7 @@ mod danger;
 mod llm;
 mod providers;
 mod tools;
+mod theme;
 mod ui;
 mod upgrade;
 mod workspace;

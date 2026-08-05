@@ -172,6 +172,17 @@ pub struct App {
     /// The resolved working directory, shown on the approval prompt so it is
     /// always clear *where* a command is about to run.
     pub workspace_root: String,
+    /// Prompts already sent this session, oldest first, for ↑/↓ recall.
+    pub prompt_history: Vec<String>,
+    /// Where ↑/↓ currently sit in `prompt_history`. `None` means "not
+    /// browsing" -- the input box holds whatever was typed rather than a
+    /// recalled entry, which is what makes the first ↑ land on the most recent
+    /// prompt instead of the second-most-recent.
+    pub history_index: Option<usize>,
+    /// What was in the input box when browsing started, restored by pressing ↓
+    /// past the newest entry. Without it, reaching for an old prompt and
+    /// changing your mind silently eats a half-written one.
+    pub history_draft: String,
 }
 
 impl App {
@@ -200,6 +211,9 @@ impl App {
             streamed_chars: 0,
             workspace_status: String::new(),
             workspace_root: String::new(),
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
         }
     }
 
@@ -276,12 +290,32 @@ impl App {
             KeyCode::Home => self.cursor = self.line_start(),
             KeyCode::End => self.cursor = self.line_end(),
 
-            KeyCode::Up | KeyCode::PageUp => {
-                self.follow_tail = false;
-                self.scroll = self.scroll.saturating_sub(if key.code == KeyCode::Up { 1 } else { 10 });
+            // Up/Down recall previous prompts rather than scrolling the
+            // transcript -- the arrows are next to the thing you are typing, so
+            // that is what they should act on. PgUp/PgDn keep the transcript.
+            // Inside a multi-line prompt they move between its lines first,
+            // because losing a half-written paragraph to a stray Up is worse
+            // than having to press PgUp to scroll.
+            KeyCode::Up => {
+                if self.cursor_line() > 0 {
+                    self.move_cursor_line(-1);
+                } else {
+                    self.recall_previous();
+                }
             }
-            KeyCode::Down | KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_add(if key.code == KeyCode::Down { 1 } else { 10 });
+            KeyCode::PageUp => {
+                self.follow_tail = false;
+                self.scroll = self.scroll.saturating_sub(10);
+            }
+            KeyCode::Down => {
+                if self.cursor_line() + 1 < self.input_buffer.split('\n').count() {
+                    self.move_cursor_line(1);
+                } else {
+                    self.recall_next();
+                }
+            }
+            KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_add(10);
             }
 
             KeyCode::Esc => self.cancel(),
@@ -326,6 +360,14 @@ impl App {
         self.tool_steps = 0;
         self.busy_started = Some(std::time::Instant::now());
         self.streamed_chars = 0;
+        // Recall skips consecutive duplicates: pressing Enter twice on the same
+        // prompt should not mean pressing Up twice to get past it.
+        if self.prompt_history.last().map(String::as_str) != Some(prompt.as_str()) {
+            self.prompt_history.push(prompt.clone());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+
         self.messages.push(Message::new(Role::User, prompt));
         self.state = AppState::Sending;
     }
@@ -688,6 +730,76 @@ impl App {
     /// Next char boundary (byte index), saturating at the end of the buffer.
     fn next_boundary(&self) -> usize {
         next_char_boundary(&self.input_buffer, self.cursor)
+    }
+
+    /// Which line of a multi-line prompt the caret is on.
+    fn cursor_line(&self) -> usize {
+        self.cursor_position().0
+    }
+
+    /// Move the caret one line up or down inside the prompt, keeping its column
+    /// where it can. Only called when such a line exists, so `delta` never runs
+    /// off either end.
+    fn move_cursor_line(&mut self, delta: isize) {
+        let (row, col) = self.cursor_position();
+        let target = if delta < 0 { row.saturating_sub(1) } else { row + 1 };
+
+        let lines: Vec<&str> = self.input_buffer.split('\n').collect();
+        let Some(line) = lines.get(target) else { return };
+
+        // Byte offset of the target line, plus `col` characters into it (or the
+        // end of it, when the target line is shorter than the current column).
+        let mut offset = 0usize;
+        for l in &lines[..target] {
+            offset += l.len() + 1; // +1 for the '\n'
+        }
+        let within: usize = line
+            .char_indices()
+            .nth(col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+        self.cursor = offset + within;
+    }
+
+    /// ↑ -- step back through prompts already sent.
+    fn recall_previous(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let next = match self.history_index {
+            // First press: remember what was being typed, then jump to the
+            // newest entry.
+            None => {
+                self.history_draft = self.input_buffer.clone();
+                self.prompt_history.len() - 1
+            }
+            Some(0) => return, // already at the oldest
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(next);
+        self.set_input(self.prompt_history[next].clone());
+    }
+
+    /// ↓ -- step forward, ending back at whatever was being typed.
+    fn recall_next(&mut self) {
+        let Some(current) = self.history_index else {
+            return;
+        };
+        if current + 1 < self.prompt_history.len() {
+            self.history_index = Some(current + 1);
+            self.set_input(self.prompt_history[current + 1].clone());
+        } else {
+            self.history_index = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.set_input(draft);
+        }
+    }
+
+    /// Replace the prompt, caret at the end -- where you want it when a
+    /// recalled prompt is about to be edited or resent.
+    fn set_input(&mut self, text: String) {
+        self.cursor = text.len();
+        self.input_buffer = text;
     }
 
     fn line_start(&self) -> usize {
@@ -1861,6 +1973,96 @@ mod tests {
             a.handle_key(key(KeyCode::Down));
         }
         a.handle_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    fn up_and_down_walk_back_through_previous_prompts() {
+        let mut a = app();
+        for prompt in ["first", "second", "third"] {
+            type_str(&mut a, prompt);
+            a.handle_key(key(KeyCode::Enter));
+            a.state = AppState::AwaitingInput; // pretend the turn finished
+        }
+
+        // Newest first, then further back, clamping at the oldest.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "third");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "second");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "first");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "first", "must clamp at the oldest entry");
+
+        // And forwards again.
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(a.input_buffer, "second");
+        // The caret sits at the end, ready to edit or resend.
+        assert_eq!(a.cursor, "second".len());
+    }
+
+    /// Reaching for an old prompt and changing your mind must not eat the
+    /// half-written one that was already in the box.
+    #[test]
+    fn stepping_forward_past_the_newest_entry_restores_the_draft() {
+        let mut a = app();
+        type_str(&mut a, "sent");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::AwaitingInput;
+
+        type_str(&mut a, "half writ");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "sent");
+
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(a.input_buffer, "half writ", "the draft must come back");
+    }
+
+    /// Inside a multi-line prompt the arrows belong to the text, not to
+    /// history -- losing a paragraph to a stray Up is worse than pressing PgUp.
+    #[test]
+    fn arrows_move_between_lines_of_a_multi_line_prompt_before_touching_history() {
+        let mut a = app();
+        type_str(&mut a, "old one");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::AwaitingInput;
+
+        type_str(&mut a, "alpha");
+        a.insert_str("\n");
+        type_str(&mut a, "beta");
+        assert_eq!(a.cursor_position(), (1, 4));
+
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.cursor_position().0, 0, "should move within the prompt");
+        assert_eq!(a.input_buffer, "alpha\nbeta", "history must not have fired");
+
+        // Only once the caret is on the first line does Up reach history.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "old one");
+    }
+
+    #[test]
+    fn page_up_and_page_down_still_scroll_the_transcript() {
+        let mut a = app();
+        a.scroll = 20;
+        a.handle_key(key(KeyCode::PageUp));
+        assert_eq!(a.scroll, 10);
+        assert!(!a.follow_tail);
+        a.handle_key(key(KeyCode::PageDown));
+        assert_eq!(a.scroll, 20);
+    }
+
+    /// Pressing Enter twice on the same prompt should not mean pressing Up
+    /// twice to get past it.
+    #[test]
+    fn resending_the_same_prompt_does_not_duplicate_it_in_history() {
+        let mut a = app();
+        for _ in 0..3 {
+            type_str(&mut a, "same");
+            a.handle_key(key(KeyCode::Enter));
+            a.state = AppState::AwaitingInput;
+        }
+        assert_eq!(a.prompt_history, vec!["same".to_string()]);
     }
 
     #[test]
