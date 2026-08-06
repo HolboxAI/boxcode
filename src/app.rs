@@ -1,10 +1,12 @@
 use crate::config::Config;
+use crate::danger;
 use crate::llm::{ChatMessage, ToolCall};
 use crate::providers;
 use crate::tools::{self, ToolOutcome};
-use crate::usage::{self, DailyUsage, QuotaVerdict, TokenUsage};
+use crate::usage;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{HashSet, VecDeque};
+use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppState {
@@ -113,6 +115,19 @@ pub enum CustomStep {
     ApiKey { endpoint: String, model: String },
 }
 
+/// Every slash command, in one place -- the single source of truth for both
+/// dispatch (`App::selected_command`) and what the autocomplete menu /
+/// welcome screen list. Adding a command means adding it here and to the
+/// `match` in `selected_command`'s caller; nowhere else should name a
+/// command as a string literal.
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/provider", "switch provider or endpoint"),
+    ("/model", "switch model"),
+    ("/new", "forget the current conversation"),
+    ("/usage", "show local token usage"),
+    ("/quota", "show today's limits, or override them"),
+];
+
 pub struct App {
     pub state: AppState,
     pub messages: Vec<Message>,
@@ -129,6 +144,13 @@ pub struct App {
     pub scroll: u16,
     /// While true the message pane sticks to the bottom as new text arrives.
     pub follow_tail: bool,
+    /// Which choice is highlighted at a `ToolApproval` prompt: `true` for
+    /// "yes", `false` for "no". A plain `App` field rather than a variant on
+    /// `Overlay::ToolApproval` itself so it resets independently of the
+    /// action/remaining-count data -- Up/Down toggles it, Enter reads it, and
+    /// every new prompt starts back on "yes" to match bare-Enter's long-
+    /// standing meaning.
+    pub approval_selected: bool,
     pub config: Config,
     pub should_exit: bool,
     /// Set once the user has interacted, so the welcome panel gives way to the transcript.
@@ -145,43 +167,79 @@ pub struct App {
     pub pending_tools: VecDeque<ToolCall>,
     /// Calls the user allowed, waiting for the event loop to spawn them.
     pub approved_tools: Vec<ToolCall>,
-    /// Set by "a" at an approval prompt: stop asking for the rest of the session.
-    /// Session-only and never persisted -- a permanent version of this belongs in
-    /// config.toml, where turning it on is a deliberate act rather than a
-    /// keystroke made while impatient.
-    pub auto_approve: bool,
+    /// A snapshot of `approved_tools` taken the moment execution starts, kept
+    /// around purely for display. `main.rs` drains `approved_tools` as soon as
+    /// it spawns the runner task, so by the next frame that list is empty --
+    /// without this copy "Running N commands…" would show N for one frame and
+    /// then silently go blank while the commands were still running.
+    pub running_tools: Vec<ToolCall>,
     /// Tool rounds spent on the current prompt, reset by `submit`. Once this hits
     /// the configured ceiling the schemas stop being sent, which is what makes a
     /// model that will not stop calling tools produce an answer instead.
     pub tool_steps: usize,
+    /// When the current turn started, for the elapsed-time shown in the
+    /// footer. `None` while idle; set once in `submit`, cleared on every path
+    /// back to `AwaitingInput` (`finish_stream`, `fail_stream`, `cancel`).
+    pub busy_started: Option<std::time::Instant>,
+    /// Characters streamed so far this turn. There is no authoritative token
+    /// count until the endpoint's final usage field (most don't send one by
+    /// default), so the footer shows `streamed_chars / 4` as a rough live
+    /// estimate -- the same kind of approximation Claude Code's own live
+    /// counter is understood to show mid-stream.
+    pub streamed_chars: usize,
+    /// Completed turns' usage, queued for `main.rs` to persist to
+    /// `usage.jsonl` and drain. Deliberately not written to disk from in
+    /// here: `App`'s methods are exercised directly by a few hundred unit
+    /// tests, and a hidden filesystem write inside `finish_stream`/
+    /// `fail_stream`/`cancel` would make every one of them touch the real
+    /// developer machine's `$HOME` unless each was individually wrapped in
+    /// the isolated-`$HOME` test helper. An in-memory queue keeps `App`
+    /// itself side-effect-free; only `main.rs`'s runtime loop -- which is
+    /// what actually runs against a real `$HOME` -- ever calls `usage::record_turn`.
+    pub pending_usage: Vec<(usize, String)>,
+    /// Today's ceilings and what has been spent against them. Separate from
+    /// `pending_usage`, which is the permanent history: this one refuses.
+    pub quota: crate::quota::DailyQuota,
+    /// Exact counts for the turn in flight, when the endpoint reported them.
+    /// `None` means fall back to the character estimate.
+    pub exact_usage: Option<crate::llm::ApiUsage>,
+    /// Set once a day so an approaching-limit notice appears once rather than
+    /// before every prompt.
+    pub warned_today: bool,
+    /// True when `quota` has changed and not yet been written.
+    ///
+    /// A flag rather than a write, for the same reason `pending_usage` is a
+    /// queue: `App` stays free of filesystem side effects, so its tests do not
+    /// silently touch the real `$HOME`. Only `main.rs`'s runtime loop persists.
+    pub quota_dirty: bool,
     /// One line for the welcome screen describing where commands will run, or
     /// why the tool is off. Set by `main` once the workspace has been resolved.
     pub workspace_status: String,
     /// The resolved working directory, shown on the approval prompt so it is
     /// always clear *where* a command is about to run.
     pub workspace_root: String,
-    /// One line for the welcome screen describing free-tier enrolment, or why it
-    /// is unavailable. Empty when the user brought their own key.
-    pub free_tier_status: String,
-    /// Today's request / token / spend tallies, loaded at startup and written
-    /// back after every request.
-    pub usage: DailyUsage,
-    /// Set when a warning has already been shown for the current day, so an
-    /// approaching-limit notice appears once rather than before every prompt.
-    pub warned_today: bool,
+    /// Prompts already sent this session, oldest first, for ↑/↓ recall.
+    pub prompt_history: Vec<String>,
+    /// Where ↑/↓ currently sit in `prompt_history`. `None` means "not
+    /// browsing" -- the input box holds whatever was typed rather than a
+    /// recalled entry, which is what makes the first ↑ land on the most recent
+    /// prompt instead of the second-most-recent.
+    pub history_index: Option<usize>,
+    /// What was in the input box when browsing started, restored by pressing ↓
+    /// past the newest entry. Without it, reaching for an old prompt and
+    /// changing your mind silently eats a half-written one.
+    pub history_draft: String,
+    /// Which entry of `matching_commands()`'s current result Up/Down has
+    /// landed on. Not reset explicitly on every keystroke -- `matching_commands`
+    /// clamps this to the filtered list's length wherever it's read, which
+    /// handles the list shrinking as more is typed without needing a reset
+    /// call at every mutation site.
+    pub command_menu_selected: usize,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
-        let usage = if config.quota.enabled {
-            DailyUsage::load(&usage::today_local())
-        } else {
-            DailyUsage::default()
-        };
         Self {
-            usage,
-            warned_today: false,
-            free_tier_status: String::new(),
             state: AppState::AwaitingInput,
             messages: Vec::new(),
             input_buffer: String::new(),
@@ -191,6 +249,7 @@ impl App {
             abort: None,
             scroll: 0,
             follow_tail: true,
+            approval_selected: true,
             config,
             should_exit: false,
             greeted: false,
@@ -199,15 +258,66 @@ impl App {
             overlay_cursor: 0,
             pending_tools: VecDeque::new(),
             approved_tools: Vec::new(),
-            auto_approve: false,
+            running_tools: Vec::new(),
             tool_steps: 0,
+            busy_started: None,
+            streamed_chars: 0,
+            pending_usage: Vec::new(),
+            quota: crate::quota::DailyQuota::default(),
+            exact_usage: None,
+            warned_today: false,
+            quota_dirty: false,
             workspace_status: String::new(),
             workspace_root: String::new(),
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            command_menu_selected: 0,
         }
     }
 
     pub fn is_busy(&self) -> bool {
         !matches!(self.state, AppState::AwaitingInput)
+    }
+
+    /// The menu is "active" -- worth computing matches for at all -- only
+    /// while the buffer, trimmed, is still just a bare `/word` being typed:
+    /// no internal space (that would mean the command word is finished and
+    /// what follows is an argument or an ordinary message that happens to
+    /// start with `/`), and not while busy, since none of these commands run
+    /// mid-turn anyway. Trimmed so incidental leading/trailing whitespace --
+    /// e.g. a trailing space after finishing "/provider" -- doesn't change
+    /// the answer, matching how the old exact-match dispatch trimmed too.
+    fn command_menu_active(&self) -> bool {
+        let trimmed = self.input_buffer.trim();
+        trimmed.starts_with('/') && !trimmed.contains(char::is_whitespace) && !self.is_busy()
+    }
+
+    /// Every command whose name starts with whatever's typed so far, in
+    /// `COMMANDS`' order. Empty (not just while inactive) means "nothing to
+    /// show" -- the caller doesn't need to check `command_menu_active`
+    /// separately, an empty result already means don't render anything.
+    pub fn matching_commands(&self) -> Vec<(&'static str, &'static str)> {
+        if !self.command_menu_active() {
+            return Vec::new();
+        }
+        let typed = self.input_buffer.trim();
+        COMMANDS
+            .iter()
+            .filter(|(name, _)| name.starts_with(typed))
+            .copied()
+            .collect()
+    }
+
+    /// The command Enter would run right now, if any -- whichever one is
+    /// highlighted in the (possibly single-entry) matching list. `None` means
+    /// Enter should fall through to `submit()` instead, which covers both
+    /// "menu inactive" and "typed a `/word` that matches nothing" (e.g. a
+    /// typo, or a message that just happens to start with `/`).
+    fn selected_command(&self) -> Option<&'static str> {
+        let matches = self.matching_commands();
+        let index = self.command_menu_selected.min(matches.len().checked_sub(1)?);
+        Some(matches[index].0)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -229,42 +339,30 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match key.code {
-            // Enter submits, unless the buffer holds exactly a known command, in
-            // which case it opens the matching overlay instead. Alt/Shift-Enter
-            // (and Ctrl-Enter, on terminals that can distinguish it) insert a
+            // Enter submits, unless the autocomplete menu has a command
+            // highlighted, in which case it runs that command instead --
+            // whatever's highlighted, not just an exact full-string match, so
+            // "/pro" + Enter runs /provider the moment it's the only match,
+            // the same as finishing typing it out would. Alt/Shift-Enter (and
+            // Ctrl-Enter, on terminals that can distinguish it) insert a
             // newline instead of either.
             KeyCode::Enter => {
                 if alt || shift {
                     self.insert_str("\n");
-                } else {
-                    match self.input_buffer.trim() {
-                        "/provider" if !self.is_busy() => {
-                            self.input_buffer.clear();
-                            self.cursor = 0;
-                            self.open_provider_picker();
-                        }
-                        "/model" if !self.is_busy() => {
-                            self.input_buffer.clear();
-                            self.cursor = 0;
-                            self.open_model_picker_from_config();
-                        }
-                        "/usage" | "/quota" if !self.is_busy() => {
-                            self.input_buffer.clear();
-                            self.cursor = 0;
-                            self.show_usage();
-                        }
-                        "/quota override" if !self.is_busy() => {
-                            self.input_buffer.clear();
-                            self.cursor = 0;
-                            self.set_quota_override(true);
-                        }
-                        "/quota reset" if !self.is_busy() => {
-                            self.input_buffer.clear();
-                            self.cursor = 0;
-                            self.set_quota_override(false);
-                        }
-                        _ => self.submit(),
+                } else if let Some(cmd) = self.selected_command() {
+                    self.input_buffer.clear();
+                    self.cursor = 0;
+                    self.command_menu_selected = 0;
+                    match cmd {
+                        "/provider" => self.open_provider_picker(),
+                        "/model" => self.open_model_picker_from_config(),
+                        "/new" => self.start_new_conversation(),
+                        "/usage" => self.show_usage(),
+                        "/quota" => self.show_quota(),
+                        other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
                     }
+                } else {
+                    self.submit();
                 }
             }
 
@@ -283,10 +381,26 @@ impl App {
             // Any other Ctrl-chord is a command, not text: never let it reach the buffer.
             KeyCode::Char(_) if ctrl => {}
 
-            KeyCode::Char(c) => self.insert_str(&c.to_string()),
-            KeyCode::Tab => self.insert_str("    "),
+            KeyCode::Char(c) => {
+                self.insert_str(&c.to_string());
+                self.command_menu_selected = 0;
+            }
+            // Completes to the highlighted command's full name without
+            // running it, so there's still a chance to review before Enter --
+            // only while the menu actually has something to complete to;
+            // otherwise Tab keeps its ordinary meaning of inserting a stop.
+            KeyCode::Tab => {
+                if let Some(cmd) = self.selected_command() {
+                    self.set_input(cmd.to_string());
+                } else {
+                    self.insert_str("    ");
+                }
+            }
 
-            KeyCode::Backspace => self.delete_before(),
+            KeyCode::Backspace => {
+                self.delete_before();
+                self.command_menu_selected = 0;
+            }
             KeyCode::Delete => self.delete_after(),
 
             KeyCode::Left => self.cursor = self.prev_boundary(),
@@ -294,12 +408,41 @@ impl App {
             KeyCode::Home => self.cursor = self.line_start(),
             KeyCode::End => self.cursor = self.line_end(),
 
-            KeyCode::Up | KeyCode::PageUp => {
-                self.follow_tail = false;
-                self.scroll = self.scroll.saturating_sub(if key.code == KeyCode::Up { 1 } else { 10 });
+            // Up/Down move the autocomplete menu's highlight while it's
+            // showing; otherwise they recall previous prompts rather than
+            // scrolling the transcript, since the arrows are next to the
+            // thing you are typing. PgUp/PgDn keep the transcript. Inside a
+            // multi-line prompt (menu inactive by definition -- it requires a
+            // single bare `/word`) they move between lines first, because
+            // losing a half-written paragraph to a stray Up is worse than
+            // having to press PgUp to scroll.
+            KeyCode::Up => {
+                let matches = self.matching_commands();
+                if !matches.is_empty() {
+                    self.command_menu_selected =
+                        (self.command_menu_selected + matches.len() - 1) % matches.len();
+                } else if self.cursor_line() > 0 {
+                    self.move_cursor_line(-1);
+                } else {
+                    self.recall_previous();
+                }
             }
-            KeyCode::Down | KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_add(if key.code == KeyCode::Down { 1 } else { 10 });
+            KeyCode::PageUp => {
+                self.follow_tail = false;
+                self.scroll = self.scroll.saturating_sub(10);
+            }
+            KeyCode::Down => {
+                let matches = self.matching_commands();
+                if !matches.is_empty() {
+                    self.command_menu_selected = (self.command_menu_selected + 1) % matches.len();
+                } else if self.cursor_line() + 1 < self.input_buffer.split('\n').count() {
+                    self.move_cursor_line(1);
+                } else {
+                    self.recall_next();
+                }
+            }
+            KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_add(10);
             }
 
             KeyCode::Esc => self.cancel(),
@@ -336,22 +479,47 @@ impl App {
             return;
         }
 
-        // Before the limits are consulted, so a session open past midnight is
-        // judged against today's allowance rather than yesterday's.
-        self.roll_over_if_needed();
+        // `/quota` takes an argument, so it cannot come through the
+        // autocomplete registry, which matches whole commands.
+        match prompt.as_str() {
+            "/quota override" => {
+                self.input_buffer.clear();
+                self.cursor = 0;
+                self.greeted = true;
+                self.set_quota_override(true);
+                return;
+            }
+            "/quota reset" => {
+                self.input_buffer.clear();
+                self.cursor = 0;
+                self.greeted = true;
+                self.set_quota_override(false);
+                return;
+            }
+            _ => {}
+        }
 
-        // Checked before the prompt is accepted, and only here -- never mid-turn.
-        // Blocking between tool rounds would strand `tool_calls` with no matching
-        // results, which invalidates the conversation for every later request.
-        // `tools.max_steps` already bounds how far a single turn can run.
+        // Checked here and only here -- never mid-turn. Blocking between tool
+        // rounds would strand `tool_calls` with no matching results, which
+        // invalidates the conversation for every later request; `max_steps`
+        // already bounds how far one turn can run.
+        self.roll_quota_day();
         if let Some(message) = self.quota_block() {
-            // The prompt deliberately stays in the input box. It was never sent,
-            // and silently destroying something the user just typed -- possibly
-            // at length -- is a worse outcome than the refusal itself.
+            // The prompt deliberately stays in the input box. It was never
+            // sent, and silently destroying something just typed -- possibly at
+            // length -- is a worse outcome than the refusal itself.
             self.greeted = true;
             self.follow_tail = true;
             self.messages.push(Message::new(Role::Error, message));
             return;
+        }
+        if !self.warned_today {
+            if let crate::quota::Verdict::Warn(w) =
+                crate::quota::evaluate(&self.quota, &self.config.quota)
+            {
+                self.warned_today = true;
+                self.messages.push(Message::new(Role::System, w));
+            }
         }
 
         self.input_buffer.clear();
@@ -360,171 +528,18 @@ impl App {
         self.follow_tail = true;
         self.streaming_response.clear();
         self.tool_steps = 0;
+        self.busy_started = Some(std::time::Instant::now());
+        self.streamed_chars = 0;
+        // Recall skips consecutive duplicates: pressing Enter twice on the same
+        // prompt should not mean pressing Up twice to get past it.
+        if self.prompt_history.last().map(String::as_str) != Some(prompt.as_str()) {
+            self.prompt_history.push(prompt.clone());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+
         self.messages.push(Message::new(Role::User, prompt));
-
-        if let Some(warning) = self.quota_warning() {
-            self.messages.push(Message::new(Role::System, warning));
-        }
         self.state = AppState::Sending;
-    }
-
-    /// Start a new day if the local date has moved on since the counters were
-    /// last touched.
-    ///
-    /// This app is a TUI that people leave open for days, so a rollover that only
-    /// happened at startup would keep yesterday's spent allowance in force well
-    /// into the morning -- and an override granted yesterday would never expire.
-    fn roll_over_if_needed(&mut self) {
-        if !self.config.quota.enabled {
-            return;
-        }
-        let today = usage::today_local();
-        if self.usage.date != today {
-            self.usage.roll_over(&today);
-            self.warned_today = false;
-            let _ = self.usage.save();
-        }
-    }
-
-    /// The reason this prompt cannot be sent, if any.
-    fn quota_block(&self) -> Option<String> {
-        match usage::evaluate(
-            &self.usage,
-            &self.config.quota,
-            &usage::time_until_local_midnight(),
-        ) {
-            QuotaVerdict::Blocked(message) => Some(message),
-            _ => None,
-        }
-    }
-
-    /// A once-per-day nudge that a limit is close, or that an override is live.
-    fn quota_warning(&mut self) -> Option<String> {
-        if self.warned_today {
-            return None;
-        }
-        match usage::evaluate(
-            &self.usage,
-            &self.config.quota,
-            &usage::time_until_local_midnight(),
-        ) {
-            QuotaVerdict::Warn(message) => {
-                self.warned_today = true;
-                Some(message)
-            }
-            _ => None,
-        }
-    }
-
-    /// Fold one finished request into today's totals and persist them.
-    ///
-    /// Called for every request the endpoint answered, including the extra ones a
-    /// tool-using turn makes -- each is a real, billable call.
-    pub fn record_usage(&mut self, tokens: TokenUsage) {
-        if !self.config.quota.enabled {
-            return;
-        }
-        self.roll_over_if_needed();
-        let price = self.config.quota.price_for(&self.config.llm.model);
-        self.usage.record(&tokens, price);
-        // Written per request rather than at exit: the app is a TUI that people
-        // close with Ctrl-C, and a quota that forgets on exit is not a quota.
-        let _ = self.usage.save();
-    }
-
-    /// `/usage` -- today's totals, spelled out.
-    fn show_usage(&mut self) {
-        self.roll_over_if_needed();
-        let quota = &self.config.quota;
-        let mut lines = vec![format!("Usage for {} (local day)", self.usage.date)];
-
-        let limit = |used: String, limit: String, unlimited: bool| {
-            if unlimited {
-                format!("{used} (no limit set)")
-            } else {
-                format!("{used} of {limit}")
-            }
-        };
-
-        lines.push(format!(
-            "  Requests: {}",
-            limit(
-                self.usage.requests.to_string(),
-                quota.max_requests_per_day.to_string(),
-                quota.max_requests_per_day == 0,
-            )
-        ));
-        lines.push(format!(
-            "  Tokens:   {}{}",
-            limit(
-                usage::format_tokens(self.usage.total_tokens()),
-                usage::format_tokens(quota.max_tokens_per_day),
-                quota.max_tokens_per_day == 0,
-            ),
-            if self.usage.any_estimated {
-                "  (estimated — this endpoint does not report token counts)"
-            } else {
-                ""
-            }
-        ));
-        lines.push(format!(
-            "            {} prompt + {} completion",
-            usage::format_tokens(self.usage.prompt_tokens),
-            usage::format_tokens(self.usage.completion_tokens)
-        ));
-        lines.push(format!(
-            "  Spend:    {}",
-            limit(
-                format!("${:.2}", self.usage.usd),
-                format!("${:.2}", quota.max_usd_per_day),
-                quota.max_usd_per_day == 0.0,
-            )
-        ));
-        // Naming the gap matters more than the number: a total that silently
-        // omits half the day's requests is worse than no total.
-        if self.usage.unpriced_requests > 0 {
-            lines.push(format!(
-                "            excludes {} request(s) on a model with no price in [quota.pricing]",
-                self.usage.unpriced_requests
-            ));
-        }
-        if self.usage.override_active {
-            lines.push("  Override: active for today".to_string());
-        }
-        lines.push(format!(
-            "  Resets in {} (local midnight)",
-            usage::time_until_local_midnight()
-        ));
-
-        // The free-tier budget is a different meter entirely -- enforced by the
-        // gateway, on a UTC day, and not editable here. Showing them side by
-        // side stops the local numbers being mistaken for the ones that bind.
-        if !self.free_tier_status.is_empty() && !self.free_tier_status.starts_with("unavailable") {
-            lines.push(String::new());
-            lines.push(format!("Free tier (enforced by the gateway)\n  {}", self.free_tier_status));
-        }
-
-        self.greeted = true;
-        self.follow_tail = true;
-        self.messages
-            .push(Message::new(Role::System, lines.join("\n")));
-    }
-
-    /// `/quota override` -- spend past the limit for the rest of today.
-    fn set_quota_override(&mut self, active: bool) {
-        // Otherwise an override could be granted against yesterday's record and
-        // then be wiped by the next rollover, silently doing nothing.
-        self.roll_over_if_needed();
-        self.usage.override_active = active;
-        let _ = self.usage.save();
-        self.greeted = true;
-        self.follow_tail = true;
-        let text = if active {
-            "Quota override active for the rest of today. It clears at local midnight."
-        } else {
-            "Quota override cleared; the daily limits apply again."
-        };
-        self.messages.push(Message::new(Role::System, text));
     }
 
     fn cancel(&mut self) {
@@ -538,6 +553,7 @@ impl App {
         self.request_id += 1;
         self.pending_tools.clear();
         self.approved_tools.clear();
+        self.running_tools.clear();
         self.overlay = None;
 
         // Before anything else is appended: synthetic results have to sit
@@ -554,7 +570,23 @@ impl App {
             self.messages
                 .push(Message::new(Role::Error, "Request cancelled."));
         }
+        // Whatever streamed before the cancel was still real usage.
+        self.record_quota();
+        self.pending_usage
+            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
+        self.busy_started = None;
         self.state = AppState::AwaitingInput;
+    }
+
+    /// `streamed_chars` is a character count, not a token count. No endpoint
+    /// used here sends a real count mid-stream -- that only ever arrives, if
+    /// at all, on the final chunk -- so this rough characters-per-token
+    /// estimate is what both the live spinner (`ui.rs`) and the persisted
+    /// usage log (`usage.rs`) show. Centralised here so both use the same
+    /// approximation rather than two copies of "divide by four" drifting
+    /// apart.
+    pub fn approx_tokens_this_turn(&self) -> usize {
+        self.streamed_chars / 4
     }
 
     /// The model asked to run something. Commit whatever prose it streamed
@@ -587,6 +619,23 @@ impl App {
     /// answer without it).
     fn advance_approvals(&mut self) {
         while let Some(call) = self.pending_tools.front() {
+            // Refused outright, and never put in front of the user at all.
+            // Offering `rm -rf /` as a y/n question is itself the bug: it takes
+            // one mistyped keystroke to accept, and there is no undo. There is
+            // deliberately no key, flag, or config value that reaches this.
+            if let danger::Risk::Blocked(reason) = self.risk_of(call) {
+                let call = self.pending_tools.pop_front().expect("front just matched");
+                let label = tools::describe_action(&call)
+                    .map(|a| a.label())
+                    .unwrap_or_else(|| call.function.name.clone());
+                self.messages.push(Message::new(
+                    Role::Error,
+                    format!("Blocked: {label}\n{reason}"),
+                ));
+                self.push_tool_outcome(tools::refused_as_dangerous(&call, &reason));
+                self.follow_tail = true;
+                continue;
+            }
             if !self.needs_approval(call) {
                 let call = self.pending_tools.pop_front().expect("front just matched");
                 self.approved_tools.push(call);
@@ -598,6 +647,7 @@ impl App {
                         action,
                         remaining: self.pending_tools.len().saturating_sub(1),
                     });
+                    self.approval_selected = true;
                     self.state = AppState::AwaitingApproval;
                     return;
                 }
@@ -615,27 +665,196 @@ impl App {
         self.state = if self.approved_tools.is_empty() {
             AppState::Sending
         } else {
+            // Snapshot for display: `main.rs` takes `approved_tools` the
+            // moment it spawns the runner, so this copy is what stays on
+            // screen for the rest of the run -- see the field doc.
+            self.running_tools = self.approved_tools.clone();
             AppState::ExecutingTools
         };
     }
 
+    /// What the guardrails make of this call, judged against the directory it
+    /// would actually run in.
+    pub fn risk_of(&self, call: &ToolCall) -> danger::Risk {
+        match tools::describe_action(call) {
+            Some(tools::Action::Command { command, .. }) => {
+                danger::classify(&command, Path::new(&self.workspace_root))
+            }
+            // Reads and writes are already confined to the workspace by
+            // `tools::resolve_in_workspace`, and cannot invoke a shell.
+            _ => danger::Risk::Normal,
+        }
+    }
+
     /// Whether `call` needs a human decision before it runs.
     ///
-    /// Order matters: the session-wide escape hatches (`require_approval`,
-    /// `auto_approve`) are checked first since they should short-circuit
-    /// regardless of what the call is, and `auto_approve_read_only` only
-    /// waives the prompt for a narrow, conservative slice of calls --
-    /// `read_file` unconditionally (it cannot write anything), and shell
-    /// commands via `tools::is_read_only`. `write_file` never qualifies:
-    /// unlike a shell command's read-only-ness, which has to be inferred,
-    /// "this writes a file" is certain, so it always asks.
+    /// Order matters, and the destructive check comes first *because* it must
+    /// outrank the session-wide escape hatches: "yes to everything this
+    /// session" and `require_approval = false` must not silently cover
+    /// `rm -rf build` an hour later. Below that, the hatches short-circuit
+    /// regardless of the call, and `auto_approve_read_only` waives the prompt
+    /// only for a narrow slice -- `read_file` unconditionally (it cannot write
+    /// anything), and shell commands via `tools::is_read_only`. `write_file`
+    /// never qualifies: unlike a shell command's read-only-ness, which has to
+    /// be inferred, "this writes a file" is certain, so it always asks.
+    /// `/new` -- forget the conversation and start fresh.
+    ///
+    /// A long session is what makes a request expensive: the whole transcript is
+    /// resent every turn, so cost grows with the square of the conversation.
+    /// Starting a new topic in a new conversation is the cheapest optimisation
+    /// available, and it needs a command rather than a restart because the
+    /// alternative is losing the configured provider and model too.
+    ///
+    /// Only the conversation is cleared. Config, provider and workspace are
+    /// deliberately untouched -- this is "forget what we discussed", not "reset
+    /// the app".
+    fn start_new_conversation(&mut self) {
+        self.messages.clear();
+        self.streaming_response.clear();
+        self.pending_tools.clear();
+        self.approved_tools.clear();
+        self.tool_steps = 0;
+        self.scroll = 0;
+        self.follow_tail = true;
+        self.greeted = true;
+        self.messages.push(Message::new(
+            Role::System,
+            "Started a new conversation. The model no longer remembers anything above this line.",
+        ));
+    }
+
+    /// Exact counts from the endpoint for the turn in flight. Preferred over
+    /// the character estimate wherever both exist -- an estimate is fine for a
+    /// history readout and not fine for a spending limit.
+    pub fn record_exact_usage(&mut self, usage: crate::llm::ApiUsage) {
+        self.exact_usage = Some(usage);
+    }
+
+    /// Fold the finished turn into today's quota. Called once per request,
+    /// including the extra round trips a tool-using turn makes -- each is a
+    /// real, billable call.
+    fn record_quota(&mut self) {
+        if !self.config.quota.enabled {
+            self.exact_usage = None;
+            return;
+        }
+        self.roll_quota_day();
+
+        let tokens = match self.exact_usage.take() {
+            Some(u) => crate::quota::TokenCount {
+                prompt: u.prompt_tokens as u64,
+                completion: u.completion_tokens as u64,
+                estimated: false,
+            },
+            // No report: reuse the same estimate the usage log records, so the
+            // two never disagree about the same turn.
+            None => crate::quota::TokenCount {
+                prompt: 0,
+                completion: self.approx_tokens_this_turn() as u64,
+                estimated: true,
+            },
+        };
+        if tokens.total() == 0 {
+            return;
+        }
+        let price = self.config.quota.price_for(&self.config.llm.model);
+        self.quota.record(&tokens, price);
+        // Flagged rather than written: `main.rs` flushes it, per request rather
+        // than at exit -- this is a TUI people close with Ctrl-C, and a limit
+        // that forgets on exit is not a limit.
+        self.quota_dirty = true;
+    }
+
+    /// Start a new day if the UTC date moved on. A TUI gets left open for days,
+    /// so a rollover that only happened at startup would keep yesterday's spent
+    /// allowance in force well into the morning.
+    fn roll_quota_day(&mut self) {
+        let today = crate::quota::today();
+        if self.quota.date != today {
+            self.quota.roll_over(&today);
+            self.warned_today = false;
+            self.quota_dirty = true;
+        }
+    }
+
+    /// The reason this prompt cannot be sent, if any.
+    fn quota_block(&self) -> Option<String> {
+        match crate::quota::evaluate(&self.quota, &self.config.quota) {
+            crate::quota::Verdict::Blocked(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// `/quota` -- show today's limits. `/quota override` / `/quota reset`
+    /// change whether they bind for the rest of the day.
+    fn show_quota(&mut self) {
+        self.roll_quota_day();
+        let text = crate::quota::describe(&self.quota, &self.config.quota);
+        self.messages.push(Message::new(Role::System, text));
+    }
+
+    fn set_quota_override(&mut self, active: bool) {
+        // Otherwise an override could be granted against yesterday's record and
+        // then be wiped by the next rollover, silently doing nothing.
+        self.roll_quota_day();
+        self.quota.override_active = active;
+        self.quota_dirty = true;
+        self.messages.push(Message::new(
+            Role::System,
+            if active {
+                "Quota override active for the rest of today. It clears at UTC midnight."
+            } else {
+                "Quota override cleared; the daily limits apply again."
+            },
+        ));
+    }
+
+    /// Reads the local usage log (see `usage.rs`) and prints a summary --
+    /// this never leaves the machine, and works with no login and no server,
+    /// since the file it reads is the only copy of this data that exists.
+    fn show_usage(&mut self) {
+        let s = usage::summary();
+        self.messages.push(Message::new(
+            Role::System,
+            format!(
+                "Usage (local, this machine only):\n\
+                 Today:      ~{} tokens\n\
+                 Last 7 days: ~{} tokens\n\
+                 All time:   ~{} tokens, {} day{} used\n\
+                 (estimated from characters streamed, not an exact count from the endpoint)",
+                s.today_tokens,
+                s.week_tokens,
+                s.all_time_tokens,
+                s.days_active,
+                if s.days_active == 1 { "" } else { "s" },
+            ),
+        ));
+        // The two meters answer different questions -- this one is history and
+        // never refuses; the quota is a ceiling and does. Showing them together,
+        // labelled, stops the log being mistaken for the thing that binds.
+        if self.config.quota.has_limits() {
+            let text = crate::quota::describe(&self.quota, &self.config.quota);
+            self.messages.push(Message::new(Role::System, text));
+        }
+    }
+
     fn needs_approval(&self, call: &ToolCall) -> bool {
-        if !self.config.tools.require_approval || self.auto_approve {
+        if self.risk_of(call).is_dangerous() {
+            return true;
+        }
+        if !self.config.tools.require_approval {
             return false;
         }
         if self.config.tools.auto_approve_read_only {
             match tools::describe_action(call) {
-                Some(tools::Action::Read { .. }) => return false,
+                // Reading, listing and searching change nothing on disk, so
+                // there is nothing for an approval prompt to protect against --
+                // and prompting for them is what trains people to stop reading
+                // the prompts that matter. `edit_file` is deliberately absent:
+                // it modifies a file and is approved like a write.
+                Some(tools::Action::Read { .. })
+                | Some(tools::Action::List { .. })
+                | Some(tools::Action::Glob { .. }) => return false,
                 Some(tools::Action::Command { command, .. }) if tools::is_read_only(&command) => {
                     return false;
                 }
@@ -645,22 +864,31 @@ impl App {
         true
     }
 
-    /// y allow · n refuse · a stop asking for this session · Esc refuse.
+    /// y allow · n refuse · Esc refuse · Up/Down choose · Enter confirms the
+    /// highlighted choice.
     ///
     /// Esc means refuse rather than cancel-the-turn: at a prompt asking whether
-    /// to run something, the reflexive keypress has to be the safe one.
+    /// to run something, the reflexive keypress has to be the safe one. y/n
+    /// stay as direct shortcuts alongside arrow navigation -- picking is fine
+    /// for someone reading the prompt for the first time, but a fast typist
+    /// answering the tenth one in a row shouldn't be made to arrow over.
+    ///
+    /// There is deliberately no "allow everything from now on" key. A decision
+    /// made once, while impatient, would otherwise silently cover every command
+    /// for the rest of the session -- including ones the model had not thought
+    /// of yet. `[tools] require_approval = false` still exists for scripted
+    /// runs, where turning it off is an explicit, visible act rather than a
+    /// keystroke.
     fn handle_command_approval_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            self.approval_selected = !self.approval_selected;
+            return;
+        }
+
         let decision = match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(true),
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.auto_approve = true;
-                self.messages.push(Message::new(
-                    Role::System,
-                    "Running commands without asking for the rest of this session.",
-                ));
-                Some(true)
-            }
+            KeyCode::Enter => Some(self.approval_selected),
             _ => None,
         };
 
@@ -688,6 +916,7 @@ impl App {
         for outcome in outcomes {
             self.push_tool_outcome(outcome);
         }
+        self.running_tools.clear();
         self.follow_tail = true;
         // Back around: the model needs a turn to use what it just got.
         self.state = AppState::Sending;
@@ -730,26 +959,19 @@ impl App {
         }
     }
 
-    /// Route one event from the request task or the command runner.
-    ///
-    /// Lives here rather than inline in the event loop so the mapping from wire
-    /// event to state transition can be tested directly -- `Usage` in particular
-    /// must reach `record_usage` for the day's tallies to mean anything.
-    pub fn handle_event(&mut self, event: crate::llm::StreamEvent) {
-        use crate::llm::StreamEvent;
-        match event {
-            StreamEvent::Token(token) => self.append_token(&token),
-            StreamEvent::ToolCalls(calls) => self.request_tools(calls),
-            StreamEvent::ToolsFinished(outcomes) => self.finish_tools(outcomes),
-            StreamEvent::Usage(tokens) => self.record_usage(tokens),
-            StreamEvent::Done => self.finish_stream(),
-            StreamEvent::Error(err) => self.fail_stream(err),
-        }
+    /// A note from the transport that is neither the model talking nor a
+    /// failure -- currently only "your answer was truncated". Pushed as a
+    /// System message so it reads as status, and kept out of `history` so the
+    /// model is never told about our own plumbing.
+    pub fn note(&mut self, note: String) {
+        self.messages.push(Message::new(Role::System, note));
+        self.follow_tail = true;
     }
 
     pub fn append_token(&mut self, token: &str) {
         if self.state == AppState::Streaming {
             self.streaming_response.push_str(token);
+            self.streamed_chars += token.chars().count();
         }
     }
 
@@ -770,6 +992,10 @@ impl App {
         } else {
             self.messages.push(Message::new(Role::Assistant, response));
         }
+        self.record_quota();
+        self.pending_usage
+            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
+        self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
 
@@ -777,6 +1003,7 @@ impl App {
         self.abort = None;
         self.pending_tools.clear();
         self.approved_tools.clear();
+        self.running_tools.clear();
         self.overlay = None;
         // First, so the results land against the calls they belong to.
         self.settle_unanswered_tool_calls("The request failed before this command ran.");
@@ -786,6 +1013,10 @@ impl App {
             self.messages.push(Message::new(Role::Assistant, partial));
         }
         self.messages.push(Message::new(Role::Error, error));
+        self.record_quota();
+        self.pending_usage
+            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
+        self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
 
@@ -858,6 +1089,76 @@ impl App {
     /// Next char boundary (byte index), saturating at the end of the buffer.
     fn next_boundary(&self) -> usize {
         next_char_boundary(&self.input_buffer, self.cursor)
+    }
+
+    /// Which line of a multi-line prompt the caret is on.
+    fn cursor_line(&self) -> usize {
+        self.cursor_position().0
+    }
+
+    /// Move the caret one line up or down inside the prompt, keeping its column
+    /// where it can. Only called when such a line exists, so `delta` never runs
+    /// off either end.
+    fn move_cursor_line(&mut self, delta: isize) {
+        let (row, col) = self.cursor_position();
+        let target = if delta < 0 { row.saturating_sub(1) } else { row + 1 };
+
+        let lines: Vec<&str> = self.input_buffer.split('\n').collect();
+        let Some(line) = lines.get(target) else { return };
+
+        // Byte offset of the target line, plus `col` characters into it (or the
+        // end of it, when the target line is shorter than the current column).
+        let mut offset = 0usize;
+        for l in &lines[..target] {
+            offset += l.len() + 1; // +1 for the '\n'
+        }
+        let within: usize = line
+            .char_indices()
+            .nth(col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+        self.cursor = offset + within;
+    }
+
+    /// ↑ -- step back through prompts already sent.
+    fn recall_previous(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let next = match self.history_index {
+            // First press: remember what was being typed, then jump to the
+            // newest entry.
+            None => {
+                self.history_draft = self.input_buffer.clone();
+                self.prompt_history.len() - 1
+            }
+            Some(0) => return, // already at the oldest
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(next);
+        self.set_input(self.prompt_history[next].clone());
+    }
+
+    /// ↓ -- step forward, ending back at whatever was being typed.
+    fn recall_next(&mut self) {
+        let Some(current) = self.history_index else {
+            return;
+        };
+        if current + 1 < self.prompt_history.len() {
+            self.history_index = Some(current + 1);
+            self.set_input(self.prompt_history[current + 1].clone());
+        } else {
+            self.history_index = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.set_input(draft);
+        }
+    }
+
+    /// Replace the prompt, caret at the end -- where you want it when a
+    /// recalled prompt is about to be edited or resent.
+    fn set_input(&mut self, text: String) {
+        self.cursor = text.len();
+        self.input_buffer = text;
     }
 
     fn line_start(&self) -> usize {
@@ -1195,14 +1496,177 @@ mod tests {
     fn app() -> App {
         let mut app = App::new(Config::default());
         app.config.tools.auto_approve_read_only = false;
-        // `App::new` reads ~/.tuisample-code/usage.json. Tests must not inherit
-        // whatever the developer's real day happens to look like, so start every
-        // fixture on a clean, known day.
-        app.usage = DailyUsage {
-            date: usage::today_local(),
-            ..Default::default()
-        };
         app
+    }
+
+    /// A quota-enabled app with `spent` requests already used today.
+    fn quota_app(limit: u64, spent: u64) -> App {
+        let mut a = app();
+        a.config.quota.max_requests_per_day = limit;
+        a.quota.date = crate::quota::today();
+        a.quota.requests = spent;
+        a
+    }
+
+    #[test]
+    fn a_prompt_is_refused_once_the_daily_limit_is_spent() {
+        let mut a = quota_app(5, 5);
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert!(
+            !a.messages.iter().any(|m| m.role == Role::User),
+            "a refused prompt must not enter the conversation"
+        );
+        let err = a.messages.iter().find(|m| m.role == Role::Error).expect("a refusal");
+        assert!(err.content.contains("Daily limit reached"), "{}", err.content);
+        assert!(err.content.contains("/quota override"), "{}", err.content);
+    }
+
+    /// Losing a long prompt to a refusal is a worse outcome than the refusal.
+    #[test]
+    fn a_refused_prompt_is_left_in_the_input_box() {
+        let mut a = quota_app(1, 1);
+        type_str(&mut a, "a carefully written prompt");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.input_buffer, "a carefully written prompt");
+    }
+
+    #[test]
+    fn one_request_below_the_limit_still_sends() {
+        let mut a = quota_app(5, 4);
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+    }
+
+    /// The upgrade-safety property: nobody who has set no limit is ever refused.
+    #[test]
+    fn with_no_limits_configured_nothing_is_refused() {
+        let mut a = app();
+        a.quota.requests = 100_000;
+        a.quota.prompt_tokens = 500_000_000;
+        a.quota.micro_usd = 4_000_000_000;
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+    }
+
+    #[test]
+    fn quota_override_unblocks_the_rest_of_the_day() {
+        let mut a = quota_app(5, 5);
+        type_str(&mut a, "/quota override");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.quota.override_active);
+        assert!(a.quota_dirty, "the change must be queued for persistence");
+
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+    }
+
+    #[test]
+    fn quota_reset_puts_the_limit_back() {
+        let mut a = quota_app(5, 5);
+        a.quota.override_active = true;
+        type_str(&mut a, "/quota reset");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(!a.quota.override_active);
+
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    /// Exact counts beat the character estimate wherever both exist -- an
+    /// estimate is fine for a history readout and not fine for a limit.
+    #[test]
+    fn exact_counts_from_the_endpoint_are_preferred_over_the_estimate() {
+        let mut a = app();
+        a.quota.date = crate::quota::today();
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 1000, completion_tokens: 500 });
+        a.state = AppState::Streaming;
+        a.append_token(&"x".repeat(4000)); // would estimate ~1000
+        a.finish_stream();
+
+        assert_eq!(a.quota.prompt_tokens, 1000);
+        assert_eq!(a.quota.completion_tokens, 500);
+        assert!(!a.quota.any_estimated, "reported counts are not estimates");
+    }
+
+    #[test]
+    fn without_a_report_the_quota_falls_back_to_the_estimate_and_says_so() {
+        let mut a = app();
+        a.quota.date = crate::quota::today();
+        a.state = AppState::Streaming;
+        a.append_token(&"x".repeat(400));
+        a.finish_stream();
+
+        assert_eq!(a.quota.requests, 1);
+        assert!(a.quota.total_tokens() > 0);
+        assert!(a.quota.any_estimated);
+    }
+
+    /// `App` must stay free of filesystem side effects, or every test above
+    /// would silently write to the developer's real `$HOME`.
+    #[test]
+    fn recording_a_turn_never_touches_the_filesystem_itself() {
+        let mut a = app();
+        a.quota.date = crate::quota::today();
+        a.state = AppState::Streaming;
+        a.append_token("hello, this is a reply long enough to register");
+        a.finish_stream();
+        // It queues instead, exactly as pending_usage does.
+        assert!(a.quota_dirty);
+        assert!(!a.pending_usage.is_empty());
+    }
+
+    #[test]
+    fn each_recorded_request_counts_including_tool_round_trips() {
+        let mut a = app();
+        a.quota.date = crate::quota::today();
+        for _ in 0..3 {
+            a.state = AppState::Streaming;
+            a.append_token("a reply long enough to count as usage");
+            a.finish_stream();
+        }
+        assert_eq!(a.quota.requests, 3);
+    }
+
+    #[test]
+    fn the_quota_command_reports_all_three_metrics() {
+        let mut a = app();
+        a.config.quota.max_requests_per_day = 10;
+        a.quota.date = crate::quota::today();
+        a.quota.requests = 3;
+
+        type_str(&mut a, "/quota");
+        a.handle_key(key(KeyCode::Enter));
+
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a report");
+        assert!(out.content.contains("Requests: 3 of 10"), "{}", out.content);
+        assert!(out.content.contains("Tokens:"), "{}", out.content);
+        assert!(out.content.contains("Spend:"), "{}", out.content);
+        assert!(out.content.contains("no limit set"), "{}", out.content);
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    /// `/usage` keeps main's local history readout and appends the ceiling only
+    /// when one is configured -- the two are different meters.
+    #[test]
+    fn usage_appends_the_quota_only_when_a_limit_exists() {
+        let mut a = app();
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(!a.messages.iter().any(|m| m.content.contains("Daily limits")));
+
+        let mut b = app();
+        b.config.quota.max_requests_per_day = 10;
+        type_str(&mut b, "/usage");
+        b.handle_key(key(KeyCode::Enter));
+        assert!(b.messages.iter().any(|m| m.content.contains("Usage (local")));
+        assert!(b.messages.iter().any(|m| m.content.contains("Daily limits")));
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1213,6 +1677,263 @@ mod tests {
         for c in s.chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
+    }
+
+    // ---- /new ------------------------------------------------------------------
+
+    #[test]
+    fn slash_new_forgets_the_conversation() {
+        let mut a = app();
+        a.messages.push(Message::new(Role::User, "first question"));
+        a.messages.push(Message::new(Role::Assistant, "an answer"));
+        a.tool_steps = 4;
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        // Nothing from before survives into what the model is sent.
+        let history = a.history(None);
+        assert!(
+            !history.iter().any(|m| m.content.as_deref().unwrap_or("").contains("first question")),
+            "the old conversation must not be resent"
+        );
+        assert_eq!(a.tool_steps, 0);
+        assert_eq!(a.state, AppState::AwaitingInput);
+        // ...and the user is told, rather than the transcript just emptying.
+        assert!(a.messages.iter().any(|m| m.role == Role::System
+            && m.content.contains("new conversation")));
+    }
+
+    /// `/new` is about the conversation, not the app: losing the configured
+    /// provider and model would make it useless as a cheap reset.
+    #[test]
+    fn slash_new_keeps_the_configuration() {
+        let mut a = app();
+        a.config.llm.model = "some-model".to_string();
+        a.config.llm.provider = "deepseek".to_string();
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.config.llm.model, "some-model");
+        assert_eq!(a.config.llm.provider, "deepseek");
+    }
+
+    #[test]
+    fn slash_new_is_ignored_mid_turn() {
+        let mut a = app();
+        a.messages.push(Message::new(Role::User, "keep me"));
+        a.state = AppState::Streaming;
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        // Treated as ordinary input, not executed: clearing history underneath a
+        // request in flight would strand its tool calls.
+        assert_eq!(a.state, AppState::Streaming);
+        assert!(a.messages.iter().any(|m| m.content == "keep me"));
+    }
+
+    // ---- /usage ------------------------------------------------------------------
+
+    #[test]
+    fn slash_usage_prints_a_local_summary() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            type_str(&mut a, "/usage");
+            a.handle_key(key(KeyCode::Enter));
+
+            assert_eq!(a.state, AppState::AwaitingInput);
+            let shown = a.messages.last().expect("a summary must be printed");
+            assert!(shown.role == Role::System, "expected a System message");
+            assert!(shown.content.contains("Today"), "{}", shown.content);
+            assert!(shown.content.contains("All time"), "{}", shown.content);
+        });
+    }
+
+    #[test]
+    fn slash_usage_is_ignored_mid_turn() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            a.state = AppState::Streaming;
+
+            type_str(&mut a, "/usage");
+            a.handle_key(key(KeyCode::Enter));
+
+            // Treated as ordinary input, same as /new mid-turn: it becomes
+            // part of the in-flight prompt rather than executing.
+            assert_eq!(a.state, AppState::Streaming);
+            assert!(a.input_buffer.contains("/usage"));
+        });
+    }
+
+    // ---- slash-command autocomplete ------------------------------------------
+
+    /// The reported bug: no live suggestions existed at all, for any command
+    /// -- you had to already know and type the exact full name before Enter
+    /// did anything. A single "/" should immediately narrow to every command.
+    #[test]
+    fn a_bare_slash_matches_every_command() {
+        let mut a = app();
+        type_str(&mut a, "/");
+        assert_eq!(a.matching_commands().len(), COMMANDS.len());
+    }
+
+    #[test]
+    fn typing_narrows_the_matches_to_a_shared_prefix() {
+        let mut a = app();
+        type_str(&mut a, "/p");
+        let names: Vec<&str> = a.matching_commands().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["/provider"]);
+    }
+
+    #[test]
+    fn a_prefix_matching_nothing_shows_no_menu() {
+        let mut a = app();
+        type_str(&mut a, "/xyz");
+        assert!(a.matching_commands().is_empty());
+    }
+
+    /// Once a space is typed, the "/word" is finished -- what follows is an
+    /// argument or just an ordinary message that happens to start with "/",
+    /// not more of the command name. The menu must not keep showing.
+    #[test]
+    fn a_space_after_the_command_word_closes_the_menu() {
+        let mut a = app();
+        type_str(&mut a, "/provider is my favourite word");
+        assert!(a.matching_commands().is_empty());
+    }
+
+    #[test]
+    fn up_and_down_cycle_the_highlighted_match_and_wrap() {
+        let mut a = app();
+        type_str(&mut a, "/");
+        assert_eq!(a.command_menu_selected, 0);
+
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(a.command_menu_selected, 1);
+
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.command_menu_selected, 0);
+
+        // Wraps rather than stopping at the ends.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.command_menu_selected, COMMANDS.len() - 1);
+    }
+
+    /// Typing more must not leave the highlight pointing past the end of a
+    /// now-shorter list -- e.g. having Down'd to the last of four matches,
+    /// then typing a character that narrows it to one.
+    #[test]
+    fn the_highlight_is_clamped_when_typing_shrinks_the_match_list() {
+        let mut a = app();
+        type_str(&mut a, "/");
+        a.command_menu_selected = COMMANDS.len() - 1;
+
+        type_str(&mut a, "p");
+        assert_eq!(a.matching_commands().len(), 1);
+        assert_eq!(a.selected_command(), Some("/provider"));
+    }
+
+    /// Enter runs the highlighted command as soon as it's the only match --
+    /// it does not require the full name to be typed out first.
+    #[test]
+    fn enter_runs_the_highlighted_command_without_the_full_name_typed() {
+        let mut a = app();
+        a.config.llm.provider = "deepseek".to_string();
+        type_str(&mut a, "/mod");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(a.input_buffer.is_empty(), "the command word should be cleared");
+        assert!(matches!(a.overlay, Some(Overlay::ModelPicker { .. })), "{:?}", a.overlay);
+    }
+
+    /// Tab completes the visible text to the full command name but does not
+    /// run it -- a chance to see what's about to happen before committing.
+    #[test]
+    fn tab_completes_without_running_the_command() {
+        let mut a = app();
+        type_str(&mut a, "/pro");
+        a.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(a.input_buffer, "/provider");
+        assert_eq!(a.overlay, None, "Tab must not have opened anything");
+    }
+
+    /// Tab's ordinary meaning (insert a stop) must survive everywhere the
+    /// menu isn't showing -- plain text, and a command word with an argument
+    /// already started.
+    #[test]
+    fn tab_still_inserts_a_stop_when_there_is_nothing_to_complete() {
+        let mut a = app();
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Tab));
+        assert_eq!(a.input_buffer, "hello    ");
+    }
+
+    /// Prompt history recall must still work exactly as before once the
+    /// buffer isn't a bare "/word" -- the new Up/Down branch must only ever
+    /// intercept the keys while the menu itself has matches.
+    #[test]
+    fn up_down_history_recall_is_unaffected_when_the_menu_is_not_showing() {
+        let mut a = app();
+        type_str(&mut a, "earlier prompt");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::AwaitingInput; // pretend the turn finished
+
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "earlier prompt");
+    }
+
+    /// A completed turn's tokens end up in the local log that `/usage` reads
+    /// -- the whole point of tracking this locally instead of only showing a
+    /// live estimate that vanishes once the turn ends.
+    #[test]
+    fn a_completed_turn_is_reflected_in_the_next_usage_summary() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = streaming_app();
+            a.streamed_chars = 400; // -> 100 approx tokens
+            a.finish_stream();
+
+            // `finish_stream` only queues -- see `pending_usage`'s doc comment
+            // on why `App` itself never touches the filesystem. Draining the
+            // queue into the real usage log is what `main.rs`'s runtime loop
+            // does after every event batch; simulate that one step here.
+            for (tokens, model) in a.pending_usage.drain(..) {
+                crate::usage::record_turn(tokens, &model);
+            }
+
+            type_str(&mut a, "/usage");
+            a.handle_key(key(KeyCode::Enter));
+
+            let shown = a.messages.last().expect("a summary must be printed");
+            assert!(shown.content.contains("~100 tokens"), "{}", shown.content);
+        });
+    }
+
+    /// The bug this module exists to prevent: `App`'s state-machine methods
+    /// must never touch the filesystem directly, since a few hundred other
+    /// tests call `finish_stream`/`fail_stream`/`cancel` without expecting
+    /// (or being isolated against) a real `$HOME` side effect. This test
+    /// deliberately does NOT use `with_isolated_home` -- if any of these
+    /// three ever regress back to writing directly, this is the test that
+    /// would need it and doesn't, which is the point.
+    #[test]
+    fn finishing_failing_or_cancelling_a_turn_only_queues_never_writes_a_file() {
+        let mut finished = streaming_app();
+        finished.streamed_chars = 40;
+        finished.finish_stream();
+        assert_eq!(finished.pending_usage, vec![(10, "gpt-3.5-turbo".to_string())]);
+
+        let mut failed = streaming_app();
+        failed.streamed_chars = 40;
+        failed.fail_stream("boom".to_string());
+        assert_eq!(failed.pending_usage, vec![(10, "gpt-3.5-turbo".to_string())]);
+
+        let mut cancelled = streaming_app();
+        cancelled.streamed_chars = 40;
+        cancelled.cancel();
+        assert_eq!(cancelled.pending_usage, vec![(10, "gpt-3.5-turbo".to_string())]);
     }
 
     /// The reported bug: typing a prompt and pressing Enter did nothing, because
@@ -1229,6 +1950,46 @@ mod tests {
         assert!(a.input_buffer.is_empty());
         assert_eq!(a.messages.len(), 1);
         assert_eq!(a.messages[0].content, "hello world");
+    }
+
+    /// The footer's elapsed-time display reads `busy_started`; it must be set
+    /// the moment a turn begins and cleared on every path back to idle, or
+    /// the clock would either never start or keep running after the turn
+    /// that started it is long over.
+    #[test]
+    fn submitting_a_prompt_starts_the_busy_timer_and_resets_the_token_estimate() {
+        let mut a = app();
+        assert!(a.busy_started.is_none());
+
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(a.busy_started.is_some());
+        assert_eq!(a.streamed_chars, 0);
+    }
+
+    #[test]
+    fn streaming_tokens_accumulate_the_character_count() {
+        let mut a = streaming_app();
+        a.append_token("Hello, ");
+        a.append_token("world!");
+        assert_eq!(a.streamed_chars, "Hello, world!".chars().count());
+    }
+
+    #[test]
+    fn the_busy_timer_clears_when_a_turn_ends_however_it_ends() {
+        let mut finished = streaming_app();
+        finished.append_token("hi");
+        finished.finish_stream();
+        assert!(finished.busy_started.is_none());
+
+        let mut failed = streaming_app();
+        failed.fail_stream("boom".to_string());
+        assert!(failed.busy_started.is_none());
+
+        let mut cancelled = streaming_app();
+        cancelled.cancel();
+        assert!(cancelled.busy_started.is_none());
     }
 
     #[test]
@@ -1509,13 +2270,106 @@ mod tests {
         assert_eq!(a.overlay, None);
     }
 
+    /// A fresh prompt starts on "yes" so bare Enter keeps its long-standing
+    /// meaning; Down moves the highlight to "no" without deciding anything.
+    #[test]
+    fn a_fresh_approval_prompt_starts_selected_on_yes() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        assert!(a.approval_selected);
+
+        a.handle_key(key(KeyCode::Down));
+        assert!(!a.approval_selected, "Down must move the highlight");
+        assert_eq!(a.state, AppState::AwaitingApproval, "arrows alone must not decide anything");
+        assert_eq!(a.pending_tools.len(), 1, "nothing should have been popped yet");
+    }
+
+    /// Enter confirms whichever choice is currently highlighted -- not always
+    /// "yes" -- once Up/Down has moved off the default.
+    #[test]
+    fn enter_confirms_the_highlighted_choice_not_always_yes() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "rm -rf build")]);
+        a.handle_key(key(KeyCode::Down)); // move to "no"
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(a.approved_tools.is_empty(), "Enter on \"no\" must decline, not approve");
+        let told = a.messages.last().unwrap();
+        assert!(told.content.contains("declined"), "{}", told.content);
+    }
+
+    /// Up and Down only ever move between the two choices here -- there's
+    /// nothing to wrap past -- so either key from either state lands on the
+    /// other choice.
+    #[test]
+    fn up_and_down_both_toggle_between_the_two_choices() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+
+        a.handle_key(key(KeyCode::Up));
+        assert!(!a.approval_selected);
+        a.handle_key(key(KeyCode::Up));
+        assert!(a.approval_selected);
+        a.handle_key(key(KeyCode::Down));
+        assert!(!a.approval_selected);
+    }
+
+    /// y/n remain direct shortcuts regardless of where the highlight is --
+    /// someone who already knows their answer shouldn't have to arrow over.
+    #[test]
+    fn y_and_n_still_work_directly_regardless_of_the_highlight() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Down)); // highlight is now on "no"
+        a.handle_key(key(KeyCode::Char('y'))); // but 'y' still means yes
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// Each new prompt resets to "yes", regardless of where the previous one
+    /// was left -- a run of approvals shouldn't inherit a stale highlight.
+    #[test]
+    fn a_new_prompt_resets_the_highlight_even_if_the_previous_one_left_it_on_no() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Down));
+        a.handle_key(key(KeyCode::Char('n')));
+
+        a.state = AppState::Streaming;
+        a.request_tools(vec![command_call("call_2", "pwd")]);
+        assert!(a.approval_selected, "the new prompt must start back on \"yes\"");
+    }
+
+    /// Regression: `main.rs` takes `approved_tools` (empties it) the instant
+    /// it spawns the runner task, so a "Running N commands…" display reading
+    /// straight off `approved_tools` would show N for one frame and then
+    /// nothing for the rest of the run, while commands were still executing.
+    /// `running_tools` is the snapshot that stays put until the run finishes.
+    #[test]
+    fn approving_a_command_snapshots_it_for_display_independent_of_approved_tools() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "ls")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(a.running_tools.len(), 1);
+
+        // Simulate what main.rs does the moment it spawns the runner.
+        a.approved_tools.clear();
+        assert_eq!(a.running_tools.len(), 1, "the snapshot must survive approved_tools being taken");
+
+        a.finish_tools(vec![outcome("call_1", "ok")]);
+        assert!(a.running_tools.is_empty(), "the snapshot must clear once the run is over");
+    }
+
     /// Esc at an approval prompt means "no", not "cancel the turn": the
     /// reflexive keypress has to be the safe one.
     #[test]
     fn esc_refuses_the_command_rather_than_cancelling_the_turn() {
         for refuse in [KeyCode::Char('n'), KeyCode::Esc] {
             let mut a = streaming_app();
-            a.request_tools(vec![command_call("call_1", "rm -rf /")]);
+            // Dangerous but not blocked: this test is about the *prompt*, and a
+            // blocked command never reaches one.
+            a.request_tools(vec![command_call("call_1", "rm -rf build")]);
             a.handle_key(key(refuse));
 
             assert!(a.approved_tools.is_empty(), "{refuse:?} must not run anything");
@@ -1570,21 +2424,132 @@ mod tests {
         }
     }
 
+    // ---- destructive-command guardrails -------------------------------------
+
+    /// The whole point of the blocked tier: it is never put in front of the
+    /// user as a y/n question, because one mistyped keystroke would accept it.
     #[test]
-    fn a_stops_asking_for_the_rest_of_the_session() {
+    fn a_catastrophic_command_is_refused_without_ever_prompting() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "rm -rf /")]);
+
+        assert_eq!(a.overlay, None, "must never be offered for approval");
+        assert!(a.approved_tools.is_empty(), "must never reach the runner");
+        assert_eq!(a.state, AppState::Sending);
+
+        let told = a.messages.last().unwrap();
+        assert_eq!(told.tool_call_id.as_deref(), Some("call_1"));
+        assert!(told.content.contains("Blocked"), "{}", told.content);
+        assert!(
+            told.content.contains("no setting can permit it"),
+            "the model must be told this is settled: {}",
+            told.content
+        );
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    /// The bypasses are the reason this feature exists. Before it,
+    /// `require_approval = false` made `needs_approval` return false for
+    /// *everything*, `rm -rf /` included.
+    #[test]
+    fn no_setting_can_unblock_a_catastrophic_command() {
+        type Bypass = (&'static str, fn(&mut App));
+        let bypasses: [Bypass; 3] = [
+            ("unattended mode", |a| {
+                a.config.tools.require_approval = false
+            }),
+            ("read-only fast path", |a| {
+                a.config.tools.auto_approve_read_only = true
+            }),
+            ("both at once", |a| {
+                a.config.tools.require_approval = false;
+                a.config.tools.auto_approve_read_only = true;
+            }),
+        ];
+
+        for (label, setup) in bypasses {
+            let mut a = streaming_app();
+            setup(&mut a);
+            a.request_tools(vec![command_call("call_1", "sudo rm -rf /")]);
+
+            assert!(
+                a.approved_tools.is_empty(),
+                "{label} let a blocked command through"
+            );
+            assert_eq!(a.overlay, None, "{label} turned it into a prompt");
+        }
+    }
+
+    /// The other half: a destructive-but-legitimate command must still stop,
+    /// even with approval switched off entirely.
+    #[test]
+    fn dangerous_commands_still_ask_in_unattended_mode() {
+        let mut a = streaming_app();
+        a.config.tools.require_approval = false;
+
+        a.request_tools(vec![command_call("call_1", "rm -rf build")]);
+
+        assert_eq!(
+            a.state,
+            AppState::AwaitingApproval,
+            "`rm -rf build` must not ride the unattended fast path"
+        );
+        assert!(a.overlay.is_some());
+    }
+
+    /// ...while ordinary work is untouched by any of this.
+    #[test]
+    fn ordinary_commands_are_unaffected_by_the_guardrails() {
+        let mut a = streaming_app();
+        a.config.tools.require_approval = false;
+        a.request_tools(vec![command_call("call_1", "cargo build")]);
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// A blocked call still has to be answered, or the next prompt 400s.
+    #[test]
+    fn a_blocked_call_mixed_with_a_normal_one_leaves_a_valid_history() {
+        let mut a = streaming_app();
+        a.config.tools.require_approval = false;
+        a.request_tools(vec![
+            command_call("call_1", "rm -rf /"),
+            command_call("call_2", "ls"),
+        ]);
+
+        assert_eq!(a.approved_tools.len(), 1, "only `ls` may run");
+        a.state = AppState::ExecutingTools;
+        a.finish_tools(vec![outcome("call_2", "ok")]);
+        assert_history_is_well_formed(&a.history(None));
+    }
+
+    /// "Allow everything from now on" was removed deliberately. `a` is now an
+    /// ordinary unrecognised key, which means the prompt stays up rather than
+    /// being dismissed -- a stray keystroke must never be read as consent.
+    #[test]
+    fn there_is_no_key_that_approves_everything_for_the_session() {
         let mut a = streaming_app();
         a.request_tools(vec![command_call("call_1", "ls")]);
-        a.handle_key(key(KeyCode::Char('a')));
-        assert!(a.auto_approve);
-        assert_eq!(a.approved_tools.len(), 1);
 
-        // A later round goes straight through with no prompt.
+        for stray in [KeyCode::Char('a'), KeyCode::Char('A')] {
+            a.handle_key(key(stray));
+            assert_eq!(
+                a.state,
+                AppState::AwaitingApproval,
+                "{stray:?} approved something"
+            );
+            assert!(a.approved_tools.is_empty(), "{stray:?} approved something");
+            assert!(a.overlay.is_some(), "{stray:?} dismissed the prompt");
+        }
+
+        // Each later command is asked about on its own, with no memory of past
+        // answers.
+        a.handle_key(key(KeyCode::Char('y')));
         a.finish_tools(vec![outcome("call_1", "ok")]);
         a.state = AppState::Streaming;
         a.request_tools(vec![command_call("call_2", "cat Cargo.toml")]);
-
-        assert_eq!(a.state, AppState::ExecutingTools);
-        assert_eq!(a.overlay, None);
+        assert_eq!(a.state, AppState::AwaitingApproval, "the second command must ask too");
     }
 
     #[test]
@@ -1629,7 +2594,10 @@ mod tests {
     fn a_read_only_prefix_chained_into_something_else_still_asks() {
         let mut a = streaming_app();
         a.config.tools.auto_approve_read_only = true;
-        a.request_tools(vec![command_call("call_1", "cat file; rm -rf /")]);
+        // Chained into a *dangerous* second command rather than a blocked one:
+        // blocking is a separate mechanism, and this test is about the fast path
+        // not being fooled by the `cat` prefix.
+        a.request_tools(vec![command_call("call_1", "cat file; rm -rf build")]);
 
         assert_eq!(a.state, AppState::AwaitingApproval);
         assert!(a.approved_tools.is_empty());
@@ -1862,6 +2830,96 @@ mod tests {
             a.handle_key(key(KeyCode::Down));
         }
         a.handle_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    fn up_and_down_walk_back_through_previous_prompts() {
+        let mut a = app();
+        for prompt in ["first", "second", "third"] {
+            type_str(&mut a, prompt);
+            a.handle_key(key(KeyCode::Enter));
+            a.state = AppState::AwaitingInput; // pretend the turn finished
+        }
+
+        // Newest first, then further back, clamping at the oldest.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "third");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "second");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "first");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "first", "must clamp at the oldest entry");
+
+        // And forwards again.
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(a.input_buffer, "second");
+        // The caret sits at the end, ready to edit or resend.
+        assert_eq!(a.cursor, "second".len());
+    }
+
+    /// Reaching for an old prompt and changing your mind must not eat the
+    /// half-written one that was already in the box.
+    #[test]
+    fn stepping_forward_past_the_newest_entry_restores_the_draft() {
+        let mut a = app();
+        type_str(&mut a, "sent");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::AwaitingInput;
+
+        type_str(&mut a, "half writ");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "sent");
+
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(a.input_buffer, "half writ", "the draft must come back");
+    }
+
+    /// Inside a multi-line prompt the arrows belong to the text, not to
+    /// history -- losing a paragraph to a stray Up is worse than pressing PgUp.
+    #[test]
+    fn arrows_move_between_lines_of_a_multi_line_prompt_before_touching_history() {
+        let mut a = app();
+        type_str(&mut a, "old one");
+        a.handle_key(key(KeyCode::Enter));
+        a.state = AppState::AwaitingInput;
+
+        type_str(&mut a, "alpha");
+        a.insert_str("\n");
+        type_str(&mut a, "beta");
+        assert_eq!(a.cursor_position(), (1, 4));
+
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.cursor_position().0, 0, "should move within the prompt");
+        assert_eq!(a.input_buffer, "alpha\nbeta", "history must not have fired");
+
+        // Only once the caret is on the first line does Up reach history.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.input_buffer, "old one");
+    }
+
+    #[test]
+    fn page_up_and_page_down_still_scroll_the_transcript() {
+        let mut a = app();
+        a.scroll = 20;
+        a.handle_key(key(KeyCode::PageUp));
+        assert_eq!(a.scroll, 10);
+        assert!(!a.follow_tail);
+        a.handle_key(key(KeyCode::PageDown));
+        assert_eq!(a.scroll, 20);
+    }
+
+    /// Pressing Enter twice on the same prompt should not mean pressing Up
+    /// twice to get past it.
+    #[test]
+    fn resending_the_same_prompt_does_not_duplicate_it_in_history() {
+        let mut a = app();
+        for _ in 0..3 {
+            type_str(&mut a, "same");
+            a.handle_key(key(KeyCode::Enter));
+            a.state = AppState::AwaitingInput;
+        }
+        assert_eq!(a.prompt_history, vec!["same".to_string()]);
     }
 
     #[test]
@@ -2141,335 +3199,5 @@ mod tests {
         if let Some(v) = prev {
             std::env::set_var("DEEPSEEK_API_KEY", v);
         }
-    }
-
-    // ---- daily usage quota ----------------------------------------------------
-
-    /// An app with a request ceiling and `spent` requests already used today.
-    fn quota_app(limit: u64, spent: u64) -> App {
-        let mut a = app();
-        a.config.quota.max_requests_per_day = limit;
-        a.usage.requests = spent;
-        a
-    }
-
-    #[test]
-    fn a_prompt_is_refused_once_the_daily_request_limit_is_spent() {
-        let mut a = quota_app(5, 5);
-        type_str(&mut a, "hello");
-        a.handle_key(key(KeyCode::Enter));
-
-        // Nothing was sent...
-        assert_eq!(a.state, AppState::AwaitingInput);
-        assert!(
-            !a.messages.iter().any(|m| m.role == Role::User),
-            "a refused prompt must not enter the conversation"
-        );
-        // ...and the refusal explains itself.
-        let error = a
-            .messages
-            .iter()
-            .find(|m| m.role == Role::Error)
-            .expect("a refusal must be shown");
-        assert!(error.content.contains("Daily quota reached"), "{}", error.content);
-        assert!(error.content.contains("/quota override"), "{}", error.content);
-    }
-
-    /// Losing a long prompt to a quota refusal would be a worse outcome than the
-    /// refusal itself, so the text stays where the user can still get at it.
-    #[test]
-    fn a_refused_prompt_is_left_in_the_input_box() {
-        let mut a = quota_app(1, 1);
-        type_str(&mut a, "a carefully written prompt");
-        a.handle_key(key(KeyCode::Enter));
-        assert_eq!(a.input_buffer, "a carefully written prompt");
-    }
-
-    #[test]
-    fn one_request_below_the_limit_still_sends() {
-        let mut a = quota_app(5, 4);
-        type_str(&mut a, "hello");
-        a.handle_key(key(KeyCode::Enter));
-        assert_eq!(a.state, AppState::Sending);
-        assert!(a.messages.iter().any(|m| m.role == Role::User));
-    }
-
-    /// The upgrade-safety property, at the level that matters: a user who has set
-    /// no limits must never see a prompt refused.
-    #[test]
-    fn with_no_limits_configured_nothing_is_ever_refused() {
-        let mut a = app();
-        a.usage.requests = 100_000;
-        a.usage.prompt_tokens = 500_000_000;
-        a.usage.usd = 4_000.0;
-        type_str(&mut a, "hello");
-        a.handle_key(key(KeyCode::Enter));
-        assert_eq!(a.state, AppState::Sending);
-    }
-
-    #[test]
-    fn a_token_limit_refuses_independently_of_the_request_count() {
-        let mut a = app();
-        a.config.quota.max_tokens_per_day = 1_000;
-        a.usage.prompt_tokens = 600;
-        a.usage.completion_tokens = 400;
-        type_str(&mut a, "hello");
-        a.handle_key(key(KeyCode::Enter));
-        assert_eq!(a.state, AppState::AwaitingInput);
-    }
-
-    #[test]
-    fn a_spend_limit_refuses_independently_of_tokens_and_requests() {
-        let mut a = app();
-        a.config.quota.max_usd_per_day = 2.50;
-        a.usage.usd = 2.50;
-        type_str(&mut a, "hello");
-        a.handle_key(key(KeyCode::Enter));
-        assert_eq!(a.state, AppState::AwaitingInput);
-    }
-
-    #[test]
-    fn quota_override_unblocks_sending_for_the_rest_of_the_day() {
-        with_isolated_home(|| {
-            let mut a = quota_app(5, 5);
-            type_str(&mut a, "/quota override");
-            a.handle_key(key(KeyCode::Enter));
-            assert!(a.usage.override_active);
-
-            type_str(&mut a, "hello");
-            a.handle_key(key(KeyCode::Enter));
-            assert_eq!(a.state, AppState::Sending);
-        });
-    }
-
-    #[test]
-    fn quota_reset_puts_the_limit_back() {
-        with_isolated_home(|| {
-            let mut a = quota_app(5, 5);
-            a.usage.override_active = true;
-            type_str(&mut a, "/quota reset");
-            a.handle_key(key(KeyCode::Enter));
-            assert!(!a.usage.override_active);
-
-            type_str(&mut a, "hello");
-            a.handle_key(key(KeyCode::Enter));
-            assert_eq!(a.state, AppState::AwaitingInput);
-        });
-    }
-
-    #[test]
-    fn approaching_the_limit_warns_once_rather_than_every_prompt() {
-        let mut a = quota_app(10, 8); // 80%
-        type_str(&mut a, "one");
-        a.handle_key(key(KeyCode::Enter));
-        assert_eq!(a.state, AppState::Sending);
-        let warnings = |a: &App| {
-            a.messages
-                .iter()
-                .filter(|m| m.role == Role::System && m.content.contains("Approaching"))
-                .count()
-        };
-        assert_eq!(warnings(&a), 1);
-
-        // A second prompt in the same day must not repeat it.
-        a.state = AppState::AwaitingInput;
-        type_str(&mut a, "two");
-        a.handle_key(key(KeyCode::Enter));
-        assert_eq!(warnings(&a), 1);
-    }
-
-    #[test]
-    fn recording_a_request_updates_the_running_totals() {
-        with_isolated_home(|| {
-            let mut a = app();
-            a.config.llm.model = "priced-model".to_string();
-            a.config.quota.pricing.insert(
-                "priced-model".to_string(),
-                crate::usage::ModelPrice { input_per_mtok: 2.0, output_per_mtok: 4.0 },
-            );
-
-            a.record_usage(TokenUsage { prompt: 1_000_000, completion: 1_000_000, estimated: false });
-
-            assert_eq!(a.usage.requests, 1);
-            assert_eq!(a.usage.total_tokens(), 2_000_000);
-            assert!((a.usage.usd - 6.0).abs() < 1e-9, "{}", a.usage.usd);
-        });
-    }
-
-    /// Usage on a model the user never priced must not quietly read as free.
-    #[test]
-    fn recording_on_an_unpriced_model_counts_tokens_but_not_dollars() {
-        with_isolated_home(|| {
-            let mut a = app();
-            a.config.llm.model = "some-local-model".to_string();
-            a.record_usage(TokenUsage { prompt: 1_000, completion: 1_000, estimated: false });
-
-            assert_eq!(a.usage.total_tokens(), 2_000);
-            assert_eq!(a.usage.usd, 0.0);
-            assert_eq!(a.usage.unpriced_requests, 1);
-        });
-    }
-
-    #[test]
-    fn recording_is_skipped_entirely_when_tracking_is_disabled() {
-        let mut a = app();
-        a.config.quota.enabled = false;
-        a.record_usage(TokenUsage { prompt: 100, completion: 100, estimated: false });
-        assert_eq!(a.usage.requests, 0);
-    }
-
-    /// Regression: the rollover used to happen only at startup and after a
-    /// recorded request, so a TUI left open overnight kept refusing prompts
-    /// against yesterday's spent allowance until it was restarted.
-    #[test]
-    fn a_session_open_past_midnight_is_judged_against_the_new_day() {
-        with_isolated_home(|| {
-            let mut a = quota_app(5, 5); // yesterday's limit, fully spent
-            a.usage.date = "2000-01-01".to_string();
-
-            type_str(&mut a, "hello");
-            a.handle_key(key(KeyCode::Enter));
-
-            assert_eq!(a.state, AppState::Sending, "a new day must start clean");
-            assert_eq!(a.usage.date, usage::today_local());
-            assert_eq!(a.usage.requests, 0);
-        });
-    }
-
-    /// ...and an override granted yesterday must not still be in force today.
-    #[test]
-    fn an_override_does_not_survive_into_the_next_day() {
-        with_isolated_home(|| {
-            let mut a = quota_app(5, 5);
-            a.usage.date = "2000-01-01".to_string();
-            a.usage.override_active = true;
-
-            type_str(&mut a, "/usage");
-            a.handle_key(key(KeyCode::Enter));
-
-            assert!(!a.usage.override_active, "yesterday's override must expire");
-        });
-    }
-
-    /// A session left running overnight must start the new day clean rather than
-    /// keep charging against yesterday's allowance.
-    #[test]
-    fn a_request_recorded_after_midnight_rolls_the_day_over() {
-        with_isolated_home(|| {
-            let mut a = quota_app(10, 9);
-            a.usage.date = "2000-01-01".to_string(); // yesterday, by a wide margin
-            a.warned_today = true;
-
-            a.record_usage(TokenUsage { prompt: 10, completion: 10, estimated: false });
-
-            assert_eq!(a.usage.date, usage::today_local());
-            assert_eq!(a.usage.requests, 1, "yesterday's 9 must not carry over");
-            assert!(!a.warned_today, "a new day gets its warning back");
-        });
-    }
-
-    /// Every request a turn makes is billed, including the extra round trips a
-    /// tool-using turn performs, so each must consume quota.
-    #[test]
-    fn each_recorded_request_counts_including_tool_round_trips() {
-        with_isolated_home(|| {
-            let mut a = app();
-            for _ in 0..3 {
-                a.record_usage(TokenUsage { prompt: 10, completion: 10, estimated: false });
-            }
-            assert_eq!(a.usage.requests, 3);
-        });
-    }
-
-    #[test]
-    fn the_usage_command_reports_all_three_metrics() {
-        let mut a = app();
-        a.usage.requests = 3;
-        a.usage.prompt_tokens = 1_500;
-        a.config.quota.max_requests_per_day = 10;
-
-        type_str(&mut a, "/usage");
-        a.handle_key(key(KeyCode::Enter));
-
-        let report = a
-            .messages
-            .iter()
-            .find(|m| m.role == Role::System)
-            .expect("a report must be shown");
-        assert!(report.content.contains("Requests: 3 of 10"), "{}", report.content);
-        assert!(report.content.contains("Tokens:"), "{}", report.content);
-        assert!(report.content.contains("Spend:"), "{}", report.content);
-        assert!(report.content.contains("Resets in"), "{}", report.content);
-        // An unset limit must read as unset, not as zero.
-        assert!(report.content.contains("no limit set"), "{}", report.content);
-        // /usage is a local command and never becomes a prompt.
-        assert!(!a.messages.iter().any(|m| m.role == Role::User));
-        assert_eq!(a.state, AppState::AwaitingInput);
-    }
-
-    /// The free-tier budget is the one that actually refuses requests, so it has
-    /// to appear in `/usage` alongside the local counters -- otherwise a user
-    /// reads "no limit set" three times and concludes there is no limit.
-    #[test]
-    fn the_usage_report_shows_the_free_tier_budget_when_enrolled() {
-        let mut a = app();
-        a.free_tier_status =
-            "free tier — deepseek-v4-flash · $0.0021 of $0.25 used today (3 requests)".to_string();
-
-        type_str(&mut a, "/usage");
-        a.handle_key(key(KeyCode::Enter));
-
-        let report = a
-            .messages
-            .iter()
-            .find(|m| m.role == Role::System)
-            .expect("a report must be shown");
-        assert!(report.content.contains("Free tier"), "{}", report.content);
-        assert!(report.content.contains("$0.25"), "{}", report.content);
-        // ...and it must be labelled as the gateway's, not confused with the
-        // local counters directly above it.
-        assert!(report.content.contains("gateway"), "{}", report.content);
-    }
-
-    #[test]
-    fn the_usage_report_omits_the_free_tier_block_for_a_byok_user() {
-        let mut a = app(); // free_tier_status empty: user brought their own key
-        type_str(&mut a, "/usage");
-        a.handle_key(key(KeyCode::Enter));
-        let report = a.messages.iter().find(|m| m.role == Role::System).unwrap();
-        assert!(!report.content.contains("Free tier"), "{}", report.content);
-    }
-
-    #[test]
-    fn the_usage_report_names_requests_it_could_not_price() {
-        let mut a = app();
-        a.usage.requests = 2;
-        a.usage.unpriced_requests = 2;
-        type_str(&mut a, "/usage");
-        a.handle_key(key(KeyCode::Enter));
-
-        let report = a.messages.iter().find(|m| m.role == Role::System).unwrap();
-        assert!(report.content.contains("no price"), "{}", report.content);
-    }
-
-    #[test]
-    fn the_usage_report_flags_estimated_token_counts() {
-        let mut a = app();
-        a.usage.any_estimated = true;
-        type_str(&mut a, "/usage");
-        a.handle_key(key(KeyCode::Enter));
-
-        let report = a.messages.iter().find(|m| m.role == Role::System).unwrap();
-        assert!(report.content.contains("estimated"), "{}", report.content);
-    }
-
-    #[test]
-    fn quota_commands_are_ignored_while_a_request_is_in_flight() {
-        let mut a = streaming_app();
-        type_str(&mut a, "/usage");
-        a.handle_key(key(KeyCode::Enter));
-        // Still streaming, and the text was treated as ordinary input rather
-        // than executed as a command mid-turn.
-        assert_eq!(a.state, AppState::Streaming);
     }
 }

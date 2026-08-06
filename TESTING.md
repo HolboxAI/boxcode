@@ -7,7 +7,6 @@
 - Environment variable handling
 - JSON response deserialization
 - String buffer operations
-- Daily usage quota: counting, persistence, midnight rollover, enforcement
 
 **Run:**
 ```bash
@@ -50,22 +49,6 @@ export TUISAMPLE_API_KEY=sk-...
 4. Response streams from LLM
 5. Can cancel with Esc
 6. Exit with Ctrl-C
-
-#### Daily quota
-```bash
-# Set a limit of one request, then send two prompts.
-TUISAMPLE_MAX_REQUESTS_PER_DAY=1 ./target/release/tuisample-code
-```
-1. After the first reply, the header shows `today: 1 req · … tok`
-2. The second prompt is refused, naming the limit and the reset time
-3. The refused prompt is **still in the input box** — nothing typed is lost
-4. `/quota override` allows it through; `/usage` shows the override as active
-5. `~/.tuisample-code/usage.json` holds the counts and survives a restart
-
-Note: if the endpoint does not support `stream_options.include_usage`, token
-counts render with a `~` prefix to mark them as local estimates. Requests are
-always exact. Spend shows `$ unpriced` until the model is given a price under
-`[quota.pricing]` in config.toml.
 
 ### 4. Install Script Testing
 ```bash

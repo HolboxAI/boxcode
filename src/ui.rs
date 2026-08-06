@@ -1,134 +1,285 @@
 use crate::app::{App, AppState, CustomStep, Overlay, Role};
 use crate::providers;
+use crate::theme;
 use crate::tools::Action;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph,
+};
 use ratatui::Frame;
+use std::path::Path;
 
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MAX_INPUT_HEIGHT: u16 = 10;
+const MAX_APPROVAL_HEIGHT: u16 = 24;
 const MIN_POPUP_WIDTH: u16 = 40;
 const MIN_POPUP_HEIGHT: u16 = 6;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let size = f.size();
-    let input_height = input_height(app, size.width);
+
+    // A tool approval takes the input box's spot at the bottom instead of
+    // floating a popup over the transcript above it -- it answers "what do
+    // you want to do about the thing just proposed", which is exactly what
+    // that spot is for. The transcript stays fully visible and in place, the
+    // way it does for every other kind of turn.
+    let approval = match &app.overlay {
+        Some(Overlay::ToolApproval { action, remaining }) => Some((action.clone(), *remaining)),
+        _ => None,
+    };
+
+    let bottom_height = match &approval {
+        Some((action, remaining)) => {
+            let inner_width = size.width.saturating_sub(4).max(1) as usize;
+            let (_, lines) = tool_approval_lines(app, action, *remaining, inner_width);
+            (lines.len() as u16 + 2).clamp(MIN_INPUT_HEIGHT, MAX_APPROVAL_HEIGHT)
+        }
+        None => input_height(app, size.width),
+    };
+
+    // Slash-command autocomplete: `matching_commands` is already empty
+    // whenever a tool approval is showing (that requires `is_busy()`, which
+    // the menu also refuses to be active under), so no extra guard is needed
+    // to keep the two from appearing at once.
+    let command_matches = app.matching_commands();
+    let menu_height: u16 = if command_matches.is_empty() {
+        0
+    } else {
+        (command_matches.len() as u16 + 2).min(8)
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(5),
-            Constraint::Length(input_height),
+            Constraint::Length(menu_height),
+            Constraint::Length(bottom_height),
             Constraint::Length(1),
         ])
         .split(size);
 
     render_header(f, chunks[0], app);
     render_messages(f, chunks[1], app);
-    render_input(f, chunks[2], app);
-    render_footer(f, chunks[3], app);
-    // Last, so it draws over everything already painted this frame.
+    if !command_matches.is_empty() {
+        render_command_menu(f, chunks[2], app, &command_matches);
+    }
+    match &approval {
+        Some((action, remaining)) => {
+            render_tool_approval_inline(f, chunks[3], app, action, *remaining)
+        }
+        None => render_input(f, chunks[3], app),
+    }
+    render_footer(f, chunks[4], app);
+
+    // Everything else here (pickers, text prompts) is a one-shot choice made
+    // before a turn even starts, with no transcript underneath it yet to stay
+    // faithful to -- floating and centered is fine for those.
     render_overlay(f, size, app);
+
+    // Last: rewrite every cell's colours in place if this terminal can't be
+    // trusted with the 24-bit RGB the rest of this file draws in -- see
+    // `theme::supports_truecolor`. Everything above stays written in terms of
+    // `theme`'s real palette either way; this is the one place that acts on
+    // whether the terminal can actually show it.
+    adapt_colors_for_terminal(f);
 }
 
+fn adapt_colors_for_terminal(f: &mut Frame) {
+    if theme::supports_truecolor() {
+        return;
+    }
+    for cell in f.buffer_mut().content.iter_mut() {
+        cell.fg = theme::adapt(cell.fg);
+        cell.bg = theme::adapt(cell.bg);
+    }
+}
+
+/// A single quiet line: the mark on the left, the model on the right.
+///
+/// Deliberately understated. The endpoint and the working directory are on the
+/// welcome panel where they are read once; repeating them across the top of
+/// every frame competes with the transcript for attention and wins, which is
+/// exactly backwards.
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    let title = format!(
-        "tuisample-code | {} | model: {}",
-        app.config.llm.endpoint, app.config.llm.model
-    );
-    let mut spans = vec![Span::styled(title, Style::default().fg(Color::Cyan))];
+    let left = Line::from(Span::styled(
+        format!(" {}", theme::LOGO),
+        theme::accent_bold(),
+    ));
+    f.render_widget(Paragraph::new(left), area);
 
-    // Today's spend sits in the one line that is always visible, so a quota is
-    // never a surprise discovered only when a prompt is refused.
-    if app.config.quota.enabled && app.usage.requests > 0 {
-        spans.push(Span::styled(
-            format!(" | today: {}", crate::usage::summary_line(&app.usage)),
-            Style::default().fg(quota_color(app)),
-        ));
-    }
-
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-/// Green under the limits, yellow approaching one, red once one is spent.
-fn quota_color(app: &App) -> Color {
-    match crate::usage::evaluate(&app.usage, &app.config.quota, "") {
-        crate::usage::QuotaVerdict::Ok => Color::DarkGray,
-        crate::usage::QuotaVerdict::Warn(_) => Color::Yellow,
-        crate::usage::QuotaVerdict::Blocked(_) => Color::Red,
+    // The welcome panel names the model in its own column; repeating it in the
+    // header while that panel is up says the same thing twice on one screen.
+    let on_welcome = !app.greeted && app.messages.is_empty();
+    let model = format!("{} ", app.config.llm.model);
+    if !on_welcome && (model.chars().count() as u16) < area.width.saturating_sub(20) {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(model, theme::faint())))
+                .alignment(Alignment::Right),
+            area,
+        );
     }
 }
 
+/// The transcript, drawn without a box around it.
+///
+/// A border here would frame the conversation as a widget in an application;
+/// without one the text simply occupies the terminal, which is what a terminal
+/// session should feel like. The two-column indent does the job the border was
+/// doing -- separating the stream from the edge of the screen -- at a quarter
+/// of the visual weight.
 fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
-    let width = area.width.saturating_sub(2).max(1) as usize;
+    const GUTTER: usize = 2;
+    let width = area.width.saturating_sub(GUTTER as u16 + 1).max(1) as usize;
     let mut lines: Vec<Line> = Vec::new();
 
     if !app.greeted && app.messages.is_empty() {
-        lines.extend(welcome_lines(app));
-    } else {
-        for msg in &app.messages {
-            // Tool activity is scaffolding, not conversation: one dim line each,
-            // no speaker label and no blank separator, so a run of six reads as a
-            // compact block rather than three screens of transcript. The full
-            // result still goes to the model -- it is just not drawn.
-            if msg.role == Role::Tool {
-                for wrapped in wrap(msg.body(), width) {
-                    lines.push(Line::from(Span::styled(wrapped, role_style(Role::Tool))));
-                }
-                continue;
-            }
-            // An assistant turn that was nothing but tool calls has no prose to
-            // show; the calls speak for themselves on the lines that follow.
-            if msg.role == Role::Assistant && !msg.tool_calls.is_empty() && msg.content.trim().is_empty()
-            {
-                continue;
-            }
+        lines.extend(welcome_lines(app, width));
 
-            lines.push(Line::from(vec![Span::styled(
-                format!("{}: ", msg.role.label()),
-                role_style(msg.role),
-            )]));
-            for wrapped in wrap(msg.body(), width) {
-                lines.push(Line::from(wrapped));
-            }
-            lines.push(Line::from(""));
-        }
+        // Unlike the transcript below, this never sticks to the bottom --
+        // the mascot and identity fields belong on screen first, not
+        // whatever happens to be last. But it does need to be reachable at
+        // all: on a short terminal (or once enough commands/warnings
+        // accumulate that the content no longer fits, which is exactly what
+        // adding /new and /usage here did to a 22-row test terminal), the
+        // unscrolled tail -- including "no API key configured" -- was
+        // silently clipped with no way to see it. PageDown already sets
+        // app.scroll generically; this just has to honour and clamp it.
+        let viewport = area.height as usize;
+        let max_scroll = lines.len().saturating_sub(viewport) as u16;
+        app.scroll = app.scroll.min(max_scroll);
 
-        if app.state == AppState::ExecutingTools {
-            for call in &app.approved_tools {
-                let label = crate::tools::describe_action(call)
-                    .map(|a| a.label())
-                    .unwrap_or_else(|| call.function.name.clone());
-                lines.push(Line::from(Span::styled(
-                    format!("{label} …"),
-                    role_style(Role::Tool),
-                )));
-            }
-        }
-
-        if app.state == AppState::Streaming {
-            lines.push(Line::from(vec![Span::styled(
-                "Assistant: ",
-                role_style(Role::Assistant),
-            )]));
-            let body = if app.streaming_response.is_empty() {
-                "…".to_string()
-            } else {
-                app.streaming_response.clone()
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().padding(Padding::new(GUTTER as u16, 1, 0, 0)))
+                .scroll((app.scroll, 0)),
+            area,
+        );
+        if app.scroll < max_scroll && area.height > 0 {
+            let more = Line::from(Span::styled(" ↓ more ", theme::faint()));
+            let hint_area = Rect {
+                x: area.x,
+                y: area.bottom().saturating_sub(1),
+                width: area.width,
+                height: 1,
             };
-            for wrapped in wrap(&body, width) {
-                lines.push(Line::from(wrapped));
+            f.render_widget(Paragraph::new(more).alignment(Alignment::Right), hint_area);
+        }
+        return;
+    }
+
+    lines.push(Line::from(""));
+    for msg in &app.messages {
+        // Tool activity is scaffolding, not conversation: one dim line each,
+        // no speaker label and no blank separator, so a run of six reads as a
+        // compact block rather than three screens of transcript. The full
+        // result still goes to the model -- it is just not drawn.
+        if msg.role == Role::Tool {
+            for (i, wrapped) in wrap(msg.body(), width.saturating_sub(2))
+                .into_iter()
+                .enumerate()
+            {
+                let marker = if i == 0 { theme::TOOL_MARK } else { " " };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} "), Style::default().fg(theme::FAINT)),
+                    Span::styled(wrapped, role_style(Role::Tool)),
+                ]));
             }
-            lines.push(Line::from(""));
+            continue;
+        }
+        // An assistant turn that was nothing but tool calls has no prose to
+        // show; the calls speak for themselves on the lines that follow.
+        if msg.role == Role::Assistant
+            && !msg.tool_calls.is_empty()
+            && msg.content.trim().is_empty()
+        {
+            continue;
+        }
+
+        // A user turn keeps a marker -- it's the one place the human's own
+        // words appear verbatim, and a "> " quote prefix reads as "you typed
+        // this" without naming a speaker. The assistant's prose gets none:
+        // narration and tool activity share one continuous stream, the way
+        // Claude Code renders a turn, rather than a labelled reply to a
+        // labelled question. System/Error stay labelled -- they're status
+        // events, not a side of the conversation.
+        match msg.role {
+            Role::User => {
+                // Padded to the full width on purpose: a background only
+                // colours the cells a span actually occupies, so without this
+                // the block would be ragged down its right edge, tracking the
+                // length of each wrapped line instead of forming one shape.
+                // The marker stays outside the block so the block starts at a
+                // consistent column on every line, wrapped or not.
+                let text_width = width.saturating_sub(2);
+                for (i, wrapped) in wrap(msg.body(), text_width).into_iter().enumerate() {
+                    let marker = if i == 0 { theme::USER_MARK } else { " " };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{marker} "), role_style(Role::User)),
+                        Span::styled(
+                            format!("{wrapped:<text_width$}"),
+                            theme::user_turn(),
+                        ),
+                    ]));
+                }
+            }
+            Role::Assistant => {
+                for wrapped in wrap(msg.body(), width) {
+                    lines.push(Line::from(Span::styled(wrapped, theme::text())));
+                }
+            }
+            Role::Error | Role::System => {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{}: ", msg.role.label()),
+                    role_style(msg.role),
+                )]));
+                for wrapped in wrap(msg.body(), width) {
+                    lines.push(Line::from(Span::styled(wrapped, theme::text())));
+                }
+            }
+            Role::Tool => unreachable!("handled above"),
+        }
+        lines.push(Line::from(""));
+    }
+
+    if app.state == AppState::ExecutingTools {
+        for call in &app.running_tools {
+            let label = crate::tools::describe_action(call)
+                .map(|a| a.label())
+                .unwrap_or_else(|| call.function.name.clone());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", theme::TOOL_MARK),
+                    Style::default().fg(theme::FAINT),
+                ),
+                Span::styled(label, role_style(Role::Tool)),
+            ]));
         }
     }
 
+    if app.state == AppState::Streaming && !app.streaming_response.is_empty() {
+        for wrapped in wrap(&app.streaming_response, width) {
+            lines.push(Line::from(Span::styled(wrapped, theme::text())));
+        }
+    }
+
+    // The live status sits at the end of the transcript rather than in the
+    // footer, so the thing you are waiting on appears where you are already
+    // looking -- directly above the prompt, in the flow of the turn.
+    if let Some(status) = activity_line(app) {
+        if app.state == AppState::Streaming && !app.streaming_response.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(status);
+    }
+    lines.push(Line::from(""));
+
     // Clamp the scroll offset to the content, and stick to the bottom while the
-    // user has not scrolled away.
-    let viewport = area.height.saturating_sub(2) as usize;
+    // user has not scrolled away. No border any more, so the whole area is
+    // viewport -- an off-by-two here silently hides the newest two lines.
+    let viewport = area.height as usize;
     let max_scroll = lines.len().saturating_sub(viewport) as u16;
     if app.follow_tail {
         app.scroll = max_scroll;
@@ -139,143 +290,254 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    let title = if app.scroll < max_scroll {
-        " Messages (↓ for more) ".to_string()
-    } else {
-        " Messages ".to_string()
-    };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let paragraph = Paragraph::new(lines).block(block).scroll((app.scroll, 0));
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().padding(Padding::new(GUTTER as u16, 1, 0, 0)))
+        .scroll((app.scroll, 0));
 
     f.render_widget(paragraph, area);
+
+    // A quiet marker that there is more above, since without a border there is
+    // no title bar left to say so.
+    if app.scroll < max_scroll && area.height > 0 {
+        let more = Line::from(Span::styled(" ↓ more ", theme::faint()));
+        let hint_area = Rect {
+            x: area.x,
+            y: area.bottom().saturating_sub(1),
+            width: area.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(more).alignment(Alignment::Right), hint_area);
+    }
 }
 
-fn welcome_lines(app: &App) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "🚀 Welcome to tuisample-code",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Connected to: ", Style::default().fg(Color::DarkGray)),
+/// The spinner line: what the app is doing, how long it has been doing it, and
+/// how to stop it. `None` when nothing is running.
+fn activity_line(app: &App) -> Option<Line<'static>> {
+    let elapsed = app.busy_started.map(|t| t.elapsed());
+    let secs = elapsed.map(|e| e.as_secs()).unwrap_or(0);
+    let frame = theme::spinner(elapsed.unwrap_or_default());
+
+    let (verb, detail) = match app.state {
+        AppState::AwaitingInput => return None,
+        AppState::AwaitingApproval => return None,
+        AppState::Sending => ("Thinking".to_string(), String::new()),
+        AppState::Streaming => {
+            // See App::approx_tokens_this_turn -- the same estimate the
+            // persisted usage log uses, always labelled "~" since it is one.
+            let approx_tokens = app.approx_tokens_this_turn();
+            let detail = if approx_tokens > 0 {
+                format!(" · ~{approx_tokens} tokens")
+            } else {
+                String::new()
+            };
+            ("Responding".to_string(), detail)
+        }
+        AppState::ExecutingTools => {
+            let n = app.running_tools.len();
+            (
+                format!("Running {n} command{}", if n == 1 { "" } else { "s" }),
+                String::new(),
+            )
+        }
+    };
+
+    Some(Line::from(vec![
+        Span::styled(format!("{frame} "), theme::accent()),
+        Span::styled(format!("{verb}… "), Style::default().fg(theme::ACCENT_SOFT)),
+        Span::styled(
+            format!("({secs}s{detail} · esc to interrupt)"),
+            theme::faint(),
+        ),
+    ]))
+}
+
+/// The greeting shown until the first prompt.
+///
+/// Deliberately not a bordered panel: the mascot sits beside the wordmark on
+/// one block, a rule divides that from the facts, and the facts are a plain
+/// aligned list. One glance should answer the three questions someone actually
+/// has on launch -- which model, where do commands run, what do I type -- and
+/// then get out of the way, because the first prompt replaces all of it.
+fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from("")];
+
+    // Beside the mascot: the wordmark, what this is, and who is using it.
+    // Blank entries keep the two columns the same height so the rule below
+    // lands flush regardless of which side is taller.
+    let beside: [Vec<Span>; 5] = [
+        vec![
+            Span::styled("tuisample-code", theme::accent_bold()),
+            Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), theme::faint()),
+        ],
+        vec![Span::styled("a terminal coding assistant", theme::faint())],
+        vec![],
+        vec![
+            Span::styled("Welcome back", theme::text()),
             Span::styled(
-                app.config.llm.model.clone(),
-                Style::default().fg(Color::Green),
+                greeting_name().map(|n| format!(", {n}")).unwrap_or_default(),
+                Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Endpoint:     ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                app.config.llm.endpoint.clone(),
-                Style::default().fg(Color::Green),
-            ),
-        ]),
+            Span::styled("!", theme::text()),
+        ],
+        vec![],
     ];
 
-    // Whether this install is on the free tier, and what that buys, stated
-    // before the first prompt rather than discovered when a limit is hit.
-    if !app.free_tier_status.is_empty() {
-        let unavailable = app.free_tier_status.starts_with("unavailable");
-        lines.push(Line::from(vec![
-            Span::styled("Plan:         ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                app.free_tier_status.clone(),
-                Style::default().fg(if unavailable { Color::Yellow } else { Color::Cyan }),
-            ),
-        ]));
+    let mascot_width = theme::MASCOT[0].chars().count();
+    // Below this the two columns collide, so the mascot goes above the text
+    // instead of beside it rather than overlapping.
+    let side_by_side = width > mascot_width + 34;
+
+    for (row, extra) in theme::MASCOT.iter().zip(beside.iter()) {
+        let mut spans = vec![Span::styled(*row, theme::accent())];
+        if side_by_side {
+            spans.push(Span::raw("    "));
+            spans.extend(extra.iter().cloned());
+        }
+        lines.push(Line::from(spans));
+    }
+    if !side_by_side {
+        lines.push(Line::from(""));
+        for extra in beside.iter().filter(|e| !e.is_empty()) {
+            lines.push(Line::from(extra.clone()));
+        }
     }
 
-    // Where commands will run, stated up front. A user should never have to
-    // guess this about a tool that can change their files -- and the two
-    // dangerous configurations shout rather than blend in.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "─".repeat(width.min(64)),
+        Style::default().fg(theme::BORDER),
+    )));
+    lines.push(Line::from(""));
+
+    // The facts, as an aligned list. `cwd` is the one a user should never have
+    // to guess about a tool that can change their files, so the two dangerous
+    // configurations shout rather than blend in.
+    let field = |name: &str, value: String, style: Style| {
+        Line::from(vec![
+            Span::styled(format!("{name:<10}"), theme::faint()),
+            Span::styled(value, style),
+        ])
+    };
+    lines.push(field(
+        "model",
+        app.config.llm.model.clone(),
+        Style::default().fg(theme::ACCENT_SOFT),
+    ));
+    lines.push(field(
+        "endpoint",
+        app.config.llm.endpoint.clone(),
+        theme::muted(),
+    ));
     if !app.workspace_status.is_empty() {
         let alarming = app.workspace_status.contains("UNATTENDED");
         let colour = if alarming {
-            Color::Red
-        } else if app.workspace_status.starts_with("off") || app.workspace_status.contains("broad")
-        {
-            Color::Yellow
+            theme::DANGER
+        } else if app.workspace_status.starts_with("off") || app.workspace_status.contains("broad") {
+            theme::WARNING
         } else {
-            Color::Green
+            theme::MUTED
         };
         let mut style = Style::default().fg(colour);
         if alarming {
             style = style.add_modifier(Modifier::BOLD);
         }
+        lines.push(field("cwd", shorten_home(&app.workspace_status), style));
+    }
+
+    lines.push(Line::from(""));
+    for (name, desc) in crate::app::COMMANDS {
         lines.push(Line::from(vec![
-            Span::styled("Commands:     ", Style::default().fg(Color::DarkGray)),
-            Span::styled(app.workspace_status.clone(), style),
+            Span::styled(format!("{name:<10}"), theme::key()),
+            Span::styled(*desc, theme::muted()),
         ]));
     }
 
-    // Only worth a line once a ceiling actually exists -- otherwise it is noise
-    // on a screen that is already dense.
-    if app.config.quota.has_limits() {
-        let mut parts = Vec::new();
-        if app.config.quota.max_requests_per_day > 0 {
-            parts.push(format!("{} requests", app.config.quota.max_requests_per_day));
-        }
-        if app.config.quota.max_tokens_per_day > 0 {
-            parts.push(format!(
-                "{} tokens",
-                crate::usage::format_tokens(app.config.quota.max_tokens_per_day)
-            ));
-        }
-        if app.config.quota.max_usd_per_day > 0.0 {
-            parts.push(format!("${:.2}", app.config.quota.max_usd_per_day));
-        }
-        lines.push(Line::from(vec![
-            Span::styled("Daily limit:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(parts.join(" · "), Style::default().fg(Color::Green)),
-            Span::styled(
-                format!("  (used today: {})", crate::usage::summary_line(&app.usage)),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+    let mut warnings = app.config.warnings();
+    if !theme::supports_truecolor() {
+        warnings.push(
+            "This terminal doesn't report reliable 24-bit colour support, so colours are \
+             approximated to a close 256-colour palette instead of the exact theme."
+                .to_string(),
+        );
     }
-
-    lines.extend([
-        Line::from(""),
-        Line::from("📝 How to use:"),
-        Line::from("  • Type your prompt below"),
-        Line::from("  • Press Enter to send"),
-        Line::from("  • Alt+Enter (or Shift+Enter) for a new line"),
-        Line::from("  • Press Esc to cancel a running request"),
-        Line::from(""),
-    ]);
-
-    let warnings = app.config.warnings();
-    if warnings.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "✓ Ready to go!",
-            Style::default().fg(Color::Green),
-        )]));
-    } else {
+    if !warnings.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Before you start",
+            Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD),
+        )));
         for w in warnings {
-            lines.push(Line::from(vec![Span::styled(
-                format!("⚠ {w}"),
-                Style::default().fg(Color::Yellow),
-            )]));
+            // Wrapped, not clipped: a warning that runs off the right edge
+            // loses the half that says what to actually do about it.
+            for part in wrap(&w, width) {
+                lines.push(Line::from(Span::styled(part, theme::muted())));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    for tip in [
+        "Ask about this project — it can read files and run commands.",
+        "Every command and every write waits for your approval.",
+    ] {
+        for part in wrap(tip, width) {
+            lines.push(Line::from(Span::styled(part, theme::faint())));
         }
     }
     lines.push(Line::from(""));
     lines
 }
 
-fn role_style(role: Role) -> Style {
-    match role {
-        Role::User => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        Role::Assistant => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        Role::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        Role::System => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-        Role::Tool => Style::default().fg(Color::Blue),
+/// The name to greet, from the environment. `None` rather than a guess when
+/// there is nothing to go on -- "Welcome back, unknown!" is worse than
+/// "Welcome back!".
+fn greeting_name() -> Option<String> {
+    for var in ["USER", "USERNAME", "LOGNAME"] {
+        if let Ok(name) = std::env::var(var) {
+            let name = name.trim().to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// `/Users/you/project` -> `~/project`, so a deep path still fits.
+fn shorten_home(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+            format!("~{}", &path[home.len()..])
+        }
+        _ => path.to_string(),
     }
 }
 
+fn role_style(role: Role) -> Style {
+    match role {
+        Role::User => Style::default()
+            .fg(theme::USER)
+            .add_modifier(Modifier::BOLD),
+        Role::Assistant => Style::default().fg(theme::TEXT),
+        Role::Error => Style::default()
+            .fg(theme::DANGER)
+            .add_modifier(Modifier::BOLD),
+        Role::System => Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
+        Role::Tool => Style::default().fg(theme::TOOL),
+    }
+}
+
+/// Columns the prompt marker and its trailing space occupy.
+const PROMPT_GUTTER: usize = 2;
+
+fn input_width(total_width: u16) -> usize {
+    total_width.saturating_sub(2 + PROMPT_GUTTER as u16).max(1) as usize
+}
+
 fn input_height(app: &App, total_width: u16) -> u16 {
-    let width = total_width.saturating_sub(2).max(1) as usize;
+    let width = input_width(total_width);
     let rows: usize = app
         .input_buffer
         .split('\n')
@@ -284,21 +546,61 @@ fn input_height(app: &App, total_width: u16) -> u16 {
     ((rows as u16) + 2).clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT)
 }
 
+/// The slash-command autocomplete list, shown directly above the input box
+/// while the buffer is a bare "/word" matching at least one command -- see
+/// `App::matching_commands`. Highlights whichever entry Up/Down has landed on
+/// with the same "❯" cursor style the approval prompt uses, so the two menus
+/// in this app read as the same kind of thing rather than two different ones.
+fn render_command_menu(f: &mut Frame, area: Rect, app: &App, matches: &[(&str, &str)]) {
+    let selected = app.command_menu_selected.min(matches.len().saturating_sub(1));
+    let lines: Vec<Line> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, (name, desc))| {
+            let on = i == selected;
+            let marker = if on { "❯ " } else { "  " };
+            let name_style = if on {
+                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT)
+            };
+            Line::from(vec![
+                Span::styled(marker, theme::accent()),
+                Span::styled(format!("{name:<11}"), name_style),
+                Span::styled(*desc, theme::faint()),
+            ])
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::BORDER));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The prompt box: a rounded rule with a `❯` marker on the first row.
+///
+/// The marker is drawn as part of the content rather than as a border
+/// decoration so it scrolls with the text, and the cursor maths below indents
+/// past it by exactly `PROMPT_GUTTER`. Getting those two out of step puts the
+/// caret two cells from where the characters actually land, which is the kind
+/// of bug that makes an input box feel broken without being obviously wrong.
 fn render_input(f: &mut Frame, area: Rect, app: &App) {
-    let width = area.width.saturating_sub(2).max(1) as usize;
+    let width = input_width(area.width);
     let busy = app.is_busy();
 
     let (text, style) = if app.input_buffer.is_empty() {
         let hint = if busy {
-            "Waiting for the model… (Esc to cancel)".to_string()
+            "working… esc to interrupt".to_string()
         } else {
-            "Type your prompt… (Enter to send, Alt+Enter for newline, Ctrl-C to exit)".to_string()
+            "Ask anything, or describe a change…".to_string()
         };
-        (hint, Style::default().fg(Color::DarkGray))
+        (hint, theme::faint())
     } else {
         (
             app.input_buffer.clone(),
-            Style::default().fg(if busy { Color::DarkGray } else { Color::White }),
+            Style::default().fg(if busy { theme::MUTED } else { theme::TEXT }),
         )
     };
 
@@ -306,21 +608,33 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
     let mut rendered: Vec<Line> = Vec::new();
     for logical in text.split('\n') {
         for chunk in hard_wrap(logical, width) {
-            rendered.push(Line::from(chunk));
+            let marker = if rendered.is_empty() {
+                theme::PROMPT_MARK
+            } else {
+                " "
+            };
+            let marker_style = if busy {
+                theme::faint()
+            } else {
+                theme::accent()
+            };
+            rendered.push(Line::from(vec![
+                Span::styled(format!("{marker} "), marker_style),
+                Span::styled(chunk, style),
+            ]));
         }
     }
 
-    let border_style = if busy {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default().fg(Color::Cyan)
-    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(if busy { " Input (busy) " } else { " Input " });
+        .border_type(BorderType::Rounded)
+        .border_style(if busy {
+            Style::default().fg(theme::BORDER)
+        } else {
+            Style::default().fg(theme::ACCENT)
+        });
 
-    f.render_widget(Paragraph::new(rendered).block(block).style(style), area);
+    f.render_widget(Paragraph::new(rendered).block(block), area);
 
     // Cursor: only meaningful while the user can actually type, and only one
     // widget may claim it per frame -- render_overlay claims it instead while
@@ -338,33 +652,40 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
         let screen_col = col % width;
 
         let max_row = area.height.saturating_sub(3) as usize;
-        let x = area.x + 1 + screen_col.min(width - 1) as u16;
+        let x = area.x + 1 + PROMPT_GUTTER as u16 + screen_col.min(width - 1) as u16;
         let y = area.y + 1 + screen_row.min(max_row) as u16;
         f.set_cursor(x, y);
     }
 }
 
+/// A dim key bar under the prompt. What the app is *doing* is on the spinner
+/// line in the transcript instead -- next to the work, not stranded at the
+/// bottom of the screen.
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let (status, color) = match &app.state {
-        AppState::AwaitingInput => ("Ready", Color::Green),
-        AppState::Sending => ("Sending…", Color::Yellow),
-        AppState::Streaming => ("Streaming…", Color::Yellow),
-        AppState::AwaitingApproval => ("Waiting for you", Color::Magenta),
-        AppState::ExecutingTools => ("Running command…", Color::Blue),
+    let keys: &[(&str, &str)] = match &app.state {
+        // The approval box prints y/n/esc itself, directly under the command
+        // they act on. Repeating them here put the same three keys on screen
+        // twice, one row apart, which reads as two different prompts.
+        AppState::AwaitingApproval => &[("^c", "exit")],
+        _ if app.is_busy() => &[("esc", "interrupt"), ("^c", "exit")],
+        _ => &[
+            ("↵", "send"),
+            ("⌥↵", "newline"),
+            ("↑↓", "history"),
+            ("^c", "exit"),
+        ],
     };
 
-    let keys = match &app.state {
-        AppState::AwaitingApproval => " | y run · n skip · a allow all · Ctrl-C exit",
-        _ => " | Enter send · Alt+Enter newline · Esc cancel · Ctrl-C exit",
-    };
+    let mut spans = vec![Span::raw("  ")];
+    for (i, (key, label)) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", theme::faint()));
+        }
+        spans.push(Span::styled(*key, theme::key()));
+        spans.push(Span::styled(format!(" {label}"), theme::faint()));
+    }
 
-    let footer = Line::from(vec![
-        Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(status, Style::default().fg(color)),
-        Span::styled(keys, Style::default().fg(Color::DarkGray)),
-    ]);
-
-    f.render_widget(Paragraph::new(footer), area);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ---- /provider and /model overlays ---------------------------------------------
@@ -379,11 +700,17 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
     match &app.overlay {
         None => {}
         Some(Overlay::ProviderPicker { selected }) => {
-            let mut items: Vec<String> = providers::PROVIDERS.iter().map(|p| p.label.to_string()).collect();
+            let mut items: Vec<String> = providers::PROVIDERS
+                .iter()
+                .map(|p| p.label.to_string())
+                .collect();
             items.push("Custom endpoint...".to_string());
             render_picker(f, area, " Select a provider ", &items, *selected);
         }
-        Some(Overlay::ModelPicker { provider_id, selected }) => {
+        Some(Overlay::ModelPicker {
+            provider_id,
+            selected,
+        }) => {
             let provider = providers::find_provider(provider_id)
                 .expect("provider_id on a ModelPicker overlay always names a registry entry");
             let items: Vec<String> = provider.models.iter().map(|m| m.to_string()).collect();
@@ -430,9 +757,9 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
             };
             render_text_prompt(f, area, title, hint, &app.overlay_input, masked);
         }
-        Some(Overlay::ToolApproval { action, remaining }) => {
-            render_tool_approval(f, area, app, action, *remaining)
-        }
+        // Drawn inline at the bottom of the frame by `render`, not as a
+        // floating overlay -- see the comment there.
+        Some(Overlay::ToolApproval { .. }) => {}
     }
 }
 
@@ -441,31 +768,55 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
 /// written; this only bounds how tall the popup gets.
 const WRITE_PREVIEW_LINES: usize = 20;
 
-/// The approval prompt. This is the only thing standing between the model and
-/// the machine, so a command or a write's content is shown verbatim and in
-/// full -- never elided, never summarised (`write_file` content is capped at
-/// `WRITE_PREVIEW_LINES` purely so one huge file cannot produce an unusable
-/// popup). Approving something you cannot fully see is not approval.
-fn render_tool_approval(f: &mut Frame, area: Rect, app: &App, action: &Action, remaining: usize) {
-    let width = area.width.saturating_sub(10).clamp(MIN_POPUP_WIDTH, 90);
-    let inner = width.saturating_sub(4).max(1) as usize;
-
+/// The approval prompt's content, shared by sizing (`render` needs the line
+/// count before it can lay out the frame) and drawing. This is the only thing
+/// standing between the model and the machine, so a command or a write's
+/// content is shown verbatim and in full -- never elided, never summarised
+/// (`write_file` content is capped at `WRITE_PREVIEW_LINES` purely so one huge
+/// file cannot produce an unusably tall prompt). Approving something you
+/// cannot fully see is not approval.
+fn tool_approval_lines(
+    app: &App,
+    action: &Action,
+    remaining: usize,
+    inner: usize,
+) -> (&'static str, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
+
+    // A destructive command gets a banner before anything else. The prompt for
+    // `rm -rf build` must not look identical to the one for `cargo build` --
+    // that sameness is what trains people to press `y` without reading.
+    if let Action::Command { command, .. } = action {
+        let verdict = crate::danger::classify(command, Path::new(&app.workspace_root));
+        if let Some(reason) = verdict.reason() {
+            lines.push(Line::from(Span::styled(
+                "⚠  DESTRUCTIVE",
+                theme::danger_bold(),
+            )));
+            for wrapped in wrap(reason, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::DANGER),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
     let (title, verb) = match action {
         Action::Command { command, purpose } => {
             if let Some(purpose) = purpose {
                 for wrapped in wrap(purpose, inner) {
-                    lines.push(Line::from(Span::styled(
-                        wrapped,
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                    lines.push(Line::from(Span::styled(wrapped, theme::faint())));
                 }
                 lines.push(Line::from(""));
             }
             for wrapped in wrap(command, inner) {
                 lines.push(Line::from(Span::styled(
                     format!("$ {wrapped}"),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::TEXT)
+                        .add_modifier(Modifier::BOLD),
                 )));
             }
             (" Run this command? ", "run")
@@ -473,72 +824,182 @@ fn render_tool_approval(f: &mut Frame, area: Rect, app: &App, action: &Action, r
         Action::Read { path } => {
             lines.push(Line::from(Span::styled(
                 format!("📄 {path}"),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
             )));
             (" Read this file? ", "read")
         }
         Action::Write { path, content } => {
             lines.push(Line::from(Span::styled(
                 format!("📝 {path}"),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
             if content.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "(empty file)",
-                    Style::default().fg(Color::DarkGray),
-                )));
+                lines.push(Line::from(Span::styled("(empty file)", theme::faint())));
             } else {
                 let total = content.lines().count();
                 for (i, line) in content.lines().enumerate() {
                     if i >= WRITE_PREVIEW_LINES {
                         lines.push(Line::from(Span::styled(
-                            format!("… {} more line{}", total - i, if total - i == 1 { "" } else { "s" }),
-                            Style::default().fg(Color::DarkGray),
+                            format!(
+                                "… {} more line{}",
+                                total - i,
+                                if total - i == 1 { "" } else { "s" }
+                            ),
+                            theme::faint(),
                         )));
                         break;
                     }
                     for wrapped in wrap(line, inner) {
-                        lines.push(Line::from(Span::styled(wrapped, Style::default().fg(Color::White))));
+                        lines.push(Line::from(Span::styled(wrapped, theme::text())));
                     }
                 }
             }
             (" Write this file? ", "write")
+        }
+        Action::List { path } => {
+            lines.push(Line::from(Span::styled(
+                format!("📁 {path}"),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            (" List this directory? ", "list")
+        }
+        Action::Glob { pattern } => {
+            lines.push(Line::from(Span::styled(
+                format!("🔎 {pattern}"),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            (" Search for these files? ", "search")
+        }
+        // An edit shows both spans, because approving a replacement you cannot
+        // see is not approval. Unlike a write it does not need the whole file --
+        // showing only what changes is the reason to prefer this tool.
+        Action::Edit { path, old, new, replace_all } => {
+            lines.push(Line::from(Span::styled(
+                format!("✏️ {path}{}", if *replace_all { "  (all occurrences)" } else { "" }),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            let mut span = |label: &str, body: &str, colour| {
+                lines.push(Line::from(Span::styled(label.to_string(), theme::faint())));
+                let total = body.lines().count();
+                for (i, line) in body.lines().enumerate() {
+                    if i >= WRITE_PREVIEW_LINES {
+                        lines.push(Line::from(Span::styled(
+                            format!("… {} more line(s)", total - i),
+                            theme::faint(),
+                        )));
+                        break;
+                    }
+                    for wrapped in wrap(line, inner) {
+                        lines.push(Line::from(Span::styled(wrapped, Style::default().fg(colour))));
+                    }
+                }
+                lines.push(Line::from(""));
+            };
+            span("replace:", old, theme::DANGER);
+            span("with:", new, theme::SUCCESS);
+            (" Apply this edit? ", "edit")
         }
     };
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!("in {}", app.workspace_root),
-        Style::default().fg(Color::DarkGray),
+        theme::faint(),
     )));
     if remaining > 0 {
         lines.push(Line::from(Span::styled(
             format!("({remaining} more queued after this one)"),
-            Style::default().fg(Color::DarkGray),
+            theme::faint(),
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("y", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {verb}   "), Style::default().fg(Color::DarkGray)),
-        Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        Span::styled(" skip   ", Style::default().fg(Color::DarkGray)),
-        Span::styled("a", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            " run everything this session",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
 
-    let popup = centered_rect(width, lines.len() as u16 + 2, area);
-    f.render_widget(Clear, popup);
+    // Two choices, one highlighted -- Up/Down move the cursor between them,
+    // Enter confirms whichever one it is on, and y/n/esc still work directly
+    // for anyone who already knows which they want. The highlighted key stays
+    // bold and in its own colour either way, so a fast glance at the colour
+    // alone (not just the cursor) still tells you which one is live.
+    let cursor = |on: bool| if on { "❯ " } else { "  " };
+    let dim_unless = |on: bool, base: Style| if on { base } else { theme::faint() };
+
+    lines.push(Line::from(vec![
+        Span::styled(cursor(app.approval_selected), theme::accent()),
+        Span::styled(
+            "y",
+            dim_unless(
+                app.approval_selected,
+                Style::default()
+                    .fg(theme::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ),
+        Span::styled(format!(" {verb}"), theme::faint()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(cursor(!app.approval_selected), theme::accent()),
+        Span::styled(
+            "n",
+            dim_unless(
+                !app.approval_selected,
+                Style::default()
+                    .fg(theme::DANGER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ),
+        Span::styled(" skip", theme::faint()),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ choose · enter confirm · esc skip",
+        theme::faint(),
+    )));
+
+    (title, lines)
+}
+
+/// Draws the approval prompt into its reserved region at the bottom of the
+/// frame -- see the placement comment on `render`. No `Clear` and no
+/// centering: unlike a floating popup, this area belongs to the prompt alone,
+/// so there is nothing underneath it to protect or re-center against.
+fn render_tool_approval_inline(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    action: &Action,
+    remaining: usize,
+) {
+    let inner = area.width.saturating_sub(4).max(1) as usize;
+    let (title, lines) = tool_approval_lines(app, action, remaining, inner);
+
+    let destructive = matches!(action, Action::Command { command, .. }
+        if crate::danger::classify(command, Path::new(&app.workspace_root)).is_dangerous());
+    let accent = if destructive {
+        theme::DANGER
+    } else {
+        theme::ACCENT
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
-        .title(title);
-    f.render_widget(Paragraph::new(lines).block(block), popup);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent))
+        .title(Span::styled(
+            title,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::new(1, 1, 0, 0));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Centers a popup sized to its content within `area`, clamped so it never
@@ -553,27 +1014,36 @@ fn centered_rect(desired_width: u16, desired_height: u16, area: Rect) -> Rect {
     let height = desired_height.max(MIN_POPUP_HEIGHT).min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect { x, y, width, height }
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 fn render_picker(f: &mut Frame, area: Rect, title: &str, items: &[String], selected: usize) {
     let popup = centered_rect(50, items.len() as u16 + 2, area);
     f.render_widget(Clear, popup);
 
-    let list_items: Vec<ListItem> = items.iter().map(|label| ListItem::new(label.clone())).collect();
+    let list_items: Vec<ListItem> = items
+        .iter()
+        .map(|label| ListItem::new(label.clone()))
+        .collect();
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title.to_string());
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(Span::styled(title.to_string(), theme::accent_bold()));
     let list = List::new(list_items)
         .block(block)
+        .style(theme::text())
         .highlight_style(
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         )
-        .highlight_symbol("> ");
+        .highlight_symbol("❯ ");
 
     let mut state = ListState::default();
     state.select(Some(selected));
@@ -583,7 +1053,14 @@ fn render_picker(f: &mut Frame, area: Rect, title: &str, items: &[String], selec
 /// Single-line text entry (masked or plain). The cursor always sits at the end
 /// of `value` -- the overlay's editing model only supports insert/backspace, no
 /// repositioning, so there is nothing else for it to reflect.
-fn render_text_prompt(f: &mut Frame, area: Rect, title: &str, hint: &str, value: &str, masked: bool) {
+fn render_text_prompt(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    hint: &str,
+    value: &str,
+    masked: bool,
+) {
     let popup = centered_rect(60, 5, area);
     f.render_widget(Clear, popup);
 
@@ -595,20 +1072,18 @@ fn render_text_prompt(f: &mut Frame, area: Rect, title: &str, hint: &str, value:
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title.to_string());
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(Span::styled(title.to_string(), theme::accent_bold()));
 
     let value_line = if display.is_empty() {
-        Line::from(Span::styled(
-            "(type here)",
-            Style::default().fg(Color::DarkGray),
-        ))
+        Line::from(Span::styled("(type here)", theme::faint()))
     } else {
-        Line::from(Span::styled(display.clone(), Style::default().fg(Color::White)))
+        Line::from(Span::styled(display.clone(), theme::text()))
     };
 
     let lines = vec![
-        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(hint, theme::faint())),
         Line::from(""),
         value_line,
     ];
@@ -689,11 +1164,65 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Message;
+    use crate::llm::{FunctionCall, ToolCall};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    fn command_call(id: &str, command: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: crate::tools::RUN_COMMAND.to_string(),
+                arguments: serde_json::json!({ "command": command }).to_string(),
+            },
+        }
+    }
+
+    fn rendered_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer.get(x, y).symbol()).collect())
+            .collect()
+    }
+
+    /// The one row (as rendered text) that contains `needle`. Panics if none
+    /// or more than one row does -- both mean the assertion that follows
+    /// can't mean what it says.
+    fn row_containing(rows: &[String], needle: &str) -> String {
+        let matches: Vec<&String> = rows.iter().filter(|r| r.contains(needle)).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one row containing {needle:?}, found {}: {rows:?}",
+            matches.len()
+        );
+        matches[0].clone()
+    }
+
+    fn rendered_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
     fn frame(width: u16, height: u16) -> Rect {
-        Rect { x: 0, y: 0, width, height }
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
     }
 
     /// Regression: a popup wider or taller than the frame indexes off the end of
@@ -717,6 +1246,353 @@ mod tests {
         }
     }
 
+    /// The markers and gutters added around the transcript and the prompt all
+    /// subtract from the usable width, and every one of those subtractions is a
+    /// chance to underflow or to index past the end of a line on a narrow
+    /// terminal. Draw every state at every awkward size.
+    #[test]
+    fn every_screen_renders_at_any_terminal_size() {
+        let states = [
+            AppState::AwaitingInput,
+            AppState::Sending,
+            AppState::Streaming,
+            AppState::ExecutingTools,
+        ];
+
+        for state in &states {
+            for greeted in [false, true] {
+                let mut app = App::new(crate::config::Config::default());
+                app.greeted = greeted;
+                app.state = state.clone();
+                app.busy_started = Some(std::time::Instant::now());
+                app.workspace_status = "/some/rather/long/project/path".to_string();
+                app.streaming_response = "a fairly long streamed sentence to force wrapping".into();
+                app.running_tools = vec![command_call("c1", "cargo test --all-features")];
+                app.messages.push(Message::new(
+                    Role::User,
+                    "a prompt long enough to wrap around",
+                ));
+                app.messages
+                    .push(Message::new(Role::Tool, "$ cargo build — 12 lines"));
+                app.input_buffer = "typed text\nsecond line".to_string();
+                app.cursor = app.input_buffer.len();
+
+                for (w, h) in [
+                    (1, 1),
+                    (2, 3),
+                    (4, 5),
+                    (10, 6),
+                    (20, 8),
+                    (40, 12),
+                    (80, 24),
+                    (200, 60),
+                ] {
+                    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    terminal.draw(|f| render(f, &mut app)).unwrap_or_else(|e| {
+                        panic!("{state:?} greeted={greeted} at {w}x{h} failed: {e}")
+                    });
+                }
+            }
+        }
+    }
+
+    /// The welcome screen answers the three launch questions -- which model,
+    /// where do commands run, what do I type -- in one glance.
+    #[test]
+    fn the_welcome_screen_shows_the_identity_the_mascot_and_the_tips() {
+        let mut cfg = crate::config::Config::default();
+        cfg.llm.model = "deepseek-chat".to_string();
+        cfg.llm.api_key = "sk-set".to_string();
+        cfg.llm.endpoint = "https://api.deepseek.com".to_string();
+        let mut app = App::new(cfg);
+        app.workspace_status = "/srv/project".to_string();
+
+        // Tall enough for the whole screen: on a short terminal the tips fall
+        // below the fold, which is deliberate -- they are the least important
+        // thing on it -- but it is not what this test is checking.
+        let rendered = rendered_text(&mut app, 100, 30);
+
+        assert!(rendered.contains("Welcome back"), "{rendered}");
+        assert!(
+            rendered.contains(env!("CARGO_PKG_VERSION")),
+            "the version banner: {rendered}"
+        );
+        assert!(rendered.contains("deepseek-chat"), "{rendered}");
+        assert!(
+            rendered.contains("/srv/project"),
+            "where commands run: {rendered}"
+        );
+        assert!(rendered.contains("waits for your approval"), "{rendered}");
+        assert!(
+            rendered.contains(theme::MASCOT[2]),
+            "the mascot: {rendered}"
+        );
+    }
+
+    /// It is a launch screen, not furniture: the first prompt must replace it
+    /// with the transcript entirely.
+    #[test]
+    fn the_welcome_screen_disappears_once_the_conversation_starts() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages.push(Message::new(Role::User, "hello there"));
+
+        let rendered = rendered_text(&mut app, 100, 22);
+
+        assert!(!rendered.contains("Welcome back"), "{rendered}");
+        assert!(!rendered.contains("a terminal coding assistant"), "{rendered}");
+        assert!(rendered.contains("hello there"), "{rendered}");
+    }
+
+    /// Beside the mascot there is only room for the wordmark on a wide
+    /// terminal. Narrower than that the two collide, so the text stacks below
+    /// it instead of overlapping it -- and nothing is lost either way.
+    #[test]
+    fn a_narrow_terminal_stacks_the_wordmark_below_the_mascot() {
+        let mut app = App::new(crate::config::Config::default());
+        app.workspace_status = "/srv".to_string();
+
+        let row_of = |app: &mut App, w: u16, needle: &str| -> usize {
+            let mut terminal = Terminal::new(TestBackend::new(w, 30)).unwrap();
+            terminal.draw(|f| render(f, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..30)
+                .find(|&y| {
+                    (0..w)
+                        .map(|x| buffer.get(x, y).symbol())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("{needle:?} not found at width {w}")) as usize
+        };
+
+        // Wide: the wordmark shares its row with the mascot's first line.
+        assert_eq!(
+            row_of(&mut app, 100, "tuisample-code"),
+            row_of(&mut app, 100, theme::MASCOT[0])
+        );
+        // Narrow: it has moved below the mascot's last line.
+        assert!(
+            row_of(&mut app, 46, "tuisample-code") > row_of(&mut app, 46, theme::MASCOT[4]),
+            "the wordmark should stack under the mascot on a narrow terminal"
+        );
+    }
+
+    /// An unconfigured setup has to say so on the launch screen, not fail on
+    /// the first prompt. 30 rows, not 22: with four commands listed now
+    /// instead of two, 22 rows clips the warning below the fold on this
+    /// content -- still reachable by scrolling (see the dedicated test for
+    /// that), but this test is about the content existing at all, on a
+    /// terminal height realistic enough not to need scrolling for it.
+    #[test]
+    fn a_missing_api_key_is_reported_on_the_welcome_screen() {
+        let mut app = App::new(crate::config::Config::default());
+        let rendered = rendered_text(&mut app, 100, 30);
+
+        assert!(rendered.contains("Before you start"), "{rendered}");
+        assert!(rendered.contains("TUISAMPLE_API_KEY"), "{rendered}");
+    }
+
+    /// Regression: the welcome screen used to render with no scroll applied
+    /// at all, so on a short terminal (or once enough content accumulated,
+    /// which is exactly what adding /new and /usage to the command list
+    /// did) the tail -- including the API-key warning -- was silently
+    /// clipped with no way to reach it. It must now be reachable via the
+    /// same PageDown that already scrolls the ordinary transcript.
+    #[test]
+    fn a_clipped_welcome_screen_warning_is_reachable_by_scrolling() {
+        let mut app = App::new(crate::config::Config::default());
+        let short = rendered_text(&mut app, 100, 22);
+        assert!(
+            !short.contains("TUISAMPLE_API_KEY"),
+            "this test's premise is that 22 rows clips the warning -- it didn't: {short}"
+        );
+        assert!(short.contains("more"), "a hint that there's more below should show: {short}");
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        let scrolled = rendered_text(&mut app, 100, 22);
+        assert!(scrolled.contains("TUISAMPLE_API_KEY"), "{scrolled}");
+    }
+
+    /// The user's own turns sit on a raised block so scrolling back finds
+    /// "where did I ask that" by shape rather than by reading. It has to be a
+    /// rectangle -- every wrapped line padded to the same right edge -- or it
+    /// reads as highlighting rather than as a block.
+    #[test]
+    fn the_users_own_turns_sit_on_a_full_width_raised_block() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages.push(Message::new(
+            Role::User,
+            "a prompt long enough that it has to wrap onto a second line in this terminal",
+        ));
+        app.messages
+            .push(Message::new(Role::Assistant, "a reply from the model"));
+
+        let (w, h) = (60u16, 24u16);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // `render` adapts every colour for this machine's actual terminal
+        // (see `theme::adapt`), so the block's background may already be a
+        // downgraded 256-colour index here rather than raw SURFACE -- compare
+        // against the same adaptation, not the pre-adaptation constant.
+        let surface = theme::adapt(theme::SURFACE);
+        let highlighted: Vec<usize> = (0..h)
+            .filter(|&y| (0..w).any(|x| buffer.get(x, y).bg == surface))
+            .map(|y| y as usize)
+            .collect();
+
+        assert_eq!(highlighted.len(), 2, "both wrapped lines of the prompt");
+        assert_eq!(
+            highlighted[1],
+            highlighted[0] + 1,
+            "the block must be contiguous"
+        );
+
+        // Every highlighted row ends at the same column, or the block is ragged.
+        let right_edge = |y: usize| -> u16 {
+            (0..w)
+                .rev()
+                .find(|&x| buffer.get(x, y as u16).bg == surface)
+                .expect("row is highlighted")
+        };
+        assert_eq!(right_edge(highlighted[0]), right_edge(highlighted[1]));
+
+        // The model's prose is not on a block -- that is the whole contrast.
+        let reply_row = (0..h)
+            .find(|&y| {
+                (0..w)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+                    .contains("a reply from the model")
+            })
+            .expect("the reply must be on screen");
+        assert!(
+            (0..w).all(|x| buffer.get(x, reply_row).bg != surface),
+            "the assistant's prose must not be highlighted"
+        );
+    }
+
+    /// Regression: the approval box prints y/n/esc directly under the command,
+    /// and the footer printed the same three keys one row below it. Two
+    /// identical key bars a row apart read as two separate prompts.
+    #[test]
+    fn the_approval_keys_appear_exactly_once() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::AwaitingApproval;
+        app.workspace_root = "/tmp/project".to_string();
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Command {
+                command: "ls -la".to_string(),
+                purpose: None,
+            },
+            remaining: 0,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let rows_with_keys = (0..24)
+            .filter(|&y| {
+                (0..80)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+                    .contains("y run")
+            })
+            .count();
+
+        assert_eq!(rows_with_keys, 1, "the y/n/esc bar must be drawn once, not twice");
+    }
+
+    /// Regression: no live suggestions existed at all -- typing "/" showed
+    /// nothing, and the exact full command had to be typed before Enter did
+    /// anything. Confirms the menu actually renders (not just that the
+    /// underlying `matching_commands()` logic is right, which app.rs's own
+    /// tests already cover) and that the highlighted entry is visually
+    /// distinguishable from the rest.
+    #[test]
+    fn the_slash_command_menu_renders_with_the_highlighted_entry_marked() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.input_buffer = "/".to_string();
+        app.cursor = 1;
+
+        let rows = rendered_rows(&mut app, 80, 24);
+        let joined = rows.concat();
+
+        for (name, _) in crate::app::COMMANDS {
+            assert!(joined.contains(name), "{name} missing from menu: {joined}");
+        }
+
+        // Two "❯"s are expected on screen at once: the menu's cursor and the
+        // input box's own separate prompt marker (visible around the typed
+        // "/") -- so this looks specifically for the menu's, not just any.
+        let highlighted_provider_row = rows
+            .iter()
+            .find(|r| r.contains('❯') && r.contains("/provider"))
+            .expect("the menu's cursor should be on /provider, the first match");
+        assert!(highlighted_provider_row.contains("switch provider"), "{highlighted_provider_row}");
+    }
+
+    /// Regression: Up/Down had no effect at an approval prompt, so the only
+    /// way to answer it was typing y/n even though the rest of the app (the
+    /// provider/model pickers, prompt history) already used arrow navigation.
+    /// The cursor ("❯") must actually move between "y" and "n" as the
+    /// highlight changes, not just the underlying state.
+    #[test]
+    fn the_cursor_moves_between_yes_and_no_as_the_highlight_changes() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::AwaitingApproval;
+        app.workspace_root = "/tmp/project".to_string();
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Command { command: "ls -la".to_string(), purpose: None },
+            remaining: 0,
+        });
+
+        app.approval_selected = true;
+        let on_yes = rendered_rows(&mut app, 80, 24);
+        let yes_row = row_containing(&on_yes, "y run");
+        let no_row = row_containing(&on_yes, "n skip");
+        assert!(yes_row.contains('❯'), "cursor should be on \"yes\": {yes_row}");
+        assert!(!no_row.contains('❯'), "cursor should not be on \"no\": {no_row}");
+
+        app.approval_selected = false;
+        let on_no = rendered_rows(&mut app, 80, 24);
+        let yes_row = row_containing(&on_no, "y run");
+        let no_row = row_containing(&on_no, "n skip");
+        assert!(!yes_row.contains('❯'), "cursor should have moved off \"yes\": {yes_row}");
+        assert!(no_row.contains('❯'), "cursor should be on \"no\": {no_row}");
+
+        let joined = on_no.concat();
+        assert!(joined.contains("↑↓ choose"), "{joined}");
+        assert!(joined.contains("enter confirm"), "{joined}");
+    }
+
+    /// The spinner is the only thing that says a turn is still alive, and it
+    /// has to say what stops it.
+    #[test]
+    fn a_running_turn_shows_a_spinner_and_how_to_interrupt_it() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::Sending;
+        app.busy_started = Some(std::time::Instant::now());
+
+        let rendered = rendered_text(&mut app, 80, 24);
+        assert!(rendered.contains("Thinking…"), "{rendered}");
+        assert!(rendered.contains("esc to interrupt"), "{rendered}");
+
+        // Idle shows none of it.
+        app.state = AppState::AwaitingInput;
+        app.busy_started = None;
+        let idle = rendered_text(&mut app, 80, 24);
+        assert!(!idle.contains("esc to interrupt"), "{idle}");
+    }
+
     /// The end of the same bug: rendering an overlay into a zero-cell frame.
     #[test]
     fn rendering_an_overlay_into_a_zero_size_frame_does_not_panic() {
@@ -735,6 +1611,146 @@ mod tests {
                 .draw(|f| render(f, &mut app))
                 .unwrap_or_else(|e| panic!("{w}x{h} failed to render: {e}"));
         }
+    }
+
+    /// Regression: a tool approval used to float as a centered popup that
+    /// `Clear`ed and covered whatever transcript was underneath it -- the
+    /// "separate popup" a user compared unfavourably to Claude Code's inline
+    /// confirmation. It must now sit in its own reserved region at the bottom,
+    /// leaving the transcript above it fully intact and visible.
+    #[test]
+    fn a_tool_approval_leaves_the_transcript_visible_above_it() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages
+            .push(Message::new(Role::User, "delete the build directory"));
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Command {
+                command: "rm -rf build".to_string(),
+                purpose: Some("clear stale output".to_string()),
+            },
+            remaining: 0,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+
+        assert!(
+            rendered.contains("delete the build directory"),
+            "the transcript must still be visible: {rendered}"
+        );
+        assert!(rendered.contains("rm -rf build"), "{rendered}");
+        assert!(rendered.contains("Run this command?"), "{rendered}");
+
+        // The prompt must sit flush against the footer -- no gap below it the
+        // way a centered floating popup would leave -- and the transcript line
+        // must be above the prompt, not swallowed by it.
+        let area = buffer.area();
+        let row_text =
+            |y: u16| -> String { (0..area.width).map(|x| buffer.get(x, y).symbol()).collect() };
+        let transcript_row = (0..area.height)
+            .find(|&y| row_text(y).contains("delete the build directory"))
+            .expect("the earlier message must still be on screen");
+        let prompt_bottom_row = (0..area.height)
+            .rev()
+            .find(|&y| row_text(y).contains("skip"))
+            .expect("the y/n key hint must be on screen");
+
+        assert!(
+            transcript_row < prompt_bottom_row,
+            "transcript (row {transcript_row}) must be above the prompt (row {prompt_bottom_row})"
+        );
+        // Row height-1 is the footer, height-2 is the prompt box's bottom
+        // border: it must be non-blank, i.e. the box sits flush against the
+        // footer with no gap -- a floating centered popup would leave one.
+        assert!(
+            !row_text(area.height - 2).trim().is_empty(),
+            "the prompt's border should be flush against the footer, not floating mid-screen with a gap"
+        );
+    }
+
+    /// Regression: `ExecutingTools` used to draw straight from
+    /// `app.approved_tools`, which `main.rs` empties the instant it spawns the
+    /// runner -- so the on-screen "N commands" count went stale after one
+    /// frame even though the run was still going. It must read `running_tools`
+    /// (the snapshot) instead, and the footer must show a live command count
+    /// and elapsed time the way "Running 5 shell commands · 42s…" does.
+    #[test]
+    fn the_footer_shows_a_live_running_command_count_while_tools_execute() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::ExecutingTools;
+        app.busy_started = Some(std::time::Instant::now());
+        app.running_tools = vec![
+            command_call("call_1", "ls"),
+            command_call("call_2", "cat Cargo.toml"),
+        ];
+        // The queue `main.rs` would already have taken by this point -- the
+        // footer and transcript must not depend on it still being populated.
+        app.approved_tools.clear();
+
+        let rendered = rendered_text(&mut app, 80, 24);
+
+        assert!(rendered.contains("Running 2 commands"), "{rendered}");
+        assert!(
+            rendered.contains("(0s") || rendered.contains("(1s"),
+            "{rendered}"
+        );
+        // …and it says how to stop, since that is the other thing you want to
+        // know while watching something run.
+        assert!(rendered.contains("esc to interrupt"), "{rendered}");
+    }
+
+    /// The token count is a live estimate, so it must read as one ("~N
+    /// tokens") rather than a bare number that looks authoritative.
+    #[test]
+    fn the_footer_shows_an_approximate_token_count_while_streaming() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::Streaming;
+        app.busy_started = Some(std::time::Instant::now());
+        app.streamed_chars = 400; // -> ~100 tokens at the chars/4 estimate
+
+        let rendered = rendered_text(&mut app, 80, 24);
+
+        assert!(rendered.contains("~100 tokens"), "{rendered}");
+    }
+
+    /// Regression: labelling every line "You: " / "Assistant: " was what made
+    /// this read as a Q&A chat log instead of one continuous stream, the thing
+    /// a user compared unfavourably to Claude Code's transcript. The user's own
+    /// words still get a "> " quote marker; the assistant's prose gets nothing.
+    #[test]
+    fn the_transcript_reads_as_a_continuous_stream_not_a_labelled_chat_log() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages
+            .push(Message::new(Role::User, "write a hello world function"));
+        app.messages
+            .push(Message::new(Role::Assistant, "Here's the function..."));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            rendered.contains(&format!(
+                "{} write a hello world function",
+                theme::USER_MARK
+            )),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Here's the function"), "{rendered}");
+        assert!(!rendered.contains("You:"), "{rendered}");
+        assert!(!rendered.contains("Assistant:"), "{rendered}");
     }
 
     /// The command must appear verbatim: approving something you cannot read is
@@ -762,9 +1778,15 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
 
-        assert!(rendered.contains("rm -rf build"), "the command must be shown");
+        assert!(
+            rendered.contains("rm -rf build"),
+            "the command must be shown"
+        );
         assert!(rendered.contains("Run this command?"), "{rendered}");
-        assert!(rendered.contains("/tmp/project"), "where it runs must be shown");
+        assert!(
+            rendered.contains("/tmp/project"),
+            "where it runs must be shown"
+        );
         assert!(rendered.contains("y run"), "the keys must be shown");
     }
 
@@ -796,107 +1818,11 @@ mod tests {
         assert!(rendered.contains("hello.py"), "the path must be shown");
         assert!(rendered.contains("print"), "the content must be shown");
         assert!(rendered.contains("Write this file?"), "{rendered}");
-        assert!(rendered.contains("y write"), "the keys must say write, not run");
-    }
-
-    // ---- daily usage quota ----------------------------------------------------
-
-    fn draw(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        terminal.draw(|f| render(f, app)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
-    }
-
-    fn quota_app() -> App {
-        let mut app = App::new(crate::config::Config::default());
-        app.usage = crate::usage::DailyUsage {
-            date: crate::usage::today_local(),
-            ..Default::default()
-        };
-        app.greeted = true; // show the transcript, not the welcome panel
-        app
-    }
-
-    #[test]
-    fn the_header_shows_todays_usage_once_there_is_any() {
-        let mut app = quota_app();
-        app.usage.requests = 12;
-        app.usage.prompt_tokens = 8_000;
-        app.usage.completion_tokens = 400;
-
-        let rendered = draw(&mut app);
-        assert!(rendered.contains("12 req"), "{rendered}");
-        assert!(rendered.contains("8.4k tok"), "{rendered}");
-    }
-
-    /// Nothing spent yet means nothing to report -- the header should not gain a
-    /// permanent "0 req" fixture.
-    #[test]
-    fn the_header_stays_clean_before_the_first_request() {
-        let mut app = quota_app();
-        assert!(!draw(&mut app).contains("req"));
-    }
-
-    /// A spend figure that excludes unpriced usage must not read as complete.
-    #[test]
-    fn an_unpriced_day_never_renders_a_dollar_zero_total() {
-        let mut app = quota_app();
-        app.usage.requests = 4;
-        app.usage.unpriced_requests = 4;
-
-        let rendered = draw(&mut app);
-        assert!(rendered.contains("unpriced"), "{rendered}");
-        assert!(!rendered.contains("$0.00"), "a silent $0.00 would be a lie: {rendered}");
-    }
-
-    #[test]
-    fn estimated_token_counts_are_marked_in_the_header() {
-        let mut app = quota_app();
-        app.usage.requests = 1;
-        app.usage.prompt_tokens = 500;
-        app.usage.any_estimated = true;
-        assert!(draw(&mut app).contains("~500 tok"));
-    }
-
-    #[test]
-    fn the_welcome_screen_states_the_limit_when_one_is_set() {
-        let mut app = quota_app();
-        app.greeted = false;
-        app.config.quota.max_requests_per_day = 200;
-        app.config.quota.max_usd_per_day = 5.0;
-
-        let rendered = draw(&mut app);
-        assert!(rendered.contains("Daily limit"), "{rendered}");
-        assert!(rendered.contains("200 requests"), "{rendered}");
-        assert!(rendered.contains("$5.00"), "{rendered}");
-    }
-
-    #[test]
-    fn the_welcome_screen_says_nothing_about_quotas_when_none_are_set() {
-        let mut app = quota_app();
-        app.greeted = false;
-        assert!(!draw(&mut app).contains("Daily limit"));
-    }
-
-    /// The usage readout must not push the endpoint and model off a narrow
-    /// terminal, and must never panic there.
-    #[test]
-    fn the_header_survives_a_narrow_terminal() {
-        let mut app = quota_app();
-        app.usage.requests = 999;
-        app.usage.prompt_tokens = 12_345_678;
-
-        for (w, h) in [(1, 1), (20, 5), (40, 10), (200, 24)] {
-            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-            terminal
-                .draw(|f| render(f, &mut app))
-                .unwrap_or_else(|e| panic!("{w}x{h} failed to render: {e}"));
-        }
+        assert!(
+            rendered.contains("y write"),
+            "the keys must say write, not run"
+        );
     }
 }
+
+

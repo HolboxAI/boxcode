@@ -21,6 +21,7 @@
 //! reason to abandon the turn.
 
 use crate::config::ToolsConfig;
+use crate::danger;
 use crate::llm::ToolCall;
 use crate::workspace::Workspace;
 use serde::Deserialize;
@@ -32,6 +33,36 @@ use std::time::Duration;
 pub const RUN_COMMAND: &str = "run_command";
 pub const READ_FILE: &str = "read_file";
 pub const WRITE_FILE: &str = "write_file";
+pub const LIST_DIR: &str = "list_dir";
+pub const GLOB: &str = "glob";
+pub const EDIT_FILE: &str = "edit_file";
+
+/// Directories whose contents are build output or dependencies rather than the
+/// project. Walking them turns a `glob` into thousands of irrelevant results and
+/// buries whatever the model was looking for.
+pub const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "dist", "build"];
+
+/// Ceiling on `glob` results, so a careless `**/*` cannot fill the context
+/// window with paths.
+const MAX_GLOB_RESULTS: usize = 500;
+/// Ceiling on `list_dir` entries, for the same reason.
+const MAX_DIR_ENTRIES: usize = 300;
+
+fn is_skipped(path: &Path, workspace: &Path) -> bool {
+    path.strip_prefix(workspace)
+        .unwrap_or(path)
+        .components()
+        .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
+}
+
+/// A workspace-relative path for display, falling back to the full path if the
+/// file somehow sits outside (which `resolve_in_workspace` should have caught).
+fn relative_to(workspace: &Workspace, path: &Path) -> String {
+    path.strip_prefix(workspace.root())
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
 
 /// One executed (or declined) tool call, on its way back to the model.
 #[derive(Debug, Clone)]
@@ -130,6 +161,83 @@ pub fn schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": LIST_DIR,
+                "description": format!(
+                    "List the files and subdirectories of one directory in the project. \
+                     Cheaper and more predictable than shelling out to `ls`/`dir`, and it \
+                     skips {} automatically. Read-only.",
+                    SKIP_DIRS.join(", ")
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory relative to the project root. Defaults to the root itself."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": GLOB,
+                "description": format!(
+                    "Find files by path pattern, recursively. Use this to locate files when you \
+                     know roughly what they are called or where they live -- it is faster and \
+                     safer than `find`, and it skips {}. Read-only.",
+                    SKIP_DIRS.join(", ")
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob relative to the project root, e.g. 'src/**/*.rs' or '**/Cargo.toml'."
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": EDIT_FILE,
+                "description":
+                    "Replace an exact span of text in an existing file, leaving the rest untouched. \
+                     Prefer this over write_file for changing part of a file: write_file replaces \
+                     the whole thing, so it loses anything you did not reproduce. Read the file \
+                     first -- old_string must match byte for byte, including indentation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to edit, relative to the project directory."
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "Exact text to replace, including indentation. Must be unique unless replace_all is set."
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Text to put in its place."
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace every occurrence instead of requiring a unique match."
+                        }
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }
+            }
+        }),
     ]
 }
 
@@ -155,6 +263,15 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
     } else {
         "This is a Unix-like system: use `ls`, `cat`, `grep`, `find`, `sed`."
     };
+    // The command that hands a file to whatever app the OS has registered for
+    // it -- `open`/`xdg-open`/`start` all return immediately after launching
+    // that app, they do not block waiting for it to close, so this is safe
+    // under the same non-interactive/timeout rules as any other command.
+    let opener = match os {
+        "macos" => "open",
+        "windows" => "start",
+        _ => "xdg-open",
+    };
 
     format!(
         "You are tuisample-code, a terminal coding assistant.\n\n\
@@ -163,6 +280,11 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
          Tools:\n\
          - {READ_FILE}(path): read a file's contents.\n\
          - {WRITE_FILE}(path, content): create a file, or overwrite one, with new content.\n\
+         - {EDIT_FILE}(path, old_string, new_string, replace_all): replace an exact span of \
+           text in an existing file, leaving the rest untouched.\n\
+         - {LIST_DIR}(path): list one directory. Read-only, runs without asking.\n\
+         - {GLOB}(pattern): find files by path pattern, e.g. 'src/**/*.rs'. Read-only, runs \
+           without asking.\n\
          - {RUN_COMMAND}(command, purpose): run a shell command and get back its exit code, \
            stdout and stderr.\n\n\
          Rules:\n\
@@ -172,7 +294,27 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
            After tool results come back, close with one short sentence saying what happened \
            (e.g. \"Created hello.py and ran it — it printed Hello, World!\"). Never end a turn \
            with only tool calls and nothing said about them; the tool log is not a substitute \
-           for telling the user what you did.\n\
+           for telling the user what you did. When you already know you'll need more than one \
+           call to finish the thought -- write a file, then run it -- request all of them in the \
+           same turn instead of one at a time: one before-sentence and one after-sentence should \
+           cover the whole batch, not a fresh pair around each individual call.\n\
+         - Verify before declaring success: run what you wrote, or run a real check -- the test \
+           suite, a linter, importing the module, curling the endpoint -- and read the actual \
+           output. Do not assume something works because the code looks right. If a command \
+           fails, read the error and fix the real problem before retrying; do not repeat the \
+           same failing command unchanged.\n\
+         - If what you just created or changed is meant to be looked at rather than run for \
+           output -- a webpage, an image, a document -- offer to open it with `{opener}` via \
+           {RUN_COMMAND} instead of only telling the user how. This is still just another \
+           command: it waits for the same approval as everything else, it does not skip the \
+           prompt.\n\
+         - Explore with {LIST_DIR} and {GLOB} before guessing at paths, and prefer them over \
+           `ls`/`find` through {RUN_COMMAND}: they need no approval, so they cost the user \
+           nothing to answer.\n\
+         - To change part of an existing file use {EDIT_FILE}, not {WRITE_FILE}. {WRITE_FILE} \
+           replaces the entire file, so it silently destroys anything you did not reproduce; \
+           reserve it for creating a file or rewriting one wholesale. Read the file first so \
+           old_string matches byte for byte.\n\
          - Use {READ_FILE} to read a file and {WRITE_FILE} to create or change one -- not \
            `cat`/`type`/`sed`/shell redirection through {RUN_COMMAND}. Reserve {RUN_COMMAND} for \
            things that are not reading or writing a single file: search, builds, tests, running \
@@ -209,6 +351,26 @@ struct WriteFileArgs {
     content: String,
 }
 
+#[derive(Deserialize)]
+struct ListDirArgs {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GlobArgs {
+    pattern: String,
+}
+
+#[derive(Deserialize)]
+struct EditFileArgs {
+    path: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
 /// What a call is asking to do, in a form the approval popup and the
 /// transcript can render without knowing which tool produced it.
 #[derive(Clone, Debug, PartialEq)]
@@ -216,6 +378,13 @@ pub enum Action {
     Command { command: String, purpose: Option<String> },
     Read { path: String },
     Write { path: String, content: String },
+    /// Read-only, like `Read`: listing a directory changes nothing.
+    List { path: String },
+    /// Read-only, like `Read`.
+    Glob { pattern: String },
+    /// Changes a file, so it is approved like `Write` -- but shows only the
+    /// span being replaced, which is the whole reason to prefer it.
+    Edit { path: String, old: String, new: String, replace_all: bool },
 }
 
 impl Action {
@@ -227,6 +396,9 @@ impl Action {
             Action::Command { command, .. } => format!("$ {command}"),
             Action::Read { path } => format!("📄 read {path}"),
             Action::Write { path, .. } => format!("📝 write {path}"),
+            Action::List { path } => format!("📁 list {path}"),
+            Action::Glob { pattern } => format!("🔎 find {pattern}"),
+            Action::Edit { path, .. } => format!("✏️ edit {path}"),
         }
     }
 }
@@ -257,6 +429,32 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
             let args: WriteFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
             let path = args.path.trim().to_string();
             (!path.is_empty()).then_some(Action::Write { path, content: args.content })
+        }
+        LIST_DIR => {
+            // `path` is optional: no argument means the project root, so an
+            // absent or unparseable object still describes a valid action.
+            let args = serde_json::from_str::<ListDirArgs>(&call.function.arguments).ok();
+            let path = args
+                .and_then(|a| a.path)
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| ".".to_string());
+            Some(Action::List { path })
+        }
+        GLOB => {
+            let args: GlobArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let pattern = args.pattern.trim().to_string();
+            (!pattern.is_empty()).then_some(Action::Glob { pattern })
+        }
+        EDIT_FILE => {
+            let args: EditFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            (!path.is_empty() && !args.old_string.is_empty()).then_some(Action::Edit {
+                path,
+                old: args.old_string,
+                new: args.new_string,
+                replace_all: args.replace_all,
+            })
         }
         _ => None,
     }
@@ -347,16 +545,29 @@ pub fn is_read_only(command: &str) -> bool {
 }
 
 pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
+    // Belt and braces. `app::advance_approvals` already refuses blocked calls
+    // before they can be queued, so reaching this is a bug -- but the cost of
+    // the check is a string scan and the cost of missing it is an erased disk,
+    // so the runner refuses independently rather than trusting its caller.
+    if let Some(Action::Command { command, .. }) = describe_action(call) {
+        if let danger::Risk::Blocked(reason) = danger::classify(&command, workspace.root()) {
+            return refused_as_dangerous(call, &reason);
+        }
+    }
+
     match call.function.name.as_str() {
         RUN_COMMAND => execute_run_command(call, workspace, config).await,
         READ_FILE => execute_read_file(call, workspace, config).await,
         WRITE_FILE => execute_write_file(call, workspace).await,
+        LIST_DIR => execute_list_dir(call, workspace),
+        GLOB => execute_glob(call, workspace),
+        EDIT_FILE => execute_edit_file(call, workspace),
         other => outcome(
             &call.id,
             format!("⚙ {other} — unknown tool"),
             format!(
                 "Error: there is no tool named '{other}'. The tools are {RUN_COMMAND}, \
-                 {READ_FILE}, {WRITE_FILE}."
+                 {READ_FILE}, {WRITE_FILE}, {LIST_DIR}, {GLOB}, {EDIT_FILE}."
             ),
         ),
     }
@@ -568,6 +779,229 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
 }
 
 /// The result to hand back when the user says no.
+/// `list_dir` -- one directory, sorted, directories first.
+fn execute_list_dir(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+    let requested = serde_json::from_str::<ListDirArgs>(&call.function.arguments)
+        .ok()
+        .and_then(|a| a.path)
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+
+    let dir = match resolve_in_workspace(workspace, &requested) {
+        Ok(p) => p,
+        Err(e) => return outcome(&call.id, format!("📁 list {requested} — {e}"), format!("Error: {e}")),
+    };
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("📁 list {requested} — {e}"),
+                format!("Error: could not list '{requested}': {e}"),
+            )
+        }
+    };
+
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_skipped(&path, workspace.root()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            dirs.push(format!("{name}/"));
+        } else {
+            files.push(name);
+        }
+    }
+    dirs.sort();
+    files.sort();
+
+    let total = dirs.len() + files.len();
+    let mut listing: Vec<String> = dirs.into_iter().chain(files).collect();
+    let truncated = listing.len() > MAX_DIR_ENTRIES;
+    listing.truncate(MAX_DIR_ENTRIES);
+
+    let mut body = if listing.is_empty() {
+        format!("'{requested}' is empty.")
+    } else {
+        listing.join("\n")
+    };
+    if truncated {
+        body.push_str(&format!("\n[{} more entries]", total - MAX_DIR_ENTRIES));
+    }
+
+    outcome(
+        &call.id,
+        format!("📁 list {requested} — {total} entries"),
+        clip(&body, 32_000),
+    )
+}
+
+/// `glob` -- find files by path pattern.
+fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<GlobArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "🔎 glob — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"pattern": "src/**/*.rs"}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+    let pattern = args.pattern.trim();
+    if pattern.is_empty() {
+        return outcome(
+            &call.id,
+            "🔎 glob — empty pattern".to_string(),
+            "Error: pattern must not be empty.".to_string(),
+        );
+    }
+
+    let joined = workspace.root().join(pattern);
+    let Some(joined) = joined.to_str() else {
+        return outcome(
+            &call.id,
+            "🔎 glob — invalid pattern".to_string(),
+            "Error: pattern is not valid UTF-8.".to_string(),
+        );
+    };
+
+    let paths = match glob::glob(joined) {
+        Ok(p) => p,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("🔎 glob {pattern} — invalid"),
+                format!("Error: '{pattern}' is not a valid glob: {e}"),
+            )
+        }
+    };
+
+    let mut files: Vec<String> = paths
+        .flatten()
+        .filter(|p| p.is_file())
+        // Canonicalize *before* the containment check. `starts_with` is lexical,
+        // so `<workspace>/../sibling/x.rs` would otherwise pass it -- a glob is a
+        // path expression like any other and must not read its way out.
+        .filter_map(|p| p.canonicalize().ok())
+        .filter(|p| p.starts_with(workspace.root()))
+        .filter(|p| !is_skipped(p, workspace.root()))
+        .map(|p| relative_to(workspace, &p))
+        .collect();
+    files.sort();
+    files.dedup();
+
+    if files.is_empty() {
+        // Finding nothing is an answer, not a failure -- an error would push the
+        // model toward retrying instead of concluding.
+        return outcome(
+            &call.id,
+            format!("🔎 glob {pattern} — no matches"),
+            format!("No files match '{pattern}'."),
+        );
+    }
+
+    let total = files.len();
+    files.truncate(MAX_GLOB_RESULTS);
+    let mut body = files.join("\n");
+    if total > MAX_GLOB_RESULTS {
+        body.push_str(&format!(
+            "\n[{} more matches; narrow the pattern]",
+            total - MAX_GLOB_RESULTS
+        ));
+    }
+
+    outcome(
+        &call.id,
+        format!("🔎 glob {pattern} — {total} match(es)"),
+        clip(&body, 32_000),
+    )
+}
+
+/// `edit_file` -- replace an exact span, leaving the rest of the file alone.
+fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<EditFileArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "✏️ edit_file — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"path": "src/main.rs", "old_string": "...", "new_string": "..."}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+
+    let requested = args.path.trim().to_string();
+    let fail = |msg: String| outcome(&call.id, format!("✏️ edit {requested} — failed"), msg);
+
+    if requested.is_empty() {
+        return fail("Error: path must not be empty.".to_string());
+    }
+    if args.old_string.is_empty() {
+        return fail(
+            "Error: old_string must not be empty. Use write_file to create a file.".to_string(),
+        );
+    }
+    if args.old_string == args.new_string {
+        return fail("Error: old_string and new_string are identical.".to_string());
+    }
+
+    let path = match resolve_in_workspace(workspace, &requested) {
+        Ok(p) => p,
+        Err(e) => return fail(format!("Error: {e}")),
+    };
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => return fail(format!("Error: could not read '{requested}': {e}")),
+    };
+
+    let matches = contents.matches(&args.old_string).count();
+    match matches {
+        0 => {
+            return fail(format!(
+                "Error: old_string was not found in '{requested}'. It must match byte for byte, \
+                 including indentation. Read the file and copy the text exactly."
+            ))
+        }
+        // Silently editing the wrong one of several identical spans is the most
+        // damaging thing this tool could do, so an ambiguous edit is refused
+        // rather than guessed at.
+        n if n > 1 && !args.replace_all => {
+            return fail(format!(
+                "Error: old_string appears {n} times in '{requested}'. Add surrounding context to \
+                 make it unique, or pass replace_all: true."
+            ))
+        }
+        _ => {}
+    }
+
+    let updated = if args.replace_all {
+        contents.replace(&args.old_string, &args.new_string)
+    } else {
+        contents.replacen(&args.old_string, &args.new_string, 1)
+    };
+
+    if let Err(e) = std::fs::write(&path, &updated) {
+        return fail(format!("Error: could not write '{requested}': {e}"));
+    }
+
+    let replaced = if args.replace_all { matches } else { 1 };
+    outcome(
+        &call.id,
+        format!("✏️ edit {requested} — {replaced} replacement(s)"),
+        format!(
+            "Replaced {replaced} occurrence(s) in '{requested}'. The file is now {} bytes.",
+            updated.len()
+        ),
+    )
+}
+
 pub fn declined(call: &ToolCall) -> ToolOutcome {
     let label = describe_action(call)
         .map(|a| a.label())
@@ -578,6 +1012,28 @@ pub fn declined(call: &ToolCall) -> ToolOutcome {
         "The user declined to let this happen. Do not try it again; take a different \
          approach or answer without it."
             .to_string(),
+    )
+}
+
+/// The result for a call the guardrails refused outright.
+///
+/// Worded so the model treats it as a settled boundary rather than an obstacle
+/// to route around: without that it tends to retry the same thing spelled
+/// differently, which is exactly what a blocklist is worst at catching.
+pub fn refused_as_dangerous(call: &ToolCall, reason: &str) -> ToolOutcome {
+    let label = describe_action(call)
+        .map(|a| a.label())
+        .unwrap_or_else(|| call.function.name.clone());
+    outcome(
+        &call.id,
+        format!("⛔ {} — blocked", clip(&label, 60)),
+        format!(
+            "Blocked by the safety guardrails and never run: {reason}.\n\
+             This was refused by the tool itself, not by the user, and no setting can permit \
+             it. Do not attempt this again in any form, and do not try to work around it. \
+             Tell the user plainly what you wanted to do and why it was blocked, and let them \
+             run it themselves if they judge it safe."
+        ),
     )
 }
 
@@ -631,6 +1087,267 @@ mod tests {
                 arguments: json!({ "command": command }).to_string(),
             },
         }
+    }
+
+    // ---- ported tools: list_dir, glob, edit_file -------------------------------
+
+    fn tool_call(name: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    /// A workspace with a nested source tree and some build output to ignore.
+    fn tree() -> (tempfile::TempDir, Workspace, ToolsConfig) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/ui")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(root.join("src/app.rs"), "let needle = 1;\n").unwrap();
+        std::fs::write(root.join("src/ui/render.rs"), "// ui\n").unwrap();
+        std::fs::write(root.join("target/debug/app.rs"), "// build output\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.rs"), "// dep\n").unwrap();
+        let ws = Workspace::new(root).expect("workspace");
+        (dir, ws, ToolsConfig::default())
+    }
+
+    #[tokio::test]
+    async fn list_dir_lists_directories_first_and_skips_build_output() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(LIST_DIR, json!({})), &ws, &cfg).await;
+        let listing = out.content;
+        assert!(listing.contains("src/"), "{listing}");
+        assert!(listing.contains("Cargo.toml"), "{listing}");
+        // Build output and dependencies are noise, not project structure.
+        assert!(!listing.contains("target"), "{listing}");
+        assert!(!listing.contains("node_modules"), "{listing}");
+        // Directories sort before files.
+        assert!(listing.find("src/").unwrap() < listing.find("Cargo.toml").unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_dir_defaults_to_the_workspace_root() {
+        let (_d, ws, cfg) = tree();
+        let with = execute(&tool_call(LIST_DIR, json!({"path": "."})), &ws, &cfg).await;
+        let without = execute(&tool_call(LIST_DIR, json!({})), &ws, &cfg).await;
+        assert_eq!(with.content, without.content);
+    }
+
+    #[tokio::test]
+    async fn list_dir_cannot_escape_the_workspace() {
+        let (_d, ws, cfg) = tree();
+        for escape in ["..", "../..", "/etc"] {
+            let out = execute(&tool_call(LIST_DIR, json!({"path": escape})), &ws, &cfg).await;
+            assert!(
+                out.content.contains("outside the workspace"),
+                "{escape} must be refused: {}",
+                out.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_matches_recursively_and_returns_relative_paths() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(GLOB, json!({"pattern": "src/**/*.rs"})), &ws, &cfg).await;
+        let mut found: Vec<&str> = out.content.lines().collect();
+        found.sort();
+        assert_eq!(found, vec!["src/app.rs", "src/ui/render.rs"]);
+    }
+
+    #[tokio::test]
+    async fn glob_skips_build_output_and_dependencies() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(GLOB, json!({"pattern": "**/*.rs"})), &ws, &cfg).await;
+        assert!(!out.content.contains("target/"), "{}", out.content);
+        assert!(!out.content.contains("node_modules/"), "{}", out.content);
+    }
+
+    /// Finding nothing is an answer, not a failure -- an error would push the
+    /// model toward retrying instead of concluding.
+    #[tokio::test]
+    async fn glob_reports_no_matches_as_a_normal_result() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(GLOB, json!({"pattern": "**/*.py"})), &ws, &cfg).await;
+        assert!(out.content.contains("No files match"), "{}", out.content);
+    }
+
+    /// A glob is a path expression like any other and must not read its way out
+    /// of the workspace.
+    ///
+    /// `..` is not rejected outright -- it is allowed to *expand*, and then
+    /// every result is canonicalized and dropped unless it is genuinely inside
+    /// the root. That ordering matters: `starts_with` is lexical, so filtering
+    /// before canonicalizing would let `<workspace>/../sibling/x` through.
+    #[tokio::test]
+    async fn glob_cannot_escape_the_workspace() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("inside.rs"), "// in\n").unwrap();
+        // A sibling of the workspace, which no pattern may reach.
+        std::fs::write(dir.path().join("outside.rs"), "// SECRET\n").unwrap();
+        let ws = Workspace::new(&root).expect("workspace");
+        let cfg = ToolsConfig::default();
+
+        for pattern in ["../*.rs", "../**/*.rs", "/etc/*"] {
+            let out = execute(&tool_call(GLOB, json!({"pattern": pattern})), &ws, &cfg).await;
+            assert!(
+                !out.content.contains("outside.rs") && !out.content.contains("SECRET"),
+                "{pattern} escaped the workspace: {}",
+                out.content
+            );
+            for line in out.content.lines().filter(|l| l.ends_with(".rs")) {
+                assert!(
+                    !line.starts_with("..") && !line.starts_with('/'),
+                    "{pattern} returned a path outside the root: {line}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_rejects_an_invalid_pattern_with_an_actionable_message() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(GLOB, json!({"pattern": "src/[unclosed"})), &ws, &cfg).await;
+        assert!(out.content.contains("not a valid glob"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn edit_file_replaces_one_span_and_leaves_the_rest() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "keep\nlet needle = 1;\nkeep too\n").unwrap();
+
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({
+                "path": "src/app.rs", "old_string": "let needle = 1;", "new_string": "let needle = 2;"
+            })),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        assert!(out.content.contains("Replaced 1"), "{}", out.content);
+        let after = std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap();
+        assert_eq!(after, "keep\nlet needle = 2;\nkeep too\n");
+    }
+
+    /// Silently editing the wrong one of several identical spans is the most
+    /// damaging thing this tool could do, so ambiguity is refused not guessed.
+    #[tokio::test]
+    async fn edit_file_refuses_an_ambiguous_match_unless_told_to_replace_all() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "x = 1;\nx = 1;\n").unwrap();
+
+        let ambiguous = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "old_string": "x = 1;", "new_string": "x = 2;"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(ambiguous.content.contains("appears 2 times"), "{}", ambiguous.content);
+        // Nothing was written.
+        assert_eq!(
+            std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap(),
+            "x = 1;\nx = 1;\n"
+        );
+
+        let all = execute(
+            &tool_call(EDIT_FILE, json!({
+                "path": "src/app.rs", "old_string": "x = 1;", "new_string": "x = 2;", "replace_all": true
+            })),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(all.content.contains("Replaced 2"), "{}", all.content);
+        assert_eq!(
+            std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap(),
+            "x = 2;\nx = 2;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_reports_a_missing_span_without_touching_the_file() {
+        let (_d, ws, cfg) = tree();
+        let before = std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap();
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "old_string": "not there", "new_string": "x"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.content.contains("was not found"), "{}", out.content);
+        assert_eq!(std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_an_empty_or_unchanged_span() {
+        let (_d, ws, cfg) = tree();
+        let empty = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "old_string": "", "new_string": "x"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(empty.content.contains("must not be empty"), "{}", empty.content);
+
+        let same = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "old_string": "a", "new_string": "a"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(same.content.contains("identical"), "{}", same.content);
+    }
+
+    #[tokio::test]
+    async fn edit_file_cannot_escape_the_workspace() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({
+                "path": "../outside.txt", "old_string": "a", "new_string": "b"
+            })),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.content.contains("outside the workspace"), "{}", out.content);
+    }
+
+    /// The approval prompt must be able to describe every tool, or a call would
+    /// reach the runner with nothing shown to the user.
+    #[test]
+    fn every_ported_tool_describes_an_action() {
+        assert!(matches!(
+            describe_action(&tool_call(LIST_DIR, json!({"path": "src"}))),
+            Some(Action::List { .. })
+        ));
+        assert!(matches!(
+            describe_action(&tool_call(LIST_DIR, json!({}))),
+            Some(Action::List { .. })
+        ));
+        assert!(matches!(
+            describe_action(&tool_call(GLOB, json!({"pattern": "**/*.rs"}))),
+            Some(Action::Glob { .. })
+        ));
+        assert!(matches!(
+            describe_action(&tool_call(EDIT_FILE, json!({
+                "path": "a.rs", "old_string": "x", "new_string": "y"
+            }))),
+            Some(Action::Edit { .. })
+        ));
+        // Unusable arguments describe nothing, so the runner reports them back
+        // to the model rather than the user being asked to approve a blank.
+        assert!(describe_action(&tool_call(GLOB, json!({"pattern": "  "}))).is_none());
+        assert!(describe_action(&tool_call(EDIT_FILE, json!({"path": "a.rs"}))).is_none());
     }
 
     fn read_call(path: &str) -> ToolCall {
@@ -914,11 +1631,71 @@ mod tests {
         );
     }
 
+    /// Regression: without this, "narrate before and after" was read as
+    /// per-call rather than per-turn, so a write followed by a run produced
+    /// three separate narrated turns (before the write, before the run, and a
+    /// final summary) instead of one plan sentence and one result sentence --
+    /// the gap a user pointed at directly when comparing this to Claude Code's
+    /// single-summary output for the same two-step task.
+    #[test]
+    fn the_system_prompt_asks_for_multiple_calls_in_one_turn_rather_than_one_narrated_turn_each() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(prompt.contains("request all of them in the same turn"), "{prompt}");
+        assert!(
+            prompt.contains("not a fresh pair around each individual call"),
+            "{prompt}"
+        );
+    }
+
+    /// Without this a model can write code, never run it, and declare success
+    /// on the strength of "it looks right" -- the same class of gap narration
+    /// closed for communication, but for correctness.
+    #[test]
+    fn the_system_prompt_requires_verifying_work_before_declaring_success() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(prompt.contains("Verify before declaring success"), "{prompt}");
+        assert!(
+            prompt.contains("Do not assume something works because the code looks right"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("do not repeat the same failing command unchanged"),
+            "{prompt}"
+        );
+    }
+
+    /// Regression: without this, the model would write something like
+    /// hello.html and only describe how to open it, instead of offering to
+    /// open it itself the way Claude Code does. The nudge must not come at
+    /// the cost of the approval rule -- opening still goes through the same
+    /// prompt as every other command, there is no exception carved out here.
+    #[test]
+    fn the_system_prompt_offers_to_open_viewable_output_without_skipping_approval() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+
+        assert!(
+            prompt.contains("offer to open it with"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("it waits for the same approval as everything else, it does not skip the prompt"),
+            "{prompt}"
+        );
+    }
+
     #[test]
     fn the_schemas_name_exactly_the_tools_that_execute() {
         let schemas = schemas();
         let names: Vec<_> = schemas.iter().map(|s| s["function"]["name"].clone()).collect();
-        assert_eq!(names, vec![RUN_COMMAND, READ_FILE, WRITE_FILE]);
+        assert_eq!(
+            names,
+            vec![RUN_COMMAND, READ_FILE, WRITE_FILE, LIST_DIR, GLOB, EDIT_FILE]
+        );
     }
 
     #[test]

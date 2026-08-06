@@ -1,6 +1,6 @@
 [package]
 name = "tuisample-code"
-version = "0.6.0"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
@@ -14,7 +14,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 futures = "0.3"
-chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+glob = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

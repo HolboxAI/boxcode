@@ -83,3 +83,62 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "PASS: install_binary replaces a running binary by rename and cleans up on failure"
+
+# --- ping_install -------------------------------------------------------------
+# Anonymous install ping. Enabled by default (points at the real telemetry
+# endpoint -- see ping_install's own doc comment), must be disableable by an
+# explicit blank override, and must never fail the install itself even when a
+# URL is configured but nothing is listening.
+#
+# Deliberately does NOT test "an unset TUISAMPLE_TELEMETRY_URL reaches the
+# real production endpoint" by actually letting that curl fire -- these tests
+# run on every `cargo test`/CI pass, and that would mean every test run sends
+# a real ping to production. The URL-resolution logic itself (unset falls
+# back to the default, an explicit blank overrides and disables even with a
+# non-blank default) is what telemetry.rs's own `telemetry_url_given` tests
+# cover on the Rust side; the bash side only needs to prove *this* script's
+# substitution has the same "unset vs. explicitly blank" distinction, which
+# the test below does by explicitly overriding to a non-production URL either
+# way.
+
+fake_home=$(mktemp -d)
+fake_bin="$workdir/fake-binary"
+cat > "$fake_bin" <<'EOF'
+#!/bin/bash
+echo "tuisample-code 9.9.9"
+EOF
+chmod +x "$fake_bin"
+
+# An explicit blank override disables sending -- even though the default is
+# now a real, non-blank endpoint. This is "${VAR-default}" (no colon) rather
+# than "${VAR:-default}" specifically so this case is reachable at all: the
+# colon form can't distinguish "unset" from "set to empty".
+TUISAMPLE_TELEMETRY_URL="" HOME="$fake_home" ping_install "$fake_bin" ||
+  fail "ping_install must return 0 even when explicitly disabled"
+[ -f "$fake_home/.tuisample-code/device_id" ] &&
+  fail "an explicitly blank override must disable sending despite a non-blank default"
+
+echo "PASS: ping_install is disabled by an explicit blank TUISAMPLE_TELEMETRY_URL override"
+
+# Enabled, but pointing at nothing reachable: must still return success and
+# must still create the device id (idempotently, for install.sh's own use and
+# for the app binary to reuse on first launch), without ever blocking on the
+# network -- ping_install backgrounds the curl itself, so this call returns
+# long before any 3s curl timeout could.
+rm -rf "$fake_home"
+mkdir -p "$fake_home"
+start=$(date +%s)
+TUISAMPLE_TELEMETRY_URL="http://127.0.0.1:1/nowhere" HOME="$fake_home" ping_install "$fake_bin" ||
+  fail "ping_install must return 0 even when the endpoint is unreachable"
+elapsed=$(( $(date +%s) - start ))
+[ -f "$fake_home/.tuisample-code/device_id" ] || fail "device id must be created once enabled"
+[ -s "$fake_home/.tuisample-code/device_id" ] || fail "device id file must not be empty"
+[ "$elapsed" -lt 2 ] || fail "ping_install must not block on the network (took ${elapsed}s)"
+
+first_id=$(cat "$fake_home/.tuisample-code/device_id")
+TUISAMPLE_TELEMETRY_URL="http://127.0.0.1:1/nowhere" HOME="$fake_home" ping_install "$fake_bin"
+second_id=$(cat "$fake_home/.tuisample-code/device_id")
+[ "$first_id" = "$second_id" ] || fail "an existing device id must be reused, not regenerated"
+
+rm -rf "$fake_home"
+echo "PASS: ping_install is non-blocking, creates a stable device id once enabled, and never fails the install"

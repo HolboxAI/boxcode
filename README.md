@@ -3,24 +3,44 @@
 Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-compatible LLM endpoint.
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ tuisample-code | llm.company.internal | model: company-70b │
-├──────────────────────────────────────────────────────────┤
-│                                                           │
-│ Assistant: Here's the function...                        │
-│ def hello_world():                                       │
-│   return "Hello, World!"                                │
-│                                                           │
-│ ✓ Generated 120 tokens in 1.2s                          │
-│                                                           │
-│ You: > write a hello world function                     │
-│                                                           │
-├──────────────────────────────────────────────────────────┤
-│ > your prompt here... (Enter to send, Esc cancel)        │
-├──────────────────────────────────────────────────────────┤
-│ Status: Ready | Press Ctrl-C to exit                    │
-└──────────────────────────────────────────────────────────┘
+ ◈
+
+  ▟█▙       ▟█▙    tuisample-code  v0.8.0
+  ▜███████████▛    a terminal coding assistant
+  ██  █████  ██
+  ▜███████████▛    Welcome back, you!
+    ▜█▛   ▜█▛
+
+  ────────────────────────────────────────────────────────────────
+
+  model     deepseek-chat
+  endpoint  https://api.deepseek.com
+  cwd       ~/Desktop/HolboxAI/tuisample-code
+
+  /provider switch provider or endpoint
+  /model    switch model
+
+  Ask about this project — it can read files and run commands.
+  Every command and every write waits for your approval.
+
+╭──────────────────────────────────────────────────────────────────────╮
+│❯ add a health check endpoint                                         │
+╰──────────────────────────────────────────────────────────────────────╯
+  ↵ send  ·  ⌥↵ newline  ·  ↑↓ history  ·  ^c exit
 ```
+
+While a turn runs, a spinner sits at the end of the transcript — right above
+the prompt, where you're already looking:
+
+```
+  ❯ add a health check endpoint
+
+  I'll add it to the router and run the tests.
+  · $ cargo test — 42 lines
+
+  ⠹ Responding… (4s · ~120 tokens · esc to interrupt)
+```
+
 
 ## Quick Start
 
@@ -106,7 +126,7 @@ change files directly instead of hand-encoding writes into shell commands:
 ```
 > create hello.py and run it
 📝 /Users/you/project/hello.py
-Assistant: Created it — printing "Hello, World!" and running it now.
+Created it — printing "Hello, World!" and running it now.
 $ python3 hello.py — 1 line
 ```
 
@@ -121,21 +141,23 @@ Each one stops and waits for you — a write shows the file's full new content,
 not a shell string:
 
 ```
-┌ Write this file? ────────────────────────────┐
-│ 📝 hello.py                                   │
+╭ Write this file? ────────────────────────────╮
+│  📝 hello.py                                  │
 │                                              │
-│ print("Hello, World!")                       │
+│  print("Hello, World!")                      │
 │                                              │
-│ in /Users/you/project                        │
+│  in /Users/you/project                       │
 │                                              │
-│ y write   n skip   a run everything this session│
-└──────────────────────────────────────────────┘
+│  y write  ·  n skip  ·  esc skip             │
+╰──────────────────────────────────────────────╯
 ```
 
 **`y`** does it · **`n`** or **Esc** skips it and tells the model to try
-something else · **`a`** stops asking for the rest of the session. Reads of a
-short, conservative allowlist (`ls`, `cat`, `grep`, `git status`/`diff`, ...)
-skip the prompt by default — see `auto_approve_read_only` below.
+something else. Every action is asked about individually — there is
+deliberately no "allow everything from now on" key, so one impatient keystroke
+can never cover commands the model has not thought of yet. Reads of a short,
+conservative allowlist (`ls`, `cat`, `grep`, `git status`/`diff`, ...) skip the
+prompt by default — see `auto_approve_read_only` below.
 
 These prompts are the *only* thing limiting what the model can do. `run_command`
 can read any file your user can read, write anywhere, and delete anything —
@@ -147,6 +169,48 @@ injected paths, not a sandbox either. Read each prompt before pressing `y`.
 
 Commands run with **stdin closed** and are killed after a timeout, so anything
 interactive (`vim`, a dev server, a REPL) will time out rather than hang.
+
+### Some things are refused outright
+
+A third tier sits above the prompt. Genuinely catastrophic commands are never
+run and are **never even offered for approval** — offering `rm -rf /` as a y/n
+question is itself the bug, since one mistyped keystroke accepts it and there
+is no undo:
+
+```
+⛔ $ rm -rf / — blocked
+   `rm` aimed at `/`, which is outside the project directory
+```
+
+Refused: deleting anything outside the project directory or the project itself
+(`rm -rf /`, `~`, `/etc`, `../..`, `.`, `*`), `--no-preserve-root`, disk
+formatting (`mkfs`, `fdisk`, `dd of=/dev/sda`), writing to raw devices, fork
+bombs, shutdown/reboot, piping a download into a shell (`curl … | sh`),
+executing base64-decoded data, `kill -9 1`, and recursive `chmod`/`chown` on
+system paths. Every segment of a chained command is checked, so
+`ls && rm -rf /` is caught too.
+
+Windows and PowerShell are covered by the same rules: `del /f /s /q C:\`,
+`rd /s /q C:\`, `Remove-Item -Recurse -Force C:\`, `format`, `diskpart`,
+`cipher /w`, `bcdedit`, `reg delete HKLM`, `Clear-Disk`, and
+`vssadmin delete shadows` (which destroys the backups that would let you
+recover).
+
+**No setting reaches this.** Not `require_approval = false`, not
+`auto_approve_read_only`. There is deliberately no config option to turn it off.
+
+A middle tier — destructive but legitimate — always stops for an explicit
+decision, *even with approval switched off entirely*: `rm -rf build`,
+`git reset --hard`,
+`git clean -fd`, force-push, `sudo` anything, `find … -delete`, uninstalls,
+`docker prune`. The prompt shows a red **DESTRUCTIVE** banner and why.
+
+> This is not a sandbox, and no blocklist can be one. A command that builds its
+> argument at runtime (`rm -rf $(printf '\x2f')`) defeats any static check —
+> such commands are forced to the always-ask tier rather than judged safe, but
+> the honest claim is narrow: this catches destructive commands a model
+> produces **by mistake**, which is the realistic failure mode. It does not
+> stop a determined attacker. Real containment needs an OS sandbox.
 
 ### Configuration
 
@@ -184,152 +248,15 @@ on Windows, and the model is told which platform it is on so it reaches for
 > request comes back as `HTTP 400` — set `enabled = false` under `[tools]` and
 > everything else keeps working as before.
 
-## Free tier (no sign-in)
-
-A fresh install with no API key enrols itself anonymously and gets a small daily
-budget on one model. No account, no email, nothing to click.
-
-```
-🚀 Welcome to tuisample-code
-
-Connected to: deepseek-v4-flash
-Plan:         free tier — deepseek-v4-flash · $1.00/day (type /usage for today's budget)
-```
-
-**What is sent:** a SHA-256 of your machine's hardware id, your OS name, and the
-client version. That is all. The raw hardware id never leaves the machine, and
-the server salts the hash again before storing it — neither side holds anything
-that identifies your hardware. **Prompts and responses are never logged by the
-gateway**, only token counts.
-
-The hash exists so that reinstalling doesn't read as a brand-new device with a
-brand-new budget. It cannot be reversed into a machine id or linked to you.
-
-**If you bring your own API key, none of this happens.** Configuring a key — via
-`/provider`, `TUISAMPLE_API_KEY`, or `config.toml` — means your traffic goes
-straight to your provider and never touches our gateway. That is checked before
-enrolment, not after.
-
-Turn it off entirely with `TUISAMPLE_FREE_TIER=0`, or:
-
-```toml
-[free_tier]
-enabled = false
-```
-
-When the daily budget runs out you get a clear message and a way forward:
-
-```
-Error: Daily free-tier limit reached ($1.00 of $1.00). Resets at 2026-08-05T00:00:00Z.
-
-       The free tier resets at UTC midnight. To keep working now, add your
-       own API key with /provider.
-```
-
-> The free-tier budget resets at **UTC** midnight, not local midnight. It is
-> enforced server-side, where a client's clock and timezone cannot be trusted.
-> Your own `[quota]` limits (below) are separate and reset at *local* midnight.
-
-## Daily usage quota
-
-Every request is counted against a per-day budget, so a long agentic session
-cannot quietly run up a bill. Three things are tracked independently for the
-current **local** calendar day, and any one of them can stop further prompts:
-
-| Metric | Accuracy |
-| --- | --- |
-| **Requests** | Exact on every endpoint |
-| **Tokens** | Exact when the endpoint reports usage, otherwise estimated |
-| **Spend (USD)** | Only for models you have priced (see below) |
-
-Today's totals appear in the header (`today: 12 req · 8.4k tok · $0.03`) and in
-full via `/usage`. Counters live in `~/.tuisample-code/usage.json` and reset at
-local midnight.
-
-```toml
-[quota]
-enabled = true             # false disables tracking and enforcement entirely
-max_requests_per_day = 0   # 0 = track but never block
-max_tokens_per_day = 0     # prompt + completion
-max_usd_per_day = 0.0
-warn_at_percent = 80       # when the "approaching limit" notice appears
-include_usage = true       # ask the endpoint to report token counts
-```
-
-**Every limit defaults to `0`, which means unlimited.** Out of the box this
-feature only *reports*; it starts enforcing when you set a ceiling. Upgrading
-never causes a prompt that worked yesterday to be refused.
-
-Per-run: `TUISAMPLE_MAX_REQUESTS_PER_DAY=200`, `TUISAMPLE_MAX_TOKENS_PER_DAY`,
-`TUISAMPLE_MAX_USD_PER_DAY`, `TUISAMPLE_QUOTA_ENABLED=0`.
-
-### Pricing is yours to supply
-
-There is **no built-in price table**, deliberately. Prices change without
-notice, differ per account, and do not exist at all for local or self-hosted
-models — a confidently wrong dollar figure is worse than an absent one. Give
-the rates you are actually billed, in USD per million tokens:
-
-```toml
-[quota.pricing."deepseek-v4-flash"]
-input_per_mtok = 0.14
-output_per_mtok = 0.28
-
-[quota.pricing."gpt-5.6-terra"]
-input_per_mtok = 1.25
-output_per_mtok = 10.00
-```
-
-*(Those numbers are placeholders — substitute your real rates.)*
-
-A model with no entry still has its requests and tokens counted, but its cost
-is unknowable. Rather than count it as `$0.00` and understate the day silently,
-the total is marked incomplete (`$1.20+`) and `/usage` names how many requests
-it could not price. A `max_usd_per_day` limit therefore only constrains usage
-on models you have priced.
-
-### When token counts are estimates
-
-Token counts come from the endpoint via `stream_options.include_usage`. Many
-OpenAI-compatible servers ignore or reject that field; when counts are missing
-or zero, they fall back to a local character estimate (~4 chars per token),
-shown with a `~` prefix everywhere — `~8.4k tok`. The estimate is rough,
-especially for code and non-Latin scripts. Requests are still counted exactly,
-so a request limit remains reliable regardless. If your endpoint rejects the
-field outright, set `include_usage = false`.
-
-### Hitting the limit
-
-The prompt is refused, it **stays in the input box** rather than being
-discarded, and the transcript says which limit tripped and when it resets:
-
-```
-Error: Daily quota reached — requests: 200 of 200. Resets in 6h 12m.
-       Type /quota override to continue today, or raise the limit in
-       ~/.tuisample-code/config.toml.
-```
-
-`/quota override` unblocks the rest of the day; `/quota reset` cancels it. An
-override clears at midnight along with the counters — it is a decision about
-today, not a standing exemption.
-
-Two things worth knowing:
-
-- **A tool-using turn spends several requests.** Each round trip after a
-  command runs is a real, billable call and is counted as one. `max_steps`
-  (default 10) bounds how many a single prompt can make.
-- **The limit is checked when you submit, never mid-turn.** Interrupting a turn
-  between tool rounds would leave tool calls unanswered and invalidate the
-  conversation for every later request, so a turn already under way is allowed
-  to finish.
-
 ## Usage
 
 - **Type prompt** — Bottom input line (paste works too)
 - **Enter** — Send prompt
 - **Alt-Enter** / **Shift-Enter** — Insert a newline for multi-line prompts
 - **Esc** — Cancel ongoing request
-- **↑ / ↓ / PgUp / PgDn** — Scroll the transcript
+- **↑ / ↓** — Recall previous prompts. Inside a multi-line prompt they move
+  between its lines first, so a stray ↑ can't swallow what you were writing
+- **PgUp / PgDn** — Scroll the transcript
 - **Ctrl-A / Ctrl-E** — Jump to start / end of line
 - **Ctrl-W** — Delete previous word
 - **Ctrl-U / Ctrl-K** — Delete to start / end of line
@@ -350,14 +277,45 @@ variables override values in `config.toml`.
   configured, without going through `/provider` again. If no provider has been
   set yet (e.g. you're only using `TUISAMPLE_*` env vars or a custom endpoint),
   this shows an inline error telling you to run `/provider` first.
+- **`/new`** — Forgets the current conversation. The configured provider and
+  model are untouched; only the message history and tool-step count reset.
+- **`/usage`** — Prints your token usage from `~/.tuisample-code/usage.jsonl`:
+  today, the last 7 days, and all time. This is local and per-install only —
+  there is no login, so it is the only place this number exists; nothing here
+  is ever sent anywhere (see "Anonymous usage pings" below for the one thing
+  that is).
 
-- **`/usage`** — Today's requests, tokens and spend, each against its limit,
-  plus how long until the counters reset. `/quota` shows the same report.
-- **`/quota override`** — Keep working past today's limit; clears at midnight.
-- **`/quota reset`** — Cancel an active override.
+`/provider` and `/model` write the result to `~/.tuisample-code/config.toml`
+and apply it immediately — no restart needed, even mid-session.
 
-`/provider` and `/model` write the result to `~/.tuisample-code/config.toml` and
-apply it immediately — no restart needed, even mid-session.
+### Anonymous usage pings
+
+There is no login, so there is no way to attribute usage to a person — what
+this app can see instead is a random ID generated once per install
+(`~/.tuisample-code/device_id`), which labels a machine, not a person. Two
+things, and only these two things, ever leave your machine:
+
+- `install.sh` sends one `install` ping on a fresh install or an `--upgrade`.
+- The app itself sends one `active` ping per calendar day (UTC) it's actually
+  used, checked against `~/.tuisample-code/last_active` so a long session
+  doesn't send more than one.
+
+Each ping carries only `{anon_id, event, version, os, date}` — no prompts, no
+file paths, no command text, no conversation content. Both are silent,
+best-effort, and never block startup or fail an install: see `src/telemetry.rs`
+and the `ping_install` function in `install.sh`.
+
+**The aggregate counts are public**: [tui-telemetry.dhruvm307.workers.dev](https://tui-telemetry.dhruvm307.workers.dev)
+shows total installs, distinct anonymous devices seen, and daily-active counts,
+live. That page is also the entire ingestion endpoint (see
+`telemetry-worker.js` in the repo root) — it's as publicly *writable* as it is
+readable, so treat the numbers as self-reported, not verified.
+
+Set `TUISAMPLE_TELEMETRY_URL=""` (explicitly blank, not just unset) before
+installing or running the binary to opt out entirely.
+
+This is entirely separate from `/usage` above, which never leaves your
+machine at all.
 
 ## Architecture
 
@@ -369,12 +327,16 @@ Clean, modular structure for easy feature additions:
 - `src/main.rs` — Event loop
 - `src/app.rs` — State machine
 - `src/ui.rs` — Terminal rendering
+- `src/theme.rs` — Colours, glyphs, and the spinner, in one place
 - `src/llm.rs` — LLM client + streaming
 - `src/config.rs` — Configuration loading
 - `src/providers.rs` — Built-in provider/model registry for `/provider` and `/model`
 - `src/tools.rs` — The model's tools (`run_command`, `read_file`, `write_file`): schemas, execution, timeouts
-- `src/usage.rs` — Daily request/token/spend tracking and quota enforcement
 - `src/workspace.rs` — The working directory commands run in
+- `src/usage.rs` — Local per-install token usage log (`/usage`), never transmitted
+- `src/telemetry.rs` — Anonymous install/daily-active pings, disabled by default
+- `src/dateutil.rs` — Calendar-date helpers shared by the two above
+- `telemetry-worker.js` — The Cloudflare Worker that `telemetry.rs`/`install.sh` ping and that serves the public view
 
 ## What's Next
 

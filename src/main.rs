@@ -1,10 +1,13 @@
 mod app;
 mod config;
-mod device;
-mod freetier;
+mod danger;
+mod dateutil;
 mod llm;
 mod providers;
+mod quota;
+mod telemetry;
 mod tools;
+mod theme;
 mod ui;
 mod upgrade;
 mod usage;
@@ -73,14 +76,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     }
 
-    let mut config = Config::load()?;
-
-    // A fresh install has no key. Enrol in the free tier before the terminal is
-    // touched, so a slow or unreachable gateway shows as an ordinary message on
-    // stdout rather than a frozen alternate screen.
-    let free_tier_status = enrol_free_tier(&mut config).await;
-
+    let config = Config::load()?;
     let (workspace, workspace_status) = open_workspace(&config);
+
+    // Detached, not awaited: a slow or unreachable telemetry endpoint must
+    // never delay the terminal coming up. See telemetry.rs -- this is a
+    // no-op until a real endpoint is configured, and every failure inside it
+    // is already silent.
+    tokio::spawn(telemetry::ping_active_if_new_day(VERSION));
 
     let enhanced = setup_terminal()?;
     install_panic_hook(enhanced);
@@ -89,7 +92,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config);
-    app.free_tier_status = free_tier_status;
+    // Loaded before the first prompt so a limit already spent today is in force
+    // from the start, not after the first request slips through.
+    if app.config.quota.enabled {
+        app.quota = quota::DailyQuota::load(&quota::today());
+    }
     app.workspace_status = workspace_status;
     app.workspace_root = workspace
         .as_ref()
@@ -105,48 +112,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("Goodbye!");
     result
-}
-
-/// Enrol in the free tier if this install needs it, returning a line for the
-/// welcome screen.
-///
-/// Every failure degrades to a notice rather than an error: someone who is
-/// offline, behind a restrictive proxy, or bringing their own key must still get
-/// a working app. An empty string means there is nothing worth saying.
-async fn enrol_free_tier(config: &mut Config) -> String {
-    if freetier::is_free_tier(config) {
-        // Ask the gateway rather than guess. The budget is enforced server-side
-        // and can be changed there at any time, so anything remembered locally
-        // from enrolment would be a number that only looks authoritative.
-        return match freetier::fetch_budget(config).await {
-            Ok(budget) => format!("{} · resets at UTC midnight", budget.summary()),
-            // Not an error worth blocking on: the app works, and the limit is
-            // simply not known this second.
-            Err(_) => format!("free tier — {} (type /usage for today's budget)", config.llm.model),
-        };
-    }
-    if !freetier::should_register(config) {
-        return String::new();
-    }
-
-    println!("Setting up the free tier (no sign-in needed)…");
-    match freetier::register(config).await {
-        Ok(enrolment) => {
-            // Persist so the next launch reuses the same device rather than
-            // enrolling again.
-            if let Err(e) = config.save() {
-                eprintln!("Warning: could not save the device token ({e}). It will re-register next launch.");
-            }
-            format!(
-                "free tier — {} · ${:.2}/day (type /usage for today's budget)",
-                enrolment.model, enrolment.daily_limit_usd
-            )
-        }
-        Err(e) => {
-            eprintln!("Free tier unavailable: {e}");
-            format!("unavailable — {e}")
-        }
-    }
 }
 
 /// Resolve the root the model is confined to, and a line describing the outcome.
@@ -208,7 +173,30 @@ async fn run_app<B: ratatui::backend::Backend>(
             if id != app.request_id {
                 continue; // stale: belongs to a cancelled request
             }
-            app.handle_event(event);
+            match event {
+                StreamEvent::Token(token) => app.append_token(&token),
+                StreamEvent::ToolCalls(calls) => app.request_tools(calls),
+                StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
+                StreamEvent::Usage(u) => app.record_exact_usage(u),
+                StreamEvent::Done => app.finish_stream(),
+                StreamEvent::Notice(note) => app.note(note),
+                StreamEvent::Error(err) => app.fail_stream(err),
+            }
+        }
+
+        // The only place `finish_stream`/`fail_stream`/`cancel`'s queued
+        // usage actually reaches disk -- see `App::pending_usage`'s doc
+        // comment on why `app.rs` itself never writes this directly. Catches
+        // both this loop's own draining above and anything `handle_key`
+        // queued earlier this same iteration (a cancel via Esc).
+        for (tokens, model) in app.pending_usage.drain(..) {
+            usage::record_turn(tokens, &model);
+        }
+        // Same reasoning, same place: `App` marks the quota dirty, this loop is
+        // the only thing that writes it.
+        if app.quota_dirty {
+            app.quota.save();
+            app.quota_dirty = false;
         }
 
         // Fire a pending request.
@@ -218,11 +206,15 @@ async fn run_app<B: ratatui::backend::Backend>(
             let endpoint = app.config.llm.endpoint.clone();
             let model = app.config.llm.model.clone();
             let api_key = app.config.llm.api_key.clone();
+            let max_tokens = app.config.llm.max_tokens;
 
             // Withholding the schemas once the budget is spent is what actually
             // stops a runaway loop: the model has nothing left to call, so it
             // answers. Saying "stop" in the prompt alone would only be a request.
             let budget_left = app.tool_steps < app.config.tools.max_steps;
+            // Exact counts make the quota real; without them it falls back to the
+            // same character estimate `usage.rs` uses.
+            let include_usage = app.config.quota.enabled && app.config.quota.include_usage;
             let (schemas, system) = match workspace {
                 Some(ws) => (
                     if budget_left { tools::schemas() } else { Vec::new() },
@@ -232,18 +224,12 @@ async fn run_app<B: ratatui::backend::Backend>(
             };
             let history = app.history(system.as_deref());
             let tx_clone = tx.clone();
-            let include_usage = app.config.quota.enabled && app.config.quota.include_usage;
-            let max_tokens = app.config.llm.max_tokens;
 
             let handle = tokio::spawn(async move {
                 llm::stream_chat(
-                    &endpoint,
-                    &model,
-                    &api_key,
+                    llm::Target { endpoint: &endpoint, model: &model, api_key: &api_key, max_tokens, include_usage },
                     history,
                     schemas,
-                    include_usage,
-                    max_tokens,
                     id,
                     tx_clone,
                 )
@@ -327,25 +313,6 @@ TOOLS (read_file, write_file, run_command; writes and commands need your
                               auto_approve_read_only, command_timeout_secs,
                               max_output_bytes, max_steps.
 
-FREE TIER (a fresh install with no API key enrols anonymously and gets a
-           small daily budget on one model -- no sign-in. Only a hash of a
-           hardware id is sent; prompts are never logged. Configuring your
-           own key opts out entirely and sends traffic straight to your
-           provider):
-    TUISAMPLE_FREE_TIER       Set to 0 to never contact the gateway
-    TUISAMPLE_GATEWAY         Point at a different gateway (e.g. staging)
-
-DAILY QUOTA (requests, tokens and USD are tracked per local day in
-             ~/.tuisample-code/usage.json; every limit defaults to 0,
-             meaning track but never block):
-    TUISAMPLE_QUOTA_ENABLED        Set to 0 to disable tracking entirely
-    TUISAMPLE_MAX_REQUESTS_PER_DAY Requests before prompts are refused
-    TUISAMPLE_MAX_TOKENS_PER_DAY   Prompt + completion tokens per day
-    TUISAMPLE_MAX_USD_PER_DAY      Spend per day; needs [quota.pricing]
-                                   entries for the models you use, or
-                                   cost cannot be computed and is
-                                   reported as unpriced rather than $0.
-
 UPGRADE:
     TUISAMPLE_UPGRADE_URL_BASE
                           Fetch updates from a fork or internal mirror
@@ -354,9 +321,20 @@ UPGRADE:
 COMMANDS (type in the input box, press Enter):
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider
-    /usage                Show today's requests, tokens and spend
+    /new                  Forget the conversation and start fresh
+    /usage                Show this machine's local token history
+    /quota                Show today's limits and what's been spent
     /quota override       Keep working past today's limit
     /quota reset          Cancel an override
+
+DAILY LIMITS (optional, off by default -- every limit is 0 = no limit, so this
+              only counts until you set one. See [quota] in config.toml):
+    TUISAMPLE_QUOTA_ENABLED         Set to 0 to disable counting entirely
+    TUISAMPLE_MAX_REQUESTS_PER_DAY  Requests before prompts are refused
+    TUISAMPLE_MAX_TOKENS_PER_DAY    Prompt + completion tokens per UTC day
+    TUISAMPLE_MAX_USD_PER_DAY       Spend per UTC day; needs [quota.pricing]
+                                    entries for the models you use, or cost
+                                    cannot be computed and reads as unpriced
 
 KEYS:
     Enter                 Send prompt
