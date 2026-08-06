@@ -95,6 +95,17 @@ jobs:
           find all-artifacts -type f -exec cp {} release-assets/ \;
           ls -la release-assets/
 
+      - name: Generate checksums
+        # install.sh verifies a downloaded binary against this before
+        # installing it -- see fetch_prebuilt_binary there. Generated after
+        # every binary is in place and named the way install.sh expects
+        # (`tuisample-code-$os-$arch`), so the sums line up with what it
+        # will actually ask for.
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:

@@ -50,9 +50,16 @@ the prompt, where you're already looking:
 curl -fsSL https://raw.githubusercontent.com/HolboxAI/tuisample-code/main/install.sh | bash
 ```
 
-Or build from source:
+Downloads a prebuilt binary for your platform (macOS/Linux, x86_64/arm64) from
+the latest [release](https://github.com/HolboxAI/tuisample-code/releases) and
+verifies it against a published checksum — no Rust toolchain needed, installed
+in seconds. If your platform has no prebuilt binary yet, the script falls back
+to installing Rust (if missing) and building from source instead, same as
+before, just automatically.
+
+Or build from source yourself:
 ```bash
-git clone https://github.com/yourcompany/tuisample-code
+git clone https://github.com/HolboxAI/tuisample-code
 cd tuisample-code
 cargo build --release
 ./target/release/tuisample-code
