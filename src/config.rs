@@ -221,7 +221,12 @@ fn default_max_output_bytes() -> usize {
 }
 
 fn default_max_steps() -> usize {
-    10
+    // 10 was set when the model had three tools and made one-shot edits. With
+    // six tools and an agentic loop, real work blows through ten rounds while
+    // it is still gathering context -- and the failure mode is bad: the schemas
+    // are withheld mid-task, so the model writes its next call out as text and
+    // the turn dies. See `App::finish_stream`.
+    40
 }
 
 fn default_python_bin() -> String {
@@ -534,7 +539,7 @@ mod tests {
             assert_eq!(loaded.llm.model, "deepseek-chat");
             assert!(loaded.tools.enabled);
             assert_eq!(loaded.tools.workspace, ".");
-            assert_eq!(loaded.tools.max_steps, 10);
+            assert_eq!(loaded.tools.max_steps, default_max_steps());
             // The safe default has to survive an absent table, or upgrading
             // silently hands existing users an unattended shell.
             assert!(loaded.tools.require_approval);
