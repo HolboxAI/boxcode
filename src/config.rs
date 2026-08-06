@@ -9,6 +9,122 @@ pub struct Config {
     /// the moment a user upgrades.
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// `default` for the same reason as `[tools]`: every config.toml written
+    /// before this existed has no `[quota]` table, and without it those files
+    /// stop parsing the moment a user upgrades.
+    #[serde(default)]
+    pub quota: QuotaConfig,
+    /// Same again for `[free_tier]`, newer still.
+    #[serde(default)]
+    pub free_tier: FreeTierConfig,
+}
+
+/// Anonymous free-tier enrolment. See `freetier.rs`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FreeTierConfig {
+    /// False stops this install ever contacting the gateway.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Base URL of the gateway.
+    #[serde(default = "default_gateway")]
+    pub gateway: String,
+    /// Device token from `/register`. Not a provider key: it only spends this
+    /// device's daily allowance and is useless for anything else.
+    #[serde(default)]
+    pub device_token: String,
+    /// Stable identifier for machines with no readable hardware id, persisted so
+    /// such a machine does not draw a fresh budget on every launch.
+    #[serde(default)]
+    pub fallback_id: String,
+}
+
+fn default_gateway() -> String {
+    crate::freetier::DEFAULT_GATEWAY.to_string()
+}
+
+impl Default for FreeTierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: yes(),
+            gateway: default_gateway(),
+            device_token: String::new(),
+            fallback_id: String::new(),
+        }
+    }
+}
+
+/// Optional daily ceilings. See `quota.rs`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuotaConfig {
+    /// Off means no counting, no persistence, and no enforcement.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Requests per UTC day. One prompt can spend several: a tool round trip is
+    /// another request to the endpoint and is counted as one.
+    #[serde(default)]
+    pub max_requests_per_day: u64,
+    /// Prompt + completion tokens per UTC day.
+    #[serde(default)]
+    pub max_tokens_per_day: u64,
+    /// Dollars per UTC day. Only meaningful for models priced below; usage on an
+    /// unpriced model cannot contribute to it.
+    #[serde(default)]
+    pub max_usd_per_day: f64,
+    /// Percentage of a limit at which the UI starts warning.
+    #[serde(default = "default_warn_at")]
+    pub warn_at_percent: u8,
+    /// Ask the endpoint for exact token counts via `stream_options`. Turn off
+    /// for endpoints that reject the field; counts then fall back to the same
+    /// character estimate `usage.rs` uses, marked as such wherever shown.
+    #[serde(default = "yes")]
+    pub include_usage: bool,
+    /// Per-model prices in USD per million tokens, keyed by the exact model
+    /// name sent on the wire:
+    ///
+    /// ```toml
+    /// [quota.pricing."deepseek-v4-flash"]
+    /// input_per_mtok = 0.14
+    /// output_per_mtok = 0.28
+    /// ```
+    ///
+    /// Empty by default and deliberately so: shipping a built-in table would
+    /// mean guessing at prices that change without notice and do not exist for
+    /// local models. A model with no entry has its tokens counted and its cost
+    /// reported as unknown.
+    #[serde(default)]
+    pub pricing: std::collections::HashMap<String, crate::quota::ModelPrice>,
+}
+
+fn default_warn_at() -> u8 {
+    80
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: yes(),
+            max_requests_per_day: 0,
+            max_tokens_per_day: 0,
+            max_usd_per_day: 0.0,
+            warn_at_percent: default_warn_at(),
+            include_usage: yes(),
+            pricing: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl QuotaConfig {
+    pub fn price_for(&self, model: &str) -> Option<crate::quota::ModelPrice> {
+        self.pricing.get(model).copied()
+    }
+
+    /// True when at least one ceiling is actually set.
+    pub fn has_limits(&self) -> bool {
+        self.enabled
+            && (self.max_requests_per_day > 0
+                || self.max_tokens_per_day > 0
+                || self.max_usd_per_day > 0.0)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -19,6 +135,12 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(default)]
     pub api_key: String,
+    /// Ceiling on one reply's length. The old hard-coded 4096 was fine for chat
+    /// and far too small the moment the model started producing whole files: a
+    /// long write is simply cut off mid-token, and the endpoint reports that as
+    /// a finished reply.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
     /// Registry id from `providers::PROVIDERS` (e.g. "deepseek"), set by the
     /// `/provider` overlay. Empty means a custom/manually-entered endpoint, in
     /// which case a standalone `/model` has nothing to scope to.
@@ -84,6 +206,10 @@ fn yes() -> bool {
 
 fn dot() -> String {
     ".".to_string()
+}
+
+fn default_max_tokens() -> u32 {
+    16384
 }
 
 fn default_command_timeout() -> u64 {
@@ -154,11 +280,39 @@ impl Config {
         }
         // Exists so an automated test can drive the loop without a human at the
         // keyboard. Setting it in normal use hands the model an unattended shell.
+        if let Some(v) = env_var("TUISAMPLE_GATEWAY") {
+            config.free_tier.gateway = v;
+        }
+        if let Some(v) = env_var("TUISAMPLE_FREE_TIER") {
+            config.free_tier.enabled = truthy(&v);
+        }
+        if let Some(v) = env_var("TUISAMPLE_QUOTA_ENABLED") {
+            config.quota.enabled = truthy(&v);
+        }
+        for (name, slot) in [
+            ("TUISAMPLE_MAX_REQUESTS_PER_DAY", 0),
+            ("TUISAMPLE_MAX_TOKENS_PER_DAY", 1),
+        ] {
+            if let Some(v) = env_var(name) {
+                if let Ok(n) = v.trim().parse::<u64>() {
+                    match slot {
+                        0 => config.quota.max_requests_per_day = n,
+                        _ => config.quota.max_tokens_per_day = n,
+                    }
+                }
+            }
+        }
+        if let Some(v) = env_var("TUISAMPLE_MAX_USD_PER_DAY") {
+            if let Ok(n) = v.trim().parse::<f64>() {
+                config.quota.max_usd_per_day = n;
+            }
+        }
         if let Some(v) = env_var("TUISAMPLE_TOOLS_APPROVAL") {
             config.tools.require_approval = truthy(&v);
         }
 
         config.normalize();
+        config.normalize_quota();
         Ok(config)
     }
 
@@ -169,6 +323,9 @@ impl Config {
         self.llm.model = self.llm.model.trim().to_string();
         self.llm.api_key = self.llm.api_key.trim().to_string();
         self.llm.provider = self.llm.provider.trim().to_string();
+        // 0 would make every reply empty; the ceiling is a sanity bound, not a
+        // claim about what any particular endpoint accepts.
+        self.llm.max_tokens = self.llm.max_tokens.clamp(256, 200_000);
 
         let d = LlmConfig::default();
         if self.llm.endpoint.is_empty() {
@@ -198,6 +355,27 @@ impl Config {
 
     /// Human-readable reasons the app cannot talk to an endpoint yet, shown on
     /// the welcome screen rather than failing silently on the first prompt.
+    /// Nonsense quota settings are clamped rather than obeyed. A warn threshold
+    /// of 0 would fire before the first request; above 100 it could never fire.
+    fn normalize_quota(&mut self) {
+        self.free_tier.gateway = self.free_tier.gateway.trim().trim_end_matches('/').to_string();
+        self.free_tier.device_token = self.free_tier.device_token.trim().to_string();
+        if self.free_tier.gateway.is_empty() {
+            self.free_tier.gateway = default_gateway();
+        }
+        self.quota.warn_at_percent = self.quota.warn_at_percent.clamp(1, 100);
+        if self.quota.max_usd_per_day < 0.0 || !self.quota.max_usd_per_day.is_finite() {
+            self.quota.max_usd_per_day = 0.0;
+        }
+        // A negative price would credit the user for using the model.
+        self.quota.pricing.retain(|_, p| {
+            p.input_per_mtok >= 0.0
+                && p.output_per_mtok >= 0.0
+                && p.input_per_mtok.is_finite()
+                && p.output_per_mtok.is_finite()
+        });
+    }
+
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         if self.llm.api_key.is_empty() {
@@ -256,6 +434,7 @@ impl Default for LlmConfig {
             endpoint: "http://localhost:8000".to_string(),
             model: "gpt-3.5-turbo".to_string(),
             api_key: String::new(),
+            max_tokens: default_max_tokens(),
             provider: String::new(),
         }
     }
@@ -309,10 +488,13 @@ mod tests {
             }
 
             let config = Config {
+                quota: QuotaConfig::default(),
+                free_tier: FreeTierConfig::default(),
                 llm: LlmConfig {
                     endpoint: "https://api.deepseek.com".to_string(),
                     model: "deepseek-v4-pro".to_string(),
                     api_key: "sk-test-key".to_string(),
+                    max_tokens: 8192,
                     provider: "deepseek".to_string(),
                 },
                 tools: ToolsConfig::default(),

@@ -1,12 +1,18 @@
 mod app;
 mod config;
 mod danger;
+mod dateutil;
+mod device;
+mod freetier;
 mod llm;
 mod providers;
+mod quota;
+mod telemetry;
 mod tools;
 mod theme;
 mod ui;
 mod upgrade;
+mod usage;
 mod workspace;
 
 use app::{App, AppState};
@@ -72,8 +78,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     }
 
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+
+    // Enrol before the terminal is touched, so a slow or unreachable gateway is
+    // an ordinary line on stdout rather than a frozen alternate screen.
+    let free_tier_status = enrol_free_tier(&mut config).await;
     let (workspace, workspace_status) = open_workspace(&config);
+
+    // Detached, not awaited: a slow or unreachable telemetry endpoint must
+    // never delay the terminal coming up. See telemetry.rs -- this is a
+    // no-op until a real endpoint is configured, and every failure inside it
+    // is already silent.
+    tokio::spawn(telemetry::ping_active_if_new_day(VERSION));
 
     let enhanced = setup_terminal()?;
     install_panic_hook(enhanced);
@@ -82,6 +98,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config);
+    app.free_tier_status = free_tier_status;
+    // Loaded before the first prompt so a limit already spent today is in force
+    // from the start, not after the first request slips through.
+    if app.config.quota.enabled {
+        app.quota = quota::DailyQuota::load(&quota::today());
+    }
     app.workspace_status = workspace_status;
     app.workspace_root = workspace
         .as_ref()
@@ -155,6 +177,13 @@ async fn run_app<B: ratatui::backend::Backend>(
         // Drain every token that has arrived; doing only one per frame caps
         // throughput at ~60 tokens/sec and looks like the app is stalling.
         while let Ok((id, event)) = rx.try_recv() {
+            // The budget lookup belongs to no request, so the stale-id guard
+            // must not apply to it: a user who submits a prompt while the
+            // lookup is in flight would otherwise silently lose the answer.
+            if let StreamEvent::FreeTierBudget(line) = event {
+                app.free_tier_status = line;
+                continue;
+            }
             if id != app.request_id {
                 continue; // stale: belongs to a cancelled request
             }
@@ -162,8 +191,45 @@ async fn run_app<B: ratatui::backend::Backend>(
                 StreamEvent::Token(token) => app.append_token(&token),
                 StreamEvent::ToolCalls(calls) => app.request_tools(calls),
                 StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
+                StreamEvent::Usage(u) => app.record_exact_usage(u),
+                StreamEvent::FreeTierBudget(_) => unreachable!("handled before the stale-id guard"),
                 StreamEvent::Done => app.finish_stream(),
+                StreamEvent::Notice(note) => app.note(note),
                 StreamEvent::Error(err) => app.fail_stream(err),
+            }
+        }
+
+        // The only place `finish_stream`/`fail_stream`/`cancel`'s queued
+        // usage actually reaches disk -- see `App::pending_usage`'s doc
+        // comment on why `app.rs` itself never writes this directly. Catches
+        // both this loop's own draining above and anything `handle_key`
+        // queued earlier this same iteration (a cancel via Esc).
+        for (tokens, model) in app.pending_usage.drain(..) {
+            usage::record_turn(tokens, &model);
+        }
+        // Same reasoning, same place: `App` marks the quota dirty, this loop is
+        // the only thing that writes it.
+        if app.quota_dirty {
+            app.quota.save();
+            app.quota_dirty = false;
+        }
+
+        // Free-tier budget refresh. Spawned rather than awaited: this runs on
+        // the render loop, and a gateway that takes ten seconds to answer must
+        // not freeze the UI for ten seconds. The answer comes back as an event.
+        if app.refresh_budget {
+            app.refresh_budget = false;
+            if freetier::is_free_tier(&app.config) {
+                let config = app.config.clone();
+                let id = app.request_id;
+                let tx_budget = tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(budget) = freetier::fetch_budget(&config).await {
+                        let _ = tx_budget
+                            .send((id, StreamEvent::FreeTierBudget(budget.summary())))
+                            .await;
+                    }
+                });
             }
         }
 
@@ -174,11 +240,15 @@ async fn run_app<B: ratatui::backend::Backend>(
             let endpoint = app.config.llm.endpoint.clone();
             let model = app.config.llm.model.clone();
             let api_key = app.config.llm.api_key.clone();
+            let max_tokens = app.config.llm.max_tokens;
 
             // Withholding the schemas once the budget is spent is what actually
             // stops a runaway loop: the model has nothing left to call, so it
             // answers. Saying "stop" in the prompt alone would only be a request.
             let budget_left = app.tool_steps < app.config.tools.max_steps;
+            // Exact counts make the quota real; without them it falls back to the
+            // same character estimate `usage.rs` uses.
+            let include_usage = app.config.quota.enabled && app.config.quota.include_usage;
             let (schemas, system) = match workspace {
                 Some(ws) => (
                     if budget_left { tools::schemas() } else { Vec::new() },
@@ -190,7 +260,14 @@ async fn run_app<B: ratatui::backend::Backend>(
             let tx_clone = tx.clone();
 
             let handle = tokio::spawn(async move {
-                llm::stream_chat(&endpoint, &model, &api_key, history, schemas, id, tx_clone).await;
+                llm::stream_chat(
+                    llm::Target { endpoint: &endpoint, model: &model, api_key: &api_key, max_tokens, include_usage },
+                    history,
+                    schemas,
+                    id,
+                    tx_clone,
+                )
+                .await;
             });
 
             app.abort = Some(handle.abort_handle());
@@ -240,6 +317,46 @@ async fn run_app<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// Enrol in the free tier if this install needs it, returning a line for the
+/// welcome screen.
+///
+/// Every failure degrades to a notice rather than an error: offline, blocked by
+/// a proxy, or gateway down -- the app still starts, and still works for anyone
+/// with their own key. An empty string means there is nothing worth saying.
+async fn enrol_free_tier(config: &mut Config) -> String {
+    if freetier::is_free_tier(config) {
+        // Ask rather than remember: the limit is a server-side setting that can
+        // change at any time, so anything cached at enrolment would be a number
+        // that only looks authoritative.
+        return match freetier::fetch_budget(config).await {
+            Ok(budget) => budget.summary(),
+            Err(_) => format!("Free tier — {}", config.llm.model),
+        };
+    }
+    if !freetier::should_register(config) {
+        return String::new();
+    }
+
+    println!("Setting up the free tier (no sign-in needed)…");
+    match freetier::register(config).await {
+        Ok(enrolment) => {
+            // Persist so the next launch reuses this device rather than enrolling
+            // again -- and so the budget is not reset by a restart.
+            if let Err(e) = config.save() {
+                eprintln!("Warning: could not save the device token ({e}). It will enrol again next launch.");
+            }
+            format!(
+                "Free tier — {} · ${:.2}/day, resets at UTC midnight",
+                enrolment.model, enrolment.daily_limit_usd
+            )
+        }
+        Err(e) => {
+            eprintln!("Free tier unavailable: {e}");
+            format!("unavailable — {e}")
+        }
+    }
+}
+
 fn print_help() {
     println!(
         "tuisample-code {VERSION}
@@ -278,6 +395,29 @@ UPGRADE:
 COMMANDS (type in the input box, press Enter):
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider
+    /new                  Forget the conversation and start fresh
+    /usage                Show this machine's local token history
+    /quota                Show today's limits and what's been spent
+    /quota set <what> <n> Set your own limit: requests, tokens or usd
+    /quota clear          Remove your own limits
+    /quota override       Keep working past today's limit
+    /quota reset          Cancel an override
+
+FREE TIER (a fresh install with no API key enrols anonymously and gets a small
+           daily budget on one model -- no sign-in. Only a hash of a hardware
+           id is sent; prompts are never logged. Configuring your own key opts
+           out entirely and sends traffic straight to your provider):
+    TUISAMPLE_FREE_TIER       Set to 0 to never contact the gateway
+    TUISAMPLE_GATEWAY         Point at a different gateway (e.g. staging)
+
+DAILY LIMITS (optional, off by default -- every limit is 0 = no limit, so this
+              only counts until you set one. See [quota] in config.toml):
+    TUISAMPLE_QUOTA_ENABLED         Set to 0 to disable counting entirely
+    TUISAMPLE_MAX_REQUESTS_PER_DAY  Requests before prompts are refused
+    TUISAMPLE_MAX_TOKENS_PER_DAY    Prompt + completion tokens per UTC day
+    TUISAMPLE_MAX_USD_PER_DAY       Spend per UTC day; needs [quota.pricing]
+                                    entries for the models you use, or cost
+                                    cannot be computed and reads as unpriced
 
 KEYS:
     Enter                 Send prompt
