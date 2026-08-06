@@ -120,6 +120,10 @@ pub enum CustomStep {
 /// welcome screen list. Adding a command means adding it here and to the
 /// `match` in `selected_command`'s caller; nowhere else should name a
 /// command as a string literal.
+/// The first entry in the provider picker. Not a `providers::Provider`: it has
+/// no endpoint or model to choose, because the gateway decides both.
+pub const FREE_TIER_LABEL: &str = "Free tier — no API key needed";
+
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/provider", "switch provider or endpoint"),
     ("/model", "switch model"),
@@ -219,6 +223,9 @@ pub struct App {
     /// A flag, not a call: `App` does no I/O, so `main.rs` performs the lookup
     /// and hands the answer back on the event channel.
     pub refresh_budget: bool,
+    /// Set when the user picked the free tier and enrolment should run.
+    /// A flag, not a call: enrolment is network I/O and `App` does none.
+    pub enrol_requested: bool,
     /// One line for the welcome screen describing where commands will run, or
     /// why the tool is off. Set by `main` once the workspace has been resolved.
     pub workspace_status: String,
@@ -276,6 +283,7 @@ impl App {
             quota_dirty: false,
             free_tier_status: String::new(),
             refresh_budget: false,
+            enrol_requested: false,
             workspace_status: String::new(),
             workspace_root: String::new(),
             prompt_history: Vec::new(),
@@ -1365,8 +1373,10 @@ impl App {
     }
 
     fn handle_provider_picker_key(&mut self, key: KeyEvent, selected: usize) {
-        // +1 for the trailing "Custom endpoint..." entry.
-        let last = providers::PROVIDERS.len();
+        // The list is: free tier, then every registry provider, then "Custom
+        // endpoint...". Index 0 and the last entry are the two that are not a
+        // `providers::Provider`.
+        let last = providers::PROVIDERS.len() + 1;
         match key.code {
             KeyCode::Up => {
                 self.overlay = Some(Overlay::ProviderPicker {
@@ -1380,8 +1390,11 @@ impl App {
             }
             KeyCode::Esc => {}
             KeyCode::Enter => {
-                if selected < last {
-                    let provider = &providers::PROVIDERS[selected];
+                if selected == 0 {
+                    self.overlay = None;
+                    self.choose_free_tier();
+                } else if selected < last {
+                    let provider = &providers::PROVIDERS[selected - 1];
                     self.overlay = Some(Overlay::ModelPicker {
                         provider_id: provider.id,
                         selected: 0,
@@ -1541,6 +1554,55 @@ impl App {
     /// Any test that reaches this function MUST wrap the call in
     /// `config::test_support::with_isolated_home`, or it will write to the real
     /// developer/CI `~/.tuisample-code/config.toml`.
+    /// The user picked "Free tier" in `/provider`.
+    ///
+    /// Always re-enrols rather than reusing a stored token: registration is
+    /// idempotent on the gateway (the same hardware resolves to the same device
+    /// and the same budget), and it is the only way to learn the current model
+    /// and limit, both of which are server-side settings that can change.
+    fn choose_free_tier(&mut self) {
+        self.greeted = true;
+        self.follow_tail = true;
+        self.enrol_requested = true;
+        self.messages.push(Message::new(
+            Role::System,
+            "Switching to the free tier — no API key needed. Enrolling…",
+        ));
+    }
+
+    /// Enrolment succeeded. Applies it exactly as `/provider` applies a manual
+    /// choice, so switching back to your own key later works the same way.
+    pub fn free_tier_enrolled(&mut self, e: crate::freetier::Enrolled) {
+        self.config.free_tier.device_token = e.device_token.clone();
+        self.config.free_tier.fallback_id = e.fallback_id;
+        self.free_tier_status = format!(
+            "Free tier — {} · ${:.2}/day, resets at UTC midnight",
+            e.model, e.daily_limit_usd
+        );
+        // Reuses the existing path so the "Switched to ..." message, the
+        // config write and its error handling are identical to every other
+        // provider switch.
+        self.apply_llm_config(
+            "free-tier".to_string(),
+            e.endpoint,
+            e.model,
+            e.device_token,
+        );
+        self.refresh_budget = true;
+    }
+
+    /// Enrolment failed. The previous provider is untouched -- a free tier that
+    /// cannot be reached must not leave the user with no working endpoint.
+    pub fn free_tier_failed(&mut self, reason: String) {
+        self.messages.push(Message::new(
+            Role::Error,
+            format!(
+                "Could not join the free tier: {reason}\n\
+                 Your previous provider is unchanged. Try /provider again, or pick one with your own key."
+            ),
+        ));
+    }
+
     fn apply_llm_config(&mut self, provider: String, endpoint: String, model: String, api_key: String) {
         self.config.llm.provider = provider;
         self.config.llm.endpoint = endpoint;
@@ -3190,12 +3252,23 @@ mod tests {
     /// Navigates from a freshly opened ProviderPicker down to the registry entry
     /// whose id is `provider_id`, then presses Enter to select it (opening its
     /// scoped ModelPicker).
+    /// Walk to the trailing "Custom endpoint..." entry, wherever it now sits.
+    /// Named rather than counted, so adding another picker entry does not
+    /// silently point these tests at the wrong row.
+    fn select_custom_endpoint(a: &mut App) {
+        for _ in 0..=providers::PROVIDERS.len() {
+            a.handle_key(key(KeyCode::Down));
+        }
+        a.handle_key(key(KeyCode::Enter));
+    }
+
     fn select_provider(a: &mut App, provider_id: &str) {
         let idx = providers::PROVIDERS
             .iter()
             .position(|p| p.id == provider_id)
             .expect("provider_id must be in the registry");
-        for _ in 0..idx {
+        // +1: the free tier occupies index 0, ahead of the registry.
+        for _ in 0..=idx {
             a.handle_key(key(KeyCode::Down));
         }
         a.handle_key(key(KeyCode::Enter));
@@ -3313,12 +3386,122 @@ mod tests {
         for _ in 0..10 {
             a.handle_key(key(KeyCode::Down));
         }
+        // The list is free tier + every provider + "Custom endpoint...", so the
+        // last selectable index is one past the registry.
         assert_eq!(
             a.overlay,
             Some(Overlay::ProviderPicker {
-                selected: providers::PROVIDERS.len()
+                selected: providers::PROVIDERS.len() + 1
             })
         );
+    }
+
+    // ---- free tier in the provider picker ---------------------------------------
+
+    /// The free tier is the only option that needs nothing from the user, so it
+    /// should not be the one they have to scroll past.
+    #[test]
+    fn the_free_tier_is_the_first_entry_in_the_picker() {
+        let mut a = app();
+        type_str(&mut a, "/provider");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.overlay, Some(Overlay::ProviderPicker { selected: 0 }));
+
+        a.handle_key(key(KeyCode::Enter)); // pick it
+        assert!(a.enrol_requested, "selecting it must start enrolment");
+        assert_eq!(a.overlay, None, "the picker closes");
+        assert!(a
+            .messages
+            .iter()
+            .any(|m| m.role == Role::System && m.content.contains("free tier")));
+    }
+
+    /// The registry entries must still be reachable at their new positions.
+    #[test]
+    fn the_registry_providers_are_still_selectable_after_the_free_tier() {
+        for p in providers::PROVIDERS {
+            let mut a = app();
+            type_str(&mut a, "/provider");
+            a.handle_key(key(KeyCode::Enter));
+            select_provider(&mut a, p.id);
+            assert_eq!(
+                a.overlay,
+                Some(Overlay::ModelPicker { provider_id: p.id, selected: 0 }),
+                "{} should open its model picker",
+                p.id
+            );
+        }
+    }
+
+    #[test]
+    fn enrolment_applies_the_gateway_endpoint_and_token() {
+        with_isolated_home(|| {
+            let mut a = app();
+            a.free_tier_enrolled(crate::freetier::Enrolled {
+                endpoint: "https://gw.example".to_string(),
+                device_token: "dt_ref.secret".to_string(),
+                model: "free-model".to_string(),
+                fallback_id: "fb".to_string(),
+                daily_limit_usd: 0.25,
+            });
+
+            assert_eq!(a.config.llm.endpoint, "https://gw.example");
+            assert_eq!(a.config.llm.api_key, "dt_ref.secret");
+            assert_eq!(a.config.llm.model, "free-model");
+            assert_eq!(a.config.llm.provider, "free-tier");
+            assert_eq!(a.config.free_tier.device_token, "dt_ref.secret");
+            assert!(crate::freetier::is_free_tier(&a.config));
+            assert!(a.free_tier_status.contains("$0.25"));
+
+            // Persisted, like every other provider switch.
+            let reloaded = crate::config::Config::load().expect("config should load");
+            assert_eq!(reloaded.free_tier.device_token, "dt_ref.secret");
+        });
+    }
+
+    /// A free tier that cannot be reached must not leave the user with no
+    /// working endpoint.
+    #[test]
+    fn a_failed_enrolment_leaves_the_previous_provider_intact() {
+        let mut a = app();
+        a.config.llm.endpoint = "https://api.deepseek.com".to_string();
+        a.config.llm.api_key = "sk-mine".to_string();
+        a.config.llm.provider = "deepseek".to_string();
+
+        a.free_tier_failed("gateway unreachable".to_string());
+
+        assert_eq!(a.config.llm.endpoint, "https://api.deepseek.com");
+        assert_eq!(a.config.llm.api_key, "sk-mine");
+        assert_eq!(a.config.llm.provider, "deepseek");
+        let err = a.messages.iter().find(|m| m.role == Role::Error).expect("an error");
+        assert!(err.content.contains("unchanged"), "{}", err.content);
+    }
+
+    /// Switching to the free tier and back must both work, or the picker entry
+    /// is a one-way door.
+    #[test]
+    fn a_user_can_switch_to_the_free_tier_and_back_to_their_own_key() {
+        with_isolated_home(|| {
+            let mut a = app();
+            a.free_tier_enrolled(crate::freetier::Enrolled {
+                endpoint: "https://gw.example".to_string(),
+                device_token: "dt_a.b".to_string(),
+                model: "free-model".to_string(),
+                fallback_id: "fb".to_string(),
+                daily_limit_usd: 0.25,
+            });
+            assert!(crate::freetier::is_free_tier(&a.config));
+
+            a.apply_llm_config(
+                "deepseek".to_string(),
+                "https://api.deepseek.com".to_string(),
+                "deepseek-v4-flash".to_string(),
+                "sk-my-own".to_string(),
+            );
+            assert!(!crate::freetier::is_free_tier(&a.config), "own key wins");
+            // The token is kept, so switching back does not mint a new device.
+            assert_eq!(a.config.free_tier.device_token, "dt_a.b");
+        });
     }
 
     #[test]
@@ -3354,10 +3537,7 @@ mod tests {
         let mut a = app();
         type_str(&mut a, "/provider");
         a.handle_key(key(KeyCode::Enter));
-        for _ in 0..providers::PROVIDERS.len() {
-            a.handle_key(key(KeyCode::Down));
-        }
-        a.handle_key(key(KeyCode::Enter));
+        select_custom_endpoint(&mut a);
 
         assert_eq!(a.overlay, Some(Overlay::CustomEndpoint(CustomStep::Endpoint)));
     }
@@ -3497,10 +3677,7 @@ mod tests {
             let mut a = app();
             type_str(&mut a, "/provider");
             a.handle_key(key(KeyCode::Enter));
-            for _ in 0..providers::PROVIDERS.len() {
-                a.handle_key(key(KeyCode::Down));
-            }
-            a.handle_key(key(KeyCode::Enter)); // -> CustomEndpoint(Endpoint)
+            select_custom_endpoint(&mut a); // -> CustomEndpoint(Endpoint)
 
             type_str(&mut a, "http://localhost:9000");
             a.handle_key(key(KeyCode::Enter)); // -> CustomEndpoint(Model)
