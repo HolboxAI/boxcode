@@ -226,6 +226,11 @@ pub struct App {
     /// Set when the user picked the free tier and enrolment should run.
     /// A flag, not a call: enrolment is network I/O and `App` does none.
     pub enrol_requested: bool,
+    /// True from the moment the user picks the free tier until enrolment
+    /// settles. Distinct from `enrol_requested`, which the event loop clears as
+    /// soon as it spawns the work: without a flag that spans the whole round
+    /// trip, a prompt typed in between goes out on the *previous* endpoint.
+    pub enrolling: bool,
     /// One line for the welcome screen describing where commands will run, or
     /// why the tool is off. Set by `main` once the workspace has been resolved.
     pub workspace_status: String,
@@ -284,6 +289,7 @@ impl App {
             free_tier_status: String::new(),
             refresh_budget: false,
             enrol_requested: false,
+            enrolling: false,
             workspace_status: String::new(),
             workspace_root: String::new(),
             prompt_history: Vec::new(),
@@ -528,6 +534,20 @@ impl App {
                 return;
             }
             _ => {}
+        }
+
+        // A prompt sent now would go out on the endpoint being switched away
+        // from -- the old key, the old provider -- and the confusing part is
+        // that it half-works: the switch confirmation arrives moments later, so
+        // the failure looks like the new provider is broken.
+        if self.enrolling {
+            self.greeted = true;
+            self.follow_tail = true;
+            self.messages.push(Message::new(
+                Role::System,
+                "Still joining the free tier — your prompt is still in the box, send it again in a moment.",
+            ));
+            return;
         }
 
         // Checked here and only here -- never mid-turn. Blocking between tool
@@ -1603,6 +1623,7 @@ impl App {
         self.greeted = true;
         self.follow_tail = true;
         self.enrol_requested = true;
+        self.enrolling = true;
         self.messages.push(Message::new(
             Role::System,
             "Switching to the free tier — no API key needed. Enrolling…",
@@ -1612,6 +1633,7 @@ impl App {
     /// Enrolment succeeded. Applies it exactly as `/provider` applies a manual
     /// choice, so switching back to your own key later works the same way.
     pub fn free_tier_enrolled(&mut self, e: crate::freetier::Enrolled) {
+        self.enrolling = false;
         self.config.free_tier.device_token = e.device_token.clone();
         self.config.free_tier.fallback_id = e.fallback_id;
         self.free_tier_status = format!(
@@ -1633,6 +1655,7 @@ impl App {
     /// Enrolment failed. The previous provider is untouched -- a free tier that
     /// cannot be reached must not leave the user with no working endpoint.
     pub fn free_tier_failed(&mut self, reason: String) {
+        self.enrolling = false;
         self.messages.push(Message::new(
             Role::Error,
             format!(
@@ -3589,6 +3612,79 @@ mod tests {
 
     /// The free tier is the only option that needs nothing from the user, so it
     /// should not be the one they have to scroll past.
+    /// Regression: a prompt typed between picking the free tier and enrolment
+    /// completing went out on the *previous* endpoint. The switch confirmation
+    /// then arrived moments later, so the failure looked like the new provider
+    /// was broken when it had not been used at all.
+    #[test]
+    fn a_prompt_sent_during_enrolment_is_held_rather_than_sent_to_the_old_provider() {
+        let mut a = app();
+        a.config.llm.endpoint = "http://old-endpoint:8000".to_string();
+
+        type_str(&mut a, "/provider");
+        a.handle_key(key(KeyCode::Enter));
+        a.handle_key(key(KeyCode::Enter)); // free tier, index 0
+        assert!(a.enrolling);
+
+        type_str(&mut a, "hi");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.state, AppState::AwaitingInput, "nothing may be sent mid-switch");
+        assert!(!a.messages.iter().any(|m| m.role == Role::User));
+        // The prompt is kept, not destroyed.
+        assert_eq!(a.input_buffer, "hi");
+        assert!(a
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Still joining the free tier")));
+    }
+
+    #[test]
+    fn sending_works_again_once_enrolment_succeeds() {
+        with_isolated_home(|| {
+            let mut a = app();
+            type_str(&mut a, "/provider");
+            a.handle_key(key(KeyCode::Enter));
+            a.handle_key(key(KeyCode::Enter));
+            assert!(a.enrolling);
+
+            a.free_tier_enrolled(crate::freetier::Enrolled {
+                endpoint: "https://gw.example".to_string(),
+                device_token: "dt_a.b".to_string(),
+                model: "free-model".to_string(),
+                fallback_id: "fb".to_string(),
+                daily_limit_usd: 0.25,
+            });
+            assert!(!a.enrolling);
+
+            type_str(&mut a, "hi");
+            a.handle_key(key(KeyCode::Enter));
+            assert_eq!(a.state, AppState::Sending);
+            assert_eq!(a.config.llm.endpoint, "https://gw.example");
+        });
+    }
+
+    /// ...and unblocks on failure too, or a gateway that is down would leave the
+    /// user unable to send anything at all.
+    #[test]
+    fn sending_works_again_once_enrolment_fails() {
+        let mut a = app();
+        a.config.llm.endpoint = "http://mine:8000".to_string();
+        a.config.llm.api_key = "sk-mine".to_string();
+
+        type_str(&mut a, "/provider");
+        a.handle_key(key(KeyCode::Enter));
+        a.handle_key(key(KeyCode::Enter));
+        a.free_tier_failed("gateway unreachable".to_string());
+        assert!(!a.enrolling);
+
+        type_str(&mut a, "hi");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+        // Still on the user's own provider, which never stopped working.
+        assert_eq!(a.config.llm.endpoint, "http://mine:8000");
+    }
+
     #[test]
     fn the_free_tier_is_the_first_entry_in_the_picker() {
         let mut a = app();

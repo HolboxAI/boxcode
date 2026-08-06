@@ -5,6 +5,7 @@ mod dateutil;
 mod device;
 mod freetier;
 mod llm;
+mod notice;
 mod providers;
 mod quota;
 mod telemetry;
