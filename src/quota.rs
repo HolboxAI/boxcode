@@ -303,6 +303,15 @@ pub fn describe(quota: &DailyQuota, config: &QuotaConfig) -> String {
         lines.push("  Override: active for today".to_string());
     }
     lines.push(format!("  Resets in {} (UTC midnight)", time_until_utc_midnight()));
+    // A readout that says "no limit set" three times should also say how to set
+    // one, rather than leaving the user to find the config file.
+    if !config.has_limits() {
+        lines.push(String::new());
+        lines.push("  No limits of your own yet. Set one with:".to_string());
+        lines.push("    /quota set requests 200   ·   /quota set tokens 500000   ·   /quota set usd 0.10".to_string());
+    } else {
+        lines.push("  /quota set <requests|tokens|usd> <n> to change · /quota clear to remove".to_string());
+    }
     lines.join("\n")
 }
 

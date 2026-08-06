@@ -177,6 +177,13 @@ async fn run_app<B: ratatui::backend::Backend>(
         // Drain every token that has arrived; doing only one per frame caps
         // throughput at ~60 tokens/sec and looks like the app is stalling.
         while let Ok((id, event)) = rx.try_recv() {
+            // The budget lookup belongs to no request, so the stale-id guard
+            // must not apply to it: a user who submits a prompt while the
+            // lookup is in flight would otherwise silently lose the answer.
+            if let StreamEvent::FreeTierBudget(line) = event {
+                app.free_tier_status = line;
+                continue;
+            }
             if id != app.request_id {
                 continue; // stale: belongs to a cancelled request
             }
@@ -185,6 +192,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 StreamEvent::ToolCalls(calls) => app.request_tools(calls),
                 StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
                 StreamEvent::Usage(u) => app.record_exact_usage(u),
+                StreamEvent::FreeTierBudget(_) => unreachable!("handled before the stale-id guard"),
                 StreamEvent::Done => app.finish_stream(),
                 StreamEvent::Notice(note) => app.note(note),
                 StreamEvent::Error(err) => app.fail_stream(err),
@@ -204,6 +212,25 @@ async fn run_app<B: ratatui::backend::Backend>(
         if app.quota_dirty {
             app.quota.save();
             app.quota_dirty = false;
+        }
+
+        // Free-tier budget refresh. Spawned rather than awaited: this runs on
+        // the render loop, and a gateway that takes ten seconds to answer must
+        // not freeze the UI for ten seconds. The answer comes back as an event.
+        if app.refresh_budget {
+            app.refresh_budget = false;
+            if freetier::is_free_tier(&app.config) {
+                let config = app.config.clone();
+                let id = app.request_id;
+                let tx_budget = tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(budget) = freetier::fetch_budget(&config).await {
+                        let _ = tx_budget
+                            .send((id, StreamEvent::FreeTierBudget(budget.summary())))
+                            .await;
+                    }
+                });
+            }
         }
 
         // Fire a pending request.
@@ -371,6 +398,8 @@ COMMANDS (type in the input box, press Enter):
     /new                  Forget the conversation and start fresh
     /usage                Show this machine's local token history
     /quota                Show today's limits and what's been spent
+    /quota set <what> <n> Set your own limit: requests, tokens or usd
+    /quota clear          Remove your own limits
     /quota override       Keep working past today's limit
     /quota reset          Cancel an override
 

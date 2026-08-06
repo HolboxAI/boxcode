@@ -125,7 +125,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "switch model"),
     ("/new", "forget the current conversation"),
     ("/usage", "show local token usage"),
-    ("/quota", "show today's limits, or override them"),
+    ("/quota", "show or set your daily limits"),
 ];
 
 pub struct App {
@@ -215,6 +215,10 @@ pub struct App {
     /// One line describing free-tier enrolment, or why it is unavailable.
     /// Empty when the user brought their own key. Set by `main` at startup.
     pub free_tier_status: String,
+    /// Set when the free-tier budget should be re-read from the gateway.
+    /// A flag, not a call: `App` does no I/O, so `main.rs` performs the lookup
+    /// and hands the answer back on the event channel.
+    pub refresh_budget: bool,
     /// One line for the welcome screen describing where commands will run, or
     /// why the tool is off. Set by `main` once the workspace has been resolved.
     pub workspace_status: String,
@@ -271,6 +275,7 @@ impl App {
             warned_today: false,
             quota_dirty: false,
             free_tier_status: String::new(),
+            refresh_budget: false,
             workspace_status: String::new(),
             workspace_root: String::new(),
             prompt_history: Vec::new(),
@@ -500,6 +505,20 @@ impl App {
                 self.set_quota_override(false);
                 return;
             }
+            "/quota clear" => {
+                self.input_buffer.clear();
+                self.cursor = 0;
+                self.greeted = true;
+                self.clear_own_limits();
+                return;
+            }
+            rest if rest.starts_with("/quota set") => {
+                self.input_buffer.clear();
+                self.cursor = 0;
+                self.greeted = true;
+                self.set_own_limit(rest.trim_start_matches("/quota set").trim());
+                return;
+            }
             _ => {}
         }
 
@@ -576,6 +595,7 @@ impl App {
         }
         // Whatever streamed before the cancel was still real usage.
         self.record_quota();
+        self.refresh_budget = true;
         self.pending_usage
             .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
         self.busy_started = None;
@@ -793,6 +813,9 @@ impl App {
     /// change whether they bind for the rest of the day.
     fn show_quota(&mut self) {
         self.roll_quota_day();
+        // A budget read at startup is stale the moment a turn completes, and
+        // "how much is left" is the whole point of showing it.
+        self.refresh_budget = true;
         let mut text = crate::quota::describe(&self.quota, &self.config.quota);
         // The gateway's budget is the one that actually refuses a request, so it
         // goes first. The local counters below it are this machine's own view
@@ -801,6 +824,101 @@ impl App {
             text = format!("{}\n\n{text}", self.free_tier_status);
         }
         self.messages.push(Message::new(Role::System, text));
+    }
+
+    /// `/quota set <metric> <value>` -- a user's own ceiling, without making
+    /// them find and hand-edit a TOML file.
+    ///
+    /// Writes through to config.toml so it survives a restart, the same way
+    /// `/provider` already persists its choice.
+    fn set_own_limit(&mut self, args: &str) {
+        let mut parts = args.split_whitespace();
+        let (metric, value) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+
+        if metric.is_empty() || value.is_empty() {
+            self.messages.push(Message::new(
+                Role::Error,
+                "Usage: /quota set <requests|tokens|usd> <number>\n\
+                 e.g. /quota set requests 200   ·   /quota set usd 0.10\n\
+                 Use /quota clear to remove your limits.",
+            ));
+            return;
+        }
+
+        let described = match metric {
+            "requests" | "request" | "reqs" => match value.parse::<u64>() {
+                Ok(n) => {
+                    self.config.quota.max_requests_per_day = n;
+                    format!("{n} requests per day")
+                }
+                Err(_) => return self.bad_limit_value(value, "a whole number, e.g. 200"),
+            },
+            "tokens" | "token" => match value.parse::<u64>() {
+                Ok(n) => {
+                    self.config.quota.max_tokens_per_day = n;
+                    format!("{n} tokens per day")
+                }
+                Err(_) => return self.bad_limit_value(value, "a whole number, e.g. 500000"),
+            },
+            "usd" | "dollars" | "spend" => match value.trim_start_matches('$').parse::<f64>() {
+                Ok(n) if n >= 0.0 && n.is_finite() => {
+                    self.config.quota.max_usd_per_day = n;
+                    format!("${n:.2} per day")
+                }
+                _ => return self.bad_limit_value(value, "an amount, e.g. 0.10"),
+            },
+            other => {
+                self.messages.push(Message::new(
+                    Role::Error,
+                    format!("'{other}' is not a metric. Use requests, tokens or usd."),
+                ));
+                return;
+            }
+        };
+
+        // A dollar limit that cannot be computed is worse than no limit: it
+        // looks like protection and is not. Say so at the moment it is set,
+        // rather than leaving the user to notice $0.00 later.
+        let unpriced = matches!(metric, "usd" | "dollars" | "spend")
+            && self.config.quota.price_for(&self.config.llm.model).is_none();
+
+        let saved = match self.config.save() {
+            Ok(()) => "Saved to ~/.tuisample-code/config.toml.",
+            Err(_) => "Active for this session, but could not be written to config.toml.",
+        };
+        let mut text = format!("Your daily limit is now {described}. {saved}");
+        if unpriced {
+            text.push_str(&format!(
+                "\n\nNote: '{}' has no price in [quota.pricing], so cost cannot be computed and \
+                 this limit will never trigger. Add input_per_mtok / output_per_mtok for it, or \
+                 set a requests or tokens limit instead.",
+                self.config.llm.model
+            ));
+        }
+        self.messages.push(Message::new(Role::System, text));
+    }
+
+    fn bad_limit_value(&mut self, value: &str, expected: &str) {
+        self.messages.push(Message::new(
+            Role::Error,
+            format!("'{value}' is not {expected}."),
+        ));
+    }
+
+    /// `/quota clear` -- remove the user's own limits. Does not touch the
+    /// free-tier budget, which is not theirs to change.
+    fn clear_own_limits(&mut self) {
+        self.config.quota.max_requests_per_day = 0;
+        self.config.quota.max_tokens_per_day = 0;
+        self.config.quota.max_usd_per_day = 0.0;
+        let saved = match self.config.save() {
+            Ok(()) => "Saved.",
+            Err(_) => "Cleared for this session, but could not be written to config.toml.",
+        };
+        self.messages.push(Message::new(
+            Role::System,
+            format!("Your own daily limits are removed. {saved} The free-tier budget is unaffected."),
+        ));
     }
 
     fn set_quota_override(&mut self, active: bool) {
@@ -1003,6 +1121,7 @@ impl App {
             self.messages.push(Message::new(Role::Assistant, response));
         }
         self.record_quota();
+        self.refresh_budget = true;
         self.pending_usage
             .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
         self.busy_started = None;
@@ -1024,6 +1143,7 @@ impl App {
         }
         self.messages.push(Message::new(Role::Error, error));
         self.record_quota();
+        self.refresh_budget = true;
         self.pending_usage
             .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
         self.busy_started = None;
@@ -1516,6 +1636,149 @@ mod tests {
         a.quota.date = crate::quota::today();
         a.quota.requests = spent;
         a
+    }
+
+    // ---- /quota set and /quota clear -------------------------------------------
+
+    /// `config.save()` writes to `$HOME`, so these run isolated -- the same
+    /// reason `App` never writes the quota itself.
+    #[test]
+    fn quota_set_accepts_each_metric() {
+        crate::config::test_support::with_isolated_home(|| {
+            for (cmd, check) in [
+                ("/quota set requests 200", 0),
+                ("/quota set tokens 500000", 1),
+                ("/quota set usd 0.10", 2),
+            ] {
+                let mut a = app();
+                type_str(&mut a, cmd);
+                a.handle_key(key(KeyCode::Enter));
+                match check {
+                    0 => assert_eq!(a.config.quota.max_requests_per_day, 200, "{cmd}"),
+                    1 => assert_eq!(a.config.quota.max_tokens_per_day, 500_000, "{cmd}"),
+                    _ => assert!((a.config.quota.max_usd_per_day - 0.10).abs() < 1e-9, "{cmd}"),
+                }
+                assert!(a.messages.iter().any(|m| m.role == Role::System), "{cmd}");
+                assert_eq!(a.state, AppState::AwaitingInput, "{cmd}");
+            }
+        });
+    }
+
+    /// A limit set in the app must survive a restart, or it is a toy.
+    #[test]
+    fn quota_set_persists_to_config() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            type_str(&mut a, "/quota set requests 42");
+            a.handle_key(key(KeyCode::Enter));
+
+            let reloaded = crate::config::Config::load().expect("config should load");
+            assert_eq!(reloaded.quota.max_requests_per_day, 42);
+        });
+    }
+
+    #[test]
+    fn quota_set_then_enforces_the_new_limit() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            a.quota.date = crate::quota::today();
+            a.quota.requests = 3;
+
+            type_str(&mut a, "/quota set requests 3");
+            a.handle_key(key(KeyCode::Enter));
+
+            type_str(&mut a, "hello");
+            a.handle_key(key(KeyCode::Enter));
+            assert_eq!(a.state, AppState::AwaitingInput, "the new limit must bind at once");
+        });
+    }
+
+    #[test]
+    fn quota_clear_removes_every_limit() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            a.config.quota.max_requests_per_day = 10;
+            a.config.quota.max_tokens_per_day = 10;
+            a.config.quota.max_usd_per_day = 1.0;
+
+            type_str(&mut a, "/quota clear");
+            a.handle_key(key(KeyCode::Enter));
+
+            assert!(!a.config.quota.has_limits());
+            a.quota.requests = 100;
+            type_str(&mut a, "hello");
+            a.handle_key(key(KeyCode::Enter));
+            assert_eq!(a.state, AppState::Sending);
+        });
+    }
+
+    #[test]
+    fn a_malformed_limit_is_explained_rather_than_silently_ignored() {
+        crate::config::test_support::with_isolated_home(|| {
+            for cmd in [
+                "/quota set",
+                "/quota set requests",
+                "/quota set requests abc",
+                "/quota set wat 5",
+            ] {
+                let mut a = app();
+                type_str(&mut a, cmd);
+                a.handle_key(key(KeyCode::Enter));
+                assert!(
+                    a.messages.iter().any(|m| m.role == Role::Error),
+                    "{cmd} should explain itself"
+                );
+                assert_eq!(a.config.quota.max_requests_per_day, 0, "{cmd} must change nothing");
+                assert!(!a.messages.iter().any(|m| m.role == Role::User), "{cmd}");
+            }
+        });
+    }
+
+    /// A dollar limit with no price configured looks like protection and is
+    /// not, so setting one says so immediately rather than leaving the user to
+    /// notice $0.00 later.
+    #[test]
+    fn setting_a_usd_limit_without_a_price_warns_that_it_cannot_trigger() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            a.config.llm.model = "unpriced-model".to_string();
+            type_str(&mut a, "/quota set usd 0.10");
+            a.handle_key(key(KeyCode::Enter));
+
+            let msg = a.messages.iter().find(|m| m.role == Role::System).expect("a confirmation");
+            assert!(msg.content.contains("never trigger"), "{}", msg.content);
+        });
+    }
+
+    /// The free-tier budget belongs to the gateway; a user clearing their own
+    /// limits must not appear to have cleared that too.
+    #[test]
+    fn clearing_own_limits_says_the_free_tier_is_unaffected() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            type_str(&mut a, "/quota clear");
+            a.handle_key(key(KeyCode::Enter));
+            let msg = a.messages.iter().find(|m| m.role == Role::System).unwrap();
+            assert!(msg.content.contains("free-tier"), "{}", msg.content);
+        });
+    }
+
+    #[test]
+    fn showing_the_quota_asks_for_a_fresh_budget() {
+        let mut a = app();
+        assert!(!a.refresh_budget);
+        type_str(&mut a, "/quota");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.refresh_budget, "a startup-cached figure goes stale immediately");
+    }
+
+    #[test]
+    fn an_unset_quota_readout_says_how_to_set_one() {
+        let mut a = app();
+        type_str(&mut a, "/quota");
+        a.handle_key(key(KeyCode::Enter));
+        let msg = a.messages.iter().find(|m| m.role == Role::System).unwrap();
+        assert!(msg.content.contains("/quota set"), "{}", msg.content);
     }
 
     #[test]
