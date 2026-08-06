@@ -14,6 +14,43 @@ pub struct Config {
     /// stop parsing the moment a user upgrades.
     #[serde(default)]
     pub quota: QuotaConfig,
+    /// Same again for `[free_tier]`, newer still.
+    #[serde(default)]
+    pub free_tier: FreeTierConfig,
+}
+
+/// Anonymous free-tier enrolment. See `freetier.rs`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FreeTierConfig {
+    /// False stops this install ever contacting the gateway.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Base URL of the gateway.
+    #[serde(default = "default_gateway")]
+    pub gateway: String,
+    /// Device token from `/register`. Not a provider key: it only spends this
+    /// device's daily allowance and is useless for anything else.
+    #[serde(default)]
+    pub device_token: String,
+    /// Stable identifier for machines with no readable hardware id, persisted so
+    /// such a machine does not draw a fresh budget on every launch.
+    #[serde(default)]
+    pub fallback_id: String,
+}
+
+fn default_gateway() -> String {
+    crate::freetier::DEFAULT_GATEWAY.to_string()
+}
+
+impl Default for FreeTierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: yes(),
+            gateway: default_gateway(),
+            device_token: String::new(),
+            fallback_id: String::new(),
+        }
+    }
 }
 
 /// Optional daily ceilings. See `quota.rs`.
@@ -220,6 +257,12 @@ impl Config {
         }
         // Exists so an automated test can drive the loop without a human at the
         // keyboard. Setting it in normal use hands the model an unattended shell.
+        if let Some(v) = env_var("TUISAMPLE_GATEWAY") {
+            config.free_tier.gateway = v;
+        }
+        if let Some(v) = env_var("TUISAMPLE_FREE_TIER") {
+            config.free_tier.enabled = truthy(&v);
+        }
         if let Some(v) = env_var("TUISAMPLE_QUOTA_ENABLED") {
             config.quota.enabled = truthy(&v);
         }
@@ -286,6 +329,11 @@ impl Config {
     /// Nonsense quota settings are clamped rather than obeyed. A warn threshold
     /// of 0 would fire before the first request; above 100 it could never fire.
     fn normalize_quota(&mut self) {
+        self.free_tier.gateway = self.free_tier.gateway.trim().trim_end_matches('/').to_string();
+        self.free_tier.device_token = self.free_tier.device_token.trim().to_string();
+        if self.free_tier.gateway.is_empty() {
+            self.free_tier.gateway = default_gateway();
+        }
         self.quota.warn_at_percent = self.quota.warn_at_percent.clamp(1, 100);
         if self.quota.max_usd_per_day < 0.0 || !self.quota.max_usd_per_day.is_finite() {
             self.quota.max_usd_per_day = 0.0;
@@ -412,6 +460,7 @@ mod tests {
 
             let config = Config {
                 quota: QuotaConfig::default(),
+                free_tier: FreeTierConfig::default(),
                 llm: LlmConfig {
                     endpoint: "https://api.deepseek.com".to_string(),
                     model: "deepseek-v4-pro".to_string(),

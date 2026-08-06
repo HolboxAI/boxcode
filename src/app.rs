@@ -212,6 +212,9 @@ pub struct App {
     /// queue: `App` stays free of filesystem side effects, so its tests do not
     /// silently touch the real `$HOME`. Only `main.rs`'s runtime loop persists.
     pub quota_dirty: bool,
+    /// One line describing free-tier enrolment, or why it is unavailable.
+    /// Empty when the user brought their own key. Set by `main` at startup.
+    pub free_tier_status: String,
     /// One line for the welcome screen describing where commands will run, or
     /// why the tool is off. Set by `main` once the workspace has been resolved.
     pub workspace_status: String,
@@ -267,6 +270,7 @@ impl App {
             exact_usage: None,
             warned_today: false,
             quota_dirty: false,
+            free_tier_status: String::new(),
             workspace_status: String::new(),
             workspace_root: String::new(),
             prompt_history: Vec::new(),
@@ -789,7 +793,13 @@ impl App {
     /// change whether they bind for the rest of the day.
     fn show_quota(&mut self) {
         self.roll_quota_day();
-        let text = crate::quota::describe(&self.quota, &self.config.quota);
+        let mut text = crate::quota::describe(&self.quota, &self.config.quota);
+        // The gateway's budget is the one that actually refuses a request, so it
+        // goes first. The local counters below it are this machine's own view
+        // and cannot stop anything.
+        if !self.free_tier_status.is_empty() && !self.free_tier_status.starts_with("unavailable") {
+            text = format!("{}\n\n{text}", self.free_tier_status);
+        }
         self.messages.push(Message::new(Role::System, text));
     }
 
