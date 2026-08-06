@@ -230,7 +230,33 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
                     lines.push(Line::from(Span::styled(wrapped, theme::text())));
                 }
             }
-            Role::Error | Role::System => {
+            Role::Error => {
+                // Classified rather than uniformly red: "you have used today's
+                // allowance" and "the endpoint is unreachable" are different
+                // situations, and a wall of identical red trains people to stop
+                // reading the one that mattered.
+                let kind = crate::notice::classify(msg.body());
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{} ", kind.icon()), kind.style()),
+                    Span::styled(kind.headline(), kind.style()),
+                ]));
+                for wrapped in wrap(msg.body(), width.saturating_sub(2).max(1)) {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(wrapped, theme::text()),
+                    ]));
+                }
+                if let Some(hint) = kind.hint() {
+                    for wrapped in wrap(hint, width.saturating_sub(4).max(1)) {
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled("→ ", Style::default().fg(kind.color())),
+                            Span::styled(wrapped, theme::faint()),
+                        ]));
+                    }
+                }
+            }
+            Role::System => {
                 lines.push(Line::from(vec![Span::styled(
                     format!("{}: ", msg.role.label()),
                     role_style(msg.role),
@@ -1259,6 +1285,100 @@ mod tests {
     /// Regression: a popup wider or taller than the frame indexes off the end of
     /// the buffer, and `Clear` panics rather than clipping. Terminals really do
     /// report sizes this small -- mid-resize, and on a pty with no window size.
+    /// The point of the whole module: two different failures must not render
+    /// identically. A wall of the same red is what teaches people to skip the
+    /// one that mattered.
+    #[test]
+    fn different_failures_render_differently() {
+        let cases = [
+            ("Daily limit reached — requests 5 of 5.", "Daily limit reached", "◔"),
+            (
+                "The free tier has reached its capacity for today and is paused.",
+                "Free tier at capacity",
+                "◍",
+            ),
+            (
+                "This conversation is too long for the model's context window.",
+                "Conversation too long",
+                "▣",
+            ),
+            ("Could not reach http://x:8000: connection refused", "Endpoint unreachable", "⊘"),
+        ];
+
+        for (body, headline, icon) in cases {
+            let mut app = App::new(crate::config::Config::default());
+            app.greeted = true;
+            app.messages.push(crate::app::Message::new(Role::Error, body));
+
+            let rendered = rendered_text(&mut app, 100, 30);
+            assert!(rendered.contains(headline), "missing headline {headline}: {rendered}");
+            assert!(rendered.contains(icon), "missing icon {icon} for {headline}");
+            // The undifferentiated label is gone.
+            assert!(!rendered.contains("Error: "), "still using the generic label: {rendered}");
+        }
+    }
+
+    /// A spent allowance and a fleet-wide outage need different remedies, so
+    /// they must not share a hint.
+    #[test]
+    fn the_hint_names_the_remedy_that_actually_applies() {
+        let mut own = App::new(crate::config::Config::default());
+        own.greeted = true;
+        own.messages.push(crate::app::Message::new(
+            Role::Error,
+            "Daily free-tier limit reached ($0.25 of $0.25).",
+        ));
+        let out = rendered_text(&mut own, 100, 30);
+        assert!(out.contains("/quota"), "should point at the user's own limits: {out}");
+
+        let mut paused = App::new(crate::config::Config::default());
+        paused.greeted = true;
+        paused.messages.push(crate::app::Message::new(
+            Role::Error,
+            "The free tier has reached its capacity for today and is paused.",
+        ));
+        let out = rendered_text(&mut paused, 100, 30);
+        assert!(out.contains("Not caused by you"), "must not blame the user: {out}");
+    }
+
+    #[test]
+    fn an_unrecognised_failure_still_renders_readably() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages
+            .push(crate::app::Message::new(Role::Error, "something went sideways"));
+        let out = rendered_text(&mut app, 100, 30);
+        assert!(out.contains("Error"), "{out}");
+        assert!(out.contains("something went sideways"), "{out}");
+    }
+
+    /// System messages are not failures and keep their existing presentation.
+    #[test]
+    fn system_messages_are_untouched_by_the_error_styling() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages
+            .push(crate::app::Message::new(Role::System, "Switched to deepseek."));
+        let out = rendered_text(&mut app, 100, 30);
+        assert!(out.contains("System"), "{out}");
+    }
+
+    #[test]
+    fn a_notice_survives_a_narrow_terminal() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages.push(crate::app::Message::new(
+            Role::Error,
+            "Daily limit reached — requests 5 of 5. Resets in 3h.",
+        ));
+        for (w, h) in [(1, 1), (20, 6), (40, 12), (200, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| render(f, &mut app))
+                .unwrap_or_else(|e| panic!("{w}x{h} failed: {e}"));
+        }
+    }
+
     #[test]
     fn a_popup_never_escapes_a_small_frame() {
         for (w, h) in [(0, 0), (1, 1), (5, 3), (20, 4), (39, 5), (200, 60)] {
