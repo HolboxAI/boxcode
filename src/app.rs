@@ -125,6 +125,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "switch model"),
     ("/new", "forget the current conversation"),
     ("/usage", "show local token usage"),
+    ("/quota", "show today's limits, or override them"),
 ];
 
 pub struct App {
@@ -196,6 +197,21 @@ pub struct App {
     /// itself side-effect-free; only `main.rs`'s runtime loop -- which is
     /// what actually runs against a real `$HOME` -- ever calls `usage::record_turn`.
     pub pending_usage: Vec<(usize, String)>,
+    /// Today's ceilings and what has been spent against them. Separate from
+    /// `pending_usage`, which is the permanent history: this one refuses.
+    pub quota: crate::quota::DailyQuota,
+    /// Exact counts for the turn in flight, when the endpoint reported them.
+    /// `None` means fall back to the character estimate.
+    pub exact_usage: Option<crate::llm::ApiUsage>,
+    /// Set once a day so an approaching-limit notice appears once rather than
+    /// before every prompt.
+    pub warned_today: bool,
+    /// True when `quota` has changed and not yet been written.
+    ///
+    /// A flag rather than a write, for the same reason `pending_usage` is a
+    /// queue: `App` stays free of filesystem side effects, so its tests do not
+    /// silently touch the real `$HOME`. Only `main.rs`'s runtime loop persists.
+    pub quota_dirty: bool,
     /// One line for the welcome screen describing where commands will run, or
     /// why the tool is off. Set by `main` once the workspace has been resolved.
     pub workspace_status: String,
@@ -247,6 +263,10 @@ impl App {
             busy_started: None,
             streamed_chars: 0,
             pending_usage: Vec::new(),
+            quota: crate::quota::DailyQuota::default(),
+            exact_usage: None,
+            warned_today: false,
+            quota_dirty: false,
             workspace_status: String::new(),
             workspace_root: String::new(),
             prompt_history: Vec::new(),
@@ -338,6 +358,7 @@ impl App {
                         "/model" => self.open_model_picker_from_config(),
                         "/new" => self.start_new_conversation(),
                         "/usage" => self.show_usage(),
+                        "/quota" => self.show_quota(),
                         other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
                     }
                 } else {
@@ -458,6 +479,49 @@ impl App {
             return;
         }
 
+        // `/quota` takes an argument, so it cannot come through the
+        // autocomplete registry, which matches whole commands.
+        match prompt.as_str() {
+            "/quota override" => {
+                self.input_buffer.clear();
+                self.cursor = 0;
+                self.greeted = true;
+                self.set_quota_override(true);
+                return;
+            }
+            "/quota reset" => {
+                self.input_buffer.clear();
+                self.cursor = 0;
+                self.greeted = true;
+                self.set_quota_override(false);
+                return;
+            }
+            _ => {}
+        }
+
+        // Checked here and only here -- never mid-turn. Blocking between tool
+        // rounds would strand `tool_calls` with no matching results, which
+        // invalidates the conversation for every later request; `max_steps`
+        // already bounds how far one turn can run.
+        self.roll_quota_day();
+        if let Some(message) = self.quota_block() {
+            // The prompt deliberately stays in the input box. It was never
+            // sent, and silently destroying something just typed -- possibly at
+            // length -- is a worse outcome than the refusal itself.
+            self.greeted = true;
+            self.follow_tail = true;
+            self.messages.push(Message::new(Role::Error, message));
+            return;
+        }
+        if !self.warned_today {
+            if let crate::quota::Verdict::Warn(w) =
+                crate::quota::evaluate(&self.quota, &self.config.quota)
+            {
+                self.warned_today = true;
+                self.messages.push(Message::new(Role::System, w));
+            }
+        }
+
         self.input_buffer.clear();
         self.cursor = 0;
         self.greeted = true;
@@ -507,6 +571,7 @@ impl App {
                 .push(Message::new(Role::Error, "Request cancelled."));
         }
         // Whatever streamed before the cancel was still real usage.
+        self.record_quota();
         self.pending_usage
             .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
         self.busy_started = None;
@@ -658,6 +723,92 @@ impl App {
         ));
     }
 
+    /// Exact counts from the endpoint for the turn in flight. Preferred over
+    /// the character estimate wherever both exist -- an estimate is fine for a
+    /// history readout and not fine for a spending limit.
+    pub fn record_exact_usage(&mut self, usage: crate::llm::ApiUsage) {
+        self.exact_usage = Some(usage);
+    }
+
+    /// Fold the finished turn into today's quota. Called once per request,
+    /// including the extra round trips a tool-using turn makes -- each is a
+    /// real, billable call.
+    fn record_quota(&mut self) {
+        if !self.config.quota.enabled {
+            self.exact_usage = None;
+            return;
+        }
+        self.roll_quota_day();
+
+        let tokens = match self.exact_usage.take() {
+            Some(u) => crate::quota::TokenCount {
+                prompt: u.prompt_tokens as u64,
+                completion: u.completion_tokens as u64,
+                estimated: false,
+            },
+            // No report: reuse the same estimate the usage log records, so the
+            // two never disagree about the same turn.
+            None => crate::quota::TokenCount {
+                prompt: 0,
+                completion: self.approx_tokens_this_turn() as u64,
+                estimated: true,
+            },
+        };
+        if tokens.total() == 0 {
+            return;
+        }
+        let price = self.config.quota.price_for(&self.config.llm.model);
+        self.quota.record(&tokens, price);
+        // Flagged rather than written: `main.rs` flushes it, per request rather
+        // than at exit -- this is a TUI people close with Ctrl-C, and a limit
+        // that forgets on exit is not a limit.
+        self.quota_dirty = true;
+    }
+
+    /// Start a new day if the UTC date moved on. A TUI gets left open for days,
+    /// so a rollover that only happened at startup would keep yesterday's spent
+    /// allowance in force well into the morning.
+    fn roll_quota_day(&mut self) {
+        let today = crate::quota::today();
+        if self.quota.date != today {
+            self.quota.roll_over(&today);
+            self.warned_today = false;
+            self.quota_dirty = true;
+        }
+    }
+
+    /// The reason this prompt cannot be sent, if any.
+    fn quota_block(&self) -> Option<String> {
+        match crate::quota::evaluate(&self.quota, &self.config.quota) {
+            crate::quota::Verdict::Blocked(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// `/quota` -- show today's limits. `/quota override` / `/quota reset`
+    /// change whether they bind for the rest of the day.
+    fn show_quota(&mut self) {
+        self.roll_quota_day();
+        let text = crate::quota::describe(&self.quota, &self.config.quota);
+        self.messages.push(Message::new(Role::System, text));
+    }
+
+    fn set_quota_override(&mut self, active: bool) {
+        // Otherwise an override could be granted against yesterday's record and
+        // then be wiped by the next rollover, silently doing nothing.
+        self.roll_quota_day();
+        self.quota.override_active = active;
+        self.quota_dirty = true;
+        self.messages.push(Message::new(
+            Role::System,
+            if active {
+                "Quota override active for the rest of today. It clears at UTC midnight."
+            } else {
+                "Quota override cleared; the daily limits apply again."
+            },
+        ));
+    }
+
     /// Reads the local usage log (see `usage.rs`) and prints a summary --
     /// this never leaves the machine, and works with no login and no server,
     /// since the file it reads is the only copy of this data that exists.
@@ -678,6 +829,13 @@ impl App {
                 if s.days_active == 1 { "" } else { "s" },
             ),
         ));
+        // The two meters answer different questions -- this one is history and
+        // never refuses; the quota is a ceiling and does. Showing them together,
+        // labelled, stops the log being mistaken for the thing that binds.
+        if self.config.quota.has_limits() {
+            let text = crate::quota::describe(&self.quota, &self.config.quota);
+            self.messages.push(Message::new(Role::System, text));
+        }
     }
 
     fn needs_approval(&self, call: &ToolCall) -> bool {
@@ -834,6 +992,7 @@ impl App {
         } else {
             self.messages.push(Message::new(Role::Assistant, response));
         }
+        self.record_quota();
         self.pending_usage
             .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
         self.busy_started = None;
@@ -854,6 +1013,7 @@ impl App {
             self.messages.push(Message::new(Role::Assistant, partial));
         }
         self.messages.push(Message::new(Role::Error, error));
+        self.record_quota();
         self.pending_usage
             .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
         self.busy_started = None;
@@ -1337,6 +1497,176 @@ mod tests {
         let mut app = App::new(Config::default());
         app.config.tools.auto_approve_read_only = false;
         app
+    }
+
+    /// A quota-enabled app with `spent` requests already used today.
+    fn quota_app(limit: u64, spent: u64) -> App {
+        let mut a = app();
+        a.config.quota.max_requests_per_day = limit;
+        a.quota.date = crate::quota::today();
+        a.quota.requests = spent;
+        a
+    }
+
+    #[test]
+    fn a_prompt_is_refused_once_the_daily_limit_is_spent() {
+        let mut a = quota_app(5, 5);
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert!(
+            !a.messages.iter().any(|m| m.role == Role::User),
+            "a refused prompt must not enter the conversation"
+        );
+        let err = a.messages.iter().find(|m| m.role == Role::Error).expect("a refusal");
+        assert!(err.content.contains("Daily limit reached"), "{}", err.content);
+        assert!(err.content.contains("/quota override"), "{}", err.content);
+    }
+
+    /// Losing a long prompt to a refusal is a worse outcome than the refusal.
+    #[test]
+    fn a_refused_prompt_is_left_in_the_input_box() {
+        let mut a = quota_app(1, 1);
+        type_str(&mut a, "a carefully written prompt");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.input_buffer, "a carefully written prompt");
+    }
+
+    #[test]
+    fn one_request_below_the_limit_still_sends() {
+        let mut a = quota_app(5, 4);
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+    }
+
+    /// The upgrade-safety property: nobody who has set no limit is ever refused.
+    #[test]
+    fn with_no_limits_configured_nothing_is_refused() {
+        let mut a = app();
+        a.quota.requests = 100_000;
+        a.quota.prompt_tokens = 500_000_000;
+        a.quota.micro_usd = 4_000_000_000;
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+    }
+
+    #[test]
+    fn quota_override_unblocks_the_rest_of_the_day() {
+        let mut a = quota_app(5, 5);
+        type_str(&mut a, "/quota override");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.quota.override_active);
+        assert!(a.quota_dirty, "the change must be queued for persistence");
+
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending);
+    }
+
+    #[test]
+    fn quota_reset_puts_the_limit_back() {
+        let mut a = quota_app(5, 5);
+        a.quota.override_active = true;
+        type_str(&mut a, "/quota reset");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(!a.quota.override_active);
+
+        type_str(&mut a, "hello");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    /// Exact counts beat the character estimate wherever both exist -- an
+    /// estimate is fine for a history readout and not fine for a limit.
+    #[test]
+    fn exact_counts_from_the_endpoint_are_preferred_over_the_estimate() {
+        let mut a = app();
+        a.quota.date = crate::quota::today();
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 1000, completion_tokens: 500 });
+        a.state = AppState::Streaming;
+        a.append_token(&"x".repeat(4000)); // would estimate ~1000
+        a.finish_stream();
+
+        assert_eq!(a.quota.prompt_tokens, 1000);
+        assert_eq!(a.quota.completion_tokens, 500);
+        assert!(!a.quota.any_estimated, "reported counts are not estimates");
+    }
+
+    #[test]
+    fn without_a_report_the_quota_falls_back_to_the_estimate_and_says_so() {
+        let mut a = app();
+        a.quota.date = crate::quota::today();
+        a.state = AppState::Streaming;
+        a.append_token(&"x".repeat(400));
+        a.finish_stream();
+
+        assert_eq!(a.quota.requests, 1);
+        assert!(a.quota.total_tokens() > 0);
+        assert!(a.quota.any_estimated);
+    }
+
+    /// `App` must stay free of filesystem side effects, or every test above
+    /// would silently write to the developer's real `$HOME`.
+    #[test]
+    fn recording_a_turn_never_touches_the_filesystem_itself() {
+        let mut a = app();
+        a.quota.date = crate::quota::today();
+        a.state = AppState::Streaming;
+        a.append_token("hello, this is a reply long enough to register");
+        a.finish_stream();
+        // It queues instead, exactly as pending_usage does.
+        assert!(a.quota_dirty);
+        assert!(!a.pending_usage.is_empty());
+    }
+
+    #[test]
+    fn each_recorded_request_counts_including_tool_round_trips() {
+        let mut a = app();
+        a.quota.date = crate::quota::today();
+        for _ in 0..3 {
+            a.state = AppState::Streaming;
+            a.append_token("a reply long enough to count as usage");
+            a.finish_stream();
+        }
+        assert_eq!(a.quota.requests, 3);
+    }
+
+    #[test]
+    fn the_quota_command_reports_all_three_metrics() {
+        let mut a = app();
+        a.config.quota.max_requests_per_day = 10;
+        a.quota.date = crate::quota::today();
+        a.quota.requests = 3;
+
+        type_str(&mut a, "/quota");
+        a.handle_key(key(KeyCode::Enter));
+
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a report");
+        assert!(out.content.contains("Requests: 3 of 10"), "{}", out.content);
+        assert!(out.content.contains("Tokens:"), "{}", out.content);
+        assert!(out.content.contains("Spend:"), "{}", out.content);
+        assert!(out.content.contains("no limit set"), "{}", out.content);
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    /// `/usage` keeps main's local history readout and appends the ceiling only
+    /// when one is configured -- the two are different meters.
+    #[test]
+    fn usage_appends_the_quota_only_when_a_limit_exists() {
+        let mut a = app();
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(!a.messages.iter().any(|m| m.content.contains("Daily limits")));
+
+        let mut b = app();
+        b.config.quota.max_requests_per_day = 10;
+        type_str(&mut b, "/usage");
+        b.handle_key(key(KeyCode::Enter));
+        assert!(b.messages.iter().any(|m| m.content.contains("Usage (local")));
+        assert!(b.messages.iter().any(|m| m.content.contains("Daily limits")));
     }
 
     fn key(code: KeyCode) -> KeyEvent {

@@ -4,6 +4,7 @@ mod danger;
 mod dateutil;
 mod llm;
 mod providers;
+mod quota;
 mod telemetry;
 mod tools;
 mod theme;
@@ -91,6 +92,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config);
+    // Loaded before the first prompt so a limit already spent today is in force
+    // from the start, not after the first request slips through.
+    if app.config.quota.enabled {
+        app.quota = quota::DailyQuota::load(&quota::today());
+    }
     app.workspace_status = workspace_status;
     app.workspace_root = workspace
         .as_ref()
@@ -171,6 +177,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 StreamEvent::Token(token) => app.append_token(&token),
                 StreamEvent::ToolCalls(calls) => app.request_tools(calls),
                 StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
+                StreamEvent::Usage(u) => app.record_exact_usage(u),
                 StreamEvent::Done => app.finish_stream(),
                 StreamEvent::Notice(note) => app.note(note),
                 StreamEvent::Error(err) => app.fail_stream(err),
@@ -184,6 +191,12 @@ async fn run_app<B: ratatui::backend::Backend>(
         // queued earlier this same iteration (a cancel via Esc).
         for (tokens, model) in app.pending_usage.drain(..) {
             usage::record_turn(tokens, &model);
+        }
+        // Same reasoning, same place: `App` marks the quota dirty, this loop is
+        // the only thing that writes it.
+        if app.quota_dirty {
+            app.quota.save();
+            app.quota_dirty = false;
         }
 
         // Fire a pending request.
@@ -199,6 +212,9 @@ async fn run_app<B: ratatui::backend::Backend>(
             // stops a runaway loop: the model has nothing left to call, so it
             // answers. Saying "stop" in the prompt alone would only be a request.
             let budget_left = app.tool_steps < app.config.tools.max_steps;
+            // Exact counts make the quota real; without them it falls back to the
+            // same character estimate `usage.rs` uses.
+            let include_usage = app.config.quota.enabled && app.config.quota.include_usage;
             let (schemas, system) = match workspace {
                 Some(ws) => (
                     if budget_left { tools::schemas() } else { Vec::new() },
@@ -211,7 +227,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
             let handle = tokio::spawn(async move {
                 llm::stream_chat(
-                    llm::Target { endpoint: &endpoint, model: &model, api_key: &api_key, max_tokens },
+                    llm::Target { endpoint: &endpoint, model: &model, api_key: &api_key, max_tokens, include_usage },
                     history,
                     schemas,
                     id,
@@ -306,6 +322,19 @@ COMMANDS (type in the input box, press Enter):
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider
     /new                  Forget the conversation and start fresh
+    /usage                Show this machine's local token history
+    /quota                Show today's limits and what's been spent
+    /quota override       Keep working past today's limit
+    /quota reset          Cancel an override
+
+DAILY LIMITS (optional, off by default -- every limit is 0 = no limit, so this
+              only counts until you set one. See [quota] in config.toml):
+    TUISAMPLE_QUOTA_ENABLED         Set to 0 to disable counting entirely
+    TUISAMPLE_MAX_REQUESTS_PER_DAY  Requests before prompts are refused
+    TUISAMPLE_MAX_TOKENS_PER_DAY    Prompt + completion tokens per UTC day
+    TUISAMPLE_MAX_USD_PER_DAY       Spend per UTC day; needs [quota.pricing]
+                                    entries for the models you use, or cost
+                                    cannot be computed and reads as unpriced
 
 KEYS:
     Enter                 Send prompt

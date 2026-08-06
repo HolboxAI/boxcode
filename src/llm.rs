@@ -14,6 +14,32 @@ pub struct ChatRequest {
     /// calling should see exactly the request it saw before this feature landed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
+    /// Asks a streaming endpoint to append token counts. Omitted unless
+    /// requested, for the same reason as `tools`: plenty of OpenAI-compatible
+    /// servers reject fields they do not recognise, and exact usage is not
+    /// worth breaking a working endpoint over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
+}
+
+/// Token counts as the endpoint reports them, when it does.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ApiUsage {
+    #[serde(default)]
+    pub prompt_tokens: usize,
+    #[serde(default)]
+    pub completion_tokens: usize,
+}
+
+impl ApiUsage {
+    pub fn total(&self) -> usize {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -71,7 +97,12 @@ pub struct FunctionCall {
 
 #[derive(Deserialize)]
 pub struct StreamDelta {
+    /// `default` because the usage chunk can carry `"choices": []`, and some
+    /// endpoints omit the key entirely on that final chunk.
+    #[serde(default)]
     pub choices: Vec<Choice>,
+    #[serde(default)]
+    pub usage: Option<ApiUsage>,
 }
 
 #[derive(Deserialize)]
@@ -132,11 +163,37 @@ pub enum StreamEvent {
     /// channel, so the event loop has one place to drain and one stale-id guard
     /// covering both sources.
     ToolsFinished(Vec<crate::tools::ToolOutcome>),
+    /// Exact token counts for the request that just finished, when the endpoint
+    /// reports them. Absent rather than guessed: the caller keeps its own
+    /// character estimate as the fallback, and knowing which one it has is the
+    /// difference between a spend figure and a hunch.
+    Usage(ApiUsage),
     Done,
     /// Something the user should know that is not the model talking and not a
     /// failure -- currently only "your answer was truncated".
     Notice(String),
     Error(String),
+}
+
+/// Token counts carried by an SSE line, wherever they appear.
+///
+/// Read separately from `parse_sse_line` because the two are not mutually
+/// exclusive on the wire. The OpenAI reference puts usage in a final chunk with
+/// `"choices": []`, but other endpoints (DeepSeek among them) attach it to the
+/// same chunk that carries `finish_reason` -- which therefore has a choices
+/// entry too. Matching on choices first, as `parse_sse_line` must, would
+/// silently discard those counts and fall back to estimating.
+pub fn usage_of(line: &str) -> Option<ApiUsage> {
+    let payload = line.trim_end().strip_prefix("data:")?.trim_start();
+    if payload == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str::<StreamDelta>(payload)
+        .ok()?
+        .usage
+        // Some endpoints advertise support and then send zeroes, which is
+        // indistinguishable from not reporting at all.
+        .filter(|u| u.total() > 0)
 }
 
 /// Build the chat-completions URL, tolerating the shapes people actually paste in:
@@ -160,6 +217,9 @@ pub struct Target<'a> {
     pub model: &'a str,
     pub api_key: &'a str,
     pub max_tokens: u32,
+    /// Ask the endpoint for exact token counts. Off leaves the request byte for
+    /// byte as it was before this existed.
+    pub include_usage: bool,
 }
 
 pub async fn stream_chat(
@@ -184,7 +244,7 @@ async fn run(
     request_id: u64,
     tx: &mpsc::Sender<(u64, StreamEvent)>,
 ) -> Result<(), String> {
-    let Target { endpoint, model, api_key, max_tokens } = target;
+    let Target { endpoint, model, api_key, max_tokens, include_usage } = target;
     // A lone system prompt is not a conversation.
     if messages.iter().all(|m| m.role == "system") {
         return Err("Nothing to send.".to_string());
@@ -197,6 +257,7 @@ async fn run(
         stream: true,
         max_tokens,
         tools,
+        stream_options: include_usage.then_some(StreamOptions { include_usage: true }),
     };
 
     let client = reqwest::Client::builder()
@@ -255,6 +316,9 @@ async fn run(
             .map_err(|e| format!("Could not read response body: {e}"))?;
         let parsed: StreamDelta = serde_json::from_str(&body)
             .map_err(|e| format!("Unexpected response from {url}: {e}\n{}", truncate(&body, 800)))?;
+        if let Some(usage) = parsed.usage.filter(|u| u.total() > 0) {
+            let _ = tx.send((request_id, StreamEvent::Usage(usage))).await;
+        }
         if let Some(message) = parsed.choices.into_iter().next().and_then(|c| c.message) {
             if let Some(text) = message.content.filter(|t| !t.is_empty()) {
                 let _ = tx.send((request_id, StreamEvent::Token(text))).await;
@@ -273,6 +337,7 @@ async fn run(
     let mut buf: Vec<u8> = Vec::new();
     let mut pending: Vec<ToolCall> = Vec::new();
     let mut finish_reason: Option<String> = None;
+    let mut reported_usage: Option<ApiUsage> = None;
 
     'read: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Stream interrupted: {e}"))?;
@@ -281,7 +346,11 @@ async fn run(
         while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=nl).collect();
             let line = String::from_utf8_lossy(&line[..line.len() - 1]);
-            match parse_sse_line(line.trim_end_matches('\r')) {
+            let line = line.trim_end_matches('\r');
+            if let Some(u) = usage_of(line) {
+                reported_usage = Some(u);
+            }
+            match parse_sse_line(line) {
                 SseLine::Done => break 'read,
                 SseLine::Delta(delta, reason) => {
                     if reason.is_some() {
@@ -299,12 +368,22 @@ async fn run(
     // Trailing line without a final newline.
     if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf).to_string();
-        if let SseLine::Delta(delta, reason) = parse_sse_line(line.trim()) {
+        let line = line.trim();
+        if let Some(u) = usage_of(line) {
+            reported_usage = Some(u);
+        }
+        if let SseLine::Delta(delta, reason) = parse_sse_line(line) {
             if reason.is_some() {
                 finish_reason = reason;
             }
             apply_delta(delta, &mut pending, request_id, tx).await;
         }
+    }
+
+    // Before the tool calls, so the ordering the app relies on (tools last
+    // before the terminating event) is undisturbed.
+    if let Some(usage) = reported_usage {
+        let _ = tx.send((request_id, StreamEvent::Usage(usage))).await;
     }
 
     // Tool calls are only complete once the stream is, since `arguments` is
@@ -607,7 +686,7 @@ mod tests {
     async fn collect(endpoint: &str) -> Vec<StreamEvent> {
         let (tx, mut rx) = mpsc::channel(64);
         stream_chat(
-            Target { endpoint, model: "test-model", api_key: "sk-test", max_tokens: 4096 },
+            Target { endpoint, model: "test-model", api_key: "sk-test", max_tokens: 4096, include_usage: true },
             vec![ChatMessage::text("user", "hi")],
             Vec::new(),
             1,
@@ -743,6 +822,7 @@ mod tests {
                 StreamEvent::Token(_) => "token",
                 StreamEvent::ToolCalls(_) => "tools",
                 StreamEvent::ToolsFinished(_) => "finished",
+                StreamEvent::Usage(_) => "usage",
                 StreamEvent::Done => "done",
                 StreamEvent::Notice(_) => "notice",
                 StreamEvent::Error(_) => "error",
@@ -814,7 +894,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(64);
         stream_chat(
-            Target { endpoint: &addr, model: "m", api_key: "k", max_tokens: 4096 },
+            Target { endpoint: &addr, model: "m", api_key: "k", max_tokens: 4096, include_usage: true },
             vec![ChatMessage::text("user", "hi")],
             vec![serde_json::json!({"type": "function"})],
             1,
@@ -830,6 +910,76 @@ mod tests {
             Some(StreamEvent::Error(e)) => assert!(e.contains("enabled = false"), "{e}"),
             other => panic!("expected an Error event, got {other:?}"),
         }
+    }
+
+    /// The reference implementation puts usage in a trailing chunk with
+    /// `"choices": []`.
+    #[test]
+    fn usage_is_read_from_a_trailing_chunk_with_no_choices() {
+        let u = usage_of(r#"data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":8}}"#)
+            .expect("usage");
+        assert_eq!(u.prompt_tokens, 7);
+        assert_eq!(u.completion_tokens, 8);
+    }
+
+    /// ...but other endpoints attach it to the chunk carrying `finish_reason`,
+    /// which therefore has a choices entry. Matching on choices first would
+    /// discard the counts and silently fall back to estimating.
+    #[test]
+    fn usage_is_read_even_when_it_rides_along_with_a_choices_entry() {
+        let line = r#"data: {"choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":118,"completion_tokens":33406}}"#;
+        let u = usage_of(line).expect("usage alongside a choice");
+        assert_eq!(u.prompt_tokens, 118);
+        assert_eq!(u.completion_tokens, 33_406);
+    }
+
+    /// An endpoint that accepts `include_usage` and then reports zeroes is
+    /// indistinguishable from one that does not report at all.
+    #[test]
+    fn an_all_zero_report_is_treated_as_no_report() {
+        assert!(usage_of(r#"data: {"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0}}"#).is_none());
+        assert!(usage_of(r#"data: {"choices":[{"delta":{"content":"x"}}]}"#).is_none());
+        assert!(usage_of("data: [DONE]").is_none());
+    }
+
+    /// `stream_options` is the field most likely to be rejected by a minimal
+    /// OpenAI-compatible server, so it must be absent unless asked for.
+    #[test]
+    fn stream_options_is_omitted_entirely_when_usage_is_not_requested() {
+        let base = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            stream: true,
+            max_tokens: 4096,
+            tools: Vec::new(),
+            stream_options: None,
+        };
+        assert!(!serde_json::to_string(&base).unwrap().contains("stream_options"));
+
+        let with = ChatRequest { stream_options: Some(StreamOptions { include_usage: true }), ..base };
+        assert!(serde_json::to_string(&with)
+            .unwrap()
+            .contains(r#""stream_options":{"include_usage":true}"#));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_reports_usage_emits_it_before_done() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":123,\"completion_tokens\":45}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        let addr = serve(response.into_bytes(), 7).await;
+
+        let events = collect(&addr).await;
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::Usage(u) => Some(*u),
+            _ => None,
+        });
+        assert_eq!(usage, Some(ApiUsage { prompt_tokens: 123, completion_tokens: 45 }));
     }
 
     #[tokio::test]
