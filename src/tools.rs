@@ -1,4 +1,5 @@
-//! The model's tools: a shell escape hatch, and two typed file operations.
+//! The model's tools: a shell escape hatch, two typed file operations, and a
+//! web search.
 //!
 //! `run_command` is the general-purpose one -- inspecting a command string
 //! cannot tell you what it will do (`cat $(echo ... | base64 -d)`), so the
@@ -16,9 +17,17 @@
 //! is resolved and checked against the workspace root before anything
 //! happens, see `resolve_in_workspace`.
 //!
+//! `web_search` shells out to Python's `ddgs` package rather than talking to
+//! a search engine directly: DuckDuckGo's own scraping-resistant endpoints
+//! only yield real results behind TLS-fingerprint tricks that `ddgs`
+//! actively maintains and this project deliberately does not reimplement.
+//! The query and result count reach the driver script as `argv`, never
+//! spliced into the embedded Python source, so there is nothing for a query
+//! containing quotes or shell metacharacters to break out of.
+//!
 //! Failures come back as results the model can read rather than Rust errors: a
-//! non-zero exit, a missing file, or bad arguments are information, not a
-//! reason to abandon the turn.
+//! non-zero exit, a missing file, a failed search, or bad arguments are
+//! information, not a reason to abandon the turn.
 
 use crate::config::ToolsConfig;
 use crate::danger;
@@ -36,6 +45,7 @@ pub const WRITE_FILE: &str = "write_file";
 pub const LIST_DIR: &str = "list_dir";
 pub const GLOB: &str = "glob";
 pub const EDIT_FILE: &str = "edit_file";
+pub const WEB_SEARCH: &str = "web_search";
 
 /// Directories whose contents are build output or dependencies rather than the
 /// project. Walking them turns a `glob` into thousands of irrelevant results and
@@ -238,6 +248,32 @@ pub fn schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": WEB_SEARCH,
+                "description": "Search the web and get back a short list of results (title, URL, \
+                                 snippet). Use this when you need current information, something \
+                                 outside your training data, or the user asks you to look something \
+                                 up online. Requires Python 3 with the `ddgs` package installed on \
+                                 the user's machine (`pip install ddgs`); if that's missing the \
+                                 result will say so plainly rather than silently returning nothing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query, e.g. `rust async runtime comparison 2026`."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "How many results to return, 1-10. Defaults to 5."
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
     ]
 }
 
@@ -286,7 +322,10 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
          - {GLOB}(pattern): find files by path pattern, e.g. 'src/**/*.rs'. Read-only, runs \
            without asking.\n\
          - {RUN_COMMAND}(command, purpose): run a shell command and get back its exit code, \
-           stdout and stderr.\n\n\
+           stdout and stderr.\n\
+         - {WEB_SEARCH}(query, max_results): search the web, get back titles/URLs/snippets. \
+           Needs Python 3 + the `ddgs` package on the user's machine -- if that's missing you'll \
+           get a clear error instead of results; tell the user plainly rather than retrying.\n\n\
          Rules:\n\
          - {os_hint}\n\
          - Narrate in plain sentences, not just tool calls. Before acting, say in one short \
@@ -322,9 +361,9 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
          - Commands run through {RUN_COMMAND} are NON-INTERACTIVE: stdin is closed. Never run \
            anything that waits for input, opens an editor (vim, nano), or runs a server in the \
            foreground. Such a command will simply time out after {} seconds.\n\
-         - The user approves every write and every command before it runs (reads of a short, \
-           conservative allowlist may go through without asking). If something is declined, do \
-           not retry it — take a different approach or answer without it.\n\
+         - The user approves every write, every command, and every web search before it runs \
+           (reads of a short, conservative allowlist may go through without asking). If something \
+           is declined, do not retry it — take a different approach or answer without it.\n\
          - Anything that changes or deletes files is real and immediate. Be conservative and \
            prefer the narrowest action that does the job.\n\
          - Answers appear in a terminal: keep narration to a sentence or two, not a report.",
@@ -371,6 +410,20 @@ struct EditFileArgs {
     replace_all: bool,
 }
 
+#[derive(Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    #[serde(default)]
+    max_results: Option<u32>,
+}
+
+/// Bounds on how many results a single search may ask for. Below `MIN` a
+/// search would be pointless; above `MAX` it is a good way to fill the
+/// context window with snippets nobody reads.
+const MIN_SEARCH_RESULTS: u32 = 1;
+const MAX_SEARCH_RESULTS: u32 = 10;
+const DEFAULT_SEARCH_RESULTS: u32 = 5;
+
 /// What a call is asking to do, in a form the approval popup and the
 /// transcript can render without knowing which tool produced it.
 #[derive(Clone, Debug, PartialEq)]
@@ -385,11 +438,12 @@ pub enum Action {
     /// Changes a file, so it is approved like `Write` -- but shows only the
     /// span being replaced, which is the whole reason to prefer it.
     Edit { path: String, old: String, new: String, replace_all: bool },
+    Search { query: String, max_results: u32 },
 }
 
 impl Action {
     /// One line for `$ ... —` / transcript-style summaries, with a leading
-    /// icon so the three kinds stay visually distinct in a transcript full
+    /// icon so the different kinds stay visually distinct in a transcript full
     /// of them.
     pub fn label(&self) -> String {
         match self {
@@ -399,6 +453,7 @@ impl Action {
             Action::List { path } => format!("📁 list {path}"),
             Action::Glob { pattern } => format!("🔎 find {pattern}"),
             Action::Edit { path, .. } => format!("✏️ edit {path}"),
+            Action::Search { query, .. } => format!("🔎 search \"{query}\""),
         }
     }
 }
@@ -455,6 +510,18 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
                 new: args.new_string,
                 replace_all: args.replace_all,
             })
+        }
+        WEB_SEARCH => {
+            let args: WebSearchArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let query = args.query.trim().to_string();
+            if query.is_empty() {
+                return None;
+            }
+            let max_results = args
+                .max_results
+                .unwrap_or(DEFAULT_SEARCH_RESULTS)
+                .clamp(MIN_SEARCH_RESULTS, MAX_SEARCH_RESULTS);
+            Some(Action::Search { query, max_results })
         }
         _ => None,
     }
@@ -562,12 +629,13 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         LIST_DIR => execute_list_dir(call, workspace),
         GLOB => execute_glob(call, workspace),
         EDIT_FILE => execute_edit_file(call, workspace),
+        WEB_SEARCH => execute_web_search(call, config).await,
         other => outcome(
             &call.id,
             format!("⚙ {other} — unknown tool"),
             format!(
                 "Error: there is no tool named '{other}'. The tools are {RUN_COMMAND}, \
-                 {READ_FILE}, {WRITE_FILE}, {LIST_DIR}, {GLOB}, {EDIT_FILE}."
+                 {READ_FILE}, {WRITE_FILE}, {LIST_DIR}, {GLOB}, {EDIT_FILE}, {WEB_SEARCH}."
             ),
         ),
     }
@@ -776,6 +844,193 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
             format!("Error: could not write {path}: {e}"),
         ),
     }
+}
+
+/// The embedded driver for `web_search`, run via `python3 -c <this>`.
+///
+/// The query and result count arrive as `argv`, never interpolated into this
+/// source string -- so a query containing quotes, backslashes, or something
+/// that looks like Python (`"; import os; os.system(...)`) has nothing to
+/// break out of, the same way `execute_run_command` never builds its shell
+/// string by splicing untrusted text into other untrusted text.
+///
+/// Prints exactly one line of JSON and always exits 0 (even when `ddgs` is
+/// missing or the search itself fails) so the two are told apart by content,
+/// not by trying to parse a nonzero exit code out of a foreign interpreter's
+/// traceback.
+const DDGS_SCRIPT: &str = r#"
+import json
+import sys
+
+try:
+    from ddgs import DDGS
+except ImportError:
+    print(json.dumps({"error": "ddgs_not_installed"}))
+    sys.exit(0)
+
+query = sys.argv[1]
+max_results = int(sys.argv[2])
+
+try:
+    with DDGS() as ddgs:
+        results = list(ddgs.text(query, max_results=max_results))
+    print(json.dumps({"results": results}))
+except Exception as exc:
+    print(json.dumps({"error": str(exc)}))
+"#;
+
+async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<WebSearchArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "🔎 web_search — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"query": "..."}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+    let query = args.query.trim().to_string();
+    if query.is_empty() {
+        return outcome(
+            &call.id,
+            "🔎 web_search — empty query".to_string(),
+            "Error: the query was empty. Nothing was searched.".to_string(),
+        );
+    }
+    let max_results = args
+        .max_results
+        .unwrap_or(DEFAULT_SEARCH_RESULTS)
+        .clamp(MIN_SEARCH_RESULTS, MAX_SEARCH_RESULTS);
+
+    let mut cmd = tokio::process::Command::new(&config.python_bin);
+    cmd.arg("-c")
+        .arg(DDGS_SCRIPT)
+        .arg(&query)
+        .arg(max_results.to_string())
+        // Closed stdin and captured stdout/stderr for the same reason as
+        // run_command: nothing here should ever wait on a terminal that
+        // does not exist.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let limit = Duration::from_secs(config.search_timeout_secs);
+    let output = match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return outcome(
+                &call.id,
+                format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
+                format!(
+                    "Error: could not run '{}': {e}. web_search needs Python 3 with the `ddgs` \
+                     package installed (pip install ddgs). If Python is installed under a \
+                     different name on this machine, set tools.python_bin in config.toml.",
+                    config.python_bin
+                ),
+            )
+        }
+        Err(_) => {
+            return outcome(
+                &call.id,
+                format!("🔎 search \"{}\" — timed out", clip(&query, 50)),
+                format!(
+                    "Error: killed after {}s waiting for search results. Try again, or a \
+                     narrower query.",
+                    config.search_timeout_secs
+                ),
+            )
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return outcome(
+            &call.id,
+            format!("🔎 search \"{}\" — failed", clip(&query, 50)),
+            format!(
+                "Error: the search process exited with {:?}: {}",
+                output.status.code(),
+                clip(stderr.trim(), 500)
+            ),
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    format_search_result(&call.id, &query, &stdout, config.max_output_bytes)
+}
+
+/// Turns the driver script's one line of JSON into what the model sees.
+///
+/// Split out from `execute_web_search` on purpose: this parsing and
+/// formatting is the part worth testing exhaustively with fixture JSON --
+/// success, empty results, a reported error, garbage output -- without any
+/// of those tests needing Python or `ddgs` actually installed. Only the thin
+/// subprocess plumbing around it requires a real interpreter to exercise.
+fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize) -> ToolOutcome {
+    let trimmed = stdout.trim();
+
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) else {
+        return outcome(
+            call_id,
+            format!("🔎 search \"{}\" — unreadable response", clip(query, 50)),
+            format!(
+                "Error: could not parse the search driver's output: {}",
+                clip(trimmed, 300)
+            ),
+        );
+    };
+
+    if let Some(reason) = map.get("error").and_then(Value::as_str) {
+        return if reason == "ddgs_not_installed" {
+            outcome(
+                call_id,
+                format!("🔎 search \"{}\" — ddgs not installed", clip(query, 50)),
+                "Error: the `ddgs` Python package is not installed. Install it with: \
+                 pip install ddgs"
+                    .to_string(),
+            )
+        } else {
+            outcome(
+                call_id,
+                format!("🔎 search \"{}\" — failed", clip(query, 50)),
+                format!("Error: web search failed: {reason}"),
+            )
+        };
+    }
+
+    let results = map
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if results.is_empty() {
+        return outcome(
+            call_id,
+            format!("🔎 search \"{}\" — 0 results", clip(query, 50)),
+            format!("No results found for '{query}'."),
+        );
+    }
+
+    let mut content = String::new();
+    for (i, r) in results.iter().enumerate() {
+        let title = r.get("title").and_then(Value::as_str).unwrap_or("(untitled)");
+        let href = r.get("href").and_then(Value::as_str).unwrap_or("");
+        let body = r.get("body").and_then(Value::as_str).unwrap_or("");
+        content.push_str(&format!("{}. {title}\n   {href}\n   {body}\n\n", i + 1));
+    }
+
+    let count = results.len();
+    outcome(
+        call_id,
+        format!(
+            "🔎 search \"{}\" — {count} result{}",
+            clip(query, 50),
+            if count == 1 { "" } else { "s" }
+        ),
+        clip(content.trim_end(), budget),
+    )
 }
 
 /// The result to hand back when the user says no.
@@ -1694,7 +1949,7 @@ mod tests {
         let names: Vec<_> = schemas.iter().map(|s| s["function"]["name"].clone()).collect();
         assert_eq!(
             names,
-            vec![RUN_COMMAND, READ_FILE, WRITE_FILE, LIST_DIR, GLOB, EDIT_FILE]
+            vec![RUN_COMMAND, READ_FILE, WRITE_FILE, LIST_DIR, GLOB, EDIT_FILE, WEB_SEARCH]
         );
     }
 
@@ -1782,5 +2037,293 @@ mod tests {
         std::fs::write(dir.path().join("big.txt"), "a".repeat(1000)).unwrap();
         let out = execute(&read_call("big.txt"), &ws, &cfg).await;
         assert!(out.content.contains("truncated at 10"), "{}", out.content);
+    }
+
+    // --- web_search ---------------------------------------------------------
+    //
+    // Two layers, tested separately on purpose (see `format_search_result`'s
+    // doc comment): the pure JSON-to-transcript formatting below needs no
+    // subprocess and runs everywhere, while the subprocess-level tests swap
+    // in a fake "interpreter" -- a tiny shell script standing in for
+    // `python3` -- so timeouts, a missing `ddgs`, and malformed output can
+    // all be exercised deterministically without depending on what's
+    // actually installed on the machine running the test suite.
+
+    fn search_call(query: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: WEB_SEARCH.to_string(),
+                arguments: json!({ "query": query }).to_string(),
+            },
+        }
+    }
+
+    fn search_call_with_max(query: &str, max_results: u32) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: WEB_SEARCH.to_string(),
+                arguments: json!({ "query": query, "max_results": max_results }).to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn web_search_action_defaults_and_clamps_max_results() {
+        assert_eq!(
+            describe_action(&search_call("rust")),
+            Some(Action::Search { query: "rust".to_string(), max_results: 5 })
+        );
+        assert_eq!(
+            describe_action(&search_call_with_max("rust", 0)),
+            Some(Action::Search { query: "rust".to_string(), max_results: 1 })
+        );
+        assert_eq!(
+            describe_action(&search_call_with_max("rust", 999)),
+            Some(Action::Search { query: "rust".to_string(), max_results: 10 })
+        );
+        assert_eq!(
+            describe_action(&search_call_with_max("rust", 3)),
+            Some(Action::Search { query: "rust".to_string(), max_results: 3 })
+        );
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_search_query_has_no_action() {
+        assert_eq!(describe_action(&search_call("")), None);
+        assert_eq!(describe_action(&search_call("   ")), None);
+    }
+
+    #[test]
+    fn format_search_result_renders_multiple_results_in_order() {
+        let json = r#"{"results": [
+            {"title": "Rust", "href": "https://rust-lang.org", "body": "A systems language"},
+            {"title": "Rust (Wikipedia)", "href": "https://en.wikipedia.org/wiki/Rust", "body": "Encyclopedia entry"}
+        ]}"#;
+        let out = format_search_result("call_1", "rust", json, 8192);
+        assert!(out.display.contains("2 results"), "{}", out.display);
+        assert!(out.content.contains("1. Rust\n"), "{}", out.content);
+        assert!(out.content.contains("https://rust-lang.org"), "{}", out.content);
+        assert!(out.content.contains("A systems language"), "{}", out.content);
+        assert!(out.content.contains("2. Rust (Wikipedia)"), "{}", out.content);
+        // Order matters: result 1 must appear before result 2.
+        assert!(out.content.find("1. Rust\n").unwrap() < out.content.find("2. Rust").unwrap());
+    }
+
+    #[test]
+    fn format_search_result_uses_singular_wording_for_one_result() {
+        let json = r#"{"results": [{"title": "T", "href": "https://x", "body": "B"}]}"#;
+        let out = format_search_result("call_1", "q", json, 8192);
+        assert!(out.display.contains("1 result"), "{}", out.display);
+        assert!(!out.display.contains("1 results"), "{}", out.display);
+    }
+
+    #[test]
+    fn format_search_result_reports_no_results_plainly_rather_than_as_an_error() {
+        let out = format_search_result("call_1", "an obscure query", r#"{"results": []}"#, 8192);
+        assert!(!out.content.starts_with("Error:"), "{}", out.content);
+        assert!(out.content.contains("No results found for 'an obscure query'"), "{}", out.content);
+    }
+
+    #[test]
+    fn format_search_result_explains_a_missing_ddgs_package() {
+        let out = format_search_result("call_1", "q", r#"{"error": "ddgs_not_installed"}"#, 8192);
+        assert!(out.content.contains("pip install ddgs"), "{}", out.content);
+    }
+
+    #[test]
+    fn format_search_result_surfaces_a_generic_search_failure() {
+        let out = format_search_result("call_1", "q", r#"{"error": "RatelimitException: 202"}"#, 8192);
+        assert!(out.content.contains("RatelimitException: 202"), "{}", out.content);
+    }
+
+    #[test]
+    fn format_search_result_handles_garbage_output_without_panicking() {
+        for garbage in ["not json at all", "", "   ", "[1,2,3]", "\"just a string\"", "null", "{}"] {
+            let out = format_search_result("call_1", "q", garbage, 8192);
+            assert!(!out.content.is_empty(), "garbage={garbage:?}");
+        }
+    }
+
+    #[test]
+    fn format_search_result_tolerates_missing_fields_in_a_result() {
+        let out = format_search_result("call_1", "q", r#"{"results": [{}]}"#, 8192);
+        assert!(out.content.contains("(untitled)"), "{}", out.content);
+    }
+
+    #[test]
+    fn format_search_result_output_is_capped_by_the_configured_budget() {
+        let many: Vec<Value> = (0..50)
+            .map(|i| json!({"title": format!("Result {i}"), "href": "https://x", "body": "x".repeat(200)}))
+            .collect();
+        let stdout = json!({ "results": many }).to_string();
+        let out = format_search_result("call_1", "q", &stdout, 500);
+        assert!(out.content.contains("truncated at 500"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn unusable_web_search_arguments_are_explained_rather_than_run() {
+        let (_dir, ws, cfg) = fixture();
+        let mut bad = search_call("");
+        bad.function.arguments = "{not json".to_string();
+        let out = execute(&bad, &ws, &cfg).await;
+        assert!(out.content.contains("could not read the arguments"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn an_empty_web_search_query_is_not_run() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&search_call("   "), &ws, &cfg).await;
+        assert!(out.content.starts_with("Error:"), "{}", out.content);
+    }
+
+    /// A nonexistent interpreter must fail the same way a nonexistent shell
+    /// would: cleanly, with a message that tells the user what to install,
+    /// not a panic or a silent hang. No fake script needed -- `Command::new`
+    /// fails to spawn identically on every platform when the binary is not
+    /// found.
+    #[tokio::test]
+    async fn a_missing_python_interpreter_is_explained_rather_than_panicking() {
+        let (_dir, ws, mut cfg) = fixture();
+        cfg.python_bin = "no-such-interpreter-xyz-123".to_string();
+        let out = execute(&search_call("rust"), &ws, &cfg).await;
+        assert!(out.content.contains("could not run"), "{}", out.content);
+        assert!(out.content.contains("pip install ddgs"), "{}", out.content);
+    }
+
+    /// A fake "interpreter" -- a tiny shell script standing in for `python3`
+    /// -- so the subprocess-handling paths in `execute_web_search` can be
+    /// tested deterministically regardless of whether the real `ddgs` is
+    /// installed on the machine running the tests. Unix-only: a faithful
+    /// Windows equivalent needs a `.bat`/`.cmd` or a real exe, which is more
+    /// machinery than this is worth duplicating for.
+    #[cfg(unix)]
+    fn fake_interpreter(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-python.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake interpreter");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn web_search_reports_ddgs_not_installed_end_to_end() {
+        let (dir, ws, mut cfg) = fixture();
+        cfg.python_bin = fake_interpreter(dir.path(), r#"echo '{"error": "ddgs_not_installed"}'"#);
+        let out = execute(&search_call("rust"), &ws, &cfg).await;
+        assert!(out.content.contains("pip install ddgs"), "{}", out.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn web_search_returns_real_looking_results_end_to_end() {
+        let (dir, ws, mut cfg) = fixture();
+        cfg.python_bin = fake_interpreter(
+            dir.path(),
+            r#"echo '{"results": [{"title": "Rust", "href": "https://rust-lang.org", "body": "A language"}]}'"#,
+        );
+        let out = execute(&search_call("rust programming language"), &ws, &cfg).await;
+        assert!(out.content.contains("Rust"), "{}", out.content);
+        assert!(out.content.contains("https://rust-lang.org"), "{}", out.content);
+        assert!(out.display.contains("1 result"), "{}", out.display);
+    }
+
+    /// Without a timeout, a search that never returns (a hung `ddgs` call, a
+    /// stalled network) would freeze the turn forever -- the same failure
+    /// mode `a_command_that_never_finishes_is_killed` guards against for
+    /// `run_command`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn web_search_that_never_finishes_is_killed() {
+        let (dir, ws, mut cfg) = fixture();
+        cfg.python_bin = fake_interpreter(dir.path(), "sleep 30");
+        cfg.search_timeout_secs = 1;
+
+        let started = std::time::Instant::now();
+        let out = execute(&search_call("rust"), &ws, &cfg).await;
+
+        assert!(out.content.contains("killed after 1s"), "{}", out.content);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "should have been killed promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn web_search_surfaces_a_reported_backend_failure() {
+        let (dir, ws, mut cfg) = fixture();
+        cfg.python_bin =
+            fake_interpreter(dir.path(), r#"echo '{"error": "RatelimitException"}'"#);
+        let out = execute(&search_call("rust"), &ws, &cfg).await;
+        assert!(out.content.contains("RatelimitException"), "{}", out.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn web_search_output_is_capped_like_command_output() {
+        let (dir, ws, mut cfg) = fixture();
+        cfg.max_output_bytes = 20;
+        cfg.python_bin = fake_interpreter(
+            dir.path(),
+            r#"echo '{"results": [{"title": "T", "href": "https://x", "body": "a very long snippet that goes on and on"}]}'"#,
+        );
+        let out = execute(&search_call("rust"), &ws, &cfg).await;
+        assert!(out.content.contains("truncated at 20"), "{}", out.content);
+    }
+
+    /// A query that looks like it might break out of the embedded Python
+    /// source or a shell -- quotes, backticks, `$()`, an `os.system` payload
+    /// -- must be treated as inert search text, never executed. The query
+    /// reaches the driver script as `argv`, not spliced into source, so
+    /// there is nothing here for it to break out of; confirmed manually
+    /// against the real `ddgs` backend with a batch of these during review
+    /// (recorded in the session, not kept as a flaky network-dependent test).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_query_that_looks_like_an_injection_attempt_is_inert() {
+        let (dir, ws, mut cfg) = fixture();
+        cfg.python_bin = fake_interpreter(
+            dir.path(),
+            r#"echo '{"results": [{"title": "T", "href": "https://x", "body": "B"}]}'"#,
+        );
+        for q in [
+            r#""; import os; os.system('touch /tmp/pwned-test-marker'); x = ""#,
+            "query with `backticks` and $(command) substitution",
+            "query\nwith\nnewlines\tand\ttabs",
+        ] {
+            let out = execute(&search_call(q), &ws, &cfg).await;
+            assert!(out.content.contains("https://x"), "{}", out.content);
+        }
+        assert!(
+            !std::path::Path::new("/tmp/pwned-test-marker").exists(),
+            "an injection attempt in the query must never execute"
+        );
+    }
+
+    /// The real thing, run against the actual `ddgs` package -- skipped
+    /// rather than failed when Python or `ddgs` are not available, since a
+    /// third-party network dependency has no business making the unit test
+    /// suite red on a machine that has neither installed.
+    #[tokio::test]
+    async fn web_search_works_end_to_end_against_the_real_ddgs_if_available() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(&search_call("rust programming language"), &ws, &cfg).await;
+        if out.content.contains("could not run") || out.content.contains("pip install ddgs") {
+            eprintln!("skipping: python3/ddgs not available in this environment ({})", out.content);
+            return;
+        }
+        assert!(
+            out.display.contains("result"),
+            "expected real search results, got: {}",
+            out.content
+        );
     }
 }

@@ -185,6 +185,19 @@ pub struct ToolsConfig {
     /// commands burns tokens until the user notices.
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
+    /// The Python interpreter `web_search` shells out to. Not on every machine's
+    /// `PATH` under this name (some only have `python`, some want a specific
+    /// venv), so it is a setting rather than hardcoded -- and pointing it at a
+    /// deliberately broken path is also how tests simulate "Python is missing"
+    /// without needing to uninstall anything.
+    #[serde(default = "default_python_bin")]
+    pub python_bin: String,
+    /// How long `web_search` may wait for a search before it is killed.
+    /// Separate from `command_timeout_secs`: starting a Python interpreter and
+    /// making a network request is routinely slower than the shell commands
+    /// that budget was sized for.
+    #[serde(default = "default_search_timeout")]
+    pub search_timeout_secs: u64,
 }
 
 fn yes() -> bool {
@@ -211,6 +224,14 @@ fn default_max_steps() -> usize {
     10
 }
 
+fn default_python_bin() -> String {
+    "python3".to_string()
+}
+
+fn default_search_timeout() -> u64 {
+    20
+}
+
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
@@ -221,6 +242,8 @@ impl Default for ToolsConfig {
             command_timeout_secs: default_command_timeout(),
             max_output_bytes: default_max_output_bytes(),
             max_steps: default_max_steps(),
+            python_bin: default_python_bin(),
+            search_timeout_secs: default_search_timeout(),
         }
     }
 }
@@ -322,6 +345,12 @@ impl Config {
         self.tools.max_output_bytes = self.tools.max_output_bytes.clamp(1024, 8 * 1024 * 1024);
         self.tools.command_timeout_secs = self.tools.command_timeout_secs.clamp(1, 3600);
         self.tools.max_steps = self.tools.max_steps.clamp(1, 50);
+
+        self.tools.python_bin = self.tools.python_bin.trim().to_string();
+        if self.tools.python_bin.is_empty() {
+            self.tools.python_bin = default_python_bin();
+        }
+        self.tools.search_timeout_secs = self.tools.search_timeout_secs.clamp(1, 300);
     }
 
     /// Human-readable reasons the app cannot talk to an endpoint yet, shown on
@@ -509,7 +538,22 @@ mod tests {
             // The safe default has to survive an absent table, or upgrading
             // silently hands existing users an unattended shell.
             assert!(loaded.tools.require_approval);
+            assert_eq!(loaded.tools.python_bin, "python3");
+            assert_eq!(loaded.tools.search_timeout_secs, 20);
         });
+    }
+
+    /// Same again for a config that has a `[tools]` table but no `python_bin`
+    /// or `search_timeout_secs` key -- anyone who edited the table by hand
+    /// before `web_search` existed.
+    #[test]
+    fn a_tools_table_without_web_search_settings_still_defaults() {
+        let parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"http://x\"\n\n[tools]\nenabled = true\nmax_steps = 3\n",
+        )
+        .expect("should parse");
+        assert_eq!(parsed.tools.python_bin, "python3");
+        assert_eq!(parsed.tools.search_timeout_secs, 20);
     }
 
     /// Same again for a config that has a `[tools]` table but no
@@ -541,12 +585,16 @@ mod tests {
         config.tools.command_timeout_secs = 0;
         config.tools.max_steps = 0;
         config.tools.workspace = "  ".to_string();
+        config.tools.python_bin = "  ".to_string();
+        config.tools.search_timeout_secs = 0;
         config.normalize();
 
         assert_eq!(config.tools.max_output_bytes, 1024);
         assert_eq!(config.tools.command_timeout_secs, 1);
         assert_eq!(config.tools.max_steps, 1);
         assert_eq!(config.tools.workspace, ".");
+        assert_eq!(config.tools.python_bin, "python3");
+        assert_eq!(config.tools.search_timeout_secs, 1);
     }
 
     #[test]

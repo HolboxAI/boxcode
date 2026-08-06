@@ -921,13 +921,34 @@ fn tool_approval_lines(
             span("with:", new, theme::SUCCESS);
             (" Apply this edit? ", "edit")
         }
+        Action::Search { query, max_results } => {
+            lines.push(Line::from(Span::styled(
+                format!("🔎 {query}"),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "up to {max_results} result{} — sent to a web search service",
+                    if *max_results == 1 { "" } else { "s" }
+                ),
+                theme::faint(),
+            )));
+            (" Search the web? ", "search")
+        }
     };
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("in {}", app.workspace_root),
-        theme::faint(),
-    )));
+    // A search is not scoped to the project directory the way every other
+    // action is -- showing "in <workspace>" here would claim a boundary this
+    // one doesn't actually have.
+    if !matches!(action, Action::Search { .. }) {
+        lines.push(Line::from(Span::styled(
+            format!("in {}", app.workspace_root),
+            theme::faint(),
+        )));
+    }
     if remaining > 0 {
         lines.push(Line::from(Span::styled(
             format!("({remaining} more queued after this one)"),
@@ -1832,6 +1853,48 @@ mod tests {
             rendered.contains("y write"),
             "the keys must say write, not run"
         );
+    }
+
+    /// A search shows the query and that it leaves the machine, and -- unlike
+    /// every other action -- does not claim to be scoped to the workspace
+    /// directory, since it isn't.
+    #[test]
+    fn the_search_approval_prompt_shows_the_query_and_the_keys() {
+        let mut app = App::new(crate::config::Config::default());
+        app.workspace_root = "/tmp/project".to_string();
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Search {
+                query: "rust async runtime comparison".to_string(),
+                max_results: 5,
+            },
+            remaining: 0,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            rendered.contains("rust async runtime comparison"),
+            "the query must be shown"
+        );
+        assert!(rendered.contains("Search the web?"), "{rendered}");
+        assert!(
+            rendered.contains("web search service"),
+            "the prompt must disclose this leaves the machine"
+        );
+        assert!(
+            !rendered.contains("/tmp/project"),
+            "a search is not scoped to the workspace, so it must not claim to be"
+        );
+        assert!(rendered.contains("y search"), "the keys must say search");
     }
 }
 
