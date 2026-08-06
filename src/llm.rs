@@ -163,6 +163,10 @@ pub enum StreamEvent {
     /// channel, so the event loop has one place to drain and one stale-id guard
     /// covering both sources.
     ToolsFinished(Vec<crate::tools::ToolOutcome>),
+    /// Also not from the endpoint: the free-tier budget lookup reports back on
+    /// this channel for the same reason the command runner does -- one place to
+    /// drain, and the event loop stays the only thing doing I/O.
+    FreeTierBudget(String),
     /// Exact token counts for the request that just finished, when the endpoint
     /// reports them. Absent rather than guessed: the caller keeps its own
     /// character estimate as the fallback, and knowing which one it has is the
@@ -856,6 +860,7 @@ mod tests {
                 StreamEvent::ToolCalls(_) => "tools",
                 StreamEvent::ToolsFinished(_) => "finished",
                 StreamEvent::Usage(_) => "usage",
+                StreamEvent::FreeTierBudget(_) => "budget",
                 StreamEvent::Done => "done",
                 StreamEvent::Notice(_) => "notice",
                 StreamEvent::Error(_) => "error",

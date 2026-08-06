@@ -65,6 +65,10 @@ pub struct Budget {
     pub daily_limit_usd: f64,
     #[serde(default)]
     pub spent_usd: f64,
+    /// What is left today. `None` when the gateway has no per-device limit set,
+    /// in which case "remaining" is not a meaningful number rather than zero.
+    #[serde(default)]
+    pub remaining_usd: Option<f64>,
     #[serde(default)]
     pub requests: u64,
     #[serde(default)]
@@ -77,13 +81,34 @@ pub struct Budget {
 
 impl Budget {
     /// The line `/quota` and the welcome screen show.
+    ///
+    /// Leads with what is *left* rather than what is spent: "how much do I have?"
+    /// is the question someone actually has, and making them subtract two numbers
+    /// to answer it is a small daily tax.
     pub fn summary(&self) -> String {
         if self.daily_limit_usd <= 0.0 {
             return format!("Free tier — {} · no daily limit", self.model);
         }
+        let left = self
+            .remaining_usd
+            .unwrap_or_else(|| (self.daily_limit_usd - self.spent_usd).max(0.0));
+        if self.exhausted || left <= 0.0 {
+            return format!(
+                "Free tier — {} · spent for today (${:.2} of ${:.2}). Resets in {}.",
+                self.model,
+                self.spent_usd,
+                self.daily_limit_usd,
+                crate::quota::time_until_utc_midnight()
+            );
+        }
         format!(
-            "Free tier — {} · ${:.4} of ${:.2} used today ({} request(s)), resets at UTC midnight",
-            self.model, self.spent_usd, self.daily_limit_usd, self.requests
+            "Free tier — {} · ${:.4} left of ${:.2} today ({} used over {} request(s)), resets in {}",
+            self.model,
+            left,
+            self.daily_limit_usd,
+            format_usd(self.spent_usd),
+            self.requests,
+            crate::quota::time_until_utc_midnight()
         )
     }
 }
@@ -185,6 +210,16 @@ pub async fn fetch_budget(config: &Config) -> Result<Budget, String> {
         return Err(format!("Gateway returned {status}. {}", summarise_error(&body)));
     }
     serde_json::from_str(&body).map_err(|e| format!("Unexpected response from the gateway: {e}"))
+}
+
+/// Sub-cent amounts keep enough digits to mean something; a spend of
+/// `$0.0049` rendered as `$0.00` reads as "nothing happened".
+fn format_usd(usd: f64) -> String {
+    if usd > 0.0 && usd < 0.01 {
+        format!("${usd:.4}")
+    } else {
+        format!("${usd:.2}")
+    }
 }
 
 /// Pull the human-readable part out of an OpenAI-shaped error body.
