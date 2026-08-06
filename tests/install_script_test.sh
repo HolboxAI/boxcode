@@ -142,3 +142,136 @@ second_id=$(cat "$fake_home/.tuisample-code/device_id")
 
 rm -rf "$fake_home"
 echo "PASS: ping_install is non-blocking, creates a stable device id once enabled, and never fails the install"
+
+# --- detect_os / detect_arch -------------------------------------------------
+# Shadowing the `uname` builtin with a function is the standard bash trick for
+# this: `source`d into the same shell as the test, it wins over the real
+# command for every caller below without needing five different machines to
+# exercise five different platforms.
+
+uname() {
+  case "$1" in
+    -s) echo "$FAKE_UNAME_S" ;;
+    -m) echo "$FAKE_UNAME_M" ;;
+  esac
+}
+
+FAKE_UNAME_S="Darwin"; [ "$(detect_os)" = "macos" ] || fail "Darwin should map to macos"
+FAKE_UNAME_S="Linux"; [ "$(detect_os)" = "linux" ] || fail "Linux should map to linux"
+FAKE_UNAME_S="MINGW64_NT-10.0"; [ "$(detect_os)" = "windows" ] || fail "MINGW* should map to windows"
+FAKE_UNAME_S="SunOS"; [ "$(detect_os)" = "unsupported" ] || fail "an unrecognised OS should map to unsupported"
+
+FAKE_UNAME_M="x86_64"; [ "$(detect_arch)" = "x86_64" ] || fail "x86_64 should map to x86_64"
+FAKE_UNAME_M="arm64"; [ "$(detect_arch)" = "aarch64" ] || fail "macOS arm64 should map to aarch64"
+FAKE_UNAME_M="aarch64"; [ "$(detect_arch)" = "aarch64" ] || fail "Linux aarch64 should map to aarch64"
+FAKE_UNAME_M="i686"; [ "$(detect_arch)" = "unsupported" ] || fail "32-bit x86 should map to unsupported"
+
+unset -f uname
+
+echo "PASS: detect_os/detect_arch map uname's output onto release.yml's asset-name components"
+
+# --- asset_download_url ------------------------------------------------------
+# The part of the prebuilt-binary fetch that is pure text-in, text-out --
+# tested against a fixture shaped like the real GitHub "get the latest
+# release" response, never against the network itself.
+
+fixture_release_json='{
+  "tag_name": "v0.9.0",
+  "assets": [
+    {
+      "url": "https://api.github.com/repos/HolboxAI/tuisample-code/releases/assets/1",
+      "id": 1,
+      "node_id": "RA_1",
+      "name": "tuisample-code-linux-x86_64",
+      "label": null,
+      "content_type": "application/octet-stream",
+      "state": "uploaded",
+      "size": 12345678,
+      "download_count": 0,
+      "created_at": "2026-08-06T00:00:00Z",
+      "updated_at": "2026-08-06T00:00:00Z",
+      "browser_download_url": "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/tuisample-code-linux-x86_64"
+    },
+    {
+      "url": "https://api.github.com/repos/HolboxAI/tuisample-code/releases/assets/2",
+      "id": 2,
+      "node_id": "RA_2",
+      "name": "tuisample-code-macos-aarch64",
+      "label": null,
+      "content_type": "application/octet-stream",
+      "state": "uploaded",
+      "size": 12345678,
+      "download_count": 0,
+      "created_at": "2026-08-06T00:00:00Z",
+      "updated_at": "2026-08-06T00:00:00Z",
+      "browser_download_url": "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/tuisample-code-macos-aarch64"
+    },
+    {
+      "url": "https://api.github.com/repos/HolboxAI/tuisample-code/releases/assets/3",
+      "id": 3,
+      "node_id": "RA_3",
+      "name": "SHA256SUMS.txt",
+      "label": null,
+      "content_type": "text/plain",
+      "state": "uploaded",
+      "size": 200,
+      "download_count": 0,
+      "created_at": "2026-08-06T00:00:00Z",
+      "updated_at": "2026-08-06T00:00:00Z",
+      "browser_download_url": "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/SHA256SUMS.txt"
+    }
+  ]
+}'
+
+url=$(asset_download_url "$fixture_release_json" "tuisample-code-linux-x86_64")
+[ "$url" = "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/tuisample-code-linux-x86_64" ] ||
+  fail "expected the linux-x86_64 asset's URL, got: $url"
+
+url=$(asset_download_url "$fixture_release_json" "tuisample-code-macos-aarch64")
+[ "$url" = "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/tuisample-code-macos-aarch64" ] ||
+  fail "expected the macos-aarch64 asset's URL, got: $url"
+
+url=$(asset_download_url "$fixture_release_json" "SHA256SUMS.txt")
+[ "$url" = "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/SHA256SUMS.txt" ] ||
+  fail "expected the checksums asset's URL, got: $url"
+
+url=$(asset_download_url "$fixture_release_json" "tuisample-code-windows-x86_64.exe")
+[ -z "$url" ] || fail "an asset that is not in the release must resolve to nothing, got: $url"
+
+echo "PASS: asset_download_url finds the right asset's URL in a real-shaped release response"
+
+# --- sha256_of ----------------------------------------------------------------
+# Must agree with whatever the platform's own tool says, not a hardcoded
+# digest -- the point is proving this repo's wrapper picks the right tool, not
+# re-testing sha256sum/shasum itself.
+
+sum_file="$workdir/sum-target"
+echo -n "tuisample-code" > "$sum_file"
+computed=$(sha256_of "$sum_file")
+if command -v sha256sum &> /dev/null; then
+  reference=$(sha256sum "$sum_file" | awk '{print $1}')
+elif command -v shasum &> /dev/null; then
+  reference=$(shasum -a 256 "$sum_file" | awk '{print $1}')
+else
+  reference=""
+fi
+if [ -n "$reference" ]; then
+  [ "$computed" = "$reference" ] || fail "sha256_of disagreed with the platform's own tool"
+  echo "PASS: sha256_of matches the platform's own sha256sum/shasum"
+else
+  echo "SKIP: sha256_of (neither sha256sum nor shasum is available on this machine)"
+fi
+
+# --- fetch_prebuilt_binary: failure falls back cleanly ------------------------
+# A refused connection must fail fast and leave nothing behind -- this is the
+# exact shape of "no release has been published yet", which main() must
+# recover from by building from source, not by hanging or half-writing a file.
+
+start=$(date +%s)
+RELEASE_API_BASE="http://127.0.0.1:1" fetch_prebuilt_binary "linux" "x86_64" "$workdir/should-not-exist" &&
+  fail "fetch_prebuilt_binary should fail when the API is unreachable"
+elapsed=$(( $(date +%s) - start ))
+[ ! -e "$workdir/should-not-exist" ] || fail "a failed fetch must not leave a partial file behind"
+[ "$elapsed" -lt 5 ] || fail "a refused connection should fail fast, not wait out the full timeout (took ${elapsed}s)"
+
+echo "PASS: fetch_prebuilt_binary fails fast and cleanly when no release is reachable, so main() can fall back to a source build"

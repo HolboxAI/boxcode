@@ -1,86 +1,94 @@
 name: Build and Release
 
+# Two ways in:
+#   - push a `v*` tag yourself (e.g. for a hotfix release on top of an
+#     existing commit) -- always builds and (re)publishes that tag.
+#   - push to main with a changed Cargo.toml -- releases automatically, but
+#     only when the version in it is actually new. A PR that doesn't touch
+#     the version (docs, refactors, most day-to-day merges) triggers this
+#     workflow but does nothing past the version check; nothing gets
+#     released unless someone deliberately bumped the version, same as this
+#     project already does by hand in commits like "Bump to 0.9.0".
 on:
   push:
     tags:
       - 'v*'
+    branches:
+      - main
+    paths:
+      - Cargo.toml
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.os }}-${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos
-            arch: x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-          - os: macos
-            arch: aarch64
-            runner: macos-14
-            target: aarch64-apple-darwin
-          - os: linux
-            arch: x86_64
-            runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: linux
-            arch: aarch64
-            runner: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: windows
-            arch: x86_64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-
+  # Figures out *whether* this run should produce a release and *which* tag
+  # it belongs to, before spending five runners' worth of build time finding
+  # out the version didn't actually change. Kept as its own job (rather than
+  # inlined into create-release) so `build` can be skipped outright via
+  # `if:` when there is nothing to release.
+  determine-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      tag: ${{ steps.check.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          # Full history, not the default shallow clone: `git rev-parse
+          # <tag>` below needs to see every existing tag to tell a genuinely
+          # new version apart from one already released.
+          fetch-depth: 0
 
-      - name: Install cross (for Linux ARM)
-        if: matrix.os == 'linux' && matrix.arch == 'aarch64'
-        run: cargo install cross
-
-      - name: Build (native)
-        if: matrix.os != 'linux' || matrix.arch != 'aarch64'
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.os == 'linux' && matrix.arch == 'aarch64'
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Rename binary (Unix)
-        if: runner.os != 'Windows'
+      - id: check
         run: |
-          mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/tuisample-code artifacts/tuisample-code-${{ matrix.os }}-${{ matrix.arch }}
-          chmod +x artifacts/tuisample-code-${{ matrix.os }}-${{ matrix.arch }}
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # An explicit tag push (or a workflow_dispatch run against a
+            # tag): always (re)release it, no version comparison needed --
+            # pushing the tag *was* the decision.
+            tag="${GITHUB_REF#refs/tags/}"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "explicit tag push: $tag"
+            exit 0
+          fi
 
-      - name: Rename binary (Windows)
-        if: runner.os == 'Windows'
+          version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          tag="v$version"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "Cargo.toml is at $version, and $tag already exists -- nothing new to release."
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "Cargo.toml bumped to $version, no $tag yet -- releasing."
+          fi
+
+      # Pushed for the record (so `git tag` on this repo always reflects
+      # exactly what got released, the same as a tag pushed by hand would)
+      # -- but this run does not depend on the push re-triggering anything:
+      # a GITHUB_TOKEN-authored push does not fire other workflows, so
+      # `build`/`create-release` below run directly in this same job graph
+      # rather than waiting on release.yml's own tag trigger to fire again.
+      - name: Tag this version
+        if: steps.check.outputs.should_release == 'true' && github.ref == 'refs/heads/main'
         run: |
-          mkdir artifacts
-          copy target\${{ matrix.target }}\release\tuisample-code.exe artifacts\tuisample-code-${{ matrix.os }}-${{ matrix.arch }}.exe
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.check.outputs.tag }}" -m "${{ steps.check.outputs.tag }}"
+          git push origin "${{ steps.check.outputs.tag }}"
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: tuisample-code-${{ matrix.os }}-${{ matrix.arch }}
-          path: artifacts/
+  build:
+    needs: determine-version
+    if: needs.determine-version.outputs.should_release == 'true'
+    uses: ./.github/workflows/build-matrix.yml
 
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [determine-version, build]
+    if: needs.determine-version.outputs.should_release == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -95,9 +103,21 @@ jobs:
           find all-artifacts -type f -exec cp {} release-assets/ \;
           ls -la release-assets/
 
+      - name: Generate checksums
+        # install.sh verifies a downloaded binary against this before
+        # installing it -- see fetch_prebuilt_binary there. Generated after
+        # every binary is in place and named the way install.sh expects
+        # (`tuisample-code-$os-$arch`), so the sums line up with what it
+        # will actually ask for.
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ needs.determine-version.outputs.tag }}
           files: release-assets/*
           draft: false
           prerelease: false

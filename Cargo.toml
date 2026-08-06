@@ -1,6 +1,6 @@
 [package]
 name = "tuisample-code"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 
 [dependencies]
@@ -23,3 +23,15 @@ tempfile = "3"
 opt-level = 3
 lto = true
 strip = true
+
+# Forces reqwest's transitive OpenSSL (native-tls) to build vendored/statically
+# from source rather than link the system's, but *only* when compiling for
+# this one target -- release.yml's linux-aarch64 job runs inside a `cross`
+# container with no aarch64 openssl.pc for pkg-config to find, so plain
+# openssl-sys fails to cross-compile there. Every other target (this dev
+# machine included) keeps linking the system's OpenSSL exactly as before:
+# vendoring it everywhere would also demand a working Perl (Time::Piece,
+# missing here) and, on Windows, NASM -- trading one broken target for a
+# chance at breaking others that already work.
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }

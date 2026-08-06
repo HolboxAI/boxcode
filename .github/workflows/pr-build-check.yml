@@ -1,0 +1,18 @@
+name: PR Build Check
+
+# Answers "will this actually build for every platform release.yml ships,"
+# on the PR itself, before it merges -- the same matrix release.yml uses,
+# minus the publishing step. A green run here is not a guarantee the release
+# build will also be green (a runner outage or GitHub deprecating a runner
+# image, as already happened once, isn't something a PR check can predict),
+# but it does catch the far more common case: a change that breaks the
+# cross-compiled targets (linux-aarch64 in particular) while looking fine on
+# whatever platform you happened to test locally.
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-matrix.yml

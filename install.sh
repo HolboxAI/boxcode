@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
 
+# Where release assets and checksums are published. Overridable so a fork or
+# an internal mirror can serve its own builds -- mirrors how upgrade.rs lets
+# TUISAMPLE_UPGRADE_URL_BASE redirect its own fetches.
+RELEASE_API_BASE="${TUISAMPLE_RELEASE_API_BASE:-https://api.github.com/repos/HolboxAI/tuisample-code}"
+
 # Remove any other "tuisample-code" executable found on $PATH so a stale
 # build from a previous install can't shadow (or be shadowed by) the one we
 # just installed, regardless of which directory it ended up in.
@@ -98,54 +103,192 @@ install_binary() {
   return 1
 }
 
+# --- prebuilt-binary fetch ---------------------------------------------------
+#
+# Building from source works everywhere but costs a Rust toolchain install (if
+# missing) plus 2-3 minutes of compilation -- for the five platforms release.yml
+# already builds on every tagged release, that's pure waste. This section tries
+# a direct binary download first; `main` falls back to the source build below
+# for anything it can't satisfy (an unsupported platform, no published release
+# yet, a network hiccup), so the install never becomes *less* capable than it
+# was before, only faster when a matching binary exists.
+
+# Maps `uname -s`/`uname -m` onto the asset-name components release.yml uses
+# (`tuisample-code-$os-$arch`). Isolated in their own functions, rather than
+# inlined into main, purely so tests can shadow the `uname` builtin and drive
+# every branch without needing to run on five different machines.
+detect_os() {
+  case "$(uname -s)" in
+    Darwin) echo "macos" ;;
+    Linux) echo "linux" ;;
+    MINGW* | MSYS* | CYGWIN*) echo "windows" ;;
+    *) echo "unsupported" ;;
+  esac
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64 | amd64) echo "x86_64" ;;
+    arm64 | aarch64) echo "aarch64" ;;
+    *) echo "unsupported" ;;
+  esac
+}
+
+# Pulls the download URL for one named asset out of a GitHub "get the latest
+# release" API response. No `jq` dependency, on purpose -- this has to run on
+# a bare-minimum machine that may have nothing but bash and curl. Relies on
+# the API's stable pretty-printed layout (one field per line, `name` before
+# `browser_download_url` within the same asset object) rather than parsing
+# JSON properly; a generous line window after the match keeps this from
+# depending on the exact field count GitHub happens to emit.
+#
+# Deliberately pure -- takes the JSON as a string, does no network I/O itself
+# -- so this is the part of the fetch path tests can cover with a fixture
+# response instead of needing the real GitHub API to be reachable.
+asset_download_url() {
+  local json="$1" asset_name="$2"
+  # `|| true`: "no such asset" is an expected, common outcome (this platform
+  # has no prebuilt binary, or the release predates SHA256SUMS.txt), and
+  # `grep` finding nothing exits non-zero. Left unguarded, that would trip
+  # `set -e` at the call site under `main` and abort the whole install
+  # instead of falling back to a source build -- the exact case this
+  # function exists to handle gracefully.
+  echo "$json" |
+    grep -A 30 "\"name\": \"$asset_name\"" |
+    grep '"browser_download_url"' |
+    head -1 |
+    sed -E 's/.*"browser_download_url": *"([^"]*)".*/\1/' || true
+}
+
+# Whichever SHA-256 tool this platform actually has -- Linux ships
+# `sha256sum`, macOS ships `shasum -a 256`, and asking for the wrong one on
+# either platform is a silent no-op that would let a corrupted download
+# through. Prints nothing (and the caller treats that as "cannot verify") if
+# neither is present.
+sha256_of() {
+  local file="$1"
+  if command -v sha256sum &> /dev/null; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum &> /dev/null; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  fi
+  # Explicit, and after the branches rather than folded into an `|| true` on
+  # each: neither tool being present must still return success with empty
+  # output (the "cannot verify" case), not fail the bare assignment at the
+  # call site under `set -e`.
+  return 0
+}
+
+# Downloads the release asset matching `$os-$arch` into `$dest`, verifying it
+# against SHA256SUMS.txt when the release publishes one (older releases, from
+# before this file existed, will not -- that is a missed check, not a reason
+# to refuse an otherwise-good binary). Echoes nothing; the caller checks the
+# file it asked for.
+#
+# Returns non-zero on anything short of a verified (or unverifiable-but-
+# present) binary landing at `$dest` -- no release yet, no asset for this
+# platform, a network failure, or a checksum mismatch. Every one of those is
+# meant to be silently recoverable by falling back to a source build, not a
+# reason to abort the install, so this function itself never calls `exit`.
+fetch_prebuilt_binary() {
+  local os="$1" arch="$2" dest="$3"
+  local asset_name="tuisample-code-$os-$arch"
+
+  local release_json
+  release_json=$(curl -fsSL -m 15 "$RELEASE_API_BASE/releases/latest" 2>/dev/null) || return 1
+  [ -n "$release_json" ] || return 1
+
+  local download_url
+  download_url=$(asset_download_url "$release_json" "$asset_name")
+  [ -n "$download_url" ] || return 1
+
+  curl -fsSL -m 60 -o "$dest" "$download_url" || return 1
+  [ -s "$dest" ] || return 1
+
+  local sums_url
+  sums_url=$(asset_download_url "$release_json" "SHA256SUMS.txt")
+  if [ -n "$sums_url" ]; then
+    local expected actual
+    # `|| true`: this asset having no line in SHA256SUMS.txt is possible (a
+    # release published before this check existed) and must fall through to
+    # "cannot verify", not abort the install via `set -e`.
+    expected=$(curl -fsSL -m 15 "$sums_url" 2>/dev/null | grep " $asset_name\$" | awk '{print $1}' || true)
+    actual=$(sha256_of "$dest")
+    if [ -n "$expected" ] && [ -n "$actual" ] && [ "$expected" != "$actual" ]; then
+      echo "⚠️  Checksum mismatch for $asset_name -- refusing to install a corrupted download." >&2
+      rm -f "$dest"
+      return 1
+    fi
+  fi
+
+  chmod +x "$dest"
+  return 0
+}
+
 main() {
 echo "🚀 Installing tuisample-code..."
 echo ""
 
-# Check for Rust/Cargo, install if needed
-if ! command -v cargo &> /dev/null; then
-  echo "📦 Rust not found. Installing Rust automatically..."
-  echo "   (This takes 1-2 minutes on first install)"
-  echo ""
-
-  # Install Rust
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-  # Load Rust into current shell
-  export PATH="$HOME/.cargo/bin:$PATH"
-  source "$HOME/.cargo/env" 2>/dev/null || true
-
-  echo ""
-  echo "✓ Rust installed successfully"
-  echo ""
-fi
-
-# Verify cargo works
-if ! command -v cargo &> /dev/null; then
-  echo "Error: Could not install Rust. Please visit https://rustup.rs/"
-  exit 1
-fi
-
-# Clone repo
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
-echo "📥 Cloning repository..."
-git clone https://github.com/HolboxAI/tuisample-code.git "$TEMP_DIR"
+BINARY_PATH=""
+OS_NAME=$(detect_os)
+ARCH_NAME=$(detect_arch)
 
-echo "⚙️  Building tuisample-code (this takes 2-3 minutes)..."
-cd "$TEMP_DIR"
-cargo build --release
-
-# Verify binary exists
-BINARY_PATH="$TEMP_DIR/target/release/tuisample-code"
-if [ ! -f "$BINARY_PATH" ]; then
-  echo "❌ Error: Binary not found at $BINARY_PATH"
-  echo "Build may have failed. Check the output above."
-  exit 1
+if [ "$OS_NAME" != "unsupported" ] && [ "$ARCH_NAME" != "unsupported" ]; then
+  echo "🔍 Looking for a prebuilt $OS_NAME-$ARCH_NAME binary..."
+  CANDIDATE="$TEMP_DIR/tuisample-code"
+  if fetch_prebuilt_binary "$OS_NAME" "$ARCH_NAME" "$CANDIDATE"; then
+    BINARY_PATH="$CANDIDATE"
+    echo "✓ Downloaded a prebuilt binary — no build required"
+  else
+    echo "⚠️  No usable prebuilt binary for $OS_NAME-$ARCH_NAME yet. Building from source instead..."
+  fi
+else
+  echo "⚠️  No prebuilt binary is published for this platform ($(uname -s) $(uname -m)). Building from source instead..."
 fi
+echo ""
 
-echo "✓ Binary built successfully"
+if [ -z "$BINARY_PATH" ]; then
+  # Check for Rust/Cargo, install if needed
+  if ! command -v cargo &> /dev/null; then
+    echo "📦 Rust not found. Installing Rust automatically..."
+    echo "   (This takes 1-2 minutes on first install)"
+    echo ""
+
+    # Install Rust
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+    # Load Rust into current shell
+    export PATH="$HOME/.cargo/bin:$PATH"
+    source "$HOME/.cargo/env" 2>/dev/null || true
+
+    echo ""
+    echo "✓ Rust installed successfully"
+    echo ""
+  fi
+
+  # Verify cargo works
+  if ! command -v cargo &> /dev/null; then
+    echo "Error: Could not install Rust. Please visit https://rustup.rs/"
+    exit 1
+  fi
+
+  echo "📥 Cloning repository..."
+  git clone https://github.com/HolboxAI/tuisample-code.git "$TEMP_DIR/src"
+
+  echo "⚙️  Building tuisample-code (this takes 2-3 minutes)..."
+  (cd "$TEMP_DIR/src" && cargo build --release)
+
+  BINARY_PATH="$TEMP_DIR/src/target/release/tuisample-code"
+  if [ ! -f "$BINARY_PATH" ]; then
+    echo "❌ Error: Binary not found at $BINARY_PATH"
+    echo "Build may have failed. Check the output above."
+    exit 1
+  fi
+  echo "✓ Binary built successfully"
+fi
 
 # Install binary
 SYSTEM_BIN=/usr/local/bin/tuisample-code
