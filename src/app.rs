@@ -1431,6 +1431,17 @@ mod tests {
         }
     }
 
+    fn search_call(id: &str, query: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::WEB_SEARCH.to_string(),
+                arguments: serde_json::json!({ "query": query }).to_string(),
+            },
+        }
+    }
+
     fn outcome(call_id: &str, content: &str) -> ToolOutcome {
         ToolOutcome {
             call_id: call_id.to_string(),
@@ -1797,6 +1808,88 @@ mod tests {
             }
             other => panic!("expected a write approval prompt, got {other:?}"),
         }
+    }
+
+    /// `web_search` always asks, the same as `write_file` -- unlike a local
+    /// read, it sends the query to a third party, so `auto_approve_read_only`
+    /// must not waive the prompt for it.
+    #[test]
+    fn web_search_always_asks_even_with_the_fast_path_on() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![search_call("call_1", "rust async runtimes")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        assert!(a.approved_tools.is_empty());
+        match &a.overlay {
+            Some(Overlay::ToolApproval { action: tools::Action::Search { query, .. }, .. }) => {
+                assert_eq!(query, "rust async runtimes");
+            }
+            other => panic!("expected a search approval prompt, got {other:?}"),
+        }
+    }
+
+    /// A full simulated session, keypress by keypress: type a prompt, submit
+    /// it, receive a (faked) model response asking to search the web,
+    /// approve it exactly as a person would, then hand the *real* runner --
+    /// a real subprocess calling the real `ddgs` backend over the network --
+    /// the approved call, and feed its outcome back in the same way
+    /// `main.rs` does. Skips gracefully if this machine has no working
+    /// Python 3 + `ddgs`, the same way the equivalent test in `tools.rs`
+    /// does; the point here is the interactive state machine around the
+    /// search, not re-proving the network call works.
+    #[tokio::test]
+    async fn a_user_can_type_approve_and_receive_a_real_web_search_end_to_end() {
+        let mut a = app();
+        let dir = tempfile::tempdir().expect("temp dir");
+        a.workspace_root = dir.path().to_string_lossy().into_owned();
+
+        type_str(&mut a, "what's new in Rust 1.9x?");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.state, AppState::Sending, "submitting must hand off to Sending");
+
+        a.state = AppState::Streaming;
+        a.append_token("Let me check.");
+        a.request_tools(vec![search_call("call_1", "rust language latest release notes")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        match &a.overlay {
+            Some(Overlay::ToolApproval { action: tools::Action::Search { query, .. }, .. }) => {
+                assert_eq!(query, "rust language latest release notes");
+            }
+            other => panic!("expected a search approval prompt, got {other:?}"),
+        }
+
+        // The approving keypress, exactly as a person at the keyboard would send it.
+        a.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.approved_tools.len(), 1);
+
+        // What main.rs does next: hand the approved call to the real runner.
+        let workspace = crate::workspace::Workspace::new(dir.path()).expect("workspace");
+        let call = a.approved_tools[0].clone();
+        let real_outcome = crate::tools::execute(&call, &workspace, &a.config.tools).await;
+
+        if real_outcome.content.contains("could not run") || real_outcome.content.contains("pip install ddgs") {
+            eprintln!(
+                "skipping: python3/ddgs not available in this environment ({})",
+                real_outcome.content
+            );
+            return;
+        }
+
+        a.approved_tools.clear();
+        a.finish_tools(vec![real_outcome]);
+
+        assert_eq!(a.state, AppState::Sending, "the turn hands back to the model after a result comes in");
+        let last = a.messages.last().expect("the search result must be in the transcript");
+        assert!(last.role == Role::Tool, "expected a Tool-role message");
+        assert_eq!(last.tool_call_id.as_deref(), Some("call_1"));
+        assert!(
+            !last.content.trim().is_empty(),
+            "a real search must leave something in the transcript for the model to read"
+        );
+        assert_history_is_well_formed(&a.history(None));
     }
 
     /// A response carrying tool calls emits ToolCalls and *then* Done. If that
