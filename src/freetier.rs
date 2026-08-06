@@ -45,6 +45,20 @@ struct RegisterResponse {
     daily_limit_usd: f64,
 }
 
+/// Everything a completed enrolment changes, carried back to `App`.
+///
+/// The enrolment itself runs off the UI thread on a *clone* of the config, so
+/// the result has to travel rather than being written in place -- `App` owns the
+/// real config and is the only thing allowed to change it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Enrolled {
+    pub endpoint: String,
+    pub device_token: String,
+    pub model: String,
+    pub fallback_id: String,
+    pub daily_limit_usd: f64,
+}
+
 /// What enrolment produced, for the welcome screen.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Enrolment {

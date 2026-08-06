@@ -180,9 +180,23 @@ async fn run_app<B: ratatui::backend::Backend>(
             // The budget lookup belongs to no request, so the stale-id guard
             // must not apply to it: a user who submits a prompt while the
             // lookup is in flight would otherwise silently lose the answer.
-            if let StreamEvent::FreeTierBudget(line) = event {
-                app.free_tier_status = line;
-                continue;
+            match event {
+                // None of these belong to a request, so the stale-id guard
+                // below must not apply: a user who submits a prompt while
+                // enrolment is in flight would otherwise lose the result.
+                StreamEvent::FreeTierBudget(line) => {
+                    app.free_tier_status = line;
+                    continue;
+                }
+                StreamEvent::FreeTierEnrolled(e) => {
+                    app.free_tier_enrolled(*e);
+                    continue;
+                }
+                StreamEvent::FreeTierFailed(reason) => {
+                    app.free_tier_failed(reason);
+                    continue;
+                }
+                _ => {}
             }
             if id != app.request_id {
                 continue; // stale: belongs to a cancelled request
@@ -192,7 +206,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                 StreamEvent::ToolCalls(calls) => app.request_tools(calls),
                 StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
                 StreamEvent::Usage(u) => app.record_exact_usage(u),
-                StreamEvent::FreeTierBudget(_) => unreachable!("handled before the stale-id guard"),
+                StreamEvent::FreeTierBudget(_)
+                | StreamEvent::FreeTierEnrolled(_)
+                | StreamEvent::FreeTierFailed(_) => {
+                    unreachable!("handled before the stale-id guard")
+                }
                 StreamEvent::Done => app.finish_stream(),
                 StreamEvent::Notice(note) => app.note(note),
                 StreamEvent::Error(err) => app.fail_stream(err),
@@ -217,6 +235,30 @@ async fn run_app<B: ratatui::backend::Backend>(
         // Free-tier budget refresh. Spawned rather than awaited: this runs on
         // the render loop, and a gateway that takes ten seconds to answer must
         // not freeze the UI for ten seconds. The answer comes back as an event.
+        if app.enrol_requested {
+            app.enrol_requested = false;
+            // Runs on a clone: `App` owns the real config, so the answer comes
+            // back as an event rather than being written from another task.
+            let mut cfg = app.config.clone();
+            cfg.free_tier.enabled = true;
+            cfg.llm.api_key.clear(); // enrol regardless of the key in use now
+            cfg.free_tier.device_token.clear();
+            let tx_enrol = tx.clone();
+            tokio::spawn(async move {
+                let event = match freetier::register(&mut cfg).await {
+                    Ok(enrolment) => StreamEvent::FreeTierEnrolled(Box::new(freetier::Enrolled {
+                        endpoint: cfg.llm.endpoint.clone(),
+                        device_token: cfg.free_tier.device_token.clone(),
+                        model: cfg.llm.model.clone(),
+                        fallback_id: cfg.free_tier.fallback_id.clone(),
+                        daily_limit_usd: enrolment.daily_limit_usd,
+                    })),
+                    Err(e) => StreamEvent::FreeTierFailed(e),
+                };
+                let _ = tx_enrol.send((0, event)).await;
+            });
+        }
+
         if app.refresh_budget {
             app.refresh_budget = false;
             if freetier::is_free_tier(&app.config) {
