@@ -1123,13 +1123,52 @@ impl App {
         }
         self.abort = None;
         let response = std::mem::take(&mut self.streaming_response);
-        if response.trim().is_empty() {
+
+        // A model that wants a tool it has not been given writes the call out
+        // as prose instead, in whatever markup it was trained on. That is not
+        // an answer and must not be shown as one -- see `split_leaked_markup`.
+        let (prose, leaked) = split_leaked_markup(&response);
+        let budget_spent = self.tool_steps >= self.config.tools.max_steps;
+
+        if !prose.trim().is_empty() {
+            self.messages.push(Message::new(Role::Assistant, prose));
+        } else if !leaked && response.trim().is_empty() {
             self.messages.push(Message::new(
                 Role::Error,
                 "The endpoint returned an empty response.",
             ));
-        } else {
-            self.messages.push(Message::new(Role::Assistant, response));
+        }
+
+        if leaked {
+            // Ordered so the *cause* is reported when we know it. The budget is
+            // the reason this happens at all in normal use: withholding the
+            // schemas is what leaves the model with no way to call anything.
+            let explanation = if budget_spent {
+                format!(
+                    "Stopped after {} tool rounds — the per-turn command budget. The model \
+                     tried to keep going and wrote its next command out as text, so nothing \
+                     ran. Say \"continue\", or raise `max_steps` under [tools] in \
+                     ~/.tuisample-code/config.toml.",
+                    self.tool_steps
+                )
+            } else {
+                "The model wrote a tool call as text instead of calling the tool, so nothing \
+                 ran. Say \"continue\" to have it try again."
+                    .to_string()
+            };
+            self.messages.push(Message::new(Role::System, explanation));
+            self.follow_tail = true;
+        } else if budget_spent {
+            self.messages.push(Message::new(
+                Role::System,
+                format!(
+                    "Stopped after {} tool rounds — the per-turn command budget. Say \
+                     \"continue\" to keep going, or raise `max_steps` under [tools] in \
+                     ~/.tuisample-code/config.toml.",
+                    self.tool_steps
+                ),
+            ));
+            self.follow_tail = true;
         }
         self.record_quota();
         self.refresh_budget = true;
@@ -1631,6 +1670,49 @@ impl App {
     }
 }
 
+/// Markers that mean "what follows is a tool call the model wrote as prose".
+///
+/// Every provider has its own in-band format and none of them are the OpenAI
+/// `tool_calls` field this app reads. DeepSeek emits `<｜｜DSML｜｜tool_calls>`,
+/// Anthropic-trained models emit `<function_calls>`/`<invoke name=`, and
+/// several emit a bare `<tool_call>`. Matching a handful of literal markers is
+/// crude, but the alternative -- parsing each dialect -- is a lot of work to
+/// arrive at the same place, because the call still cannot be run: it names
+/// tools whose schemas were deliberately withheld.
+const LEAKED_TOOL_MARKERS: &[&str] = &[
+    // The opening delimiter, not just the name: cutting at "DSML" lands inside
+    // `<｜｜DSML｜｜tool_calls>` and leaves a dangling `<｜｜` on the end of the
+    // prose. U+FF5C (fullwidth vertical line) does not occur in ordinary text,
+    // so this is safe to match on its own.
+    "<｜",
+    "DSML",
+    "<function_calls>",
+    "<invoke name=",
+    "<tool_call>",
+    "<tool_calls>",
+    "<|tool_calls|>",
+    "<|tool_call_begin|>",
+];
+
+/// Splits an assistant reply into the prose worth showing and whether a tool
+/// call was written out as text after it.
+///
+/// The prose before the marker is kept: the model usually explains what it is
+/// about to do before it does it, and that sentence is the useful part. The
+/// markup itself is dropped -- it is not an answer, nothing ran, and rendering
+/// it makes a plain misfire look like the model broke.
+fn split_leaked_markup(response: &str) -> (String, bool) {
+    let cut = LEAKED_TOOL_MARKERS
+        .iter()
+        .filter_map(|marker| response.find(marker))
+        .min();
+
+    match cut {
+        Some(at) => (response[..at].trim_end().to_string(), true),
+        None => (response.to_string(), false),
+    }
+}
+
 /// Previous char boundary (byte index) in `s` before `cursor`, saturating at 0.
 /// Shared by `input_buffer` and `overlay_input` editing.
 fn prev_char_boundary(s: &str, cursor: usize) -> usize {
@@ -1688,6 +1770,113 @@ mod tests {
     /// fixture turns the read-only fast path off by default; those tests would
     /// otherwise start silently skipping their own approval prompts the moment
     /// their example command happened to match `tools::is_read_only`.
+    /// Regression: a real DeepSeek session. Once the per-turn budget ran out
+    /// the schemas were withheld, so the model wrote its next `run_command`
+    /// out in DeepSeek's own markup as ordinary prose. That markup was
+    /// rendered as the answer and the turn ended, with nothing anywhere saying
+    /// why -- it read as the model breaking rather than as us taking its tools
+    /// away mid-task.
+    #[test]
+    fn a_tool_call_leaked_as_text_is_explained_not_rendered() {
+        let mut a = app();
+        a.config.tools.max_steps = 3;
+        a.tool_steps = 3; // budget spent, so schemas were withheld
+        a.state = AppState::Streaming;
+        a.streaming_response = "I'll open the firewall next.\n\
+             <｜｜DSML｜｜tool_calls>\n\
+             <｜｜DSML｜｜invoke name=\"run_command\">\n\
+             aws ec2 create-security-group --group-name toy-store-sg\n\
+             </｜｜DSML｜｜invoke>"
+            .to_string();
+
+        a.finish_stream();
+
+        let shown: String = a.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(!shown.contains("DSML"), "raw markup must not reach the transcript: {shown}");
+        assert!(!shown.contains("create-security-group"), "{shown}");
+        // The sentence before the markup is the useful part and is kept.
+        assert!(shown.contains("I'll open the firewall next."), "{shown}");
+        // Not one character of the delimiter may survive: cutting at "DSML"
+        // rather than at the opening `<｜` leaves a dangling `<｜｜` glued to
+        // the end of the sentence, which is how this first shipped.
+        assert!(!shown.contains('｜'), "delimiter fragment left behind: {shown}");
+        assert!(
+            shown.contains("firewall next.\nStopped") || !shown.contains("next.<"),
+            "prose must end cleanly: {shown}"
+        );
+        // And the cause is named, with both ways out.
+        assert!(shown.contains("3 tool rounds"), "{shown}");
+        assert!(shown.contains("max_steps"), "{shown}");
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    /// The same leak without the budget being spent is a plain formatting
+    /// misfire, and says so instead of blaming a limit that was not hit.
+    #[test]
+    fn a_leak_with_budget_remaining_is_reported_as_a_misfire() {
+        let mut a = app();
+        a.config.tools.max_steps = 10;
+        a.tool_steps = 1;
+        a.state = AppState::Streaming;
+        a.streaming_response = "Checking.\n<tool_call>{\"name\":\"run_command\"}</tool_call>".to_string();
+
+        a.finish_stream();
+
+        let shown: String = a.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(shown.contains("wrote a tool call as text"), "{shown}");
+        assert!(!shown.contains("max_steps"), "no limit was hit: {shown}");
+        assert!(!shown.contains("<tool_call>"), "{shown}");
+    }
+
+    /// Hitting the budget with a genuine text answer must still say why the
+    /// agent stopped -- silently ending mid-task is the original complaint.
+    #[test]
+    fn exhausting_the_budget_is_reported_even_without_a_leak() {
+        let mut a = app();
+        a.config.tools.max_steps = 2;
+        a.tool_steps = 2;
+        a.state = AppState::Streaming;
+        a.streaming_response = "Here is what I found so far.".to_string();
+
+        a.finish_stream();
+
+        let shown: String = a.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(shown.contains("Here is what I found so far."), "{shown}");
+        assert!(shown.contains("2 tool rounds"), "{shown}");
+    }
+
+    /// An ordinary turn stays clean: no notices, no stripping.
+    #[test]
+    fn an_ordinary_reply_is_left_completely_alone() {
+        let mut a = app();
+        a.tool_steps = 1;
+        a.state = AppState::Streaming;
+        a.streaming_response = "Done — the tests pass.".to_string();
+
+        a.finish_stream();
+
+        assert_eq!(a.messages.len(), 1, "no extra notices on a clean turn");
+        assert_eq!(a.messages[0].content, "Done — the tests pass.");
+        assert!(a.messages[0].role == Role::Assistant);
+    }
+
+    #[test]
+    fn markup_with_no_prose_before_it_leaves_no_empty_assistant_turn() {
+        let mut a = app();
+        a.state = AppState::Streaming;
+        a.streaming_response = "<function_calls><invoke name=\"glob\">".to_string();
+
+        a.finish_stream();
+
+        assert!(
+            !a.messages.iter().any(|m| m.role == Role::Assistant),
+            "an empty assistant bubble is noise"
+        );
+        assert!(a.messages.iter().any(|m| m.role == Role::System));
+        // And it must not be misreported as the endpoint sending nothing.
+        assert!(!a.messages.iter().any(|m| m.role == Role::Error));
+    }
+
     fn app() -> App {
         let mut app = App::new(Config::default());
         app.config.tools.auto_approve_read_only = false;
@@ -3747,3 +3936,4 @@ mod tests {
         }
     }
 }
+
