@@ -710,10 +710,10 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
     match &app.overlay {
         None => {}
         Some(Overlay::ProviderPicker { selected }) => {
-            let mut items: Vec<String> = providers::PROVIDERS
-                .iter()
-                .map(|p| p.label.to_string())
-                .collect();
+            // Free tier first: it is the only option that needs nothing from
+            // the user, so it should not be the one they scroll past.
+            let mut items: Vec<String> = vec![crate::app::FREE_TIER_LABEL.to_string()];
+            items.extend(providers::PROVIDERS.iter().map(|p| p.label.to_string()));
             items.push("Custom endpoint...".to_string());
             render_picker(f, area, " Select a provider ", &items, *selected);
         }
