@@ -17,16 +17,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-13 (Intel) has been fully retired by GitHub -- a workflow
-          # requesting it just queues forever, which is what actually
-          # happened here (24h timeout waiting for a runner that no longer
-          # exists). macos-14 is deprecated too, so this jumps straight to
-          # the current images rather than trading one soon-to-vanish label
-          # for another.
-          - os: macos
-            arch: x86_64
-            runner: macos-15-large
-            target: x86_64-apple-darwin
+          # No Intel-macOS entry: macos-13 (the label this used) has been
+          # fully retired by GitHub, and every remaining Intel image
+          # (macos-15-large etc.) is a paid "Larger Runner", not a standard
+          # hosted one -- confirmed by actually hitting "recent account
+          # payments have failed or your spending limit needs to be
+          # increased" on this org. There is currently no free way to build
+          # this target. install.sh's source-build fallback already covers
+          # an Intel Mac with no prebuilt binary to fetch; if this org ever
+          # enables Larger Runners, add the entry back with a `-large`
+          # runner label.
           - os: macos
             arch: aarch64
             runner: macos-15
