@@ -332,6 +332,19 @@ async fn run(
             _ => {}
         }
 
+        // A conversation that no longer fits is the other common 400, and it
+        // is the one with an obvious remedy the user will never guess from the
+        // provider's raw wording ("maximum context length is 65536 tokens").
+        if crate::notice::classify(&body) == crate::notice::Kind::ContextFull {
+            return Err(format!(
+                "This conversation is too long for {model}'s context window.\n\n\
+                 Every turn resends the whole history, so a long session eventually \
+                 stops fitting. /new starts fresh and keeps your provider and model.\n\
+                 {}",
+                truncate(body.trim(), 300)
+            ));
+        }
+
         // The most likely cause of a 400 the moment file tools ship is an
         // endpoint that does not implement tool calling, so name the fix.
         let hint = if status == reqwest::StatusCode::BAD_REQUEST && sent_tools {
