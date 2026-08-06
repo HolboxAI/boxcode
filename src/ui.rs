@@ -428,6 +428,16 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         app.config.llm.endpoint.clone(),
         theme::muted(),
     ));
+    // What this install is running on, and what that buys -- stated before the
+    // first prompt rather than discovered by hitting a limit.
+    if !app.free_tier_status.is_empty() {
+        let unavailable = app.free_tier_status.starts_with("unavailable");
+        lines.push(field(
+            "plan",
+            app.free_tier_status.clone(),
+            Style::default().fg(if unavailable { theme::WARNING } else { theme::MUTED }),
+        ));
+    }
     if !app.workspace_status.is_empty() {
         let alarming = app.workspace_status.contains("UNATTENDED");
         let colour = if alarming {
