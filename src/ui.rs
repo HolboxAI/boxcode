@@ -183,7 +183,7 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
             {
                 let marker = if i == 0 { theme::TOOL_MARK } else { " " };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{marker} "), Style::default().fg(theme::FAINT)),
+                    Span::styled(format!("{marker} "), Style::default().fg(theme::p().faint)),
                     Span::styled(wrapped, role_style(Role::Tool)),
                 ]));
             }
@@ -278,7 +278,7 @@ fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{} ", theme::TOOL_MARK),
-                    Style::default().fg(theme::FAINT),
+                    Style::default().fg(theme::p().faint),
                 ),
                 Span::styled(label, role_style(Role::Tool)),
             ]));
@@ -369,7 +369,7 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
 
     Some(Line::from(vec![
         Span::styled(format!("{frame} "), theme::accent()),
-        Span::styled(format!("{verb}… "), Style::default().fg(theme::ACCENT_SOFT)),
+        Span::styled(format!("{verb}… "), Style::default().fg(theme::p().accent_soft)),
         Span::styled(
             format!("({secs}s{detail} · esc to interrupt)"),
             theme::faint(),
@@ -401,7 +401,7 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             Span::styled("Welcome back", theme::text()),
             Span::styled(
                 greeting_name().map(|n| format!(", {n}")).unwrap_or_default(),
-                Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
             ),
             Span::styled("!", theme::text()),
         ],
@@ -431,7 +431,7 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "─".repeat(width.min(64)),
-        Style::default().fg(theme::BORDER),
+        Style::default().fg(theme::p().border),
     )));
     lines.push(Line::from(""));
 
@@ -447,7 +447,7 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     lines.push(field(
         "model",
         app.config.llm.model.clone(),
-        Style::default().fg(theme::ACCENT_SOFT),
+        Style::default().fg(theme::p().accent_soft),
     ));
     lines.push(field(
         "endpoint",
@@ -461,17 +461,17 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(field(
             "plan",
             app.free_tier_status.clone(),
-            Style::default().fg(if unavailable { theme::WARNING } else { theme::MUTED }),
+            Style::default().fg(if unavailable { theme::p().warning } else { theme::p().muted }),
         ));
     }
     if !app.workspace_status.is_empty() {
         let alarming = app.workspace_status.contains("UNATTENDED");
         let colour = if alarming {
-            theme::DANGER
+            theme::p().danger
         } else if app.workspace_status.starts_with("off") || app.workspace_status.contains("broad") {
-            theme::WARNING
+            theme::p().warning
         } else {
-            theme::MUTED
+            theme::p().muted
         };
         let mut style = Style::default().fg(colour);
         if alarming {
@@ -500,7 +500,7 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Before you start",
-            Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::p().warning).add_modifier(Modifier::BOLD),
         )));
         for w in warnings {
             // Wrapped, not clipped: a warning that runs off the right edge
@@ -552,16 +552,16 @@ fn shorten_home(path: &str) -> String {
 fn role_style(role: Role) -> Style {
     match role {
         Role::User => Style::default()
-            .fg(theme::USER)
+            .fg(theme::p().user)
             .add_modifier(Modifier::BOLD),
-        Role::Assistant => Style::default().fg(theme::TEXT),
+        Role::Assistant => Style::default().fg(theme::p().text),
         Role::Error => Style::default()
-            .fg(theme::DANGER)
+            .fg(theme::p().danger)
             .add_modifier(Modifier::BOLD),
         Role::System => Style::default()
-            .fg(theme::ACCENT)
+            .fg(theme::p().accent)
             .add_modifier(Modifier::BOLD),
-        Role::Tool => Style::default().fg(theme::TOOL),
+        Role::Tool => Style::default().fg(theme::p().tool),
     }
 }
 
@@ -596,9 +596,9 @@ fn render_command_menu(f: &mut Frame, area: Rect, app: &App, matches: &[(&str, &
             let on = i == selected;
             let marker = if on { "❯ " } else { "  " };
             let name_style = if on {
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::p().accent).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::TEXT)
+                Style::default().fg(theme::p().text)
             };
             Line::from(vec![
                 Span::styled(marker, theme::accent()),
@@ -611,7 +611,7 @@ fn render_command_menu(f: &mut Frame, area: Rect, app: &App, matches: &[(&str, &
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::BORDER));
+        .border_style(Style::default().fg(theme::p().border));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -636,7 +636,7 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
     } else {
         (
             app.input_buffer.clone(),
-            Style::default().fg(if busy { theme::MUTED } else { theme::TEXT }),
+            Style::default().fg(if busy { theme::p().muted } else { theme::p().text }),
         )
     };
 
@@ -665,9 +665,9 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(if busy {
-            Style::default().fg(theme::BORDER)
+            Style::default().fg(theme::p().border)
         } else {
-            Style::default().fg(theme::ACCENT)
+            Style::default().fg(theme::p().accent)
         });
 
     f.render_widget(Paragraph::new(rendered).block(block), area);
@@ -832,7 +832,7 @@ fn tool_approval_lines(
             for wrapped in wrap(reason, inner) {
                 lines.push(Line::from(Span::styled(
                     wrapped,
-                    Style::default().fg(theme::DANGER),
+                    Style::default().fg(theme::p().danger),
                 )));
             }
             lines.push(Line::from(""));
@@ -851,7 +851,7 @@ fn tool_approval_lines(
                 lines.push(Line::from(Span::styled(
                     format!("$ {wrapped}"),
                     Style::default()
-                        .fg(theme::TEXT)
+                        .fg(theme::p().text)
                         .add_modifier(Modifier::BOLD),
                 )));
             }
@@ -861,7 +861,7 @@ fn tool_approval_lines(
             lines.push(Line::from(Span::styled(
                 format!("📄 {path}"),
                 Style::default()
-                    .fg(theme::TEXT)
+                    .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
             )));
             (" Read this file? ", "read")
@@ -870,7 +870,7 @@ fn tool_approval_lines(
             lines.push(Line::from(Span::styled(
                 format!("📝 {path}"),
                 Style::default()
-                    .fg(theme::TEXT)
+                    .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
@@ -901,7 +901,7 @@ fn tool_approval_lines(
             lines.push(Line::from(Span::styled(
                 format!("📁 {path}"),
                 Style::default()
-                    .fg(theme::TEXT)
+                    .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
             )));
             (" List this directory? ", "list")
@@ -910,7 +910,7 @@ fn tool_approval_lines(
             lines.push(Line::from(Span::styled(
                 format!("🔎 {pattern}"),
                 Style::default()
-                    .fg(theme::TEXT)
+                    .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
             )));
             (" Search for these files? ", "search")
@@ -922,7 +922,7 @@ fn tool_approval_lines(
             lines.push(Line::from(Span::styled(
                 format!("✏️ {path}{}", if *replace_all { "  (all occurrences)" } else { "" }),
                 Style::default()
-                    .fg(theme::TEXT)
+                    .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
@@ -943,15 +943,15 @@ fn tool_approval_lines(
                 }
                 lines.push(Line::from(""));
             };
-            span("replace:", old, theme::DANGER);
-            span("with:", new, theme::SUCCESS);
+            span("replace:", old, theme::p().danger);
+            span("with:", new, theme::p().success);
             (" Apply this edit? ", "edit")
         }
         Action::Search { query, max_results } => {
             lines.push(Line::from(Span::styled(
                 format!("🔎 {query}"),
                 Style::default()
-                    .fg(theme::TEXT)
+                    .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(Span::styled(
@@ -998,7 +998,7 @@ fn tool_approval_lines(
             dim_unless(
                 app.approval_selected,
                 Style::default()
-                    .fg(theme::SUCCESS)
+                    .fg(theme::p().success)
                     .add_modifier(Modifier::BOLD),
             ),
         ),
@@ -1011,7 +1011,7 @@ fn tool_approval_lines(
             dim_unless(
                 !app.approval_selected,
                 Style::default()
-                    .fg(theme::DANGER)
+                    .fg(theme::p().danger)
                     .add_modifier(Modifier::BOLD),
             ),
         ),
@@ -1042,9 +1042,9 @@ fn render_tool_approval_inline(
     let destructive = matches!(action, Action::Command { command, .. }
         if crate::danger::classify(command, Path::new(&app.workspace_root)).is_dangerous());
     let accent = if destructive {
-        theme::DANGER
+        theme::p().danger
     } else {
-        theme::ACCENT
+        theme::p().accent
     };
 
     let block = Block::default()
@@ -1090,14 +1090,14 @@ fn render_picker(f: &mut Frame, area: Rect, title: &str, items: &[String], selec
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::ACCENT))
+        .border_style(Style::default().fg(theme::p().accent))
         .title(Span::styled(title.to_string(), theme::accent_bold()));
     let list = List::new(list_items)
         .block(block)
         .style(theme::text())
         .highlight_style(
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme::p().accent)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         )
         .highlight_symbol("❯ ");
@@ -1130,7 +1130,7 @@ fn render_text_prompt(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::ACCENT))
+        .border_style(Style::default().fg(theme::p().accent))
         .title(Span::styled(title.to_string(), theme::accent_bold()));
 
     let value_line = if display.is_empty() {
@@ -1589,7 +1589,7 @@ mod tests {
         // (see `theme::adapt`), so the block's background may already be a
         // downgraded 256-colour index here rather than raw SURFACE -- compare
         // against the same adaptation, not the pre-adaptation constant.
-        let surface = theme::adapt(theme::SURFACE);
+        let surface = theme::adapt(theme::p().surface);
         let highlighted: Vec<usize> = (0..h)
             .filter(|&y| (0..w).any(|x| buffer.get(x, y).bg == surface))
             .map(|y| y as usize)
@@ -2017,5 +2017,6 @@ mod tests {
         assert!(rendered.contains("y search"), "the keys must say search");
     }
 }
+
 
 

@@ -17,6 +17,9 @@ pub struct Config {
     /// Same again for `[free_tier]`, newer still.
     #[serde(default)]
     pub free_tier: FreeTierConfig,
+    /// Same again for `[ui]`.
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 /// Anonymous free-tier enrolment. See `freetier.rs`.
@@ -146,6 +149,29 @@ pub struct LlmConfig {
     /// which case a standalone `/model` has nothing to scope to.
     #[serde(default)]
     pub provider: String,
+}
+
+/// Appearance.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// `auto`, `dark` or `light`.
+    ///
+    /// The colours have to suit the terminal's background, and the app never
+    /// paints one -- it draws on whatever is already there. `auto` asks the
+    /// terminal and falls back to a palette that is legible either way, which
+    /// is safe but less vivid than saying outright which one you use.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { theme: default_theme() }
+    }
+}
+
+fn default_theme() -> String {
+    "auto".to_string()
 }
 
 /// Settings for the shell command tool.
@@ -328,6 +354,13 @@ impl Config {
         self.llm.model = self.llm.model.trim().to_string();
         self.llm.api_key = self.llm.api_key.trim().to_string();
         self.llm.provider = self.llm.provider.trim().to_string();
+
+        // A typo here must not silently mean "dark": fall back to `auto`,
+        // which is the variant that cannot be unreadable.
+        self.ui.theme = self.ui.theme.trim().to_ascii_lowercase();
+        if !matches!(self.ui.theme.as_str(), "auto" | "dark" | "light") {
+            self.ui.theme = default_theme();
+        }
         // 0 would make every reply empty; the ceiling is a sanity bound, not a
         // claim about what any particular endpoint accepts.
         self.llm.max_tokens = self.llm.max_tokens.clamp(256, 200_000);
@@ -495,6 +528,7 @@ mod tests {
             let config = Config {
                 quota: QuotaConfig::default(),
                 free_tier: FreeTierConfig::default(),
+                ui: UiConfig::default(),
                 llm: LlmConfig {
                     endpoint: "https://api.deepseek.com".to_string(),
                     model: "deepseek-v4-pro".to_string(),

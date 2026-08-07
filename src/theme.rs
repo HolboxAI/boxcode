@@ -107,32 +107,169 @@ pub fn adapt(color: Color) -> Color {
 
 // ---- palette ------------------------------------------------------------------
 
-/// Headline colour: the logo, focused borders, the spinner.
-pub const ACCENT: Color = Color::Rgb(167, 139, 250);
-/// A lighter violet for text that should read as accent but not shout.
-pub const ACCENT_SOFT: Color = Color::Rgb(196, 181, 253);
-/// The human's own words. Deliberately a different hue from ACCENT so a glance
-/// down the transcript separates "what I said" from "what the app said".
-pub const USER: Color = Color::Rgb(125, 211, 252);
-/// Ordinary prose.
-pub const TEXT: Color = Color::Rgb(226, 232, 240);
-/// Secondary text: hints, labels, the key bar.
-pub const MUTED: Color = Color::Rgb(129, 140, 162);
-/// Barely-there text: placeholder, box rules.
-pub const FAINT: Color = Color::Rgb(88, 98, 118);
-/// Unfocused borders.
-pub const BORDER: Color = Color::Rgb(71, 85, 105);
-/// A raised block behind the user's own turns, so scrolling back finds "where
-/// did I ask that" by shape rather than by reading. Light enough to separate
-/// from the terminal background, dark enough that `TEXT` on top of it is still
-/// comfortable to read.
-pub const SURFACE: Color = Color::Rgb(48, 50, 68);
-/// Tool activity -- scaffolding, not conversation, so it sits back.
-pub const TOOL: Color = Color::Rgb(148, 163, 184);
+/// Which way round the terminal is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Light text on a dark background.
+    Dark,
+    /// Dark text on a light background.
+    Light,
+    /// Nobody said and the terminal would not tell us. Accents are picked to
+    /// clear the contrast bar on *both* backgrounds, and body text defers to
+    /// the terminal's own foreground, so a wrong guess is impossible rather
+    /// than merely unlikely.
+    Unknown,
+}
 
-pub const SUCCESS: Color = Color::Rgb(110, 231, 183);
-pub const WARNING: Color = Color::Rgb(251, 191, 36);
-pub const DANGER: Color = Color::Rgb(248, 113, 113);
+/// Every colour the UI draws, resolved for one background.
+///
+/// A struct rather than the `const`s this used to be, because the right answer
+/// depends on something only known at runtime. The old constants were tuned
+/// for a dark terminal and the app never painted a background, so on a light
+/// one the prose colour sat at 1.23:1 against white -- invisible.
+#[derive(Clone, Copy, Debug)]
+pub struct Palette {
+    pub accent: Color,
+    pub accent_soft: Color,
+    pub user: Color,
+    pub text: Color,
+    pub muted: Color,
+    pub faint: Color,
+    pub border: Color,
+    /// Behind the user's own turns.
+    pub surface: Color,
+    /// On top of `surface`. Set explicitly and never left to the terminal:
+    /// the block paints its own background, so its text must contrast with
+    /// *that*, not with whatever is behind the app.
+    pub on_surface: Color,
+    pub tool: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub danger: Color,
+}
+
+/// Light text for a dark terminal. The original palette.
+const DARK: Palette = Palette {
+    accent: Color::Rgb(167, 139, 250),
+    accent_soft: Color::Rgb(196, 181, 253),
+    user: Color::Rgb(125, 211, 252),
+    text: Color::Rgb(226, 232, 240),
+    muted: Color::Rgb(148, 158, 178),
+    faint: Color::Rgb(110, 120, 140),
+    border: Color::Rgb(88, 102, 123),
+    surface: Color::Rgb(48, 50, 68),
+    on_surface: Color::Rgb(226, 232, 240),
+    tool: Color::Rgb(148, 163, 184),
+    success: Color::Rgb(110, 231, 183),
+    warning: Color::Rgb(251, 191, 36),
+    danger: Color::Rgb(248, 113, 113),
+};
+
+/// The same hues taken darker and more saturated, for a light terminal. Kept
+/// recognisably the same violet-and-sky identity rather than swapped for a
+/// different scheme -- this is the same app, on a different background.
+const LIGHT: Palette = Palette {
+    accent: Color::Rgb(91, 33, 182),
+    accent_soft: Color::Rgb(109, 40, 217),
+    user: Color::Rgb(3, 105, 161),
+    text: Color::Rgb(15, 23, 42),
+    muted: Color::Rgb(71, 85, 105),
+    faint: Color::Rgb(100, 116, 139),
+    border: Color::Rgb(126, 142, 166),
+    surface: Color::Rgb(237, 233, 254),
+    on_surface: Color::Rgb(30, 27, 75),
+    tool: Color::Rgb(71, 85, 105),
+    success: Color::Rgb(4, 120, 87),
+    warning: Color::Rgb(146, 64, 14),
+    danger: Color::Rgb(185, 28, 28),
+};
+
+/// Used when the background is genuinely unknown.
+///
+/// Mid-tone accents, chosen to clear the contrast bar against black *and*
+/// white -- so they are never invisible, at the cost of being less vivid than
+/// either tuned palette. `text`, `muted` and `faint` defer to the terminal's
+/// own foreground via `Color::Reset`, which is correct on any background by
+/// definition. `surface` still paints, so it carries its own `on_surface`.
+const NEUTRAL: Palette = Palette {
+    accent: Color::Rgb(124, 92, 230),
+    accent_soft: Color::Rgb(139, 110, 235),
+    user: Color::Rgb(2, 132, 199),
+    text: Color::Reset,
+    muted: Color::Reset,
+    faint: Color::Rgb(128, 128, 128),
+    border: Color::Rgb(128, 128, 128),
+    surface: Color::Rgb(88, 76, 140),
+    on_surface: Color::Rgb(255, 255, 255),
+    tool: Color::Rgb(120, 130, 150),
+    success: Color::Rgb(13, 148, 96),
+    warning: Color::Rgb(180, 95, 6),
+    danger: Color::Rgb(220, 38, 38),
+};
+
+static PALETTE: OnceLock<Palette> = OnceLock::new();
+
+/// Fix the palette for the process. Called once from `main` with whatever the
+/// config and the terminal between them worked out; later calls do nothing,
+/// which keeps `palette()` free of locking on the hot path.
+pub fn init(mode: Mode) {
+    let _ = PALETTE.set(match mode {
+        Mode::Dark => DARK,
+        Mode::Light => LIGHT,
+        Mode::Unknown => NEUTRAL,
+    });
+}
+
+/// The palette in force. Defaults to `NEUTRAL` rather than `DARK` when `init`
+/// was never called: a test or an embedder that forgets should get the variant
+/// that is readable everywhere, not the one that is invisible on half of
+/// terminals.
+pub fn palette() -> &'static Palette {
+    PALETTE.get_or_init(|| NEUTRAL)
+}
+
+/// Shorthand -- this is read on essentially every span the UI builds.
+pub fn p() -> &'static Palette {
+    palette()
+}
+
+/// What the environment says about the background, if anything.
+///
+/// `COLORFGBG` is the only widely-implemented environment signal: rxvt,
+/// Konsole and a few others set it to something like `15;0` -- foreground
+/// then background, as palette indices. Index 0-6 and 8 are the dark half of
+/// the 16-colour palette, so a background there means a dark terminal.
+///
+/// Most terminals do not set it at all (VS Code, iTerm2 and Apple Terminal all
+/// do not), which is why this returns `None` rather than guessing, and why the
+/// config option is the reliable route rather than a nicety.
+pub fn mode_from_env() -> Option<Mode> {
+    mode_from_colorfgbg(std::env::var("COLORFGBG").ok().as_deref())
+}
+
+fn mode_from_colorfgbg(value: Option<&str>) -> Option<Mode> {
+    let raw = value?;
+    // The last field is the background; some terminals emit `fg;bg` and some
+    // `fg;<something>;bg`.
+    let background = raw.rsplit(';').next()?.trim();
+    let index: u8 = background.parse().ok()?;
+    Some(match index {
+        0..=6 | 8 => Mode::Dark,
+        _ => Mode::Light,
+    })
+}
+
+/// Whether an RGB background is dark enough to want light text on it, by
+/// perceived luminance rather than a simple average -- green contributes far
+/// more to how bright a colour looks than blue does.
+pub fn mode_from_background(r: u8, g: u8, b: u8) -> Mode {
+    let luminance = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
+    if luminance < 128.0 {
+        Mode::Dark
+    } else {
+        Mode::Light
+    }
+}
 
 // ---- glyphs -------------------------------------------------------------------
 
@@ -183,44 +320,305 @@ pub fn spinner(elapsed: Duration) -> &'static str {
 // ---- styles -------------------------------------------------------------------
 
 pub fn accent() -> Style {
-    Style::default().fg(ACCENT)
+    Style::default().fg(p().accent)
 }
 
 pub fn accent_bold() -> Style {
-    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    Style::default().fg(p().accent).add_modifier(Modifier::BOLD)
 }
 
 pub fn text() -> Style {
-    Style::default().fg(TEXT)
+    Style::default().fg(p().text)
 }
 
 pub fn muted() -> Style {
-    Style::default().fg(MUTED)
+    Style::default().fg(p().muted)
 }
 
 pub fn faint() -> Style {
-    Style::default().fg(FAINT)
+    Style::default().fg(p().faint)
 }
 
 pub fn danger_bold() -> Style {
-    Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+    Style::default().fg(p().danger).add_modifier(Modifier::BOLD)
 }
 
 /// The user's own words, on their raised block.
 pub fn user_turn() -> Style {
-    Style::default().fg(TEXT).bg(SURFACE)
+    Style::default().fg(p().on_surface).bg(p().surface)
 }
 
 /// A key the user can press, in a hint bar.
 pub fn key() -> Style {
     Style::default()
-        .fg(ACCENT_SOFT)
+        .fg(p().accent_soft)
         .add_modifier(Modifier::BOLD)
 }
+
+// ---- asking the terminal directly ---------------------------------------------
+
+/// Parse an OSC 11 reply into a background colour.
+///
+/// Terminals answer `ESC ] 11 ; rgb:RRRR/GGGG/BBBB` followed by BEL or ST, and
+/// the component width varies -- `rgb:0d/11/17` and `rgb:0d0d/1111/1717` are
+/// both legal and mean the same thing. Each component is scaled by its own
+/// width rather than assumed to be 16-bit.
+fn parse_osc11(reply: &str) -> Option<(u8, u8, u8)> {
+    let start = reply.find("rgb:")? + 4;
+    let rest = &reply[start..];
+    let end = rest
+        .find(['\x07', '\x1b'])
+        .unwrap_or(rest.len());
+    let mut parts = rest[..end].split('/');
+
+    let mut component = || -> Option<u8> {
+        let hex = parts.next()?.trim();
+        if hex.is_empty() || hex.len() > 4 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let value = u32::from_str_radix(hex, 16).ok()?;
+        let max = 16u32.pow(hex.len() as u32) - 1;
+        Some(((value * 255 + max / 2) / max) as u8)
+    };
+    let (r, g, b) = (component()?, component()?, component()?);
+    if parts.next().is_some() {
+        return None; // more than three components is not an rgb: reply
+    }
+    Some((r, g, b))
+}
+
+/// Ask the terminal what colour its background is, and wait briefly for an
+/// answer.
+///
+/// This is the only detection that works on the terminals people actually use:
+/// `COLORFGBG` is absent in VS Code, iTerm2 and Apple Terminal alike. The cost
+/// is that it has to be done in raw mode, before the UI starts, and a terminal
+/// that ignores the query leaves us waiting -- hence the deadline, and hence
+/// `None` rather than a guess when nothing comes back.
+///
+/// Anything read here that is not the reply is discarded. A stray keystroke
+/// during startup is not worth the complexity of pushing back, and the reply
+/// is identified by its prefix rather than by position.
+#[cfg(unix)]
+fn query_background(deadline: std::time::Duration) -> Option<(u8, u8, u8)> {
+    use std::io::{Read, Write};
+
+    let already_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !already_raw && crossterm::terminal::enable_raw_mode().is_err() {
+        return None;
+    }
+
+    let mut out = std::io::stdout();
+    let asked = out.write_all(b"\x1b]11;?\x1b\\").and_then(|()| out.flush());
+
+    let mut answer = None;
+    if asked.is_ok() {
+        let started = std::time::Instant::now();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while started.elapsed() < deadline {
+            if !crossterm::event::poll(std::time::Duration::from_millis(5)).unwrap_or(false) {
+                continue;
+            }
+            // `poll` says stdin is ready; read one byte so a reply that arrives
+            // in pieces is still assembled.
+            if std::io::stdin().read(&mut byte).ok()? == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+            if byte[0] == 0x07 || (buf.len() > 2 && buf.ends_with(b"\x1b\\")) {
+                answer = parse_osc11(&String::from_utf8_lossy(&buf));
+                break;
+            }
+        }
+    }
+
+    if !already_raw {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+    answer
+}
+
+#[cfg(not(unix))]
+fn query_background(_deadline: std::time::Duration) -> Option<(u8, u8, u8)> {
+    // Windows consoles do not answer OSC 11; `[ui] theme` is the route there.
+    None
+}
+
+/// Work out which palette to use, in order of how much the source actually
+/// knows: what the user configured, then what the environment states, then
+/// what the terminal answers, then `Unknown` -- which is legible either way.
+pub fn resolve_mode(configured: &str) -> Mode {
+    match configured {
+        "dark" => return Mode::Dark,
+        "light" => return Mode::Light,
+        _ => {}
+    }
+    if let Some(mode) = mode_from_env() {
+        return mode;
+    }
+    match query_background(std::time::Duration::from_millis(120)) {
+        Some((r, g, b)) => mode_from_background(r, g, b),
+        None => Mode::Unknown,
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- contrast -----------------------------------------------------------
+
+    /// WCAG relative luminance.
+    fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+        let channel = |v: u8| {
+            let v = v as f64 / 255.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    }
+
+    fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    fn rgb(color: Color) -> Option<(u8, u8, u8)> {
+        match color {
+            Color::Rgb(r, g, b) => Some((r, g, b)),
+            // `Reset` is the terminal's own foreground, which contrasts with
+            // its own background by construction -- there is nothing to check.
+            _ => None,
+        }
+    }
+
+    /// Foregrounds that carry actual words, and the bar they must clear.
+    fn readable(p: &Palette) -> Vec<(&'static str, Color)> {
+        vec![
+            ("text", p.text),
+            ("muted", p.muted),
+            ("faint", p.faint),
+            ("user", p.user),
+            ("accent_soft", p.accent_soft),
+            ("tool", p.tool),
+            ("success", p.success),
+            ("warning", p.warning),
+            ("danger", p.danger),
+        ]
+    }
+
+    /// The bug this whole module was rewritten for: every colour was tuned for
+    /// a dark terminal, the app never painted a background, and on a light one
+    /// the prose sat at 1.23:1 against white. Each palette must clear the WCAG
+    /// bar against the background it is actually for.
+    #[test]
+    fn each_palette_is_readable_on_the_background_it_is_for() {
+        const WHITE: (u8, u8, u8) = (255, 255, 255);
+        const BLACK: (u8, u8, u8) = (0, 0, 0);
+
+        for (name, palette, background) in [
+            ("DARK", &DARK, BLACK),
+            ("LIGHT", &LIGHT, WHITE),
+        ] {
+            for (label, color) in readable(palette) {
+                let Some(fg) = rgb(color) else { continue };
+                let ratio = contrast(fg, background);
+                assert!(
+                    ratio >= 4.5,
+                    "{name}.{label} is {ratio:.2}:1 against its own background, needs 4.5:1"
+                );
+            }
+            // Borders and rules are decoration, not text: 3:1 is the bar.
+            for (label, color) in [("border", palette.border), ("accent", palette.accent)] {
+                let Some(fg) = rgb(color) else { continue };
+                let ratio = contrast(fg, background);
+                assert!(ratio >= 3.0, "{name}.{label} is {ratio:.2}:1, needs 3:1");
+            }
+        }
+    }
+
+    /// `NEUTRAL` is what runs when nobody could say which way round the
+    /// terminal is, so every colour in it has to work on *both*. This is what
+    /// makes a failed detection merely less vivid rather than unreadable.
+    #[test]
+    fn the_unknown_palette_is_legible_on_black_and_on_white() {
+        for (label, color) in readable(&NEUTRAL) {
+            let Some(fg) = rgb(color) else { continue };
+            for (side, background) in [("white", (255, 255, 255)), ("black", (0, 0, 0))] {
+                let ratio = contrast(fg, background);
+                assert!(
+                    ratio >= 3.0,
+                    "NEUTRAL.{label} is {ratio:.2}:1 on {side}; it must work on both"
+                );
+            }
+        }
+    }
+
+    /// The user-turn block paints its own background, so its text contrasts
+    /// with *that* -- never with the terminal. Leaving it on `Reset` was how
+    /// the block ended up as dark-on-dark on a light terminal.
+    #[test]
+    fn text_on_the_user_turn_block_contrasts_with_the_block() {
+        for (name, palette) in [("DARK", &DARK), ("LIGHT", &LIGHT), ("NEUTRAL", &NEUTRAL)] {
+            let (Some(fg), Some(bg)) = (rgb(palette.on_surface), rgb(palette.surface)) else {
+                panic!("{name}: the block and its text must both be explicit colours");
+            };
+            let ratio = contrast(fg, bg);
+            assert!(ratio >= 4.5, "{name}: on_surface is {ratio:.2}:1 on surface");
+        }
+    }
+
+    // ---- background detection -----------------------------------------------
+
+    #[test]
+    fn colorfgbg_is_read_as_foreground_then_background() {
+        assert_eq!(mode_from_colorfgbg(Some("15;0")), Some(Mode::Dark));
+        assert_eq!(mode_from_colorfgbg(Some("0;15")), Some(Mode::Light));
+        // Some terminals emit a third field; the background is still last.
+        assert_eq!(mode_from_colorfgbg(Some("15;default;0")), Some(Mode::Dark));
+        // Absent or unparseable is "no opinion", never a guess.
+        assert_eq!(mode_from_colorfgbg(None), None);
+        assert_eq!(mode_from_colorfgbg(Some("")), None);
+        assert_eq!(mode_from_colorfgbg(Some("nonsense")), None);
+    }
+
+    #[test]
+    fn background_luminance_decides_dark_from_light() {
+        assert_eq!(mode_from_background(0, 0, 0), Mode::Dark);
+        assert_eq!(mode_from_background(255, 255, 255), Mode::Light);
+        assert_eq!(mode_from_background(13, 17, 23), Mode::Dark); // GitHub dark
+        assert_eq!(mode_from_background(253, 246, 227), Mode::Light); // solarized light
+        // Weighted, not averaged: saturated green reads far brighter than its
+        // mean channel value suggests, and a plain average calls it dark.
+        assert_eq!(mode_from_background(0, 200, 0), Mode::Light);
+    }
+
+    #[test]
+    fn an_osc11_reply_is_parsed_at_any_component_width() {
+        assert_eq!(parse_osc11("\x1b]11;rgb:0000/0000/0000\x07"), Some((0, 0, 0)));
+        assert_eq!(parse_osc11("\x1b]11;rgb:ffff/ffff/ffff\x07"), Some((255, 255, 255)));
+        // 8-bit components mean the same thing as 16-bit ones.
+        assert_eq!(parse_osc11("\x1b]11;rgb:0d/11/17\x07"), Some((13, 17, 23)));
+        assert_eq!(parse_osc11("\x1b]11;rgb:0d0d/1111/1717\x1b\\"), Some((13, 17, 23)));
+    }
+
+    #[test]
+    fn a_reply_that_is_not_a_colour_is_rejected_rather_than_misread() {
+        assert_eq!(parse_osc11(""), None);
+        assert_eq!(parse_osc11("\x1b]11;?\x07"), None);
+        assert_eq!(parse_osc11("rgb:zz/11/17"), None);
+        assert_eq!(parse_osc11("rgb:00/11"), None);
+        assert_eq!(parse_osc11("rgb:00/11/22/33"), None);
+    }
+
+    /// An explicit setting is the one thing that must never be second-guessed:
+    /// it is the only reliable route on the terminals that answer nothing.
+    #[test]
+    fn an_explicit_theme_setting_wins_without_asking_anything() {
+        assert_eq!(resolve_mode("dark"), Mode::Dark);
+        assert_eq!(resolve_mode("light"), Mode::Light);
+    }
 
     // ---- truecolor fallback -------------------------------------------------
 
