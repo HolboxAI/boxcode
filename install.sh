@@ -157,16 +157,26 @@ install_embedded_python() {
     return 1
   fi
 
-  mkdir -p "$(dirname "$dir")"
-  rm -rf "$dir"
-  if ! tar xzf "$tmp/python.tar.gz" -C "$(dirname "$dir")" 2>/dev/null; then
-    rm -rf "$tmp" "$dir"
+  # Extracted into $tmp -- the same directory the archive itself just
+  # downloaded into, and NOT $(dirname "$dir") directly. $dir is always
+  # ".../.tuisample-code/python", so $(dirname "$dir")/python always
+  # equals $dir itself; extracting straight there and then trying to `mv`
+  # the result onto $dir would be moving a path onto itself, which mv
+  # correctly refuses ("cannot move to a subdirectory of itself") -- caught
+  # live testing this for real, not by reasoning about it in the abstract.
+  # Harmless in practice (tar had already put the real files exactly where
+  # they needed to be, so the failed mv was a redundant no-op, not a
+  # correctness bug), but a stray, confusing error on every real install.
+  if ! tar xzf "$tmp/python.tar.gz" -C "$tmp" 2>/dev/null; then
+    rm -rf "$tmp"
     return 1
   fi
+  mkdir -p "$(dirname "$dir")"
+  rm -rf "$dir"
   # Every python-build-standalone release extracts to a top-level "python"
   # directory regardless of platform or version -- confirmed against the
   # real release this is pinned to, not assumed.
-  mv "$(dirname "$dir")/python" "$dir"
+  mv "$tmp/python" "$dir"
   rm -rf "$tmp"
 
   [ -x "$dir/bin/python3" ]
