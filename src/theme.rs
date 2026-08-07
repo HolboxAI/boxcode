@@ -268,17 +268,6 @@ fn mode_from_colorfgbg(value: Option<&str>) -> Option<Mode> {
     })
 }
 
-/// Whether an RGB background is dark enough to want light text on it, by
-/// perceived luminance rather than a simple average -- green contributes far
-/// more to how bright a colour looks than blue does.
-pub fn mode_from_background(r: u8, g: u8, b: u8) -> Mode {
-    let luminance = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
-    if luminance < 128.0 {
-        Mode::Dark
-    } else {
-        Mode::Light
-    }
-}
 
 // ---- glyphs -------------------------------------------------------------------
 
@@ -364,111 +353,29 @@ pub fn key() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-// ---- asking the terminal directly ---------------------------------------------
-
-/// Parse an OSC 11 reply into a background colour.
+/// Work out which palette to use: what the user configured, then what the
+/// environment states, then `Unknown` -- which is legible either way.
 ///
-/// Terminals answer `ESC ] 11 ; rgb:RRRR/GGGG/BBBB` followed by BEL or ST, and
-/// the component width varies -- `rgb:0d/11/17` and `rgb:0d0d/1111/1717` are
-/// both legal and mean the same thing. Each component is scaled by its own
-/// width rather than assumed to be 16-bit.
-fn parse_osc11(reply: &str) -> Option<(u8, u8, u8)> {
-    let start = reply.find("rgb:")? + 4;
-    let rest = &reply[start..];
-    let end = rest
-        .find(['\x07', '\x1b'])
-        .unwrap_or(rest.len());
-    let mut parts = rest[..end].split('/');
-
-    let mut component = || -> Option<u8> {
-        let hex = parts.next()?.trim();
-        if hex.is_empty() || hex.len() > 4 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return None;
-        }
-        let value = u32::from_str_radix(hex, 16).ok()?;
-        let max = 16u32.pow(hex.len() as u32) - 1;
-        Some(((value * 255 + max / 2) / max) as u8)
-    };
-    let (r, g, b) = (component()?, component()?, component()?);
-    if parts.next().is_some() {
-        return None; // more than three components is not an rgb: reply
-    }
-    Some((r, g, b))
-}
-
-/// Ask the terminal what colour its background is, and wait briefly for an
-/// answer.
+/// This deliberately does **not** ask the terminal. An earlier version sent an
+/// OSC 11 query and waited for the reply, which hung the app at startup until
+/// a key was pressed: `crossterm::event::poll` reports that bytes are
+/// available, but crossterm has already drained them into its own buffer, so
+/// the blocking `read` that followed waited for bytes that were never coming.
+/// The deadline could not save it, because the wait was inside `read` rather
+/// than between iterations.
 ///
-/// This is the only detection that works on the terminals people actually use:
-/// `COLORFGBG` is absent in VS Code, iTerm2 and Apple Terminal alike. The cost
-/// is that it has to be done in raw mode, before the UI starts, and a terminal
-/// that ignores the query leaves us waiting -- hence the deadline, and hence
-/// `None` rather than a guess when nothing comes back.
-///
-/// Anything read here that is not the reply is discarded. A stray keystroke
-/// during startup is not worth the complexity of pushing back, and the reply
-/// is identified by its prefix rather than by position.
-#[cfg(unix)]
-fn query_background(deadline: std::time::Duration) -> Option<(u8, u8, u8)> {
-    use std::io::{Read, Write};
-
-    let already_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
-    if !already_raw && crossterm::terminal::enable_raw_mode().is_err() {
-        return None;
-    }
-
-    let mut out = std::io::stdout();
-    let asked = out.write_all(b"\x1b]11;?\x1b\\").and_then(|()| out.flush());
-
-    let mut answer = None;
-    if asked.is_ok() {
-        let started = std::time::Instant::now();
-        let mut buf = Vec::new();
-        let mut byte = [0u8; 1];
-        while started.elapsed() < deadline {
-            if !crossterm::event::poll(std::time::Duration::from_millis(5)).unwrap_or(false) {
-                continue;
-            }
-            // `poll` says stdin is ready; read one byte so a reply that arrives
-            // in pieces is still assembled.
-            if std::io::stdin().read(&mut byte).ok()? == 0 {
-                break;
-            }
-            buf.push(byte[0]);
-            if byte[0] == 0x07 || (buf.len() > 2 && buf.ends_with(b"\x1b\\")) {
-                answer = parse_osc11(&String::from_utf8_lossy(&buf));
-                break;
-            }
-        }
-    }
-
-    if !already_raw {
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-    answer
-}
-
-#[cfg(not(unix))]
-fn query_background(_deadline: std::time::Duration) -> Option<(u8, u8, u8)> {
-    // Windows consoles do not answer OSC 11; `[ui] theme` is the route there.
-    None
-}
-
-/// Work out which palette to use, in order of how much the source actually
-/// knows: what the user configured, then what the environment states, then
-/// what the terminal answers, then `Unknown` -- which is legible either way.
+/// Doing it correctly means a non-blocking read on the raw file descriptor,
+/// never mixed with crossterm's own reader -- and it would still race with
+/// that reader once the app is running. It is not worth it: since every
+/// palette's body text defers to the terminal's foreground and every other
+/// colour is checked against both backgrounds, the only thing detection buys
+/// is more vivid accents. `[ui] theme` buys the same thing, reliably, with no
+/// startup cost and no possibility of hanging.
 pub fn resolve_mode(configured: &str) -> Mode {
     match configured {
-        "dark" => return Mode::Dark,
-        "light" => return Mode::Light,
-        _ => {}
-    }
-    if let Some(mode) = mode_from_env() {
-        return mode;
-    }
-    match query_background(std::time::Duration::from_millis(120)) {
-        Some((r, g, b)) => mode_from_background(r, g, b),
-        None => Mode::Unknown,
+        "dark" => Mode::Dark,
+        "light" => Mode::Light,
+        _ => mode_from_env().unwrap_or(Mode::Unknown),
     }
 }
 
@@ -622,33 +529,24 @@ mod tests {
         assert_eq!(mode_from_colorfgbg(Some("nonsense")), None);
     }
 
-    #[test]
-    fn background_luminance_decides_dark_from_light() {
-        assert_eq!(mode_from_background(0, 0, 0), Mode::Dark);
-        assert_eq!(mode_from_background(255, 255, 255), Mode::Light);
-        assert_eq!(mode_from_background(13, 17, 23), Mode::Dark); // GitHub dark
-        assert_eq!(mode_from_background(253, 246, 227), Mode::Light); // solarized light
-        // Weighted, not averaged: saturated green reads far brighter than its
-        // mean channel value suggests, and a plain average calls it dark.
-        assert_eq!(mode_from_background(0, 200, 0), Mode::Light);
-    }
 
-    #[test]
-    fn an_osc11_reply_is_parsed_at_any_component_width() {
-        assert_eq!(parse_osc11("\x1b]11;rgb:0000/0000/0000\x07"), Some((0, 0, 0)));
-        assert_eq!(parse_osc11("\x1b]11;rgb:ffff/ffff/ffff\x07"), Some((255, 255, 255)));
-        // 8-bit components mean the same thing as 16-bit ones.
-        assert_eq!(parse_osc11("\x1b]11;rgb:0d/11/17\x07"), Some((13, 17, 23)));
-        assert_eq!(parse_osc11("\x1b]11;rgb:0d0d/1111/1717\x1b\\"), Some((13, 17, 23)));
-    }
 
+
+    /// Regression: the app hung at startup, indefinitely, until a key was
+    /// pressed. `resolve_mode` asked the terminal for its background colour
+    /// and then blocked reading the reply, so every launch stalled on a
+    /// terminal that had nothing to say. Startup must not wait on anything.
     #[test]
-    fn a_reply_that_is_not_a_colour_is_rejected_rather_than_misread() {
-        assert_eq!(parse_osc11(""), None);
-        assert_eq!(parse_osc11("\x1b]11;?\x07"), None);
-        assert_eq!(parse_osc11("rgb:zz/11/17"), None);
-        assert_eq!(parse_osc11("rgb:00/11"), None);
-        assert_eq!(parse_osc11("rgb:00/11/22/33"), None);
+    fn resolving_the_palette_never_waits_on_the_terminal() {
+        for configured in ["auto", "dark", "light", "nonsense"] {
+            let started = std::time::Instant::now();
+            let _ = resolve_mode(configured);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_millis(20),
+                "resolve_mode({configured:?}) took {took:?}; it must not block on I/O"
+            );
+        }
     }
 
     /// An explicit setting is the one thing that must never be second-guessed:

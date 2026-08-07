@@ -375,9 +375,20 @@ async fn enrol_free_tier(config: &mut Config) -> String {
         // Ask rather than remember: the limit is a server-side setting that can
         // change at any time, so anything cached at enrolment would be a number
         // that only looks authoritative.
-        return match freetier::fetch_budget(config).await {
-            Ok(budget) => budget.summary(),
-            Err(_) => format!("Free tier — {}", config.llm.model),
+        //
+        // Bounded separately from the client's own 20s ceiling, because this
+        // one runs *before the terminal is drawn*. Twenty seconds of a blank
+        // screen with no explanation is indistinguishable from a hang, and the
+        // thing being waited for is one line of the welcome panel. A slow
+        // gateway should cost that line, not the whole launch -- the same rule
+        // telemetry already follows by not being awaited at all.
+        const BUDGET_LOOKUP_BUDGET: Duration = Duration::from_millis(1500);
+        return match tokio::time::timeout(BUDGET_LOOKUP_BUDGET, freetier::fetch_budget(config)).await
+        {
+            Ok(Ok(budget)) => budget.summary(),
+            // Timed out, or the gateway said no: either way the model name is
+            // the honest thing to show, without a figure we do not have.
+            _ => format!("Free tier — {}", config.llm.model),
         };
     }
     if !freetier::should_register(config) {
