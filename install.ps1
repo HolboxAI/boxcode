@@ -34,10 +34,24 @@ function Get-ReleaseApiBase {
 # `arm64` distinctly (rather than folding it into "unsupported") so the
 # no-prebuilt-binary error message can say which architecture it looked for.
 function Get-Arch {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-    switch ($arch) {
-        'X64' { return 'x86_64' }
-        'Arm64' { return 'arm64' }
+    # Deliberately not [System.Runtime.InteropServices.RuntimeInformation]::
+    # OSArchitecture -- confirmed on a real Windows machine (Windows
+    # PowerShell 5.1, not PowerShell 7, where this was actually tested
+    # before shipping) that it does not reliably resolve there, silently
+    # reporting an architecture this switch didn't recognise. Environment
+    # variables are the standard, battle-tested way to detect this that
+    # works identically across every PowerShell version back to 2.0 --
+    # rustup's own install script uses the same approach for the same
+    # reason.
+    #
+    # PROCESSOR_ARCHITEW6432 is set (and reports the *true* OS
+    # architecture) only when this process itself is running under WOW64 --
+    # a 32-bit process on a 64-bit OS, where PROCESSOR_ARCHITECTURE alone
+    # would misreport "x86" -- so it takes precedence when present.
+    $raw = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    switch ($raw) {
+        'AMD64' { return 'x86_64' }
+        'ARM64' { return 'arm64' }
         default { return 'unsupported' }
     }
 }
