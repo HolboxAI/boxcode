@@ -350,17 +350,94 @@ echo "PASS: ensure_ddgs_available fails gracefully (not via set -e) when neither
 
 unset -f python3
 
-# No python3 at all: must return immediately without ever trying to install
-# anything, and without touching `set -e`.
+# A maximally stripped-down PATH -- not even `uname` -- must still explain
+# itself plainly and return cleanly, never crash or hang silently.
+# detect_os/detect_arch (called from install_embedded_python, now that
+# ensure_ddgs_available reaches for one when there is no system python3)
+# fall back to "unsupported" the same way they do for a real unrecognised
+# platform when `uname` itself can't be found; stray "command not found"
+# chatter on stderr along the way is expected here and deliberately not
+# asserted against, only stdout is.
+#
+# Forces a clean slate first: install_embedded_python's own idempotency
+# check (`if python3 already exists, done`) would otherwise silently
+# short-circuit past all of this on a second run of this suite on the same
+# machine, once the "real embedded Python" test further down has left one
+# behind -- this test's whole point is exercising what happens when
+# uname/curl/etc. genuinely cannot be found, which never even gets reached
+# once an embedded Python already satisfies the check first.
+rm -rf "$HOME/.tuisample-code/python"
 no_python_dir="$workdir/no-python-path"
 mkdir -p "$no_python_dir"
-# Deliberately just this one empty directory -- not /bin or /usr/bin, which
-# have a real python3 on this machine. `[`, `command`, and `echo` are bash
-# builtins, so an otherwise-empty PATH does not stop them from working.
-out=$(PATH="$no_python_dir" ensure_ddgs_available)
-[ -z "$out" ] || fail "with no python3 on PATH, nothing should be printed, got: $out"
+out=$(PATH="$no_python_dir" ensure_ddgs_available 2>/dev/null)
+echo "$out" | grep -q "Could not install 'ddgs' automatically" ||
+  fail "expected the graceful-failure message even on a maximally stripped-down PATH, got: $out"
 
-echo "PASS: ensure_ddgs_available is a silent no-op when python3 isn't on PATH"
+echo "PASS: ensure_ddgs_available fails gracefully, not silently, on a maximally stripped-down PATH"
+
+# A more realistic "no python3" PATH: every ordinary tool install_embedded_python
+# itself needs (uname, curl, tar, mkdir, mv, rm) is present, python3 alone is
+# not -- proving detect_os/detect_arch resolve a real target here (unlike the
+# test above), so this is actually exercising "downloading failed", not
+# "couldn't even tell what to download". TUISAMPLE_PYTHON_STANDALONE_URL
+# points at a refused connection so this stays fast and network-independent.
+#
+# Forced clean slate again, same reason as the test above -- each test
+# clears it independently rather than relying on running right after one
+# that already did, so reordering this file can never quietly break either.
+rm -rf "$HOME/.tuisample-code/python"
+curated_path_dir="$workdir/no-python3-but-otherwise-normal"
+mkdir -p "$curated_path_dir"
+for tool in uname curl tar gzip mkdir dirname mv rm cp chmod mktemp; do
+  tool_path=$(command -v "$tool") || fail "this test needs a real '$tool' on the machine running it"
+  ln -sf "$tool_path" "$curated_path_dir/$tool"
+done
+start=$(date +%s)
+# PYTHON_STANDALONE_BASE_URL directly, not TUISAMPLE_PYTHON_STANDALONE_URL --
+# the latter is only consulted once, at source time, to compute the
+# former's default (same reason the fetch_prebuilt_binary test above
+# overrides RELEASE_API_BASE directly rather than its TUISAMPLE_ env var).
+out=$(PATH="$curated_path_dir" PYTHON_STANDALONE_BASE_URL="http://127.0.0.1:1" ensure_ddgs_available)
+elapsed=$(( $(date +%s) - start ))
+# Not silent -- it did genuinely try, and says so -- but must end with the
+# same plain "couldn't install it, here's how to by hand" message the other
+# failure path uses, not trail off after "downloading..." with nothing
+# further, which would read as a hang rather than a failure.
+echo "$out" | grep -q "No Python found" || fail "expected to see that a download was attempted, got: $out"
+echo "$out" | grep -q "Could not install 'ddgs' automatically" || fail "expected the graceful-failure message, got: $out"
+if echo "$out" | grep -q "ddgs installed"; then
+  fail "must not claim success when the download failed: $out"
+fi
+[ "$elapsed" -lt 5 ] || fail "a refused connection should fail fast, took ${elapsed}s"
+
+echo "PASS: ensure_ddgs_available is a silent no-op when python3 is missing and the embedded-Python download fails"
+
+# The real thing: no system python3 reachable, but everything else ordinary
+# -- downloads and extracts a genuine self-contained Python, then installs
+# ddgs into it. Skipped rather than failed when unreachable, same
+# convention as every other "the real thing" test in this file; this one
+# just pulls tens of MB, so it earns being its own dedicated test rather
+# than folded into the others above. Unconditionally clears any embedded
+# Python already on this machine first -- otherwise install_embedded_python
+# would (correctly) reuse it instead of downloading, which would mean this
+# test was no longer actually testing the download. Left in place
+# afterwards rather than cleaned up: a real, working embedded Python is a
+# perfectly fine thing for this machine to end up with, the same way the
+# ddgs-reinstall test above leaves ddgs genuinely installed rather than
+# reverting it.
+embedded_python_dir="$HOME/.tuisample-code/python"
+rm -rf "$embedded_python_dir"
+
+real_out=$(PATH="$curated_path_dir" ensure_ddgs_available 2>&1)
+if echo "$real_out" | grep -q "No Python found"; then
+  echo "$real_out" | grep -q "ddgs installed" ||
+    fail "expected the embedded Python to be downloaded and ddgs installed into it, got: $real_out"
+  "$embedded_python_dir/bin/python3" -c "import ddgs" ||
+    fail "the embedded Python should genuinely have ddgs importable after this"
+  echo "PASS: ensure_ddgs_available downloads and uses a real embedded Python when there is no system python3"
+else
+  echo "SKIP: embedded-Python real-network test ($real_out)"
+fi
 
 # The real thing, run against whatever this machine actually has -- skipped
 # rather than failed when Python isn't available, the same convention

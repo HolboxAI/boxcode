@@ -170,6 +170,149 @@ if ($firstId -eq $secondId) {
 Remove-Item -Recurse -Force $fakeHome -ErrorAction SilentlyContinue
 Remove-Item Env:\TUISAMPLE_TELEMETRY_URL -ErrorAction SilentlyContinue
 
+# --- Get-PythonStandaloneTarget -------------------------------------------------
+# Deterministic and pure -- no reason for this one to depend on the network
+# or the machine's real architecture.
+if ((Get-PythonStandaloneTarget -Arch 'x86_64') -eq 'x86_64-pc-windows-msvc') {
+    Test-Pass 'Get-PythonStandaloneTarget maps x86_64 to the msvc target'
+} else {
+    Test-Fail "Get-PythonStandaloneTarget(x86_64) returned $(Get-PythonStandaloneTarget -Arch 'x86_64')"
+}
+if ($null -eq (Get-PythonStandaloneTarget -Arch 'arm64')) {
+    Test-Pass 'Get-PythonStandaloneTarget has no arm64 target, same as release.yml builds none'
+} else {
+    Test-Fail 'Get-PythonStandaloneTarget should not have an arm64 target'
+}
+
+# --- Install-EmbeddedPython: failure path ---------------------------------------
+# A bad base URL must fail fast and leave nothing behind, the same
+# "no release reachable" shape Get-PrebuiltBinary's own failure test covers.
+$badPythonHome = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-badpython-$PID"
+Remove-Item -Recurse -Force $badPythonHome -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $badPythonHome | Out-Null
+$env:USERPROFILE = $badPythonHome
+$env:PROCESSOR_ARCHITECTURE = 'AMD64'
+Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
+$env:TUISAMPLE_PYTHON_STANDALONE_URL = 'http://127.0.0.1:1'
+$start = Get-Date
+if (Install-EmbeddedPython) {
+    Test-Fail 'Install-EmbeddedPython should have failed against an unreachable URL'
+} else {
+    Test-Pass 'Install-EmbeddedPython fails when the download is unreachable'
+}
+$elapsed = ((Get-Date) - $start).TotalSeconds
+if ($elapsed -lt 10) {
+    Test-Pass "a refused connection fails fast (${elapsed}s), not the full timeout"
+} else {
+    Test-Fail "took too long to fail: ${elapsed}s"
+}
+if (Test-Path (Get-EmbeddedPythonDir)) {
+    Test-Fail 'a failed download must not leave a partial embedded Python behind'
+} else {
+    Test-Pass 'a failed download leaves nothing behind'
+}
+Remove-Item Env:\TUISAMPLE_PYTHON_STANDALONE_URL -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $badPythonHome -ErrorAction SilentlyContinue
+
+# --- Install-EmbeddedPython: the real thing --------------------------------------
+# Against the actual published python-build-standalone release -- skipped
+# rather than failed when unreachable, same convention as this file's other
+# "the real thing" tests. Can't execute the resulting python.exe from here
+# (it's a real Windows PE binary, this is running on Linux), so this proves
+# the download/extraction pipeline for real and stops there; Install-Ddgs's
+# own logic once a Python is found is exercised separately below with a
+# stand-in that this OS can actually run.
+$realPythonHome = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-realpython-$PID"
+Remove-Item -Recurse -Force $realPythonHome -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $realPythonHome | Out-Null
+$env:USERPROFILE = $realPythonHome
+$env:PROCESSOR_ARCHITECTURE = 'AMD64'
+Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
+try {
+    if (Install-EmbeddedPython) {
+        $exe = Join-Path (Get-EmbeddedPythonDir) 'python.exe'
+        if ((Test-Path $exe) -and (Get-Item $exe).Length -gt 0) {
+            Test-Pass 'Install-EmbeddedPython downloads and extracts a real, non-empty python.exe'
+        } else {
+            Test-Fail 'Install-EmbeddedPython reported success but python.exe is missing or empty'
+        }
+    } else {
+        Write-Host 'SKIP: Install-EmbeddedPython real-network test (returned false)'
+    }
+} catch {
+    Write-Host "SKIP: Install-EmbeddedPython real-network test ($_)"
+}
+Remove-Item -Recurse -Force $realPythonHome -ErrorAction SilentlyContinue
+
+# --- Install-Ddgs: falls back to an embedded Python when none is on PATH --------
+# A fake "python" -- a tiny script standing in for python.exe, the same
+# trick tools.rs's own tests use for python_bin -- pre-seeded directly at
+# Get-EmbeddedPythonDir's python.exe path. Install-EmbeddedPython's own
+# idempotency check (`if python.exe already exists, done`) then treats it
+# as already installed and never touches the network, so this exercises
+# Install-Ddgs's real fallback *logic* deterministically, without needing a
+# real Windows python.exe this OS could never execute anyway.
+$fallbackHome = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-fallback-$PID"
+Remove-Item -Recurse -Force $fallbackHome -ErrorAction SilentlyContinue
+$fakeEmbeddedDir = Join-Path $fallbackHome '.tuisample-code\python'
+New-Item -ItemType Directory -Force -Path $fakeEmbeddedDir | Out-Null
+$fakePythonExe = Join-Path $fakeEmbeddedDir 'python.exe'
+# On Unix (this test's actual host, whatever the platform under test), a
+# shebang script works the same way through `&` invocation as a real
+# executable would -- there is nothing Windows-specific about the *logic*
+# Install-Ddgs runs once it has a python path in hand, only about which
+# path that is, which Get-EmbeddedPythonDir already abstracts.
+Set-Content -Path $fakePythonExe -Value @'
+#!/bin/sh
+if [ "$1" = "-c" ]; then
+  [ -f "$(dirname "$0")/ddgs-marker" ]
+  exit $?
+fi
+if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then
+  touch "$(dirname "$0")/ddgs-marker"
+  exit 0
+fi
+exit 1
+'@
+chmod +x $fakePythonExe
+
+$env:USERPROFILE = $fallbackHome
+$env:PROCESSOR_ARCHITECTURE = 'AMD64'
+
+# A curated allowlist PATH, not a denylist filter over the real one: an
+# earlier version of this test filtered out any PATH directory containing
+# python/python3, which on a real machine also strips *every other* tool
+# that happens to live alongside them (touch, dirname, ...) -- exactly the
+# tools the fake python.exe stand-in above needs once its own shebang hands
+# control to /bin/sh. Same fix tests/install_script_test.sh's own
+# ensure_ddgs_available tests already needed for the identical reason.
+$curatedPathDir = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-curated-path-$PID"
+Remove-Item -Recurse -Force $curatedPathDir -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $curatedPathDir | Out-Null
+foreach ($tool in @('touch', 'dirname')) {
+    $toolCmd = Get-Command $tool -ErrorAction SilentlyContinue
+    if (-not $toolCmd) {
+        Test-Fail "this test needs a real '$tool' on the machine running it"
+        continue
+    }
+    New-Item -ItemType SymbolicLink -Path (Join-Path $curatedPathDir $tool) -Target $toolCmd.Source -Force | Out-Null
+}
+
+$oldPath = $env:PATH
+$env:PATH = $curatedPathDir
+Install-Ddgs
+$env:PATH = $oldPath
+Remove-Item -Recurse -Force $curatedPathDir -ErrorAction SilentlyContinue
+
+if (Test-Path (Join-Path $fakeEmbeddedDir 'ddgs-marker')) {
+    Test-Pass 'Install-Ddgs falls back to the embedded Python and installs ddgs into it when nothing is on PATH'
+} else {
+    Test-Fail 'Install-Ddgs should have used the pre-seeded embedded Python fallback'
+}
+Remove-Item -Recurse -Force $fallbackHome -ErrorAction SilentlyContinue
+Remove-Item Env:\PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue
+Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
+
 # --- Main: full end-to-end run, sandboxed ---------------------------------------
 $sandboxHome = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-test-sandbox-$PID"
 $sandboxAppData = Join-Path $sandboxHome 'LocalAppData'
