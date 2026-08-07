@@ -255,6 +255,28 @@ on Windows, and the model is told which platform it is on so it reaches for
 > request comes back as `HTTP 400` — set `enabled = false` under `[tools]` and
 > everything else keeps working as before.
 
+## Appearance
+
+The colours adapt to your terminal's background. On launch the app works out
+whether you are on a dark or a light terminal — first from `[ui] theme` if you
+set it, then from `COLORFGBG`, then by asking the terminal directly (OSC 11).
+
+Most terminals answer, but not all: VS Code, iTerm2 and Apple Terminal set no
+`COLORFGBG`, and Windows consoles do not reply to the query. When nothing can
+be established, a third palette is used whose colours are legible on a dark
+*and* a light background — safe, just less vivid than either tuned one.
+
+If the guess is wrong, or you just want the vivid version, say so outright:
+
+```toml
+[ui]
+theme = "auto"   # auto | dark | light
+```
+
+Every colour is contrast-checked in CI against the background it is for
+(4.5:1 for text, 3:1 for rules and borders), so a future palette tweak cannot
+quietly make something unreadable again.
+
 ## Usage
 
 - **Type prompt** — Bottom input line (paste works too)

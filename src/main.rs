@@ -80,6 +80,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut config = Config::load()?;
+    // Before anything is drawn: the colours depend on the terminal's
+    // background, and asking for that needs the terminal to itself, with
+    // no alternate screen up and nothing else reading stdin.
+    theme::init(theme::resolve_mode(&config.ui.theme));
 
     // Enrol before the terminal is touched, so a slow or unreachable gateway is
     // an ordinary line on stdout rather than a frozen alternate screen.

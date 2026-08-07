@@ -81,9 +81,9 @@ impl Kind {
             | Kind::ProviderCapacity
             | Kind::ContextFull
             | Kind::Truncated
-            | Kind::RateLimited => theme::WARNING,
+            | Kind::RateLimited => theme::p().warning,
             Kind::Auth | Kind::Offline | Kind::Provider | Kind::Refused | Kind::Other => {
-                theme::DANGER
+                theme::p().danger
             }
         }
     }
@@ -295,10 +295,10 @@ mod tests {
     #[test]
     fn actionable_kinds_are_amber_and_faults_are_red() {
         for k in [Kind::DailyLimit, Kind::ProviderCapacity, Kind::ContextFull, Kind::Truncated] {
-            assert_eq!(k.color(), theme::WARNING, "{k:?} is expected, not a fault");
+            assert_eq!(k.color(), theme::p().warning, "{k:?} is expected, not a fault");
         }
         for k in [Kind::Auth, Kind::Offline, Kind::Provider, Kind::Other] {
-            assert_eq!(k.color(), theme::DANGER, "{k:?} is a fault");
+            assert_eq!(k.color(), theme::p().danger, "{k:?} is a fault");
         }
     }
 
