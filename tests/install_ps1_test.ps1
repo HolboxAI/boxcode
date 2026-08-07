@@ -27,16 +27,41 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'install.ps1')
 
 # --- Get-Arch -----------------------------------------------------------------
-# Only asserts it returns *something* from the known set: the real value
-# depends on the machine actually running the test, and every value in that
-# set is meaningful (unlike a bad value, which would mean the switch in
-# Get-Arch fell through to a case it shouldn't have).
-$arch = Get-Arch
-if ($arch -in @('x86_64', 'arm64', 'unsupported')) {
-    Test-Pass "Get-Arch returns a recognised value ($arch)"
-} else {
-    Test-Fail "Get-Arch returned an unrecognised value: $arch"
+# Deterministic, not "returns something from a known set" -- that weaker
+# check is exactly what let the real bug this guards against ship in the
+# first place: on a real Windows machine (PowerShell 5.1, not the
+# PowerShell 7 this was developed against), [RuntimeInformation]::
+# OSArchitecture didn't resolve the way it did in testing, and Get-Arch
+# silently returned "unsupported" on an ordinary 64-bit machine -- which
+# *is* one of the "known set" values, so a test that only checked set
+# membership would never have caught it. Env vars are saved and restored so
+# this doesn't leak into any other test or the real environment.
+$savedArchitecture = $env:PROCESSOR_ARCHITECTURE
+$savedArchitew6432 = $env:PROCESSOR_ARCHITEW6432
+
+function Test-Arch {
+    param([string] $Architecture, [string] $Architew6432, [string] $Expected, [string] $Description)
+    $env:PROCESSOR_ARCHITECTURE = $Architecture
+    if ($Architew6432) { $env:PROCESSOR_ARCHITEW6432 = $Architew6432 } else { Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue }
+    $got = Get-Arch
+    if ($got -eq $Expected) {
+        Test-Pass "Get-Arch: $Description"
+    } else {
+        Test-Fail "Get-Arch: $Description -- expected '$Expected', got '$got'"
+    }
 }
+
+Test-Arch -Architecture 'AMD64' -Architew6432 $null -Expected 'x86_64' -Description '64-bit Intel/AMD reports AMD64'
+Test-Arch -Architecture 'ARM64' -Architew6432 $null -Expected 'arm64' -Description '64-bit ARM reports ARM64'
+Test-Arch -Architecture 'x86' -Architew6432 $null -Expected 'unsupported' -Description 'genuine 32-bit x86 is unsupported'
+# The WOW64 case: a 32-bit PowerShell process running on a 64-bit OS reports
+# PROCESSOR_ARCHITECTURE=x86 (its own bitness), but PROCESSOR_ARCHITEW6432
+# carries the *actual* OS architecture -- must win when both are present.
+Test-Arch -Architecture 'x86' -Architew6432 'AMD64' -Expected 'x86_64' -Description 'PROCESSOR_ARCHITEW6432 overrides a WOW64-reported x86'
+Test-Arch -Architecture '' -Architew6432 $null -Expected 'unsupported' -Description 'neither variable set is unsupported, not a crash'
+
+if ($null -ne $savedArchitecture) { $env:PROCESSOR_ARCHITECTURE = $savedArchitecture } else { Remove-Item Env:\PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue }
+if ($null -ne $savedArchitew6432) { $env:PROCESSOR_ARCHITEW6432 = $savedArchitew6432 } else { Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue }
 
 # --- Get-AssetDownloadUrl ------------------------------------------------------
 # Pure and fixture-driven, like asset_download_url's own bash tests -- no
@@ -154,6 +179,14 @@ New-Item -ItemType Directory -Force -Path $sandboxAppData | Out-Null
 $env:USERPROFILE = $sandboxHome
 $env:LOCALAPPDATA = $sandboxAppData
 $env:TUISAMPLE_TELEMETRY_URL = 'off'
+# A normal 64-bit Windows machine reports AMD64 -- without pinning this,
+# Get-Arch reads whatever this machine's own PROCESSOR_ARCHITECTURE
+# actually is, which is unset entirely on Linux/macOS. That would make this
+# test silently skip forever in CI (ubuntu-latest has no such variable),
+# exactly the kind of quiet coverage loss that let the real Get-Arch bug
+# through in the first place.
+$env:PROCESSOR_ARCHITECTURE = 'AMD64'
+Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
 try {
     Main
     $installedExe = Join-Path $sandboxAppData 'Programs\tuisample-code\tuisample-code.exe'
@@ -167,6 +200,7 @@ try {
 }
 Remove-Item -Recurse -Force $sandboxHome -ErrorAction SilentlyContinue
 Remove-Item Env:\TUISAMPLE_TELEMETRY_URL -ErrorAction SilentlyContinue
+Remove-Item Env:\PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue
 
 if ($failed) {
     Write-Host ''
