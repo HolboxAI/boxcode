@@ -25,6 +25,16 @@
 //! spliced into the embedded Python source, so there is nothing for a query
 //! containing quotes or shell metacharacters to break out of.
 //!
+//! This makes a working Python install a real runtime dependency, which is
+//! why `install.sh`/`install.ps1` auto-install `ddgs` (and, when there is no
+//! system Python at all, a self-contained one -- see `embedded_python_path`
+//! below and those scripts' own `ensure_ddgs_available`/`Install-Ddgs`). All
+//! of this is a TEMPORARY stop-gap, not a permanent architecture decision:
+//! the plan is to move `web_search` off `ddgs` entirely onto a real search
+//! API (Brave Search was the original recommendation) with no runtime
+//! dependency to install in the first place, once this is past its testing
+//! stage. Kept simple until then rather than engineered for permanence.
+//!
 //! Failures come back as results the model can read rather than Rust errors: a
 //! non-zero exit, a missing file, a failed search, or bad arguments are
 //! information, not a reason to abandon the turn.
@@ -879,6 +889,51 @@ except Exception as exc:
     print(json.dumps({"error": str(exc)}))
 "#;
 
+/// TEMPORARY, not a permanent architecture decision: a stop-gap for
+/// machines with no Python at all, on the way to `web_search` moving off
+/// `ddgs` entirely onto a real search API with no runtime dependency to
+/// install in the first place -- see this module's own doc comment. Until
+/// then, `install.sh`/`install.ps1` download a self-contained Python into
+/// this fixed, well-known location when there is no system one (see
+/// `ensure_ddgs_available`/`Install-EmbeddedPython` there), and this is
+/// where `execute_web_search` looks for it if `config.python_bin` -- almost
+/// always still "python3", the default -- can't be found.
+///
+/// A location, not a promise it exists: `None` whenever it genuinely
+/// doesn't (nothing has installed one, or `$HOME`/`%USERPROFILE%` isn't
+/// set), which the caller treats the same as any other reason a fallback
+/// isn't available.
+fn embedded_python_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let base = PathBuf::from(home).join(".tuisample-code").join("python");
+    let candidate = if cfg!(windows) {
+        base.join("python.exe")
+    } else {
+        base.join("bin").join("python3")
+    };
+    candidate.is_file().then_some(candidate)
+}
+
+/// Builds the argv `execute_web_search` runs, for whichever interpreter path
+/// it ends up trying -- factored out so falling back to the embedded Python
+/// after the configured one is not found doesn't mean reconstructing this
+/// by hand a second time and risking the two drifting apart.
+fn web_search_command(python_bin: &std::ffi::OsStr, query: &str, max_results: u32) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(python_bin);
+    cmd.arg("-c")
+        .arg(DDGS_SCRIPT)
+        .arg(query)
+        .arg(max_results.to_string())
+        // Closed stdin and captured stdout/stderr for the same reason as
+        // run_command: nothing here should ever wait on a terminal that
+        // does not exist.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd
+}
+
 async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<WebSearchArgs>(&call.function.arguments) else {
         return outcome(
@@ -903,21 +958,11 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
         .unwrap_or(DEFAULT_SEARCH_RESULTS)
         .clamp(MIN_SEARCH_RESULTS, MAX_SEARCH_RESULTS);
 
-    let mut cmd = tokio::process::Command::new(&config.python_bin);
-    cmd.arg("-c")
-        .arg(DDGS_SCRIPT)
-        .arg(&query)
-        .arg(max_results.to_string())
-        // Closed stdin and captured stdout/stderr for the same reason as
-        // run_command: nothing here should ever wait on a terminal that
-        // does not exist.
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut cmd = web_search_command(std::ffi::OsStr::new(&config.python_bin), &query, max_results);
 
     let limit = Duration::from_secs(config.search_timeout_secs);
     let mut retries_left = 3;
+    let mut tried_embedded_fallback = false;
     let output = loop {
         match tokio::time::timeout(limit, cmd.output()).await {
             Ok(Ok(output)) => break output,
@@ -934,6 +979,35 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && retries_left > 0 => {
                 retries_left -= 1;
                 tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // The configured interpreter genuinely isn't there -- before
+            // giving up, one more thing to try: a Python install.sh/
+            // install.ps1 may have set up on their own (see
+            // embedded_python_path's own doc comment). Tried once, not in
+            // the retry budget above: this is a different interpreter
+            // entirely, not the same one transiently unavailable.
+            Ok(Err(e))
+                if e.kind() == std::io::ErrorKind::NotFound && !tried_embedded_fallback =>
+            {
+                tried_embedded_fallback = true;
+                match embedded_python_path() {
+                    Some(embedded) => {
+                        cmd = web_search_command(embedded.as_os_str(), &query, max_results);
+                    }
+                    None => {
+                        return outcome(
+                            &call.id,
+                            format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
+                            format!(
+                                "Error: could not run '{}': {e}. web_search needs Python 3 with the \
+                                 `ddgs` package installed (pip install ddgs). If Python is installed \
+                                 under a different name on this machine, set tools.python_bin in \
+                                 config.toml.",
+                                config.python_bin
+                            ),
+                        )
+                    }
+                }
             }
             Ok(Err(e)) => {
                 return outcome(
@@ -2202,11 +2276,35 @@ mod tests {
     /// not a panic or a silent hang. No fake script needed -- `Command::new`
     /// fails to spawn identically on every platform when the binary is not
     /// found.
+    ///
+    /// Isolates `$HOME` (locking config::test_support::HOME_LOCK the same
+    /// way web_search_falls_back_to_the_embedded_python... does, and for
+    /// the same reason `with_isolated_home` itself can't be used from an
+    /// async test): this test's entire premise is "no interpreter can be
+    /// found, not even a fallback", which the real machine running the
+    /// suite may not actually be in -- an earlier test run's embedded
+    /// Python left genuinely installed at the real `~/.tuisample-code/
+    /// python` (deliberately, the same way a real ddgs reinstall is left in
+    /// place elsewhere in this file) would otherwise make this assertion
+    /// false on a second run, exactly as happened while writing this.
     #[tokio::test]
     async fn a_missing_python_interpreter_is_explained_rather_than_panicking() {
+        let _guard = crate::config::test_support::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
         let (_dir, ws, mut cfg) = fixture();
         cfg.python_bin = "no-such-interpreter-xyz-123".to_string();
         let out = execute(&search_call("rust"), &ws, &cfg).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
         assert!(out.content.contains("could not run"), "{}", out.content);
         assert!(out.content.contains("pip install ddgs"), "{}", out.content);
     }
@@ -2226,6 +2324,64 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    /// embedded_python_path/the fallback in execute_web_search, proven
+    /// against a real (fake-content, real-file) interpreter at the exact
+    /// path install.sh's/install.ps1's embedded-Python installers use --
+    /// not mocked at the Rust level, the environment is genuinely set up
+    /// the way a machine with no system python3 but a working embedded one
+    /// would be.
+    ///
+    /// Locks config::test_support::HOME_LOCK directly rather than going
+    /// through with_isolated_home: this test is async (needs `execute`'s
+    /// `.await`), and with_isolated_home's closure runs synchronously on
+    /// the calling thread, which is already inside #[tokio::test]'s own
+    /// runtime -- calling block_on again in there to bridge into async code
+    /// would panic ("Cannot start a runtime from within a runtime").
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn web_search_falls_back_to_the_embedded_python_when_configured_one_is_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::config::test_support::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let embedded_bin_dir = fake_home.path().join(".tuisample-code").join("python").join("bin");
+        std::fs::create_dir_all(&embedded_bin_dir).unwrap();
+        let embedded_python = embedded_bin_dir.join("python3");
+        std::fs::write(
+            &embedded_python,
+            "#!/bin/sh\necho '{\"results\": [{\"title\": \"T\", \"href\": \"https://embedded-python-worked\", \"body\": \"B\"}]}'\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&embedded_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&embedded_python, perms).unwrap();
+
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let (_dir, ws, mut cfg) = fixture();
+        // A configured interpreter that does not exist -- exactly the state
+        // a fresh config.toml is in (python_bin defaults to "python3", and
+        // "python3" is, by construction, not on PATH on the machine this
+        // scenario is meant to model).
+        cfg.python_bin = "no-such-system-python-xyz".to_string();
+
+        let out = execute(&search_call("rust"), &ws, &cfg).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            out.content.contains("https://embedded-python-worked"),
+            "expected the embedded Python fallback to have actually run, got: {}",
+            out.content
+        );
     }
 
     #[cfg(unix)]

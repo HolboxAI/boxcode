@@ -91,35 +91,130 @@ ping_install() {
 # guarantee instead of a coincidence, the same way Rust itself gets installed
 # automatically below if it's missing.
 #
-# Best-effort in every direction, and never allowed to fail the install: no
-# python3 means web_search simply won't work (the tool itself already
-# explains that clearly when it's actually used, so there is nothing more
-# useful to say here), and a failed pip install is reported but not fatal --
-# the app remains fully usable without web_search either way.
+# Best-effort in every direction, and never allowed to fail the install: a
+# python that genuinely can't be gotten (see install_embedded_python) means
+# web_search simply won't work (the tool itself already explains that
+# clearly when it's actually used, so there is nothing more useful to say
+# here), and a failed pip install is reported but not fatal -- the app
+# remains fully usable without web_search either way.
+
+# TEMPORARY, see tools.rs's own doc comment: python-build-standalone is a
+# stop-gap for machines with no Python at all, not a permanent architecture
+# decision. Likely replaced entirely if/when web_search moves off ddgs onto
+# a real search API with no runtime dependency to auto-install in the first
+# place. Pinned to one specific release rather than "latest" so this stays
+# predictable -- there is no reason web_search's Python needs to track
+# python-build-standalone's own release cadence.
+PYTHON_STANDALONE_RELEASE="20260807"
+PYTHON_STANDALONE_VERSION="3.12.13"
+# Overridable for the same reason RELEASE_API_BASE is: lets a test point
+# this at an unreachable host to exercise the "couldn't get one" path
+# deterministically and without a real download, and lets a fork/mirror
+# serve its own copy.
+PYTHON_STANDALONE_BASE_URL="${TUISAMPLE_PYTHON_STANDALONE_URL:-https://github.com/astral-sh/python-build-standalone/releases/download}"
+
+# Maps this script's own os/arch onto python-build-standalone's target
+# triples. Empty output (not an error) for anything it doesn't publish a
+# build for -- the caller treats that the same as any other reason an
+# embedded Python couldn't be gotten.
+python_standalone_target() {
+  case "$1-$2" in
+    macos-x86_64) echo "x86_64-apple-darwin" ;;
+    macos-aarch64) echo "aarch64-apple-darwin" ;;
+    linux-x86_64) echo "x86_64-unknown-linux-gnu" ;;
+    linux-aarch64) echo "aarch64-unknown-linux-gnu" ;;
+    windows-x86_64) echo "x86_64-pc-windows-msvc" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Fixed, well-known location so tools.rs's web_search can find this without
+# install.sh ever having to edit config.toml -- see embedded_python_path()
+# there.
+embedded_python_dir() {
+  echo "$HOME/.tuisample-code/python"
+}
+
+# Downloads and extracts a self-contained Python into embedded_python_dir,
+# for machines with no system python3 at all. Idempotent: does nothing if
+# one is already there from a previous run. Every failure (unsupported
+# platform, network, a bad archive) is handled by returning non-zero, not by
+# exiting -- this is one option among several ensure_ddgs_available tries,
+# not something that should ever be allowed to fail the install itself.
+install_embedded_python() {
+  local dir target url tmp
+  dir=$(embedded_python_dir)
+  [ -x "$dir/bin/python3" ] && return 0
+
+  target=$(python_standalone_target "$(detect_os)" "$(detect_arch)")
+  [ -n "$target" ] || return 1
+
+  url="$PYTHON_STANDALONE_BASE_URL/$PYTHON_STANDALONE_RELEASE/cpython-$PYTHON_STANDALONE_VERSION+$PYTHON_STANDALONE_RELEASE-$target-install_only_stripped.tar.gz"
+  tmp=$(mktemp -d)
+  echo "🐍 No Python found -- downloading a self-contained one for web_search..."
+  if ! curl -fsSL -m 120 -o "$tmp/python.tar.gz" "$url"; then
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$dir")"
+  rm -rf "$dir"
+  if ! tar xzf "$tmp/python.tar.gz" -C "$(dirname "$dir")" 2>/dev/null; then
+    rm -rf "$tmp" "$dir"
+    return 1
+  fi
+  # Every python-build-standalone release extracts to a top-level "python"
+  # directory regardless of platform or version -- confirmed against the
+  # real release this is pinned to, not assumed.
+  mv "$(dirname "$dir")/python" "$dir"
+  rm -rf "$tmp"
+
+  [ -x "$dir/bin/python3" ]
+}
+
 ensure_ddgs_available() {
-  if ! command -v python3 &> /dev/null; then
+  local python_bin embedded=0
+  if command -v python3 &> /dev/null; then
+    python_bin="python3"
+  elif install_embedded_python; then
+    python_bin="$(embedded_python_dir)/bin/python3"
+    embedded=1
+  else
+    # install_embedded_python already printed that it was trying -- leaving
+    # it at that would look like this silently hung or half-worked rather
+    # than plainly failed.
+    echo "⚠️  Could not install 'ddgs' automatically. web_search will explain how"
+    echo "   to install it yourself (pip install ddgs) if you end up using it."
     return 0
   fi
-  if python3 -c "import ddgs" &> /dev/null; then
+
+  if "$python_bin" -c "import ddgs" &> /dev/null; then
     return 0
   fi
 
   echo "🔎 Installing the 'ddgs' Python package (needed for web_search)..."
-  # Plain `pip install` first -- works everywhere it's allowed to. Many
-  # current Linux distros mark their system Python as "externally managed"
-  # (PEP 668) and refuse that outright, even with `--user`; retried with
-  # `--break-system-packages` for exactly that case; a single small package
-  # in the user's own site-packages is what `--user` was already asking for,
-  # this just gets past the distro's opt-out-required guard rail for it.
-  # `-m pip` rather than a bare `pip3`, since some systems have python3 but
-  # no separate `pip3` executable on PATH.
-  if python3 -m pip install --user ddgs &> /dev/null; then
-    :
-  elif python3 -m pip install --user --break-system-packages ddgs &> /dev/null; then
-    :
+  if [ "$embedded" -eq 1 ]; then
+    # The embedded Python is not a system install at all -- there is no
+    # PEP 668 marker to work around, and no reason to scope the install to
+    # a "user" site when this whole directory is already ours alone.
+    "$python_bin" -m pip install ddgs &> /dev/null || true
+  else
+    # Plain `pip install` first -- works everywhere it's allowed to. Many
+    # current Linux distros mark their system Python as "externally managed"
+    # (PEP 668) and refuse that outright, even with `--user`; retried with
+    # `--break-system-packages` for exactly that case; a single small package
+    # in the user's own site-packages is what `--user` was already asking for,
+    # this just gets past the distro's opt-out-required guard rail for it.
+    # `-m pip` rather than a bare `pip3`, since some systems have python3 but
+    # no separate `pip3` executable on PATH.
+    if "$python_bin" -m pip install --user ddgs &> /dev/null; then
+      :
+    elif "$python_bin" -m pip install --user --break-system-packages ddgs &> /dev/null; then
+      :
+    fi
   fi
 
-  if python3 -c "import ddgs" &> /dev/null; then
+  if "$python_bin" -c "import ddgs" &> /dev/null; then
     echo "✓ ddgs installed"
   else
     echo "⚠️  Could not install 'ddgs' automatically. web_search will explain how"

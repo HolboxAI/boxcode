@@ -109,30 +109,132 @@ function Get-PrebuiltBinary {
     }
 }
 
+# TEMPORARY, see tools.rs's own doc comment: python-build-standalone is a
+# stop-gap for machines with no Python at all, not a permanent architecture
+# decision -- the Unix counterpart of this whole section is install.sh's
+# install_embedded_python, which has the fuller reasoning (pinned release,
+# why not "latest", etc.). Kept in sync with it by hand for now.
+$PythonStandaloneRelease = '20260807'
+$PythonStandaloneVersion = '3.12.13'
+function Get-PythonStandaloneBaseUrl {
+    # A function re-evaluated on every call, not a variable fixed once at
+    # dot-source time -- same reason Get-ReleaseApiBase above is one: a
+    # test (or a fork) that sets $env:TUISAMPLE_PYTHON_STANDALONE_URL after
+    # this file has already been dot-sourced needs that to actually take
+    # effect.
+    if ($env:TUISAMPLE_PYTHON_STANDALONE_URL) {
+        return $env:TUISAMPLE_PYTHON_STANDALONE_URL
+    }
+    return 'https://github.com/astral-sh/python-build-standalone/releases/download'
+}
+
+# Only x86_64 -- release.yml does not build a Windows arm64 tuisample-code
+# either, so there is no reason to promise a Windows arm64 Python here.
+function Get-PythonStandaloneTarget {
+    param([string] $Arch)
+    if ($Arch -eq 'x86_64') { return 'x86_64-pc-windows-msvc' }
+    return $null
+}
+
+function Get-EmbeddedPythonDir {
+    Join-Path $env:USERPROFILE '.tuisample-code\python'
+}
+
+# Downloads and extracts a self-contained Python for machines with no system
+# Python at all. Idempotent (does nothing if one is already there from a
+# previous run) and never throws -- every failure is a return, one option
+# among several Install-Ddgs tries, not something that should ever be
+# allowed to fail the install itself.
+function Install-EmbeddedPython {
+    $dir = Get-EmbeddedPythonDir
+    if (Test-Path (Join-Path $dir 'python.exe')) {
+        return $true
+    }
+
+    $target = Get-PythonStandaloneTarget -Arch (Get-Arch)
+    if (-not $target) {
+        return $false
+    }
+
+    $url = "$(Get-PythonStandaloneBaseUrl)/$PythonStandaloneRelease/cpython-$PythonStandaloneVersion+$PythonStandaloneRelease-$target-install_only_stripped.tar.gz"
+    $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-python-$PID"
+    Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    $archive = Join-Path $tmpDir 'python.tar.gz'
+
+    Write-Host "Python not found -- downloading a self-contained one for web_search..."
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $archive -TimeoutSec 120
+    } catch {
+        Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dir) | Out-Null
+    Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+    # tar, not Expand-Archive: the asset is a .tar.gz on every platform
+    # release.yml/python-build-standalone publish, Windows included -- one
+    # archive format everywhere rather than a Windows-only special case.
+    # Bundled with Windows itself since the 1803 update, so this needs no
+    # extra tooling beyond what a modern Windows already has.
+    & tar xzf $archive -C $tmpDir 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+        return $false
+    }
+    # Every python-build-standalone release extracts to a top-level "python"
+    # directory regardless of platform or version -- confirmed against the
+    # real release this is pinned to, not assumed.
+    Move-Item -Force -Path (Join-Path $tmpDir 'python') -Destination $dir
+    Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+
+    return Test-Path (Join-Path $dir 'python.exe')
+}
+
 # `web_search` needs Python's `ddgs` package -- see tools.rs's own doc
 # comment for why it shells out to Python rather than a pure-Rust HTTP call,
 # and install.sh's ensure_ddgs_available for the Unix counterpart of this
-# same step. Best-effort in every direction: no python means web_search
-# simply won't work (it already explains that clearly when actually used),
-# and a failed pip install is reported but never fatal to the install itself.
+# same step. Best-effort in every direction: a python that genuinely can't
+# be gotten (see Install-EmbeddedPython) means web_search simply won't work
+# (it already explains that clearly when actually used), and a failed pip
+# install is reported but never fatal to the install itself.
 function Install-Ddgs {
-    $python = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $python) {
-        $python = Get-Command python3 -ErrorAction SilentlyContinue
+    $pythonPath = $null
+    $embedded = $false
+
+    $found = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $found) {
+        $found = Get-Command python3 -ErrorAction SilentlyContinue
     }
-    if (-not $python) {
+    if ($found) {
+        $pythonPath = $found.Source
+    } elseif (Install-EmbeddedPython) {
+        $pythonPath = Join-Path (Get-EmbeddedPythonDir) 'python.exe'
+        $embedded = $true
+    } else {
+        # Install-EmbeddedPython already said it was trying -- leaving it at
+        # that would look like this silently hung or half-worked rather
+        # than plainly failed.
+        Write-Host "  Could not install 'ddgs' automatically. web_search will explain how"
+        Write-Host "  to install it yourself (pip install ddgs) if you end up using it."
         return
     }
 
-    & $python.Source -c 'import ddgs' 2>$null
+    & $pythonPath -c 'import ddgs' 2>$null
     if ($LASTEXITCODE -eq 0) {
         return
     }
 
     Write-Host "Installing the 'ddgs' Python package (needed for web_search)..."
-    & $python.Source -m pip install --user ddgs *> $null
+    if ($embedded) {
+        # Not a system install at all -- there is no reason to scope this to
+        # a "user" site when the whole directory is already ours alone.
+        & $pythonPath -m pip install ddgs *> $null
+    } else {
+        & $pythonPath -m pip install --user ddgs *> $null
+    }
 
-    & $python.Source -c 'import ddgs' 2>$null
+    & $pythonPath -c 'import ddgs' 2>$null
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  ddgs installed"
     } else {
