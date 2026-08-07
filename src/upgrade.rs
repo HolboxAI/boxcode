@@ -1,11 +1,18 @@
 //! `tuisample-code --upgrade` — pull the latest build without having to
 //! remember (or re-paste) the curl one-liner.
 //!
-//! The install itself is delegated to `install.sh` fetched from the repo, not
-//! reimplemented here. That script already knows how to pick an install
-//! directory, escalate with sudo, sweep stale copies off `$PATH`, and verify
-//! what the shell actually resolves to. A second install path written in Rust
-//! would only drift away from it.
+//! The install itself is delegated to `install.sh` (or, on Windows,
+//! `install.ps1`) fetched from the repo, not reimplemented here. Those
+//! scripts already know how to pick an install directory, escalate
+//! privileges, sweep stale copies off `PATH`, and verify what the shell
+//! actually resolves to. A second install path written in Rust would only
+//! drift away from them.
+//!
+//! Which platform's installer to fetch and how to run it is threaded through
+//! as a `windows: bool` parameter (`run` fixes it to `cfg!(windows)`; tests
+//! pass either value directly) rather than branching on `cfg!(windows)`
+//! inline -- a compile-time `cfg!` would make the Windows branch of this
+//! logic permanently untestable on any machine that isn't Windows.
 
 use std::error::Error;
 use std::process::Command;
@@ -36,6 +43,10 @@ fn raw_url(path: &str) -> String {
 }
 
 pub async fn run(force: bool) -> Result<(), Box<dyn Error>> {
+    run_for(force, cfg!(windows)).await
+}
+
+async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
     println!("🔎 Checking {} for a newer version...", base_url());
 
     let client = reqwest::Client::builder()
@@ -68,23 +79,29 @@ pub async fn run(force: bool) -> Result<(), Box<dyn Error>> {
     }
 
     println!("📥 Fetching the installer...");
-    let script = fetch_installer(&client).await?;
+    let script = fetch_installer(&client, windows).await?;
 
-    let script_path =
-        std::env::temp_dir().join(format!("tuisample-code-install-{}.sh", std::process::id()));
+    let script_path = std::env::temp_dir().join(format!(
+        "tuisample-code-install-{}.{}",
+        std::process::id(),
+        installer_extension(windows)
+    ));
     std::fs::write(&script_path, script)?;
     println!();
 
-    let status = Command::new("bash").arg(&script_path).status();
+    let status = installer_command(&script_path, windows).status();
     let _ = std::fs::remove_file(&script_path);
 
     match status {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("installer exited with {status}").into()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err("--upgrade needs `bash` on PATH, and it wasn't found. \
+            let interpreter = interpreter_name(windows);
+            Err(format!(
+                "--upgrade needs `{interpreter}` on PATH, and it wasn't found. \
                  Reinstall manually: https://github.com/HolboxAI/tuisample-code"
-                .into())
+            )
+            .into())
         }
         Err(e) => Err(Box::new(e)),
     }
@@ -100,8 +117,46 @@ async fn fetch_latest_version(client: &reqwest::Client) -> Result<String, Box<dy
     parse_package_version(&body).ok_or_else(|| "no [package] version in Cargo.toml".into())
 }
 
-async fn fetch_installer(client: &reqwest::Client) -> Result<String, Box<dyn Error>> {
-    let url = raw_url("install.sh");
+fn installer_filename(windows: bool) -> &'static str {
+    if windows {
+        "install.ps1"
+    } else {
+        "install.sh"
+    }
+}
+
+fn installer_extension(windows: bool) -> &'static str {
+    if windows {
+        "ps1"
+    } else {
+        "sh"
+    }
+}
+
+fn interpreter_name(windows: bool) -> &'static str {
+    if windows {
+        "powershell.exe"
+    } else {
+        "bash"
+    }
+}
+
+/// The command that will actually run the downloaded installer. Windows'
+/// default execution policy blocks running an unsigned, freshly-downloaded
+/// `.ps1` at all -- `-ExecutionPolicy Bypass` scopes that override to just
+/// this one process, the same way `bash <script>` never needed the script's
+/// own execute bit set.
+fn installer_command(script_path: &std::path::Path, windows: bool) -> Command {
+    let mut cmd = Command::new(interpreter_name(windows));
+    if windows {
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+    }
+    cmd.arg(script_path);
+    cmd
+}
+
+async fn fetch_installer(client: &reqwest::Client, windows: bool) -> Result<String, Box<dyn Error>> {
+    let url = raw_url(installer_filename(windows));
     let response = client
         .get(&url)
         .send()
@@ -112,16 +167,23 @@ async fn fetch_installer(client: &reqwest::Client) -> Result<String, Box<dyn Err
         return Err(format!("HTTP {status} fetching {url}").into());
     }
     let body = response.text().await?;
-    if !looks_like_installer(&body) {
-        return Err("downloaded install.sh does not look like the installer".into());
+    if !looks_like_installer(&body, windows) {
+        return Err(format!("downloaded {} does not look like the installer", installer_filename(windows)).into());
     }
     Ok(body)
 }
 
-/// Never hand an unexpected body to bash — a captive-portal login page or an
-/// error blob would otherwise be executed as a shell script.
-fn looks_like_installer(body: &str) -> bool {
-    body.starts_with("#!") && body.contains("tuisample-code")
+/// Never hand an unexpected body to the interpreter — a captive-portal login
+/// page or an error blob would otherwise be executed as a script. PowerShell
+/// has no shebang convention, so `install.ps1` is required to open with a
+/// `#`-prefixed comment line instead; either way, a real installer body and
+/// stray HTML/JSON are trivially told apart.
+fn looks_like_installer(body: &str, windows: bool) -> bool {
+    if windows {
+        body.trim_start().starts_with('#') && body.contains("tuisample-code")
+    } else {
+        body.starts_with("#!") && body.contains("tuisample-code")
+    }
 }
 
 /// Reads `version` from the `[package]` table only — a `version = "..."` under
@@ -250,13 +312,61 @@ version = \"9.9.9\"
 
     #[test]
     fn only_a_real_installer_reaches_bash() {
-        assert!(looks_like_installer("#!/bin/bash\ninstall tuisample-code\n"));
+        assert!(looks_like_installer("#!/bin/bash\ninstall tuisample-code\n", false));
         // What a captive portal or an error page would return.
-        assert!(!looks_like_installer("<html><body>Sign in to continue</body></html>"));
-        assert!(!looks_like_installer("404: Not Found"));
+        assert!(!looks_like_installer("<html><body>Sign in to continue</body></html>", false));
+        assert!(!looks_like_installer("404: Not Found", false));
         // Right shebang, wrong script.
-        assert!(!looks_like_installer("#!/bin/bash\nrm -rf /\n"));
-        assert!(!looks_like_installer(""));
+        assert!(!looks_like_installer("#!/bin/bash\nrm -rf /\n", false));
+        assert!(!looks_like_installer("", false));
+    }
+
+    /// The Windows counterpart: `install.ps1` has no shebang convention to
+    /// check, so this is `looks_like_installer`'s only guard against handing
+    /// a captive-portal page or an error blob to PowerShell instead.
+    #[test]
+    fn only_a_real_installer_reaches_powershell() {
+        assert!(looks_like_installer("# tuisample-code installer\nWrite-Host 'hi'\n", true));
+        assert!(!looks_like_installer("<html><body>Sign in to continue</body></html>", true));
+        assert!(!looks_like_installer("404: Not Found", true));
+        // Right leading comment, wrong script.
+        assert!(!looks_like_installer("# just a comment\nRemove-Item -Recurse C:\\\n", true));
+        assert!(!looks_like_installer("", true));
+    }
+
+    /// Pure logic, not a real subprocess launch (see the module doc for why
+    /// `windows: bool` is threaded through rather than checked via
+    /// `cfg!(windows)`): proves `run_for` will reach for the right
+    /// interpreter, with the right flags, on either platform -- without
+    /// needing an actual Windows machine, or PowerShell installed here, to
+    /// find out.
+    #[test]
+    fn installer_command_targets_the_right_interpreter_per_platform() {
+        let script = std::path::Path::new("/tmp/whatever-install-script");
+
+        let unix_cmd = installer_command(script, false);
+        assert_eq!(unix_cmd.get_program(), "bash");
+        let unix_args: Vec<_> = unix_cmd.get_args().collect();
+        assert_eq!(unix_args, vec![script.as_os_str()]);
+
+        let windows_cmd = installer_command(script, true);
+        assert_eq!(windows_cmd.get_program(), "powershell.exe");
+        let windows_args: Vec<_> = windows_cmd.get_args().collect();
+        assert_eq!(
+            windows_args,
+            vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script.to_str().unwrap()]
+        );
+    }
+
+    #[test]
+    fn installer_filenames_and_extensions_match_per_platform() {
+        assert_eq!(installer_filename(false), "install.sh");
+        assert_eq!(installer_extension(false), "sh");
+        assert_eq!(interpreter_name(false), "bash");
+
+        assert_eq!(installer_filename(true), "install.ps1");
+        assert_eq!(installer_extension(true), "ps1");
+        assert_eq!(interpreter_name(true), "powershell.exe");
     }
 
     /// Serve `Cargo.toml` and `install.sh` on an ephemeral port.
@@ -310,32 +420,123 @@ version = \"9.9.9\"
         reset();
         let base = serve_repo(manifest("99.0.0"), installer.clone()).await;
         std::env::set_var(URL_BASE_ENV, &base);
-        run(false).await.expect("upgrade should succeed");
+        run_for(false, false).await.expect("upgrade should succeed");
         assert!(ran(), "a newer version should have run the installer");
 
         // Already current: nothing should be installed.
         reset();
         let base = serve_repo(manifest(CURRENT), installer.clone()).await;
         std::env::set_var(URL_BASE_ENV, &base);
-        run(false).await.expect("up-to-date check should succeed");
+        run_for(false, false).await.expect("up-to-date check should succeed");
         assert!(!ran(), "an up-to-date build must not reinstall");
 
         // ...unless --force is given.
         reset();
         let base = serve_repo(manifest(CURRENT), installer.clone()).await;
         std::env::set_var(URL_BASE_ENV, &base);
-        run(true).await.expect("forced upgrade should succeed");
+        run_for(true, false).await.expect("forced upgrade should succeed");
         assert!(ran(), "--force should reinstall even when up to date");
 
         // A body that isn't the installer must never be executed.
         reset();
         let base = serve_repo(manifest("99.0.0"), "<html>Sign in</html>".to_string()).await;
         std::env::set_var(URL_BASE_ENV, &base);
-        let result = run(false).await;
+        let result = run_for(false, false).await;
         assert!(result.is_err(), "a non-installer body should be rejected");
         assert!(!ran(), "a rejected body must not be executed");
 
         reset();
         std::env::remove_var(URL_BASE_ENV);
+    }
+
+    /// Finds a real PowerShell interpreter already on `PATH` -- `pwsh`
+    /// (PowerShell Core, cross-platform, what GitHub's own hosted Linux
+    /// runners ship) or `powershell.exe` (Windows) -- without ever touching
+    /// this process's own `PATH`. `None` means genuinely absent, not merely
+    /// unsearched.
+    fn find_real_powershell() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            for name in ["pwsh", "powershell.exe", "pwsh.exe"] {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    /// The real Windows path, proven against a real PowerShell interpreter
+    /// rather than mocked -- skipped, not failed, when none is reachable
+    /// (most non-Windows machines). Unlike `upgrade_end_to_end`, this never
+    /// touches this *process's* `PATH`: the shim directory (containing a
+    /// `powershell.exe` that is actually whatever real interpreter was
+    /// found) is attached only to the child process's environment via
+    /// `Command::env`, so it cannot race with anything else `cargo test`
+    /// runs in parallel.
+    #[tokio::test]
+    async fn upgrade_end_to_end_on_windows_if_a_real_powershell_is_available() {
+        let Some(real_interpreter) = find_real_powershell() else {
+            eprintln!("skipping: no pwsh/powershell.exe found on PATH in this environment");
+            return;
+        };
+
+        let shim_dir = std::env::temp_dir().join(format!("tuisample-pwsh-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&shim_dir);
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        let shim_path = shim_dir.join("powershell.exe");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_interpreter, &shim_path).expect("symlink shim");
+        #[cfg(not(unix))]
+        std::fs::copy(&real_interpreter, &shim_path).expect("copy shim");
+
+        let marker =
+            std::env::temp_dir().join(format!("tuisample-upgrade-windows-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // PowerShell, not batch: `install.ps1` is what actually ships.
+        let installer = format!(
+            "# tuisample-code installer (test stand-in)\nSet-Content -Path '{}' -Value 'ran'\n",
+            marker.display()
+        );
+        let manifest = "[package]\nname = \"tuisample-code\"\nversion = \"99.0.0\"\n";
+        let base = serve_repo(manifest.to_string(), installer).await;
+
+        let script_path = std::env::temp_dir().join(format!("tuisample-code-install-{}.ps1", std::process::id()));
+        // Mirrors fetch_installer's download, minus the HTTP round trip --
+        // the point of this test is proving the *interpreter invocation*
+        // works for real, which fetch_installer's own logic already has
+        // dedicated coverage for above.
+        let client = reqwest::Client::new();
+        let body = client
+            .get(format!("{base}/install.ps1"))
+            .send()
+            .await
+            .expect("fetch stand-in installer")
+            .text()
+            .await
+            .expect("read stand-in installer body");
+        std::fs::write(&script_path, &body).expect("write script");
+
+        let mut cmd = installer_command(&script_path, true);
+        // The one line that makes this a real, not mocked, invocation: the
+        // child process's PATH gains the shim directory, so
+        // `Command::new("powershell.exe")` inside installer_command
+        // resolves to the real interpreter found above -- entirely within
+        // this one subprocess's environment.
+        let shim_path_str = shim_dir.to_str().expect("shim dir is valid UTF-8");
+        let child_path = match std::env::var_os("PATH") {
+            Some(existing) => format!("{shim_path_str}:{}", existing.to_string_lossy()),
+            None => shim_path_str.to_string(),
+        };
+        cmd.env("PATH", child_path);
+
+        let status = cmd.status().expect("run the real (shimmed) powershell.exe");
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_dir_all(&shim_dir);
+
+        assert!(status.success(), "the real PowerShell interpreter should have run the stand-in installer");
+        assert!(marker.exists(), "the stand-in installer should have run and left its marker");
+        let _ = std::fs::remove_file(&marker);
     }
 }

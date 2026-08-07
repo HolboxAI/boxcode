@@ -917,30 +917,47 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
         .kill_on_drop(true);
 
     let limit = Duration::from_secs(config.search_timeout_secs);
-    let output = match tokio::time::timeout(limit, cmd.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            return outcome(
-                &call.id,
-                format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
-                format!(
-                    "Error: could not run '{}': {e}. web_search needs Python 3 with the `ddgs` \
-                     package installed (pip install ddgs). If Python is installed under a \
-                     different name on this machine, set tools.python_bin in config.toml.",
-                    config.python_bin
-                ),
-            )
-        }
-        Err(_) => {
-            return outcome(
-                &call.id,
-                format!("🔎 search \"{}\" — timed out", clip(&query, 50)),
-                format!(
-                    "Error: killed after {}s waiting for search results. Try again, or a \
-                     narrower query.",
-                    config.search_timeout_secs
-                ),
-            )
+    let mut retries_left = 3;
+    let output = loop {
+        match tokio::time::timeout(limit, cmd.output()).await {
+            Ok(Ok(output)) => break output,
+            // A script that was just written and chmod'd executable can
+            // transiently report "text file busy" on some filesystems
+            // (overlayfs especially -- what most CI/Docker containers run
+            // on) even after the writer has closed it; a known kernel/VFS
+            // race, not a real "this cannot be run." It always clears
+            // within milliseconds, so this is retried a few times rather
+            // than surfaced as a hard failure. `python_bin` itself is
+            // ordinarily a long-settled system binary, not a freshly
+            // written file, but nothing here can assume that of every
+            // possible configuration.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && retries_left > 0 => {
+                retries_left -= 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(Err(e)) => {
+                return outcome(
+                    &call.id,
+                    format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
+                    format!(
+                        "Error: could not run '{}': {e}. web_search needs Python 3 with the `ddgs` \
+                         package installed (pip install ddgs). If Python is installed under a \
+                         different name on this machine, set tools.python_bin in config.toml.",
+                        config.python_bin
+                    ),
+                )
+            }
+            Err(_) => {
+                return outcome(
+                    &call.id,
+                    format!("🔎 search \"{}\" — timed out", clip(&query, 50)),
+                    format!(
+                        "Error: killed after {}s waiting for search results. Try again, or a \
+                         narrower query.",
+                        config.search_timeout_secs
+                    ),
+                )
+            }
         }
     };
 
@@ -2305,6 +2322,52 @@ mod tests {
         assert!(
             !std::path::Path::new("/tmp/pwned-test-marker").exists(),
             "an injection attempt in the query must never execute"
+        );
+    }
+
+    /// Regression test for a real CI flake: a script written and chmod'd
+    /// executable moments before it's run can transiently report "text file
+    /// busy" on some filesystems (overlayfs, notably -- what most CI/Docker
+    /// containers run on), which surfaced in this exact suite. Rather than
+    /// try to reproduce overlayfs's own internal caching race (environment-
+    /// specific and not reliably forceable), this proves the *retry
+    /// mechanism itself* against the deterministic, filesystem-agnostic
+    /// case Linux guarantees: exec-ing a file that is genuinely still open
+    /// for writing always fails with ETXTBSY, and always succeeds the
+    /// moment the writer releases it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_transiently_busy_interpreter_is_retried_rather_than_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, ws, mut cfg) = fixture();
+        let script_path = dir.path().join("busy-interpreter.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\necho '{\"results\": [{\"title\": \"T\", \"href\": \"https://x\", \"body\": \"B\"}]}'\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        cfg.python_bin = script_path.to_string_lossy().into_owned();
+
+        // Held open for writing (without even writing anything further) for
+        // longer than one retry's backoff but well within the retry
+        // budget, so the first attempt(s) must hit real ETXTBSY and only a
+        // later retry can succeed -- proving the loop, not just its syntax.
+        let held_open = std::fs::OpenOptions::new().write(true).open(&script_path).unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            drop(held_open);
+        });
+
+        let out = execute(&search_call("rust"), &ws, &cfg).await;
+        release.await.unwrap();
+
+        assert!(
+            out.content.contains("https://x"),
+            "expected the retry to recover once the writer released the file, got: {}",
+            out.content
         );
     }
 
