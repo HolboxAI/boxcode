@@ -273,9 +273,12 @@ If the guess is wrong, or you just want the vivid version, say so outright:
 theme = "auto"   # auto | dark | light
 ```
 
-Every colour is contrast-checked in CI against the background it is for
-(4.5:1 for text, 3:1 for rules and borders), so a future palette tweak cannot
-quietly make something unreadable again.
+Two things make a wrong guess survivable. Body text never picks a colour at
+all — it takes the terminal's own foreground, which cannot clash with the
+terminal's own background, so what you type is always readable. And every
+other colour that carries words is contrast-checked in CI against *both*
+backgrounds, so landing on the wrong palette costs vividness rather than
+legibility.
 
 ## Usage
 

@@ -132,6 +132,13 @@ pub struct Palette {
     pub accent: Color,
     pub accent_soft: Color,
     pub user: Color,
+    /// Body text, and the prompt you type into.
+    ///
+    /// `Color::Reset` in every palette, deliberately. This is the one colour a
+    /// wrong guess about the background makes *invisible* rather than merely
+    /// dull, and it is the bulk of what is on screen. Deferring to the
+    /// terminal's own foreground is correct on any background by definition,
+    /// so no amount of failed detection can hide what you are typing.
     pub text: Color,
     pub muted: Color,
     pub faint: Color,
@@ -148,21 +155,23 @@ pub struct Palette {
     pub danger: Color,
 }
 
-/// Light text for a dark terminal. The original palette.
+/// For a dark terminal.
 const DARK: Palette = Palette {
+    // `accent` never carries body text -- it is the logo, the spinner and the
+    // focused border -- so it is free to be as vivid as the background allows.
     accent: Color::Rgb(167, 139, 250),
-    accent_soft: Color::Rgb(196, 181, 253),
-    user: Color::Rgb(125, 211, 252),
-    text: Color::Rgb(226, 232, 240),
-    muted: Color::Rgb(148, 158, 178),
+    accent_soft: Color::Rgb(148, 108, 240),
+    user: Color::Rgb(43, 146, 199),
+    text: Color::Reset,
+    muted: Color::Rgb(138, 148, 170),
     faint: Color::Rgb(110, 120, 140),
     border: Color::Rgb(88, 102, 123),
     surface: Color::Rgb(48, 50, 68),
-    on_surface: Color::Rgb(226, 232, 240),
-    tool: Color::Rgb(148, 163, 184),
-    success: Color::Rgb(110, 231, 183),
-    warning: Color::Rgb(251, 191, 36),
-    danger: Color::Rgb(248, 113, 113),
+    on_surface: Color::Rgb(232, 236, 244),
+    tool: Color::Rgb(128, 142, 164),
+    success: Color::Rgb(20, 150, 110),
+    warning: Color::Rgb(191, 124, 10),
+    danger: Color::Rgb(224, 72, 72),
 };
 
 /// The same hues taken darker and more saturated, for a light terminal. Kept
@@ -170,17 +179,17 @@ const DARK: Palette = Palette {
 /// different scheme -- this is the same app, on a different background.
 const LIGHT: Palette = Palette {
     accent: Color::Rgb(91, 33, 182),
-    accent_soft: Color::Rgb(109, 40, 217),
+    accent_soft: Color::Rgb(136, 92, 225),
     user: Color::Rgb(3, 105, 161),
-    text: Color::Rgb(15, 23, 42),
-    muted: Color::Rgb(71, 85, 105),
+    text: Color::Reset,
+    muted: Color::Rgb(92, 106, 128),
     faint: Color::Rgb(100, 116, 139),
     border: Color::Rgb(126, 142, 166),
     surface: Color::Rgb(237, 233, 254),
     on_surface: Color::Rgb(30, 27, 75),
-    tool: Color::Rgb(71, 85, 105),
-    success: Color::Rgb(4, 120, 87),
-    warning: Color::Rgb(146, 64, 14),
+    tool: Color::Rgb(100, 120, 140),
+    success: Color::Rgb(30, 125, 100),
+    warning: Color::Rgb(170, 100, 25),
     danger: Color::Rgb(185, 28, 28),
 };
 
@@ -193,18 +202,18 @@ const LIGHT: Palette = Palette {
 /// definition. `surface` still paints, so it carries its own `on_surface`.
 const NEUTRAL: Palette = Palette {
     accent: Color::Rgb(124, 92, 230),
-    accent_soft: Color::Rgb(139, 110, 235),
-    user: Color::Rgb(2, 132, 199),
+    accent_soft: Color::Rgb(136, 92, 225),
+    user: Color::Rgb(43, 146, 199),
     text: Color::Reset,
-    muted: Color::Reset,
+    muted: Color::Rgb(124, 134, 156),
     faint: Color::Rgb(128, 128, 128),
     border: Color::Rgb(128, 128, 128),
     surface: Color::Rgb(88, 76, 140),
     on_surface: Color::Rgb(255, 255, 255),
-    tool: Color::Rgb(120, 130, 150),
-    success: Color::Rgb(13, 148, 96),
-    warning: Color::Rgb(180, 95, 6),
-    danger: Color::Rgb(220, 38, 38),
+    tool: Color::Rgb(120, 134, 156),
+    success: Color::Rgb(13, 140, 100),
+    warning: Color::Rgb(176, 112, 8),
+    danger: Color::Rgb(211, 60, 60),
 };
 
 static PALETTE: OnceLock<Palette> = OnceLock::new();
@@ -538,20 +547,50 @@ mod tests {
         }
     }
 
-    /// `NEUTRAL` is what runs when nobody could say which way round the
-    /// terminal is, so every colour in it has to work on *both*. This is what
-    /// makes a failed detection merely less vivid rather than unreadable.
+    /// The one that matters most in practice: detection can be wrong.
+    ///
+    /// `COLORFGBG` is unset on most terminals and some ignore OSC 11, so
+    /// `auto` can land on the wrong palette. When it does, the result has to be
+    /// *less vivid*, never unreadable. Every colour that carries words is
+    /// therefore checked against **both** backgrounds, in every palette --
+    /// which is the property that was missing when a user reported their typed
+    /// prompt was still white on a light terminal.
+    ///
+    /// `accent` is exempt: it draws the logo, the spinner and the focused
+    /// border, never body text, so it is free to be vivid for its own
+    /// background. It is covered by the 3:1 rule in the test above.
     #[test]
-    fn the_unknown_palette_is_legible_on_black_and_on_white() {
-        for (label, color) in readable(&NEUTRAL) {
-            let Some(fg) = rgb(color) else { continue };
-            for (side, background) in [("white", (255, 255, 255)), ("black", (0, 0, 0))] {
-                let ratio = contrast(fg, background);
-                assert!(
-                    ratio >= 3.0,
-                    "NEUTRAL.{label} is {ratio:.2}:1 on {side}; it must work on both"
-                );
+    fn no_palette_can_be_unreadable_on_either_background_even_if_guessed_wrong() {
+        const WHITE: (u8, u8, u8) = (255, 255, 255);
+        const BLACK: (u8, u8, u8) = (0, 0, 0);
+
+        for (name, palette) in [("DARK", &DARK), ("LIGHT", &LIGHT), ("NEUTRAL", &NEUTRAL)] {
+            for (label, color) in readable(palette) {
+                let Some(fg) = rgb(color) else { continue };
+                for (side, background) in [("white", WHITE), ("black", BLACK)] {
+                    let ratio = contrast(fg, background);
+                    assert!(
+                        ratio >= 3.0,
+                        "{name}.{label} is {ratio:.2}:1 on {side}; a wrong guess must cost \
+                         vividness, not legibility"
+                    );
+                }
             }
+        }
+    }
+
+    /// Body text is the bulk of the screen and the thing a wrong guess hides
+    /// completely, so it never picks a colour at all -- it takes the
+    /// terminal's own foreground, which cannot clash with the terminal's own
+    /// background.
+    #[test]
+    fn body_text_always_defers_to_the_terminal_foreground() {
+        for (name, palette) in [("DARK", &DARK), ("LIGHT", &LIGHT), ("NEUTRAL", &NEUTRAL)] {
+            assert_eq!(
+                palette.text,
+                Color::Reset,
+                "{name}.text must be Reset, or a wrong guess makes typing invisible"
+            );
         }
     }
 
