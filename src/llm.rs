@@ -166,7 +166,16 @@ pub enum StreamEvent {
     /// Also not from the endpoint: the free-tier budget lookup reports back on
     /// this channel for the same reason the command runner does -- one place to
     /// drain, and the event loop stays the only thing doing I/O.
-    FreeTierBudget(String),
+    ///
+    /// Carries the parsed budget rather than a formatted line: `/quota` and
+    /// `/usage` render it differently, and a caller that has only the sentence
+    /// cannot answer "how much is left" without parsing English back into a
+    /// number. Boxed for the same reason `FreeTierEnrolled` is.
+    FreeTierBudget(Box<crate::freetier::Budget>),
+    /// The budget lookup failed. Sent rather than swallowed: `/quota` waits for
+    /// this event before printing, so a silent failure would leave the readout
+    /// never appearing at all.
+    FreeTierBudgetUnavailable(String),
     /// Enrolment finished. Boxed because this variant is much larger than the
     /// rest and every event would otherwise pay for it.
     FreeTierEnrolled(Box<crate::freetier::Enrolled>),
@@ -878,6 +887,7 @@ mod tests {
                 StreamEvent::ToolsFinished(_) => "finished",
                 StreamEvent::Usage(_) => "usage",
                 StreamEvent::FreeTierBudget(_) => "budget",
+                StreamEvent::FreeTierBudgetUnavailable(_) => "budget-failed",
                 StreamEvent::FreeTierEnrolled(_) => "enrolled",
                 StreamEvent::FreeTierFailed(_) => "enrol-failed",
                 StreamEvent::Done => "done",

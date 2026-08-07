@@ -94,19 +94,63 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// The line `/quota` and the welcome screen show.
+    /// What is left today, or `None` when the gateway sets no per-device limit
+    /// -- in which case "remaining" is not a meaningful number rather than zero.
     ///
-    /// Leads with what is *left* rather than what is spent: "how much do I have?"
-    /// is the question someone actually has, and making them subtract two numbers
-    /// to answer it is a small daily tax.
+    /// Prefers the gateway's own `remaining_usd` over subtracting: the gateway
+    /// is the thing that actually refuses, so where the two could disagree its
+    /// figure is the one that matters.
+    pub fn left_usd(&self) -> Option<f64> {
+        if self.daily_limit_usd <= 0.0 {
+            return None;
+        }
+        Some(
+            self.remaining_usd
+                .unwrap_or_else(|| (self.daily_limit_usd - self.spent_usd).max(0.0)),
+        )
+    }
+
+    /// True once today's allowance is gone.
+    pub fn is_spent(&self) -> bool {
+        self.exhausted || self.left_usd().is_some_and(|left| left <= 0.0)
+    }
+
+    /// The multi-line block `/quota` shows for the gateway-enforced budget.
+    ///
+    /// Leads with what is *left*: "how much do I have?" is the question someone
+    /// actually has, and making them subtract two numbers to answer it is a
+    /// small daily tax.
+    pub fn quota_block(&self) -> String {
+        let mut lines = vec![format!("Free tier — {}", self.model)];
+        match self.left_usd() {
+            None => lines.push("  No daily limit set on this device.".to_string()),
+            Some(_) if self.is_spent() => lines.push(format!(
+                "  Spent for today — {} of {} used.",
+                format_usd(self.spent_usd),
+                format_usd(self.daily_limit_usd)
+            )),
+            Some(left) => lines.push(format!(
+                "  {} left of {} today",
+                format_usd(left),
+                format_usd(self.daily_limit_usd)
+            )),
+        }
+        lines.push(format!(
+            "  Used {} over {} request(s) · resets in {} (UTC midnight)",
+            format_usd(self.spent_usd),
+            self.requests,
+            crate::quota::time_until_utc_midnight()
+        ));
+        lines.join("\n")
+    }
+
+    /// The one-line form, for the welcome screen where there is no room for more.
     pub fn summary(&self) -> String {
         if self.daily_limit_usd <= 0.0 {
             return format!("Free tier — {} · no daily limit", self.model);
         }
-        let left = self
-            .remaining_usd
-            .unwrap_or_else(|| (self.daily_limit_usd - self.spent_usd).max(0.0));
-        if self.exhausted || left <= 0.0 {
+        let left = self.left_usd().unwrap_or(0.0);
+        if self.is_spent() {
             return format!(
                 "Free tier — {} · spent for today (${:.2} of ${:.2}). Resets in {}.",
                 self.model,
@@ -226,14 +270,25 @@ pub async fn fetch_budget(config: &Config) -> Result<Budget, String> {
     serde_json::from_str(&body).map_err(|e| format!("Unexpected response from the gateway: {e}"))
 }
 
-/// Sub-cent amounts keep enough digits to mean something; a spend of
-/// `$0.0049` rendered as `$0.00` reads as "nothing happened".
-fn format_usd(usd: f64) -> String {
-    if usd > 0.0 && usd < 0.01 {
-        format!("${usd:.4}")
-    } else {
-        format!("${usd:.2}")
+/// Money, at a precision the daily budget can actually be read against.
+///
+/// Two decimals is the wrong unit here: against a $0.25/day allowance a real
+/// spend of `$0.0167` rounds to `$0.02`, and `$0.2333` left rounds to `$0.23`
+/// -- close enough to the limit to look alarming and too coarse to act on.
+/// Below a dollar this keeps four, trimming trailing zeros so a round limit
+/// still reads as `$0.25` rather than `$0.2500`.
+pub fn format_usd(usd: f64) -> String {
+    if usd >= 1.0 {
+        return format!("${usd:.2}");
     }
+    let text = format!("{usd:.4}");
+    let trimmed = text.trim_end_matches('0');
+    let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    // Never fewer than two, though: "$0.2" reads as a typo rather than a price.
+    if trimmed.split('.').nth(1).is_none_or(|d| d.len() < 2) {
+        return format!("${usd:.2}");
+    }
+    format!("${trimmed}")
 }
 
 /// Pull the human-readable part out of an OpenAI-shaped error body.
@@ -318,6 +373,54 @@ mod tests {
         assert!(s.contains("$0.0021"), "{s}");
         assert!(s.contains("$0.25"), "{s}");
         assert!(s.contains("3 request"), "{s}");
+    }
+
+    /// Against a 25-cent budget, cents are the wrong unit.
+    #[test]
+    fn money_keeps_enough_precision_to_read_against_a_small_budget() {
+        assert_eq!(format_usd(0.0167), "$0.0167");
+        assert_eq!(format_usd(0.2333), "$0.2333");
+        // ...but a round figure is not padded out with noise.
+        assert_eq!(format_usd(0.25), "$0.25");
+        assert_eq!(format_usd(0.1), "$0.10");
+        assert_eq!(format_usd(0.0), "$0.00");
+        assert_eq!(format_usd(1.5), "$1.50");
+    }
+
+    #[test]
+    fn the_quota_block_leads_with_what_is_left() {
+        let b = Budget {
+            model: "m".to_string(),
+            daily_limit_usd: 0.25,
+            spent_usd: 0.0167,
+            requests: 13,
+            ..Default::default()
+        };
+        assert_eq!(b.left_usd(), Some(0.25 - 0.0167));
+        assert!(!b.is_spent());
+        let block = b.quota_block();
+        assert!(block.contains("$0.2333 left of $0.25"), "{block}");
+        assert!(block.contains("13 request"), "{block}");
+    }
+
+    /// The gateway's own figure wins where the two could disagree -- it is the
+    /// thing that actually refuses the request.
+    #[test]
+    fn a_gateway_reported_remainder_is_preferred_over_subtracting() {
+        let b = Budget {
+            daily_limit_usd: 0.25,
+            spent_usd: 0.10,
+            remaining_usd: Some(0.05),
+            ..Default::default()
+        };
+        assert_eq!(b.left_usd(), Some(0.05));
+    }
+
+    #[test]
+    fn an_exhausted_budget_reads_as_spent_rather_than_as_a_remainder() {
+        let b = Budget { daily_limit_usd: 0.25, spent_usd: 0.25, exhausted: true, ..Default::default() };
+        assert!(b.is_spent());
+        assert!(b.quota_block().contains("Spent for today"), "{}", b.quota_block());
     }
 
     #[test]

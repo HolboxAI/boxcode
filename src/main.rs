@@ -189,8 +189,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                 // None of these belong to a request, so the stale-id guard
                 // below must not apply: a user who submits a prompt while
                 // enrolment is in flight would otherwise lose the result.
-                StreamEvent::FreeTierBudget(line) => {
-                    app.free_tier_status = line;
+                StreamEvent::FreeTierBudget(budget) => {
+                    app.free_tier_budget_updated(*budget);
+                    continue;
+                }
+                StreamEvent::FreeTierBudgetUnavailable(reason) => {
+                    app.free_tier_budget_unavailable(reason);
                     continue;
                 }
                 StreamEvent::FreeTierEnrolled(e) => {
@@ -212,6 +216,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
                 StreamEvent::Usage(u) => app.record_exact_usage(u),
                 StreamEvent::FreeTierBudget(_)
+                | StreamEvent::FreeTierBudgetUnavailable(_)
                 | StreamEvent::FreeTierEnrolled(_)
                 | StreamEvent::FreeTierFailed(_) => {
                     unreachable!("handled before the stale-id guard")
@@ -271,11 +276,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                 let id = app.request_id;
                 let tx_budget = tx.clone();
                 tokio::spawn(async move {
-                    if let Ok(budget) = freetier::fetch_budget(&config).await {
-                        let _ = tx_budget
-                            .send((id, StreamEvent::FreeTierBudget(budget.summary())))
-                            .await;
-                    }
+                    // Both outcomes are reported. A readout waiting on this
+                    // answer has to be released either way, or `/quota` prints
+                    // nothing at all when the gateway is unreachable.
+                    let event = match freetier::fetch_budget(&config).await {
+                        Ok(budget) => StreamEvent::FreeTierBudget(Box::new(budget)),
+                        Err(e) => StreamEvent::FreeTierBudgetUnavailable(e),
+                    };
+                    let _ = tx_budget.send((id, event)).await;
                 });
             }
         }
@@ -443,8 +451,8 @@ COMMANDS (type in the input box, press Enter):
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider
     /new                  Forget the conversation and start fresh
-    /usage                Show this machine's local token history
-    /quota                Show today's limits and what's been spent
+    /usage                What today cost, in tokens and money, plus history
+    /quota                What is left of today's budget, and your own limits
     /quota set <what> <n> Set your own limit: requests, tokens or usd
     /quota clear          Remove your own limits
     /quota override       Keep working past today's limit

@@ -105,6 +105,18 @@ pub enum Overlay {
     },
 }
 
+/// A readout that cannot be printed until the gateway answers.
+///
+/// Both `/quota` and `/usage` lead with a figure only the gateway knows, and a
+/// cached one goes stale the moment a turn completes -- so the command reserves
+/// a line in the transcript and fills it in when the answer lands, rather than
+/// printing a number that was true a few requests ago.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Readout {
+    Quota,
+    Usage,
+}
+
 /// Sequential manual entry used when the user picks "Custom endpoint..." instead
 /// of a known provider -- preserves the tool's "any OpenAI-compatible endpoint"
 /// generality rather than limiting it to the built-in registry.
@@ -128,8 +140,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/provider", "switch provider or endpoint"),
     ("/model", "switch model"),
     ("/new", "forget the current conversation"),
-    ("/usage", "show local token usage"),
-    ("/quota", "show or set your daily limits"),
+    ("/usage", "what today cost, and the history"),
+    ("/quota", "what is left today, and your own limits"),
 ];
 
 pub struct App {
@@ -219,6 +231,15 @@ pub struct App {
     /// One line describing free-tier enrolment, or why it is unavailable.
     /// Empty when the user brought their own key. Set by `main` at startup.
     pub free_tier_status: String,
+    /// The gateway's own view of today, as data rather than a sentence.
+    ///
+    /// This is the figure that actually refuses a free-tier request, so it --
+    /// not the local counters -- is what `/quota` leads with. `None` until the
+    /// first successful lookup, or when the user is on their own key.
+    pub free_tier_budget: Option<crate::freetier::Budget>,
+    /// A `/quota` or `/usage` awaiting the gateway, with the index of the
+    /// transcript line it will overwrite once the answer arrives.
+    pub pending_readout: Option<(Readout, usize)>,
     /// Set when the free-tier budget should be re-read from the gateway.
     /// A flag, not a call: `App` does no I/O, so `main.rs` performs the lookup
     /// and hands the answer back on the event channel.
@@ -287,6 +308,8 @@ impl App {
             warned_today: false,
             quota_dirty: false,
             free_tier_status: String::new(),
+            free_tier_budget: None,
+            pending_readout: None,
             refresh_budget: false,
             enrol_requested: false,
             enrolling: false,
@@ -622,10 +645,13 @@ impl App {
                 .push(Message::new(Role::Error, "Request cancelled."));
         }
         // Whatever streamed before the cancel was still real usage.
-        self.record_quota();
+        let tokens = self.record_quota();
         self.refresh_budget = true;
+        // The metered figure, not a second independent estimate: the log used
+        // to record streamed characters alone, which misses every prompt token
+        // and every byte of a tool call.
         self.pending_usage
-            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
+            .push((tokens.total() as usize, self.config.llm.model.clone()));
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -751,6 +777,10 @@ impl App {
     /// the app".
     fn start_new_conversation(&mut self) {
         self.messages.clear();
+        // Holds an index into `messages`, which has just been emptied -- a
+        // budget arriving after this would otherwise overwrite whatever now
+        // occupies that slot.
+        self.pending_readout = None;
         self.streaming_response.clear();
         self.pending_tools.clear();
         self.approved_tools.clear();
@@ -774,29 +804,28 @@ impl App {
     /// Fold the finished turn into today's quota. Called once per request,
     /// including the extra round trips a tool-using turn makes -- each is a
     /// real, billable call.
-    fn record_quota(&mut self) {
-        if !self.config.quota.enabled {
-            self.exact_usage = None;
-            return;
-        }
-        self.roll_quota_day();
-
+    /// Returns what the turn cost, so the caller can log the same figure it
+    /// metered -- the two must never disagree about the same turn.
+    fn record_quota(&mut self) -> crate::quota::TokenCount {
         let tokens = match self.exact_usage.take() {
             Some(u) => crate::quota::TokenCount {
                 prompt: u.prompt_tokens as u64,
                 completion: u.completion_tokens as u64,
                 estimated: false,
             },
-            // No report: reuse the same estimate the usage log records, so the
-            // two never disagree about the same turn.
+            // No report: fall back to the character estimate, marked as such.
             None => crate::quota::TokenCount {
                 prompt: 0,
                 completion: self.approx_tokens_this_turn() as u64,
                 estimated: true,
             },
         };
+        if !self.config.quota.enabled {
+            return tokens;
+        }
+        self.roll_quota_day();
         if tokens.total() == 0 {
-            return;
+            return tokens;
         }
         let price = self.config.quota.price_for(&self.config.llm.model);
         self.quota.record(&tokens, price);
@@ -804,6 +833,7 @@ impl App {
         // than at exit -- this is a TUI people close with Ctrl-C, and a limit
         // that forgets on exit is not a limit.
         self.quota_dirty = true;
+        tokens
     }
 
     /// Start a new day if the UTC date moved on. A TUI gets left open for days,
@@ -826,21 +856,192 @@ impl App {
         }
     }
 
-    /// `/quota` -- show today's limits. `/quota override` / `/quota reset`
-    /// change whether they bind for the rest of the day.
+    /// `/quota` -- what is left today, and what will refuse the next prompt.
+    /// `/quota override` / `/quota reset` change whether the local ones bind.
     fn show_quota(&mut self) {
         self.roll_quota_day();
-        // A budget read at startup is stale the moment a turn completes, and
-        // "how much is left" is the whole point of showing it.
-        self.refresh_budget = true;
-        let mut text = crate::quota::describe(&self.quota, &self.config.quota);
-        // The gateway's budget is the one that actually refuses a request, so it
-        // goes first. The local counters below it are this machine's own view
-        // and cannot stop anything.
-        if !self.free_tier_status.is_empty() && !self.free_tier_status.starts_with("unavailable") {
-            text = format!("{}\n\n{text}", self.free_tier_status);
+        self.request_readout(Readout::Quota);
+    }
+
+    /// Print a readout, or reserve a line and wait for the gateway.
+    ///
+    /// Waiting is the whole point on the free tier: the previous version read
+    /// the cached `free_tier_status`, so `/quota` answered "how much is left"
+    /// with a number from before the last few requests, and the fresh one --
+    /// which arrived moments later -- only ever reached the welcome panel,
+    /// which is no longer on screen by then.
+    fn request_readout(&mut self, readout: Readout) {
+        self.follow_tail = true;
+        if !crate::freetier::is_free_tier(&self.config) {
+            let text = self.render_readout(readout);
+            self.messages.push(Message::new(Role::System, text));
+            return;
         }
-        self.messages.push(Message::new(Role::System, text));
+        self.refresh_budget = true;
+        let placeholder = Message::new(Role::System, "Checking today's free-tier budget…");
+        // A second command asked before the first answer arrives takes over the
+        // line already reserved. Reserving a fresh one would strand the old
+        // placeholder: only one readout is tracked, so nothing would ever fill
+        // it in and "Checking…" would sit in the transcript for good.
+        let index = match self.pending_readout {
+            Some((_, index)) if index < self.messages.len() => {
+                self.messages[index] = placeholder;
+                index
+            }
+            _ => {
+                self.messages.push(placeholder);
+                self.messages.len() - 1
+            }
+        };
+        self.pending_readout = Some((readout, index));
+    }
+
+    fn render_readout(&self, readout: Readout) -> String {
+        match readout {
+            Readout::Quota => self.quota_readout(),
+            Readout::Usage => self.usage_readout(),
+        }
+    }
+
+    /// Fill in the line `request_readout` reserved, now the gateway has
+    /// answered one way or the other.
+    fn settle_pending_readout(&mut self, note: Option<&str>) {
+        let Some((readout, index)) = self.pending_readout.take() else {
+            return;
+        };
+        let mut text = self.render_readout(readout);
+        if let Some(note) = note {
+            text.push_str("\n\n");
+            text.push_str(note);
+        }
+        // Overwrite in place rather than appending, so asking a question does
+        // not leave its own "checking…" above the answer forever.
+        match self.messages.get_mut(index) {
+            Some(slot) => *slot = Message::new(Role::System, text),
+            None => self.messages.push(Message::new(Role::System, text)),
+        }
+        self.follow_tail = true;
+    }
+
+    /// The gateway answered. Both the sentence (welcome panel) and the numbers
+    /// (`/quota`, `/usage`) come from this one reply.
+    pub fn free_tier_budget_updated(&mut self, budget: crate::freetier::Budget) {
+        self.free_tier_status = budget.summary();
+        self.free_tier_budget = Some(budget);
+        self.settle_pending_readout(None);
+    }
+
+    /// The gateway could not be reached. Any cached budget is kept rather than
+    /// cleared: a figure from a few minutes ago, labelled as such, is more use
+    /// than a blank -- and a readout that silently never appears is the worst
+    /// of the three.
+    pub fn free_tier_budget_unavailable(&mut self, reason: String) {
+        self.settle_pending_readout(Some(&format!(
+            "The free-tier figures above may be out of date — could not reach the gateway: {reason}"
+        )));
+    }
+
+    /// `/quota`: the ceilings, most binding first. Nothing here is history.
+    fn quota_readout(&self) -> String {
+        let free_tier = crate::freetier::is_free_tier(&self.config);
+        let mut blocks = vec![format!("Daily limits ({} UTC)", self.quota.date)];
+
+        // The gateway's budget goes first because it is the only one here that
+        // can actually stop a request on the free tier; the local counters
+        // below it are this machine's own bookkeeping.
+        if free_tier {
+            blocks.push(match &self.free_tier_budget {
+                Some(budget) => budget.quota_block(),
+                None => format!(
+                    "Free tier — {}\n  Budget unavailable — the gateway could not be reached.",
+                    self.config.llm.model
+                ),
+            });
+        }
+        blocks.push(crate::quota::describe(
+            &self.quota,
+            &self.config.quota,
+            free_tier,
+        ));
+        blocks.join("\n\n")
+    }
+
+    /// `/usage`: what today actually cost, then the longer history.
+    ///
+    /// Deliberately carries no ceilings at all. The old readout appended the
+    /// whole quota block underneath itself, which put two different meters --
+    /// one that refuses and one that never does -- in one message with nothing
+    /// to tell them apart.
+    fn usage_readout(&self) -> String {
+        let free_tier = crate::freetier::is_free_tier(&self.config);
+
+        // Today comes from the daily counters, never from the history log: the
+        // counters hold the endpoint's exact prompt+completion totals, while
+        // the log holds a character estimate of the streamed prose alone --
+        // which misses prompt tokens and every byte of a tool call, and so
+        // reads roughly two orders of magnitude low on an agentic day.
+        // Every figure on the "Today" line comes from one source, never a mix:
+        // the gateway counts requests this machine never got to record (one
+        // that failed before any usage was reported is still a request it
+        // served), so pairing its cost with the local request count would put
+        // two disagreeing numbers side by side -- 13 requests billed, 8 shown.
+        let (cost, tokens, requests) = match (free_tier, &self.free_tier_budget) {
+            (true, Some(budget)) => (
+                format!("{} spent", crate::freetier::format_usd(budget.spent_usd)),
+                // The gateway does not always report tokens; fall back rather
+                // than print a zero it never meant as one.
+                if budget.tokens > 0 { budget.tokens } else { self.quota.total_tokens() },
+                budget.requests,
+            ),
+            (true, None) => (
+                "cost unavailable".to_string(),
+                self.quota.total_tokens(),
+                self.quota.requests,
+            ),
+            (false, _) if self.quota.unpriced_requests > 0 => (
+                format!(
+                    "cost unknown — add a price for '{}' under [quota.pricing]",
+                    self.config.llm.model
+                ),
+                self.quota.total_tokens(),
+                self.quota.requests,
+            ),
+            (false, _) => (
+                format!("{} spent", crate::freetier::format_usd(self.quota.usd())),
+                self.quota.total_tokens(),
+                self.quota.requests,
+            ),
+        };
+
+        let mut lines = vec![
+            "Usage (this machine only)".to_string(),
+            format!(
+                "  Today:       {cost} · {} tokens · {} request(s)",
+                crate::quota::thousands(tokens),
+                crate::quota::thousands(requests),
+            ),
+        ];
+        if self.quota.any_estimated {
+            lines.push(
+                "               (tokens estimated — this endpoint does not report exact counts)"
+                    .to_string(),
+            );
+        }
+
+        let history = usage::summary();
+        lines.push(String::new());
+        lines.push(format!(
+            "  Last 7 days: ~{} tokens",
+            crate::quota::thousands(history.week_tokens as u64)
+        ));
+        lines.push(format!(
+            "  All time:    ~{} tokens over {} day{}",
+            crate::quota::thousands(history.all_time_tokens as u64),
+            history.days_active,
+            if history.days_active == 1 { "" } else { "s" },
+        ));
+        lines.push("  (history is tokens only — see /quota for what is left today)".to_string());
+        lines.join("\n")
     }
 
     /// `/quota set <metric> <value>` -- a user's own ceiling, without making
@@ -944,43 +1145,30 @@ impl App {
         self.roll_quota_day();
         self.quota.override_active = active;
         self.quota_dirty = true;
-        self.messages.push(Message::new(
-            Role::System,
-            if active {
-                "Quota override active for the rest of today. It clears at UTC midnight."
-            } else {
-                "Quota override cleared; the daily limits apply again."
-            },
-        ));
+        let mut text = if active {
+            "Quota override active for the rest of today. It clears at UTC midnight.".to_string()
+        } else {
+            "Quota override cleared; the daily limits apply again.".to_string()
+        };
+        // An override reaches only the counters on this machine. The free-tier
+        // budget is enforced at the gateway, which has never heard of it -- and
+        // "override active" next to a spent allowance reads as a promise the
+        // next prompt will not keep.
+        if active && crate::freetier::is_free_tier(&self.config) {
+            text.push_str(
+                "\n\nThis covers your own limits only. The free-tier budget is enforced by the \
+                 gateway and is unaffected — once it is spent, prompts are refused until it resets.",
+            );
+        }
+        self.messages.push(Message::new(Role::System, text));
     }
 
-    /// Reads the local usage log (see `usage.rs`) and prints a summary --
-    /// this never leaves the machine, and works with no login and no server,
-    /// since the file it reads is the only copy of this data that exists.
+    /// `/usage` -- history and today's spend. Never leaves the machine, and
+    /// works with no login and no server, since the files it reads are the only
+    /// copy of this data that exists.
     fn show_usage(&mut self) {
-        let s = usage::summary();
-        self.messages.push(Message::new(
-            Role::System,
-            format!(
-                "Usage (local, this machine only):\n\
-                 Today:      ~{} tokens\n\
-                 Last 7 days: ~{} tokens\n\
-                 All time:   ~{} tokens, {} day{} used\n\
-                 (estimated from characters streamed, not an exact count from the endpoint)",
-                s.today_tokens,
-                s.week_tokens,
-                s.all_time_tokens,
-                s.days_active,
-                if s.days_active == 1 { "" } else { "s" },
-            ),
-        ));
-        // The two meters answer different questions -- this one is history and
-        // never refuses; the quota is a ceiling and does. Showing them together,
-        // labelled, stops the log being mistaken for the thing that binds.
-        if self.config.quota.has_limits() {
-            let text = crate::quota::describe(&self.quota, &self.config.quota);
-            self.messages.push(Message::new(Role::System, text));
-        }
+        self.roll_quota_day();
+        self.request_readout(Readout::Usage);
     }
 
     /// Whether `call` needs a human decision before it runs.
@@ -1190,10 +1378,13 @@ impl App {
             ));
             self.follow_tail = true;
         }
-        self.record_quota();
+        let tokens = self.record_quota();
         self.refresh_budget = true;
+        // The metered figure, not a second independent estimate: the log used
+        // to record streamed characters alone, which misses every prompt token
+        // and every byte of a tool call.
         self.pending_usage
-            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
+            .push((tokens.total() as usize, self.config.llm.model.clone()));
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -1212,10 +1403,13 @@ impl App {
             self.messages.push(Message::new(Role::Assistant, partial));
         }
         self.messages.push(Message::new(Role::Error, error));
-        self.record_quota();
+        let tokens = self.record_quota();
         self.refresh_budget = true;
+        // The metered figure, not a second independent estimate: the log used
+        // to record streamed characters alone, which misses every prompt token
+        // and every byte of a tool call.
         self.pending_usage
-            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
+            .push((tokens.total() as usize, self.config.llm.model.clone()));
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -2040,13 +2234,173 @@ mod tests {
         });
     }
 
+    /// An app enrolled in the free tier, as `freetier::is_free_tier` recognises it.
+    fn free_tier_app() -> App {
+        let mut a = app();
+        a.config.free_tier.enabled = true;
+        a.config.free_tier.device_token = "dt_a.b".to_string();
+        a.config.llm.api_key = "dt_a.b".to_string();
+        a.config.llm.model = "deepseek-v4-flash".to_string();
+        a
+    }
+
+    fn budget(limit: f64, spent: f64, requests: u64) -> crate::freetier::Budget {
+        crate::freetier::Budget {
+            model: "deepseek-v4-flash".to_string(),
+            daily_limit_usd: limit,
+            spent_usd: spent,
+            requests,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn showing_the_quota_asks_for_a_fresh_budget() {
-        let mut a = app();
+        let mut a = free_tier_app();
         assert!(!a.refresh_budget);
         type_str(&mut a, "/quota");
         a.handle_key(key(KeyCode::Enter));
         assert!(a.refresh_budget, "a startup-cached figure goes stale immediately");
+        assert!(a.pending_readout.is_some(), "the readout must wait for the answer");
+    }
+
+    /// The bug this split exists for: `/quota` used to print the *cached*
+    /// free-tier line, and the fresh one that arrived moments later only ever
+    /// reached the welcome panel -- which is long gone by then.
+    #[test]
+    fn the_quota_readout_shows_the_budget_that_arrives_not_the_one_cached() {
+        let mut a = free_tier_app();
+        a.free_tier_status = "Free tier — $0.25 left of $0.25 today".to_string();
+
+        type_str(&mut a, "/quota");
+        a.handle_key(key(KeyCode::Enter));
+        // Nothing stale is committed while the lookup is in flight.
+        assert!(!a.messages.iter().any(|m| m.content.contains("$0.25 left")));
+
+        a.free_tier_budget_updated(budget(0.25, 0.0167, 13));
+
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a readout");
+        assert!(out.content.contains("$0.2333 left of $0.25"), "{}", out.content);
+        assert!(out.content.contains("13 request"), "{}", out.content);
+        // ...and it replaced the placeholder rather than stacking beneath it.
+        assert!(!a.messages.iter().any(|m| m.content.contains("Checking")));
+    }
+
+    /// Two spend figures in one block, one of them a misleading zero, is what
+    /// made the old readout unreadable.
+    #[test]
+    fn the_free_tier_readout_carries_exactly_one_dollar_figure() {
+        let mut a = free_tier_app();
+        a.quota.date = crate::quota::today();
+        a.quota.requests = 8;
+        a.quota.prompt_tokens = 36_110;
+        a.quota.completion_tokens = 17_300;
+        a.quota.unpriced_requests = 8;
+
+        type_str(&mut a, "/quota");
+        a.handle_key(key(KeyCode::Enter));
+        a.free_tier_budget_updated(budget(0.25, 0.0167, 13));
+
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a readout");
+        assert!(!out.content.contains("$0.0000"), "the local zero must be gone: {}", out.content);
+        assert!(out.content.contains("metered by the gateway"), "{}", out.content);
+        // The local token counters are still shown -- they are not misleading.
+        assert!(out.content.contains("53,410"), "{}", out.content);
+    }
+
+    /// A gateway that cannot be reached must still release the readout, or the
+    /// user is left looking at "Checking…" forever.
+    #[test]
+    fn an_unreachable_gateway_still_produces_a_readout() {
+        let mut a = free_tier_app();
+        type_str(&mut a, "/quota");
+        a.handle_key(key(KeyCode::Enter));
+
+        a.free_tier_budget_unavailable("connection refused".to_string());
+
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a readout");
+        assert!(!out.content.contains("Checking"), "{}", out.content);
+        assert!(out.content.contains("connection refused"), "{}", out.content);
+        assert!(a.pending_readout.is_none());
+    }
+
+    /// An override reaches the local counters only; the gateway has never heard
+    /// of it. Saying "override active" and nothing else promises something the
+    /// next prompt will not deliver.
+    #[test]
+    fn an_override_says_it_does_not_reach_the_free_tier_budget() {
+        let mut a = free_tier_app();
+        type_str(&mut a, "/quota override");
+        a.handle_key(key(KeyCode::Enter));
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a confirmation");
+        assert!(out.content.contains("gateway"), "{}", out.content);
+        assert!(out.content.contains("unaffected"), "{}", out.content);
+
+        // Someone on their own key has no gateway budget, so the caveat is noise.
+        let mut b = app();
+        type_str(&mut b, "/quota override");
+        b.handle_key(key(KeyCode::Enter));
+        let out = b.messages.iter().find(|m| m.role == Role::System).expect("a confirmation");
+        assert!(!out.content.contains("gateway"), "{}", out.content);
+    }
+
+    /// Only one readout is tracked, so a second command asked before the first
+    /// answer lands must take over its line rather than reserve another --
+    /// nothing would ever fill the abandoned one in.
+    #[test]
+    fn a_second_readout_before_the_answer_does_not_strand_the_first() {
+        let mut a = free_tier_app();
+        type_str(&mut a, "/quota");
+        a.handle_key(key(KeyCode::Enter));
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+
+        a.free_tier_budget_updated(budget(0.25, 0.0167, 13));
+
+        assert!(
+            !a.messages.iter().any(|m| m.content.contains("Checking")),
+            "a placeholder was left behind: {:?}",
+            a.messages.iter().map(Message::body).collect::<Vec<_>>()
+        );
+        // The command asked most recently is the one answered.
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a readout");
+        assert!(out.content.contains("Usage (this machine only)"), "{}", out.content);
+    }
+
+    /// `pending_readout` holds an index into `messages`; `/new` empties it.
+    #[test]
+    fn a_new_conversation_cancels_a_readout_still_in_flight() {
+        let mut a = free_tier_app();
+        type_str(&mut a, "/quota");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.pending_readout.is_some());
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.pending_readout.is_none());
+
+        // A late answer must not overwrite the new conversation's own lines.
+        let before = a.messages.len();
+        a.free_tier_budget_updated(budget(0.25, 0.0, 0));
+        assert_eq!(a.messages.len(), before, "a stale answer writes nothing");
+    }
+
+    /// Someone on their own key has no gateway to wait for, so the readout is
+    /// immediate -- and still tells them what they have set.
+    #[test]
+    fn with_an_own_key_the_quota_readout_is_immediate_and_local() {
+        let mut a = app();
+        a.config.quota.max_requests_per_day = 2000;
+        a.quota.date = crate::quota::today();
+        a.quota.requests = 8;
+
+        type_str(&mut a, "/quota");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(a.pending_readout.is_none(), "nothing to wait for");
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a readout");
+        assert!(out.content.contains("Requests: 8 of 2,000"), "{}", out.content);
+        assert!(!out.content.contains("Free tier"), "{}", out.content);
     }
 
     #[test]
@@ -2202,21 +2556,58 @@ mod tests {
         assert_eq!(a.state, AppState::AwaitingInput);
     }
 
-    /// `/usage` keeps main's local history readout and appends the ceiling only
-    /// when one is configured -- the two are different meters.
+    /// The two meters answer different questions -- one is history and never
+    /// refuses, the other is a ceiling and does. `/usage` used to append the
+    /// whole quota block underneath itself, which put both in one message with
+    /// nothing to tell them apart.
     #[test]
-    fn usage_appends_the_quota_only_when_a_limit_exists() {
+    fn usage_never_shows_a_ceiling() {
         let mut a = app();
+        a.config.quota.max_requests_per_day = 10;
         type_str(&mut a, "/usage");
         a.handle_key(key(KeyCode::Enter));
-        assert!(!a.messages.iter().any(|m| m.content.contains("Daily limits")));
 
-        let mut b = app();
-        b.config.quota.max_requests_per_day = 10;
-        type_str(&mut b, "/usage");
-        b.handle_key(key(KeyCode::Enter));
-        assert!(b.messages.iter().any(|m| m.content.contains("Usage (local")));
-        assert!(b.messages.iter().any(|m| m.content.contains("Daily limits")));
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a report");
+        assert!(out.content.contains("Usage (this machine only)"), "{}", out.content);
+        assert!(!out.content.contains("Daily limits"), "{}", out.content);
+        assert!(!out.content.contains("of 10"), "no ceilings here: {}", out.content);
+        assert!(out.content.contains("/quota"), "it must point at the other meter");
+    }
+
+    /// The headline `/usage` figure: today's cost and today's tokens.
+    #[test]
+    fn usage_leads_with_todays_cost_and_tokens() {
+        let mut a = free_tier_app();
+        a.quota.date = crate::quota::today();
+        a.quota.requests = 8;
+        a.quota.prompt_tokens = 36_110;
+        a.quota.completion_tokens = 17_300;
+
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+        a.free_tier_budget_updated(budget(0.25, 0.0167, 13));
+
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a report");
+        assert!(out.content.contains("$0.0167 spent"), "{}", out.content);
+        assert!(out.content.contains("53,410 tokens"), "{}", out.content);
+    }
+
+    /// Today's tokens come from the daily counters, not the history log: the
+    /// log records streamed characters alone, which misses prompt tokens and
+    /// every byte of a tool call and so reads orders of magnitude low.
+    #[test]
+    fn the_logged_token_count_is_the_metered_one_not_a_second_estimate() {
+        let mut a = app();
+        a.state = AppState::Streaming;
+        a.streamed_chars = 400; // the old estimate would log 100
+        a.record_exact_usage(crate::llm::ApiUsage {
+            prompt_tokens: 36_110,
+            completion_tokens: 17_300,
+        });
+        a.finish_stream();
+
+        let (tokens, _) = a.pending_usage.first().expect("a turn was logged");
+        assert_eq!(*tokens, 53_410, "the log and the quota must agree about one turn");
     }
 
     fn key(code: KeyCode) -> KeyEvent {

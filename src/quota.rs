@@ -255,26 +255,45 @@ pub fn today() -> String {
     dateutil::today_string()
 }
 
-/// The `/quota` readout, and the extra lines `/usage` appends.
-pub fn describe(quota: &DailyQuota, config: &QuotaConfig) -> String {
+/// Group digits so a five- or six-figure token count can be read at a glance.
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The user's own ceilings, counted on this machine.
+///
+/// `spend_is_elsewhere` is set when a gateway is the thing that actually meters
+/// money -- on the free tier. The local dollar figure is then not merely
+/// incomplete but actively misleading: it reads `$0.0000` beside the gateway's
+/// real spend, and two contradictory totals in one readout is worse than one
+/// total and a pointer. So the line is replaced rather than shown.
+pub fn describe(quota: &DailyQuota, config: &QuotaConfig, spend_is_elsewhere: bool) -> String {
     let limit = |used: String, limit: String, unlimited: bool| {
-        if unlimited { format!("{used} (no limit set)") } else { format!("{used} of {limit}") }
+        if unlimited { format!("{used} — no limit set") } else { format!("{used} of {limit}") }
     };
 
-    let mut lines = vec![format!("Daily limits ({} UTC):", quota.date)];
+    let mut lines = vec!["Your own limits (counted on this machine)".to_string()];
     lines.push(format!(
         "  Requests: {}",
         limit(
-            quota.requests.to_string(),
-            config.max_requests_per_day.to_string(),
+            thousands(quota.requests),
+            thousands(config.max_requests_per_day),
             config.max_requests_per_day == 0
         )
     ));
     lines.push(format!(
         "  Tokens:   {}{}",
         limit(
-            quota.total_tokens().to_string(),
-            config.max_tokens_per_day.to_string(),
+            thousands(quota.total_tokens()),
+            thousands(config.max_tokens_per_day),
             config.max_tokens_per_day == 0
         ),
         if quota.any_estimated {
@@ -283,32 +302,36 @@ pub fn describe(quota: &DailyQuota, config: &QuotaConfig) -> String {
             ""
         }
     ));
-    lines.push(format!(
-        "  Spend:    {}",
-        limit(
-            format!("${:.4}", quota.usd()),
-            format!("${:.2}", config.max_usd_per_day),
-            config.max_usd_per_day == 0.0
-        )
-    ));
-    // Naming the gap matters more than the number: a total that silently omits
-    // half the day's requests is worse than no total.
-    if quota.unpriced_requests > 0 {
+
+    if spend_is_elsewhere {
+        lines.push("  Spend:    metered by the gateway — see the free-tier figure above".to_string());
+    } else {
         lines.push(format!(
-            "            excludes {} request(s) on a model with no price in [quota.pricing]",
-            quota.unpriced_requests
+            "  Spend:    {}",
+            limit(
+                format!("${:.4}", quota.usd()),
+                format!("${:.2}", config.max_usd_per_day),
+                config.max_usd_per_day == 0.0
+            )
         ));
+        // Naming the gap matters more than the number: a total that silently
+        // omits half the day's requests is worse than no total.
+        if quota.unpriced_requests > 0 {
+            lines.push(format!(
+                "            excludes {} request(s) on a model with no price in [quota.pricing]",
+                quota.unpriced_requests
+            ));
+        }
     }
+
     if quota.override_active {
         lines.push("  Override: active for today".to_string());
     }
-    lines.push(format!("  Resets in {} (UTC midnight)", time_until_utc_midnight()));
     // A readout that says "no limit set" three times should also say how to set
     // one, rather than leaving the user to find the config file.
     if !config.has_limits() {
-        lines.push(String::new());
         lines.push("  No limits of your own yet. Set one with:".to_string());
-        lines.push("    /quota set requests 200   ·   /quota set tokens 500000   ·   /quota set usd 0.10".to_string());
+        lines.push("    /quota set requests 200  ·  /quota set tokens 500000  ·  /quota set usd 0.10".to_string());
     } else {
         lines.push("  /quota set <requests|tokens|usd> <n> to change · /quota clear to remove".to_string());
     }
@@ -436,7 +459,7 @@ mod tests {
         q.record(&TokenCount { prompt: 5_000_000, completion: 5_000_000, estimated: false }, None);
         assert_eq!(q.micro_usd, 0);
         assert_eq!(q.unpriced_requests, 1);
-        assert!(describe(&q, &QuotaConfig::default()).contains("no price"));
+        assert!(describe(&q, &QuotaConfig::default(), false).contains("no price"));
     }
 
     #[test]
@@ -444,7 +467,35 @@ mod tests {
         let mut q = DailyQuota::default();
         q.record(&TokenCount { prompt: 100, completion: 100, estimated: true }, None);
         assert!(q.any_estimated);
-        assert!(describe(&q, &QuotaConfig::default()).contains("estimated"));
+        assert!(describe(&q, &QuotaConfig::default(), false).contains("estimated"));
+    }
+
+    /// The regression this whole readout split exists for: on the free tier the
+    /// gateway meters the money, and a local `$0.0000` printed beside its real
+    /// figure is two contradictory totals in one block.
+    #[test]
+    fn on_the_free_tier_the_local_dollar_figure_is_replaced_not_shown() {
+        let mut q = DailyQuota::default();
+        q.record(&TokenCount { prompt: 36_110, completion: 17_300, estimated: false }, None);
+
+        let free = describe(&q, &QuotaConfig::default(), true);
+        assert!(!free.contains("$0.0000"), "a misleading zero must not appear: {free}");
+        assert!(free.contains("metered by the gateway"), "{free}");
+        // The unpriced-model caveat belongs to the local figure, so it goes too.
+        assert!(!free.contains("no price in"), "{free}");
+
+        // ...but someone on their own key still gets it, since nothing else meters them.
+        let own = describe(&q, &QuotaConfig::default(), false);
+        assert!(own.contains("$0.0000"), "{own}");
+        assert!(own.contains("no price in"), "{own}");
+    }
+
+    #[test]
+    fn token_counts_are_grouped_for_reading() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(53_410), "53,410");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 
     /// Integer micro-dollars exist so this holds exactly over many requests.
@@ -467,7 +518,7 @@ mod tests {
 
     #[test]
     fn an_unset_limit_reads_as_unset_rather_than_zero() {
-        let out = describe(&DailyQuota::default(), &QuotaConfig::default());
+        let out = describe(&DailyQuota::default(), &QuotaConfig::default(), false);
         assert!(out.contains("no limit set"), "{out}");
     }
 }
