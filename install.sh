@@ -84,6 +84,50 @@ ping_install() {
   return 0
 }
 
+# `web_search` needs Python's `ddgs` package -- see tools.rs's own doc comment
+# for why it shells out to Python rather than a pure-Rust HTTP call. Whether
+# it actually works has so far depended on ddgs already happening to be on
+# the machine for some unrelated reason; this makes that a real, install-time
+# guarantee instead of a coincidence, the same way Rust itself gets installed
+# automatically below if it's missing.
+#
+# Best-effort in every direction, and never allowed to fail the install: no
+# python3 means web_search simply won't work (the tool itself already
+# explains that clearly when it's actually used, so there is nothing more
+# useful to say here), and a failed pip install is reported but not fatal --
+# the app remains fully usable without web_search either way.
+ensure_ddgs_available() {
+  if ! command -v python3 &> /dev/null; then
+    return 0
+  fi
+  if python3 -c "import ddgs" &> /dev/null; then
+    return 0
+  fi
+
+  echo "🔎 Installing the 'ddgs' Python package (needed for web_search)..."
+  # Plain `pip install` first -- works everywhere it's allowed to. Many
+  # current Linux distros mark their system Python as "externally managed"
+  # (PEP 668) and refuse that outright, even with `--user`; retried with
+  # `--break-system-packages` for exactly that case; a single small package
+  # in the user's own site-packages is what `--user` was already asking for,
+  # this just gets past the distro's opt-out-required guard rail for it.
+  # `-m pip` rather than a bare `pip3`, since some systems have python3 but
+  # no separate `pip3` executable on PATH.
+  if python3 -m pip install --user ddgs &> /dev/null; then
+    :
+  elif python3 -m pip install --user --break-system-packages ddgs &> /dev/null; then
+    :
+  fi
+
+  if python3 -c "import ddgs" &> /dev/null; then
+    echo "✓ ddgs installed"
+  else
+    echo "⚠️  Could not install 'ddgs' automatically. web_search will explain how"
+    echo "   to install it yourself (pip install ddgs) if you end up using it."
+  fi
+  return 0
+}
+
 # Put a binary at $dest, replacing whatever is there.
 #
 # Writing straight over the destination breaks `tuisample-code --upgrade`: that
@@ -348,6 +392,9 @@ elif [ "$RESOLVED" != "$INSTALLED_AT" ]; then
 else
   echo "✓ Verified: $RESOLVED ($("$RESOLVED" --version 2>/dev/null || echo 'version unknown'))"
 fi
+
+# Best-effort either way -- see ensure_ddgs_available's own doc comment.
+ensure_ddgs_available
 
 # Best-effort and silent either way -- see ping_install's own doc comment.
 ping_install "$INSTALLED_AT"

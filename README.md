@@ -46,16 +46,31 @@ the prompt, where you're already looking:
 
 ### 1. Install
 
+macOS / Linux:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/HolboxAI/tuisample-code/main/install.sh | bash
 ```
 
-Downloads a prebuilt binary for your platform (macOS/Linux, x86_64/arm64) from
-the latest [release](https://github.com/HolboxAI/tuisample-code/releases) and
-verifies it against a published checksum — no Rust toolchain needed, installed
-in seconds. If your platform has no prebuilt binary yet, the script falls back
-to installing Rust (if missing) and building from source instead, same as
-before, just automatically.
+Windows (PowerShell):
+```powershell
+irm https://raw.githubusercontent.com/HolboxAI/tuisample-code/main/install.ps1 | iex
+```
+
+Downloads a prebuilt binary for your platform (macOS/Linux/Windows,
+x86_64/arm64) from the latest
+[release](https://github.com/HolboxAI/tuisample-code/releases) and verifies it
+against a published checksum — no Rust toolchain needed, installed in
+seconds. Also installs Python's `ddgs` package if it's missing, since
+`web_search` needs it.
+
+On macOS/Linux, if your platform has no prebuilt binary yet, `install.sh`
+falls back to installing Rust (if missing) and building from source instead,
+same as before, just automatically. There is no such fallback on Windows —
+building from source there needs the MSVC Build Tools, a much bigger ask than
+`rustup` alone, so `install.ps1` will tell you plainly if it can't find a
+prebuilt binary rather than trying to set up a C++ toolchain unasked; install
+Rust yourself and run `cargo build --release`, or use WSL with the regular
+`install.sh`.
 
 Or build from source yourself:
 ```bash
@@ -118,7 +133,8 @@ To rebuild from the latest source regardless, use `tuisample-code --upgrade
 > install command from step 1 once more, and `--upgrade` works from then on.
 
 Running somewhere with no route to github.com? Point upgrades at a fork or an
-internal mirror serving the same `Cargo.toml` and `install.sh`:
+internal mirror serving the same `Cargo.toml` and `install.sh`/`install.ps1`
+(whichever your platform uses):
 
 ```bash
 export TUISAMPLE_UPGRADE_URL_BASE=https://git.company.internal/tuisample-code/raw/main
@@ -324,7 +340,8 @@ this app can see instead is a random ID generated once per install
 (`~/.tuisample-code/device_id`), which labels a machine, not a person. Two
 things, and only these two things, ever leave your machine:
 
-- `install.sh` sends one `install` ping on a fresh install or an `--upgrade`.
+- `install.sh`/`install.ps1` sends one `install` ping on a fresh install or an
+  `--upgrade`.
 - The app itself sends one `active` ping per calendar day (UTC) it's actually
   used, checked against `~/.tuisample-code/last_active` so a long session
   doesn't send more than one.
@@ -332,7 +349,10 @@ things, and only these two things, ever leave your machine:
 Each ping carries only `{anon_id, event, version, os, date}` — no prompts, no
 file paths, no command text, no conversation content. Both are silent,
 best-effort, and never block startup or fail an install: see `src/telemetry.rs`
-and the `ping_install` function in `install.sh`.
+and the `ping_install`/`Send-InstallPing` functions in `install.sh`/`install.ps1`.
+`TUISAMPLE_TELEMETRY_URL=""` disables it on macOS/Linux; PowerShell cannot
+represent an explicitly-blank environment variable (`$env:X = ''` deletes it
+outright), so use `TUISAMPLE_TELEMETRY_URL=off` on Windows instead.
 
 **The aggregate counts are public**: [tui-telemetry.dhruvm307.workers.dev](https://tui-telemetry.dhruvm307.workers.dev)
 shows total installs, distinct anonymous devices seen, and daily-active counts,

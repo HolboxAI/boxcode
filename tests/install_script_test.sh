@@ -275,3 +275,108 @@ elapsed=$(( $(date +%s) - start ))
 [ "$elapsed" -lt 5 ] || fail "a refused connection should fail fast, not wait out the full timeout (took ${elapsed}s)"
 
 echo "PASS: fetch_prebuilt_binary fails fast and cleanly when no release is reachable, so main() can fall back to a source build"
+
+# --- ensure_ddgs_available ----------------------------------------------------
+# A fake `python3` -- shadowing it as a shell function works the same way
+# shadowing `uname` did earlier, and `command -v` finds shell functions just
+# like real executables, so ensure_ddgs_available cannot tell the difference.
+#
+# The fake tracks "is ddgs importable" via a marker file rather than call
+# count, so it composes the same way the real thing does: `import ddgs`
+# succeeds once (and only once) something has actually "installed" it.
+
+fake_python3_marker=""
+fake_python3_pip_behavior=""
+
+python3() {
+  if [ "$1" = "-c" ]; then
+    [ -n "$fake_python3_marker" ] && [ -f "$fake_python3_marker" ]
+    return $?
+  fi
+  if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then
+    case "$fake_python3_pip_behavior" in
+      succeeds)
+        touch "$fake_python3_marker"
+        return 0
+        ;;
+      needs-break-system-packages)
+        if printf '%s\n' "$@" | grep -q -- --break-system-packages; then
+          touch "$fake_python3_marker"
+          return 0
+        fi
+        return 1
+        ;;
+      always-fails)
+        return 1
+        ;;
+    esac
+  fi
+  return 1
+}
+
+fake_python3_marker="$workdir/ddgs-already-there"
+touch "$fake_python3_marker"
+out=$(ensure_ddgs_available)
+[ -z "$out" ] || fail "already-importable ddgs should not print anything, got: $out"
+rm -f "$fake_python3_marker"
+
+echo "PASS: ensure_ddgs_available does nothing when ddgs is already importable"
+
+fake_python3_marker="$workdir/ddgs-plain-install"
+rm -f "$fake_python3_marker"
+fake_python3_pip_behavior="succeeds"
+out=$(ensure_ddgs_available)
+echo "$out" | grep -q "ddgs installed" || fail "expected a success message, got: $out"
+[ -f "$fake_python3_marker" ] || fail "the plain pip install path should have run"
+
+echo "PASS: ensure_ddgs_available installs ddgs with a plain pip install when that's enough"
+
+fake_python3_marker="$workdir/ddgs-break-system-packages"
+rm -f "$fake_python3_marker"
+fake_python3_pip_behavior="needs-break-system-packages"
+out=$(ensure_ddgs_available)
+echo "$out" | grep -q "ddgs installed" || fail "expected a success message via the PEP 668 fallback, got: $out"
+
+echo "PASS: ensure_ddgs_available falls back to --break-system-packages for externally-managed Pythons"
+
+fake_python3_marker="$workdir/ddgs-never-appears"
+rm -f "$fake_python3_marker"
+fake_python3_pip_behavior="always-fails"
+out=$(ensure_ddgs_available)
+echo "$out" | grep -q "Could not install 'ddgs' automatically" || fail "expected the graceful-failure message, got: $out"
+echo "$out" | grep -q "pip install ddgs" || fail "the failure message should still say how to install it manually"
+
+echo "PASS: ensure_ddgs_available fails gracefully (not via set -e) when neither install attempt works"
+
+unset -f python3
+
+# No python3 at all: must return immediately without ever trying to install
+# anything, and without touching `set -e`.
+no_python_dir="$workdir/no-python-path"
+mkdir -p "$no_python_dir"
+# Deliberately just this one empty directory -- not /bin or /usr/bin, which
+# have a real python3 on this machine. `[`, `command`, and `echo` are bash
+# builtins, so an otherwise-empty PATH does not stop them from working.
+out=$(PATH="$no_python_dir" ensure_ddgs_available)
+[ -z "$out" ] || fail "with no python3 on PATH, nothing should be printed, got: $out"
+
+echo "PASS: ensure_ddgs_available is a silent no-op when python3 isn't on PATH"
+
+# The real thing, run against the actual `ddgs` package -- skipped rather
+# than failed when Python isn't available, the same convention tools.rs's
+# own live tests use. Since this machine already has ddgs installed (as
+# confirmed while building the web_search feature), this exercises the
+# "already there, nothing to do" path for real, not just against a fake.
+if command -v python3 &> /dev/null; then
+  real_out=$(ensure_ddgs_available)
+  if python3 -c "import ddgs" &> /dev/null; then
+    [ -z "$real_out" ] || fail "ddgs is genuinely already installed here, so there should be nothing to print, got: $real_out"
+    echo "PASS: ensure_ddgs_available is a real no-op against this machine's actual ddgs install"
+  else
+    echo "$real_out" | grep -qE "ddgs installed|Could not install" ||
+      fail "expected either a real install attempt or its failure message, got: $real_out"
+    echo "PASS: ensure_ddgs_available really attempted to install ddgs on this machine"
+  fi
+else
+  echo "SKIP: ensure_ddgs_available real-Python test (no python3 on this machine)"
+fi

@@ -44,3 +44,9 @@ jobs:
 
       - name: Test install script
         run: bash tests/install_script_test.sh
+
+      - name: Test install.ps1
+        # ubuntu-latest ships pwsh preinstalled, so this genuinely runs the
+        # PowerShell installer's real functions on every CI run, not just on
+        # a real Windows machine.
+        run: pwsh -NoProfile -File tests/install_ps1_test.ps1
