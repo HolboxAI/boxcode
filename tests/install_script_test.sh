@@ -362,20 +362,28 @@ out=$(PATH="$no_python_dir" ensure_ddgs_available)
 
 echo "PASS: ensure_ddgs_available is a silent no-op when python3 isn't on PATH"
 
-# The real thing, run against the actual `ddgs` package -- skipped rather
-# than failed when Python isn't available, the same convention tools.rs's
-# own live tests use. Since this machine already has ddgs installed (as
-# confirmed while building the web_search feature), this exercises the
-# "already there, nothing to do" path for real, not just against a fake.
+# The real thing, run against whatever this machine actually has -- skipped
+# rather than failed when Python isn't available, the same convention
+# tools.rs's own live tests use. Which branch below actually runs depends on
+# whether ddgs was *already* present -- checked first and remembered, since
+# ensure_ddgs_available's own call can change that state (a real install, on
+# a machine that didn't have it yet), and checking again afterwards would be
+# checking the wrong moment in time.
 if command -v python3 &> /dev/null; then
+  ddgs_was_already_there=0
+  python3 -c "import ddgs" &> /dev/null && ddgs_was_already_there=1
+
   real_out=$(ensure_ddgs_available)
-  if python3 -c "import ddgs" &> /dev/null; then
-    [ -z "$real_out" ] || fail "ddgs is genuinely already installed here, so there should be nothing to print, got: $real_out"
+
+  if [ "$ddgs_was_already_there" -eq 1 ]; then
+    [ -z "$real_out" ] || fail "ddgs was genuinely already installed here, so there should have been nothing to print, got: $real_out"
     echo "PASS: ensure_ddgs_available is a real no-op against this machine's actual ddgs install"
   else
     echo "$real_out" | grep -qE "ddgs installed|Could not install" ||
       fail "expected either a real install attempt or its failure message, got: $real_out"
-    echo "PASS: ensure_ddgs_available really attempted to install ddgs on this machine"
+    python3 -c "import ddgs" &> /dev/null ||
+      fail "expected ddgs to actually be importable after a reported successful install"
+    echo "PASS: ensure_ddgs_available really installed ddgs on this machine, where it was genuinely missing"
   fi
 else
   echo "SKIP: ensure_ddgs_available real-Python test (no python3 on this machine)"
