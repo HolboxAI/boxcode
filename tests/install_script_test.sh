@@ -275,3 +275,193 @@ elapsed=$(( $(date +%s) - start ))
 [ "$elapsed" -lt 5 ] || fail "a refused connection should fail fast, not wait out the full timeout (took ${elapsed}s)"
 
 echo "PASS: fetch_prebuilt_binary fails fast and cleanly when no release is reachable, so main() can fall back to a source build"
+
+# --- ensure_ddgs_available ----------------------------------------------------
+# A fake `python3` -- shadowing it as a shell function works the same way
+# shadowing `uname` did earlier, and `command -v` finds shell functions just
+# like real executables, so ensure_ddgs_available cannot tell the difference.
+#
+# The fake tracks "is ddgs importable" via a marker file rather than call
+# count, so it composes the same way the real thing does: `import ddgs`
+# succeeds once (and only once) something has actually "installed" it.
+
+fake_python3_marker=""
+fake_python3_pip_behavior=""
+
+python3() {
+  if [ "$1" = "-c" ]; then
+    [ -n "$fake_python3_marker" ] && [ -f "$fake_python3_marker" ]
+    return $?
+  fi
+  if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then
+    case "$fake_python3_pip_behavior" in
+      succeeds)
+        touch "$fake_python3_marker"
+        return 0
+        ;;
+      needs-break-system-packages)
+        if printf '%s\n' "$@" | grep -q -- --break-system-packages; then
+          touch "$fake_python3_marker"
+          return 0
+        fi
+        return 1
+        ;;
+      always-fails)
+        return 1
+        ;;
+    esac
+  fi
+  return 1
+}
+
+fake_python3_marker="$workdir/ddgs-already-there"
+touch "$fake_python3_marker"
+out=$(ensure_ddgs_available)
+[ -z "$out" ] || fail "already-importable ddgs should not print anything, got: $out"
+rm -f "$fake_python3_marker"
+
+echo "PASS: ensure_ddgs_available does nothing when ddgs is already importable"
+
+fake_python3_marker="$workdir/ddgs-plain-install"
+rm -f "$fake_python3_marker"
+fake_python3_pip_behavior="succeeds"
+out=$(ensure_ddgs_available)
+echo "$out" | grep -q "ddgs installed" || fail "expected a success message, got: $out"
+[ -f "$fake_python3_marker" ] || fail "the plain pip install path should have run"
+
+echo "PASS: ensure_ddgs_available installs ddgs with a plain pip install when that's enough"
+
+fake_python3_marker="$workdir/ddgs-break-system-packages"
+rm -f "$fake_python3_marker"
+fake_python3_pip_behavior="needs-break-system-packages"
+out=$(ensure_ddgs_available)
+echo "$out" | grep -q "ddgs installed" || fail "expected a success message via the PEP 668 fallback, got: $out"
+
+echo "PASS: ensure_ddgs_available falls back to --break-system-packages for externally-managed Pythons"
+
+fake_python3_marker="$workdir/ddgs-never-appears"
+rm -f "$fake_python3_marker"
+fake_python3_pip_behavior="always-fails"
+out=$(ensure_ddgs_available)
+echo "$out" | grep -q "Could not install 'ddgs' automatically" || fail "expected the graceful-failure message, got: $out"
+echo "$out" | grep -q "pip install ddgs" || fail "the failure message should still say how to install it manually"
+
+echo "PASS: ensure_ddgs_available fails gracefully (not via set -e) when neither install attempt works"
+
+unset -f python3
+
+# A maximally stripped-down PATH -- not even `uname` -- must still explain
+# itself plainly and return cleanly, never crash or hang silently.
+# detect_os/detect_arch (called from install_embedded_python, now that
+# ensure_ddgs_available reaches for one when there is no system python3)
+# fall back to "unsupported" the same way they do for a real unrecognised
+# platform when `uname` itself can't be found; stray "command not found"
+# chatter on stderr along the way is expected here and deliberately not
+# asserted against, only stdout is.
+#
+# Forces a clean slate first: install_embedded_python's own idempotency
+# check (`if python3 already exists, done`) would otherwise silently
+# short-circuit past all of this on a second run of this suite on the same
+# machine, once the "real embedded Python" test further down has left one
+# behind -- this test's whole point is exercising what happens when
+# uname/curl/etc. genuinely cannot be found, which never even gets reached
+# once an embedded Python already satisfies the check first.
+rm -rf "$HOME/.tuisample-code/python"
+no_python_dir="$workdir/no-python-path"
+mkdir -p "$no_python_dir"
+out=$(PATH="$no_python_dir" ensure_ddgs_available 2>/dev/null)
+echo "$out" | grep -q "Could not install 'ddgs' automatically" ||
+  fail "expected the graceful-failure message even on a maximally stripped-down PATH, got: $out"
+
+echo "PASS: ensure_ddgs_available fails gracefully, not silently, on a maximally stripped-down PATH"
+
+# A more realistic "no python3" PATH: every ordinary tool install_embedded_python
+# itself needs (uname, curl, tar, mkdir, mv, rm) is present, python3 alone is
+# not -- proving detect_os/detect_arch resolve a real target here (unlike the
+# test above), so this is actually exercising "downloading failed", not
+# "couldn't even tell what to download". TUISAMPLE_PYTHON_STANDALONE_URL
+# points at a refused connection so this stays fast and network-independent.
+#
+# Forced clean slate again, same reason as the test above -- each test
+# clears it independently rather than relying on running right after one
+# that already did, so reordering this file can never quietly break either.
+rm -rf "$HOME/.tuisample-code/python"
+curated_path_dir="$workdir/no-python3-but-otherwise-normal"
+mkdir -p "$curated_path_dir"
+for tool in uname curl tar gzip mkdir dirname mv rm cp chmod mktemp; do
+  tool_path=$(command -v "$tool") || fail "this test needs a real '$tool' on the machine running it"
+  ln -sf "$tool_path" "$curated_path_dir/$tool"
+done
+start=$(date +%s)
+# PYTHON_STANDALONE_BASE_URL directly, not TUISAMPLE_PYTHON_STANDALONE_URL --
+# the latter is only consulted once, at source time, to compute the
+# former's default (same reason the fetch_prebuilt_binary test above
+# overrides RELEASE_API_BASE directly rather than its TUISAMPLE_ env var).
+out=$(PATH="$curated_path_dir" PYTHON_STANDALONE_BASE_URL="http://127.0.0.1:1" ensure_ddgs_available)
+elapsed=$(( $(date +%s) - start ))
+# Not silent -- it did genuinely try, and says so -- but must end with the
+# same plain "couldn't install it, here's how to by hand" message the other
+# failure path uses, not trail off after "downloading..." with nothing
+# further, which would read as a hang rather than a failure.
+echo "$out" | grep -q "No Python found" || fail "expected to see that a download was attempted, got: $out"
+echo "$out" | grep -q "Could not install 'ddgs' automatically" || fail "expected the graceful-failure message, got: $out"
+if echo "$out" | grep -q "ddgs installed"; then
+  fail "must not claim success when the download failed: $out"
+fi
+[ "$elapsed" -lt 5 ] || fail "a refused connection should fail fast, took ${elapsed}s"
+
+echo "PASS: ensure_ddgs_available is a silent no-op when python3 is missing and the embedded-Python download fails"
+
+# The real thing: no system python3 reachable, but everything else ordinary
+# -- downloads and extracts a genuine self-contained Python, then installs
+# ddgs into it. Skipped rather than failed when unreachable, same
+# convention as every other "the real thing" test in this file; this one
+# just pulls tens of MB, so it earns being its own dedicated test rather
+# than folded into the others above. Unconditionally clears any embedded
+# Python already on this machine first -- otherwise install_embedded_python
+# would (correctly) reuse it instead of downloading, which would mean this
+# test was no longer actually testing the download. Left in place
+# afterwards rather than cleaned up: a real, working embedded Python is a
+# perfectly fine thing for this machine to end up with, the same way the
+# ddgs-reinstall test above leaves ddgs genuinely installed rather than
+# reverting it.
+embedded_python_dir="$HOME/.tuisample-code/python"
+rm -rf "$embedded_python_dir"
+
+real_out=$(PATH="$curated_path_dir" ensure_ddgs_available 2>&1)
+if echo "$real_out" | grep -q "No Python found"; then
+  echo "$real_out" | grep -q "ddgs installed" ||
+    fail "expected the embedded Python to be downloaded and ddgs installed into it, got: $real_out"
+  "$embedded_python_dir/bin/python3" -c "import ddgs" ||
+    fail "the embedded Python should genuinely have ddgs importable after this"
+  echo "PASS: ensure_ddgs_available downloads and uses a real embedded Python when there is no system python3"
+else
+  echo "SKIP: embedded-Python real-network test ($real_out)"
+fi
+
+# The real thing, run against whatever this machine actually has -- skipped
+# rather than failed when Python isn't available, the same convention
+# tools.rs's own live tests use. Which branch below actually runs depends on
+# whether ddgs was *already* present -- checked first and remembered, since
+# ensure_ddgs_available's own call can change that state (a real install, on
+# a machine that didn't have it yet), and checking again afterwards would be
+# checking the wrong moment in time.
+if command -v python3 &> /dev/null; then
+  ddgs_was_already_there=0
+  python3 -c "import ddgs" &> /dev/null && ddgs_was_already_there=1
+
+  real_out=$(ensure_ddgs_available)
+
+  if [ "$ddgs_was_already_there" -eq 1 ]; then
+    [ -z "$real_out" ] || fail "ddgs was genuinely already installed here, so there should have been nothing to print, got: $real_out"
+    echo "PASS: ensure_ddgs_available is a real no-op against this machine's actual ddgs install"
+  else
+    echo "$real_out" | grep -qE "ddgs installed|Could not install" ||
+      fail "expected either a real install attempt or its failure message, got: $real_out"
+    python3 -c "import ddgs" &> /dev/null ||
+      fail "expected ddgs to actually be importable after a reported successful install"
+    echo "PASS: ensure_ddgs_available really installed ddgs on this machine, where it was genuinely missing"
+  fi
+else
+  echo "SKIP: ensure_ddgs_available real-Python test (no python3 on this machine)"
+fi

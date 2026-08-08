@@ -435,7 +435,12 @@ impl Default for LlmConfig {
 pub(crate) mod test_support {
     use std::sync::Mutex;
 
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    // pub(crate), not private: tools.rs's own embedded_python_path tests
+    // need to hold this too (see there) -- an async test can't route
+    // through with_isolated_home below without nesting a second tokio
+    // runtime inside the first, which panics, so it locks this directly
+    // instead.
+    pub(crate) static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     pub(crate) fn with_isolated_home<R>(f: impl FnOnce() -> R) -> R {
         let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
