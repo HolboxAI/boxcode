@@ -163,14 +163,6 @@ pub enum StreamEvent {
     /// channel, so the event loop has one place to drain and one stale-id guard
     /// covering both sources.
     ToolsFinished(Vec<crate::tools::ToolOutcome>),
-    /// Also not from the endpoint: the free-tier budget lookup reports back on
-    /// this channel for the same reason the command runner does -- one place to
-    /// drain, and the event loop stays the only thing doing I/O.
-    FreeTierBudget(String),
-    /// Enrolment finished. Boxed because this variant is much larger than the
-    /// rest and every event would otherwise pay for it.
-    FreeTierEnrolled(Box<crate::freetier::Enrolled>),
-    FreeTierFailed(String),
     /// Exact token counts for the request that just finished, when the endpoint
     /// reports them. Absent rather than guessed: the caller keeps its own
     /// character estimate as the fallback, and knowing which one it has is the
@@ -202,6 +194,29 @@ pub fn usage_of(line: &str) -> Option<ApiUsage> {
         // Some endpoints advertise support and then send zeroes, which is
         // indistinguishable from not reporting at all.
         .filter(|u| u.total() > 0)
+}
+
+/// Pull the human-readable part out of an OpenAI-shaped error body.
+///
+/// The raw body is JSON with the sentence buried three levels down, so printing
+/// it verbatim buries the one line the reader needs in punctuation.
+fn summarise_error(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                trimmed.chars().take(200).collect()
+            }
+        })
 }
 
 /// Build the chat-completions URL, tolerating the shapes people actually paste in:
@@ -299,37 +314,13 @@ async fn run(
         } else {
             format!("\n{}", truncate(detail, 800))
         };
-        // The free-tier gateway answers with these, and they are not faults a
-        // user can debug from a raw status line -- so say what happened and what
-        // they can do about it.
-        match status.as_u16() {
-            402 => {
-                return Err(format!(
-                    "{}\n\nThe free tier resets at UTC midnight. To keep working now, add your own \
-                     API key with /provider.",
-                    crate::freetier::summarise_error(&body)
-                ))
-            }
-            503 => {
-                return Err(format!(
-                    "{}\n\nAdd your own API key with /provider to continue immediately.",
-                    crate::freetier::summarise_error(&body)
-                ))
-            }
-            401 if body.contains("invalid_token") || body.contains("missing_token") => {
-                return Err(
-                    "This device is no longer registered for the free tier. Restart the app to \
-                     enrol again, or add your own API key with /provider."
-                        .to_string(),
-                )
-            }
-            429 => {
-                return Err(format!(
-                    "{}\n\nThis is a rate limit, not a fault -- wait a moment and try again.",
-                    crate::freetier::summarise_error(&body)
-                ))
-            }
-            _ => {}
+        // A raw `HTTP 429` status line says nothing a user can act on, and the
+        // remedy is the one thing worth saying: it is not a fault.
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(format!(
+                "{}\n\nThis is a rate limit, not a fault -- wait a moment and try again.",
+                summarise_error(&body)
+            ));
         }
 
         // A conversation that no longer fits is the other common 400, and it
@@ -877,9 +868,6 @@ mod tests {
                 StreamEvent::ToolCalls(_) => "tools",
                 StreamEvent::ToolsFinished(_) => "finished",
                 StreamEvent::Usage(_) => "usage",
-                StreamEvent::FreeTierBudget(_) => "budget",
-                StreamEvent::FreeTierEnrolled(_) => "enrolled",
-                StreamEvent::FreeTierFailed(_) => "enrol-failed",
                 StreamEvent::Done => "done",
                 StreamEvent::Notice(_) => "notice",
                 StreamEvent::Error(_) => "error",

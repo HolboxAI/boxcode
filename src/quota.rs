@@ -255,26 +255,59 @@ pub fn today() -> String {
     dateutil::today_string()
 }
 
-/// The `/quota` readout, and the extra lines `/usage` appends.
+/// Group digits so a five- or six-figure token count can be read at a glance.
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Money, at a precision a small daily budget can actually be read against.
+///
+/// Two decimals is the wrong unit below a dollar: against a $0.25/day ceiling a
+/// real spend of `$0.0167` rounds to `$0.02`, which is too coarse to act on.
+/// Below a dollar this keeps four, trimming trailing zeros so a round figure
+/// still reads as `$0.25` rather than `$0.2500`.
+pub fn format_usd(usd: f64) -> String {
+    if usd >= 1.0 {
+        return format!("${usd:.2}");
+    }
+    let text = format!("{usd:.4}");
+    let trimmed = text.trim_end_matches('0');
+    let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    // Never fewer than two, though: "$0.2" reads as a typo rather than a price.
+    if trimmed.split('.').nth(1).is_none_or(|d| d.len() < 2) {
+        return format!("${usd:.2}");
+    }
+    format!("${trimmed}")
+}
+
+/// The user's own ceilings, counted on this machine.
 pub fn describe(quota: &DailyQuota, config: &QuotaConfig) -> String {
     let limit = |used: String, limit: String, unlimited: bool| {
-        if unlimited { format!("{used} (no limit set)") } else { format!("{used} of {limit}") }
+        if unlimited { format!("{used} — no limit set") } else { format!("{used} of {limit}") }
     };
 
-    let mut lines = vec![format!("Daily limits ({} UTC):", quota.date)];
+    let mut lines = vec!["Your own limits (counted on this machine)".to_string()];
     lines.push(format!(
         "  Requests: {}",
         limit(
-            quota.requests.to_string(),
-            config.max_requests_per_day.to_string(),
+            thousands(quota.requests),
+            thousands(config.max_requests_per_day),
             config.max_requests_per_day == 0
         )
     ));
     lines.push(format!(
         "  Tokens:   {}{}",
         limit(
-            quota.total_tokens().to_string(),
-            config.max_tokens_per_day.to_string(),
+            thousands(quota.total_tokens()),
+            thousands(config.max_tokens_per_day),
             config.max_tokens_per_day == 0
         ),
         if quota.any_estimated {
@@ -283,6 +316,7 @@ pub fn describe(quota: &DailyQuota, config: &QuotaConfig) -> String {
             ""
         }
     ));
+
     lines.push(format!(
         "  Spend:    {}",
         limit(
@@ -291,24 +325,23 @@ pub fn describe(quota: &DailyQuota, config: &QuotaConfig) -> String {
             config.max_usd_per_day == 0.0
         )
     ));
-    // Naming the gap matters more than the number: a total that silently omits
-    // half the day's requests is worse than no total.
+    // Naming the gap matters more than the number: a total that silently
+    // omits half the day's requests is worse than no total.
     if quota.unpriced_requests > 0 {
         lines.push(format!(
             "            excludes {} request(s) on a model with no price in [quota.pricing]",
             quota.unpriced_requests
         ));
     }
+
     if quota.override_active {
         lines.push("  Override: active for today".to_string());
     }
-    lines.push(format!("  Resets in {} (UTC midnight)", time_until_utc_midnight()));
     // A readout that says "no limit set" three times should also say how to set
     // one, rather than leaving the user to find the config file.
     if !config.has_limits() {
-        lines.push(String::new());
         lines.push("  No limits of your own yet. Set one with:".to_string());
-        lines.push("    /quota set requests 200   ·   /quota set tokens 500000   ·   /quota set usd 0.10".to_string());
+        lines.push("    /quota set requests 200  ·  /quota set tokens 500000  ·  /quota set usd 0.10".to_string());
     } else {
         lines.push("  /quota set <requests|tokens|usd> <n> to change · /quota clear to remove".to_string());
     }
@@ -445,6 +478,26 @@ mod tests {
         q.record(&TokenCount { prompt: 100, completion: 100, estimated: true }, None);
         assert!(q.any_estimated);
         assert!(describe(&q, &QuotaConfig::default()).contains("estimated"));
+    }
+
+    /// Against a 25-cent-a-day ceiling, cents are the wrong unit.
+    #[test]
+    fn money_keeps_enough_precision_to_read_against_a_small_budget() {
+        assert_eq!(format_usd(0.0167), "$0.0167");
+        assert_eq!(format_usd(0.2333), "$0.2333");
+        // ...but a round figure is not padded out with noise.
+        assert_eq!(format_usd(0.25), "$0.25");
+        assert_eq!(format_usd(0.1), "$0.10");
+        assert_eq!(format_usd(0.0), "$0.00");
+        assert_eq!(format_usd(1.5), "$1.50");
+    }
+
+    #[test]
+    fn token_counts_are_grouped_for_reading() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(53_410), "53,410");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 
     /// Integer micro-dollars exist so this holds exactly over many requests.

@@ -120,16 +120,12 @@ pub enum CustomStep {
 /// welcome screen list. Adding a command means adding it here and to the
 /// `match` in `selected_command`'s caller; nowhere else should name a
 /// command as a string literal.
-/// The first entry in the provider picker. Not a `providers::Provider`: it has
-/// no endpoint or model to choose, because the gateway decides both.
-pub const FREE_TIER_LABEL: &str = "Free tier — no API key needed";
-
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/provider", "switch provider or endpoint"),
     ("/model", "switch model"),
     ("/new", "forget the current conversation"),
-    ("/usage", "show local token usage"),
-    ("/quota", "show or set your daily limits"),
+    ("/usage", "what today cost, and the history"),
+    ("/quota", "what is left today, and your own limits"),
 ];
 
 pub struct App {
@@ -216,21 +212,6 @@ pub struct App {
     /// queue: `App` stays free of filesystem side effects, so its tests do not
     /// silently touch the real `$HOME`. Only `main.rs`'s runtime loop persists.
     pub quota_dirty: bool,
-    /// One line describing free-tier enrolment, or why it is unavailable.
-    /// Empty when the user brought their own key. Set by `main` at startup.
-    pub free_tier_status: String,
-    /// Set when the free-tier budget should be re-read from the gateway.
-    /// A flag, not a call: `App` does no I/O, so `main.rs` performs the lookup
-    /// and hands the answer back on the event channel.
-    pub refresh_budget: bool,
-    /// Set when the user picked the free tier and enrolment should run.
-    /// A flag, not a call: enrolment is network I/O and `App` does none.
-    pub enrol_requested: bool,
-    /// True from the moment the user picks the free tier until enrolment
-    /// settles. Distinct from `enrol_requested`, which the event loop clears as
-    /// soon as it spawns the work: without a flag that spans the whole round
-    /// trip, a prompt typed in between goes out on the *previous* endpoint.
-    pub enrolling: bool,
     /// One line for the welcome screen describing where commands will run, or
     /// why the tool is off. Set by `main` once the workspace has been resolved.
     pub workspace_status: String,
@@ -286,10 +267,6 @@ impl App {
             exact_usage: None,
             warned_today: false,
             quota_dirty: false,
-            free_tier_status: String::new(),
-            refresh_budget: false,
-            enrol_requested: false,
-            enrolling: false,
             workspace_status: String::new(),
             workspace_root: String::new(),
             prompt_history: Vec::new(),
@@ -536,20 +513,6 @@ impl App {
             _ => {}
         }
 
-        // A prompt sent now would go out on the endpoint being switched away
-        // from -- the old key, the old provider -- and the confusing part is
-        // that it half-works: the switch confirmation arrives moments later, so
-        // the failure looks like the new provider is broken.
-        if self.enrolling {
-            self.greeted = true;
-            self.follow_tail = true;
-            self.messages.push(Message::new(
-                Role::System,
-                "Still joining the free tier — your prompt is still in the box, send it again in a moment.",
-            ));
-            return;
-        }
-
         // Checked here and only here -- never mid-turn. Blocking between tool
         // rounds would strand `tool_calls` with no matching results, which
         // invalidates the conversation for every later request; `max_steps`
@@ -622,10 +585,12 @@ impl App {
                 .push(Message::new(Role::Error, "Request cancelled."));
         }
         // Whatever streamed before the cancel was still real usage.
-        self.record_quota();
-        self.refresh_budget = true;
+        let tokens = self.record_quota();
+        // The metered figure, not a second independent estimate: the log used
+        // to record streamed characters alone, which misses every prompt token
+        // and every byte of a tool call.
         self.pending_usage
-            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
+            .push((tokens.total() as usize, self.config.llm.model.clone()));
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -774,29 +739,28 @@ impl App {
     /// Fold the finished turn into today's quota. Called once per request,
     /// including the extra round trips a tool-using turn makes -- each is a
     /// real, billable call.
-    fn record_quota(&mut self) {
-        if !self.config.quota.enabled {
-            self.exact_usage = None;
-            return;
-        }
-        self.roll_quota_day();
-
+    /// Returns what the turn cost, so the caller can log the same figure it
+    /// metered -- the two must never disagree about the same turn.
+    fn record_quota(&mut self) -> crate::quota::TokenCount {
         let tokens = match self.exact_usage.take() {
             Some(u) => crate::quota::TokenCount {
                 prompt: u.prompt_tokens as u64,
                 completion: u.completion_tokens as u64,
                 estimated: false,
             },
-            // No report: reuse the same estimate the usage log records, so the
-            // two never disagree about the same turn.
+            // No report: fall back to the character estimate, marked as such.
             None => crate::quota::TokenCount {
                 prompt: 0,
                 completion: self.approx_tokens_this_turn() as u64,
                 estimated: true,
             },
         };
+        if !self.config.quota.enabled {
+            return tokens;
+        }
+        self.roll_quota_day();
         if tokens.total() == 0 {
-            return;
+            return tokens;
         }
         let price = self.config.quota.price_for(&self.config.llm.model);
         self.quota.record(&tokens, price);
@@ -804,6 +768,7 @@ impl App {
         // than at exit -- this is a TUI people close with Ctrl-C, and a limit
         // that forgets on exit is not a limit.
         self.quota_dirty = true;
+        tokens
     }
 
     /// Start a new day if the UTC date moved on. A TUI gets left open for days,
@@ -826,21 +791,80 @@ impl App {
         }
     }
 
-    /// `/quota` -- show today's limits. `/quota override` / `/quota reset`
-    /// change whether they bind for the rest of the day.
+    /// `/quota` -- what is left today, and what will refuse the next prompt.
+    /// `/quota override` / `/quota reset` change whether the local ones bind.
     fn show_quota(&mut self) {
         self.roll_quota_day();
-        // A budget read at startup is stale the moment a turn completes, and
-        // "how much is left" is the whole point of showing it.
-        self.refresh_budget = true;
-        let mut text = crate::quota::describe(&self.quota, &self.config.quota);
-        // The gateway's budget is the one that actually refuses a request, so it
-        // goes first. The local counters below it are this machine's own view
-        // and cannot stop anything.
-        if !self.free_tier_status.is_empty() && !self.free_tier_status.starts_with("unavailable") {
-            text = format!("{}\n\n{text}", self.free_tier_status);
-        }
+        self.print_readout(Self::quota_readout);
+    }
+
+    /// Every figure a readout needs is already in memory -- the counters are
+    /// this machine's own -- so it renders and prints in one go.
+    fn print_readout(&mut self, render: fn(&Self) -> String) {
+        self.follow_tail = true;
+        let text = render(self);
         self.messages.push(Message::new(Role::System, text));
+    }
+
+    /// `/quota`: the ceilings, most binding first. Nothing here is history.
+    fn quota_readout(&self) -> String {
+        format!(
+            "Daily limits ({} UTC)\n\n{}",
+            self.quota.date,
+            crate::quota::describe(&self.quota, &self.config.quota)
+        )
+    }
+
+    /// `/usage`: what today actually cost, then the longer history.
+    ///
+    /// Deliberately carries no ceilings at all. The old readout appended the
+    /// whole quota block underneath itself, which put two different meters --
+    /// one that refuses and one that never does -- in one message with nothing
+    /// to tell them apart.
+    fn usage_readout(&self) -> String {
+        // Today comes from the daily counters, never from the history log: the
+        // counters hold the endpoint's exact prompt+completion totals, while
+        // the log holds a character estimate of the streamed prose alone --
+        // which misses prompt tokens and every byte of a tool call, and so
+        // reads roughly two orders of magnitude low on an agentic day.
+        let cost = if self.quota.unpriced_requests > 0 {
+            format!(
+                "cost unknown — add a price for '{}' under [quota.pricing]",
+                self.config.llm.model
+            )
+        } else {
+            format!("{} spent", crate::quota::format_usd(self.quota.usd()))
+        };
+
+        let mut lines = vec![
+            "Usage (this machine only)".to_string(),
+            format!(
+                "  Today:       {cost} · {} tokens · {} request(s)",
+                crate::quota::thousands(self.quota.total_tokens()),
+                crate::quota::thousands(self.quota.requests),
+            ),
+        ];
+        if self.quota.any_estimated {
+            lines.push(
+                "               (tokens estimated — this endpoint does not report exact counts)"
+                    .to_string(),
+            );
+        }
+
+        let history = usage::summary();
+        lines.push(String::new());
+        lines.push(format!(
+            "  Last 7 days: ~{} tokens",
+            crate::quota::thousands(history.week_tokens as u64)
+        ));
+        lines.push(format!(
+            "  All time:    ~{} tokens over {} day{}",
+            crate::quota::thousands(history.all_time_tokens as u64),
+            history.days_active,
+            if history.days_active == 1 { "" } else { "s" },
+        ));
+        lines.push("  (history is tokens only — see /quota for what is left today)".to_string());
+        lines.join("\n")
     }
 
     /// `/quota set <metric> <value>` -- a user's own ceiling, without making
@@ -922,8 +946,7 @@ impl App {
         ));
     }
 
-    /// `/quota clear` -- remove the user's own limits. Does not touch the
-    /// free-tier budget, which is not theirs to change.
+    /// `/quota clear` -- remove the user's own limits.
     fn clear_own_limits(&mut self) {
         self.config.quota.max_requests_per_day = 0;
         self.config.quota.max_tokens_per_day = 0;
@@ -934,7 +957,7 @@ impl App {
         };
         self.messages.push(Message::new(
             Role::System,
-            format!("Your own daily limits are removed. {saved} The free-tier budget is unaffected."),
+            format!("Your own daily limits are removed. {saved}"),
         ));
     }
 
@@ -944,43 +967,20 @@ impl App {
         self.roll_quota_day();
         self.quota.override_active = active;
         self.quota_dirty = true;
-        self.messages.push(Message::new(
-            Role::System,
-            if active {
-                "Quota override active for the rest of today. It clears at UTC midnight."
-            } else {
-                "Quota override cleared; the daily limits apply again."
-            },
-        ));
+        let text = if active {
+            "Quota override active for the rest of today. It clears at UTC midnight."
+        } else {
+            "Quota override cleared; the daily limits apply again."
+        };
+        self.messages.push(Message::new(Role::System, text));
     }
 
-    /// Reads the local usage log (see `usage.rs`) and prints a summary --
-    /// this never leaves the machine, and works with no login and no server,
-    /// since the file it reads is the only copy of this data that exists.
+    /// `/usage` -- history and today's spend. Never leaves the machine, and
+    /// works with no login and no server, since the files it reads are the only
+    /// copy of this data that exists.
     fn show_usage(&mut self) {
-        let s = usage::summary();
-        self.messages.push(Message::new(
-            Role::System,
-            format!(
-                "Usage (local, this machine only):\n\
-                 Today:      ~{} tokens\n\
-                 Last 7 days: ~{} tokens\n\
-                 All time:   ~{} tokens, {} day{} used\n\
-                 (estimated from characters streamed, not an exact count from the endpoint)",
-                s.today_tokens,
-                s.week_tokens,
-                s.all_time_tokens,
-                s.days_active,
-                if s.days_active == 1 { "" } else { "s" },
-            ),
-        ));
-        // The two meters answer different questions -- this one is history and
-        // never refuses; the quota is a ceiling and does. Showing them together,
-        // labelled, stops the log being mistaken for the thing that binds.
-        if self.config.quota.has_limits() {
-            let text = crate::quota::describe(&self.quota, &self.config.quota);
-            self.messages.push(Message::new(Role::System, text));
-        }
+        self.roll_quota_day();
+        self.print_readout(Self::usage_readout);
     }
 
     /// Whether `call` needs a human decision before it runs.
@@ -1190,10 +1190,12 @@ impl App {
             ));
             self.follow_tail = true;
         }
-        self.record_quota();
-        self.refresh_budget = true;
+        let tokens = self.record_quota();
+        // The metered figure, not a second independent estimate: the log used
+        // to record streamed characters alone, which misses every prompt token
+        // and every byte of a tool call.
         self.pending_usage
-            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
+            .push((tokens.total() as usize, self.config.llm.model.clone()));
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -1212,10 +1214,12 @@ impl App {
             self.messages.push(Message::new(Role::Assistant, partial));
         }
         self.messages.push(Message::new(Role::Error, error));
-        self.record_quota();
-        self.refresh_budget = true;
+        let tokens = self.record_quota();
+        // The metered figure, not a second independent estimate: the log used
+        // to record streamed characters alone, which misses every prompt token
+        // and every byte of a tool call.
         self.pending_usage
-            .push((self.approx_tokens_this_turn(), self.config.llm.model.clone()));
+            .push((tokens.total() as usize, self.config.llm.model.clone()));
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -1432,10 +1436,9 @@ impl App {
     }
 
     fn handle_provider_picker_key(&mut self, key: KeyEvent, selected: usize) {
-        // The list is: free tier, then every registry provider, then "Custom
-        // endpoint...". Index 0 and the last entry are the two that are not a
-        // `providers::Provider`.
-        let last = providers::PROVIDERS.len() + 1;
+        // The list is every registry provider, then "Custom endpoint..." --
+        // the last entry being the only one that is not a `providers::Provider`.
+        let last = providers::PROVIDERS.len();
         match key.code {
             KeyCode::Up => {
                 self.overlay = Some(Overlay::ProviderPicker {
@@ -1449,11 +1452,8 @@ impl App {
             }
             KeyCode::Esc => {}
             KeyCode::Enter => {
-                if selected == 0 {
-                    self.overlay = None;
-                    self.choose_free_tier();
-                } else if selected < last {
-                    let provider = &providers::PROVIDERS[selected - 1];
+                if selected < last {
+                    let provider = &providers::PROVIDERS[selected];
                     self.overlay = Some(Overlay::ModelPicker {
                         provider_id: provider.id,
                         selected: 0,
@@ -1613,58 +1613,6 @@ impl App {
     /// Any test that reaches this function MUST wrap the call in
     /// `config::test_support::with_isolated_home`, or it will write to the real
     /// developer/CI `~/.tuisample-code/config.toml`.
-    /// The user picked "Free tier" in `/provider`.
-    ///
-    /// Always re-enrols rather than reusing a stored token: registration is
-    /// idempotent on the gateway (the same hardware resolves to the same device
-    /// and the same budget), and it is the only way to learn the current model
-    /// and limit, both of which are server-side settings that can change.
-    fn choose_free_tier(&mut self) {
-        self.greeted = true;
-        self.follow_tail = true;
-        self.enrol_requested = true;
-        self.enrolling = true;
-        self.messages.push(Message::new(
-            Role::System,
-            "Switching to the free tier — no API key needed. Enrolling…",
-        ));
-    }
-
-    /// Enrolment succeeded. Applies it exactly as `/provider` applies a manual
-    /// choice, so switching back to your own key later works the same way.
-    pub fn free_tier_enrolled(&mut self, e: crate::freetier::Enrolled) {
-        self.enrolling = false;
-        self.config.free_tier.device_token = e.device_token.clone();
-        self.config.free_tier.fallback_id = e.fallback_id;
-        self.free_tier_status = format!(
-            "Free tier — {} · ${:.2}/day, resets at UTC midnight",
-            e.model, e.daily_limit_usd
-        );
-        // Reuses the existing path so the "Switched to ..." message, the
-        // config write and its error handling are identical to every other
-        // provider switch.
-        self.apply_llm_config(
-            "free-tier".to_string(),
-            e.endpoint,
-            e.model,
-            e.device_token,
-        );
-        self.refresh_budget = true;
-    }
-
-    /// Enrolment failed. The previous provider is untouched -- a free tier that
-    /// cannot be reached must not leave the user with no working endpoint.
-    pub fn free_tier_failed(&mut self, reason: String) {
-        self.enrolling = false;
-        self.messages.push(Message::new(
-            Role::Error,
-            format!(
-                "Could not join the free tier: {reason}\n\
-                 Your previous provider is unchanged. Try /provider again, or pick one with your own key."
-            ),
-        ));
-    }
-
     fn apply_llm_config(&mut self, provider: String, endpoint: String, model: String, api_key: String) {
         self.config.llm.provider = provider;
         self.config.llm.endpoint = endpoint;
@@ -2027,26 +1975,43 @@ mod tests {
         });
     }
 
-    /// The free-tier budget belongs to the gateway; a user clearing their own
-    /// limits must not appear to have cleared that too.
     #[test]
-    fn clearing_own_limits_says_the_free_tier_is_unaffected() {
+    fn clearing_own_limits_confirms_it_was_saved() {
         crate::config::test_support::with_isolated_home(|| {
             let mut a = app();
+            a.config.quota.max_requests_per_day = 5;
             type_str(&mut a, "/quota clear");
             a.handle_key(key(KeyCode::Enter));
+            assert_eq!(a.config.quota.max_requests_per_day, 0);
             let msg = a.messages.iter().find(|m| m.role == Role::System).unwrap();
-            assert!(msg.content.contains("free-tier"), "{}", msg.content);
+            assert!(msg.content.contains("Saved"), "{}", msg.content);
         });
     }
 
     #[test]
-    fn showing_the_quota_asks_for_a_fresh_budget() {
+    fn an_override_is_confirmed_and_says_when_it_lapses() {
         let mut a = app();
-        assert!(!a.refresh_budget);
+        type_str(&mut a, "/quota override");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.quota.override_active);
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a confirmation");
+        assert!(out.content.contains("UTC midnight"), "{}", out.content);
+    }
+
+    /// Every figure the readout needs is already counted on this machine, so
+    /// `/quota` answers on the spot rather than reserving a line to fill in.
+    #[test]
+    fn the_quota_readout_is_immediate_and_local() {
+        let mut a = app();
+        a.config.quota.max_requests_per_day = 2000;
+        a.quota.date = crate::quota::today();
+        a.quota.requests = 8;
+
         type_str(&mut a, "/quota");
         a.handle_key(key(KeyCode::Enter));
-        assert!(a.refresh_budget, "a startup-cached figure goes stale immediately");
+
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a readout");
+        assert!(out.content.contains("Requests: 8 of 2,000"), "{}", out.content);
     }
 
     #[test]
@@ -2202,21 +2167,64 @@ mod tests {
         assert_eq!(a.state, AppState::AwaitingInput);
     }
 
-    /// `/usage` keeps main's local history readout and appends the ceiling only
-    /// when one is configured -- the two are different meters.
+    /// The two meters answer different questions -- one is history and never
+    /// refuses, the other is a ceiling and does. `/usage` used to append the
+    /// whole quota block underneath itself, which put both in one message with
+    /// nothing to tell them apart.
     #[test]
-    fn usage_appends_the_quota_only_when_a_limit_exists() {
+    fn usage_never_shows_a_ceiling() {
         let mut a = app();
+        a.config.quota.max_requests_per_day = 10;
         type_str(&mut a, "/usage");
         a.handle_key(key(KeyCode::Enter));
-        assert!(!a.messages.iter().any(|m| m.content.contains("Daily limits")));
 
-        let mut b = app();
-        b.config.quota.max_requests_per_day = 10;
-        type_str(&mut b, "/usage");
-        b.handle_key(key(KeyCode::Enter));
-        assert!(b.messages.iter().any(|m| m.content.contains("Usage (local")));
-        assert!(b.messages.iter().any(|m| m.content.contains("Daily limits")));
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a report");
+        assert!(out.content.contains("Usage (this machine only)"), "{}", out.content);
+        assert!(!out.content.contains("Daily limits"), "{}", out.content);
+        assert!(!out.content.contains("of 10"), "no ceilings here: {}", out.content);
+        assert!(out.content.contains("/quota"), "it must point at the other meter");
+    }
+
+    /// The headline `/usage` figure: today's cost and today's tokens.
+    #[test]
+    fn usage_leads_with_todays_cost_and_tokens() {
+        let mut a = app();
+        a.config.llm.model = "priced-model".to_string();
+        a.config.quota.pricing.insert(
+            "priced-model".to_string(),
+            crate::quota::ModelPrice { input_per_mtok: 0.14, output_per_mtok: 0.28 },
+        );
+        a.quota.date = crate::quota::today();
+        a.quota.requests = 8;
+        a.quota.prompt_tokens = 36_110;
+        a.quota.completion_tokens = 17_300;
+        // 36,110 in @ $0.14/Mtok + 17,300 out @ $0.28/Mtok = $0.009899…
+        a.quota.micro_usd = 9_899;
+
+        type_str(&mut a, "/usage");
+        a.handle_key(key(KeyCode::Enter));
+
+        let out = a.messages.iter().find(|m| m.role == Role::System).expect("a report");
+        assert!(out.content.contains("$0.0099 spent"), "{}", out.content);
+        assert!(out.content.contains("53,410 tokens"), "{}", out.content);
+    }
+
+    /// Today's tokens come from the daily counters, not the history log: the
+    /// log records streamed characters alone, which misses prompt tokens and
+    /// every byte of a tool call and so reads orders of magnitude low.
+    #[test]
+    fn the_logged_token_count_is_the_metered_one_not_a_second_estimate() {
+        let mut a = app();
+        a.state = AppState::Streaming;
+        a.streamed_chars = 400; // the old estimate would log 100
+        a.record_exact_usage(crate::llm::ApiUsage {
+            prompt_tokens: 36_110,
+            completion_tokens: 17_300,
+        });
+        a.finish_stream();
+
+        let (tokens, _) = a.pending_usage.first().expect("a turn was logged");
+        assert_eq!(*tokens, 53_410, "the log and the quota must agree about one turn");
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -3479,8 +3487,7 @@ mod tests {
             .iter()
             .position(|p| p.id == provider_id)
             .expect("provider_id must be in the registry");
-        // +1: the free tier occupies index 0, ahead of the registry.
-        for _ in 0..=idx {
+        for _ in 0..idx {
             a.handle_key(key(KeyCode::Down));
         }
         a.handle_key(key(KeyCode::Enter));
@@ -3598,112 +3605,20 @@ mod tests {
         for _ in 0..10 {
             a.handle_key(key(KeyCode::Down));
         }
-        // The list is free tier + every provider + "Custom endpoint...", so the
-        // last selectable index is one past the registry.
+        // The list is every provider + "Custom endpoint...", so the last
+        // selectable index is the registry's length.
         assert_eq!(
             a.overlay,
             Some(Overlay::ProviderPicker {
-                selected: providers::PROVIDERS.len() + 1
+                selected: providers::PROVIDERS.len()
             })
         );
     }
 
-    // ---- free tier in the provider picker ---------------------------------------
-
-    /// The free tier is the only option that needs nothing from the user, so it
-    /// should not be the one they have to scroll past.
-    /// Regression: a prompt typed between picking the free tier and enrolment
-    /// completing went out on the *previous* endpoint. The switch confirmation
-    /// then arrived moments later, so the failure looked like the new provider
-    /// was broken when it had not been used at all.
+    /// The picker opens on the registry itself: every entry must be reachable
+    /// at the index the list actually draws it at.
     #[test]
-    fn a_prompt_sent_during_enrolment_is_held_rather_than_sent_to_the_old_provider() {
-        let mut a = app();
-        a.config.llm.endpoint = "http://old-endpoint:8000".to_string();
-
-        type_str(&mut a, "/provider");
-        a.handle_key(key(KeyCode::Enter));
-        a.handle_key(key(KeyCode::Enter)); // free tier, index 0
-        assert!(a.enrolling);
-
-        type_str(&mut a, "hi");
-        a.handle_key(key(KeyCode::Enter));
-
-        assert_eq!(a.state, AppState::AwaitingInput, "nothing may be sent mid-switch");
-        assert!(!a.messages.iter().any(|m| m.role == Role::User));
-        // The prompt is kept, not destroyed.
-        assert_eq!(a.input_buffer, "hi");
-        assert!(a
-            .messages
-            .iter()
-            .any(|m| m.content.contains("Still joining the free tier")));
-    }
-
-    #[test]
-    fn sending_works_again_once_enrolment_succeeds() {
-        with_isolated_home(|| {
-            let mut a = app();
-            type_str(&mut a, "/provider");
-            a.handle_key(key(KeyCode::Enter));
-            a.handle_key(key(KeyCode::Enter));
-            assert!(a.enrolling);
-
-            a.free_tier_enrolled(crate::freetier::Enrolled {
-                endpoint: "https://gw.example".to_string(),
-                device_token: "dt_a.b".to_string(),
-                model: "free-model".to_string(),
-                fallback_id: "fb".to_string(),
-                daily_limit_usd: 0.25,
-            });
-            assert!(!a.enrolling);
-
-            type_str(&mut a, "hi");
-            a.handle_key(key(KeyCode::Enter));
-            assert_eq!(a.state, AppState::Sending);
-            assert_eq!(a.config.llm.endpoint, "https://gw.example");
-        });
-    }
-
-    /// ...and unblocks on failure too, or a gateway that is down would leave the
-    /// user unable to send anything at all.
-    #[test]
-    fn sending_works_again_once_enrolment_fails() {
-        let mut a = app();
-        a.config.llm.endpoint = "http://mine:8000".to_string();
-        a.config.llm.api_key = "sk-mine".to_string();
-
-        type_str(&mut a, "/provider");
-        a.handle_key(key(KeyCode::Enter));
-        a.handle_key(key(KeyCode::Enter));
-        a.free_tier_failed("gateway unreachable".to_string());
-        assert!(!a.enrolling);
-
-        type_str(&mut a, "hi");
-        a.handle_key(key(KeyCode::Enter));
-        assert_eq!(a.state, AppState::Sending);
-        // Still on the user's own provider, which never stopped working.
-        assert_eq!(a.config.llm.endpoint, "http://mine:8000");
-    }
-
-    #[test]
-    fn the_free_tier_is_the_first_entry_in_the_picker() {
-        let mut a = app();
-        type_str(&mut a, "/provider");
-        a.handle_key(key(KeyCode::Enter));
-        assert_eq!(a.overlay, Some(Overlay::ProviderPicker { selected: 0 }));
-
-        a.handle_key(key(KeyCode::Enter)); // pick it
-        assert!(a.enrol_requested, "selecting it must start enrolment");
-        assert_eq!(a.overlay, None, "the picker closes");
-        assert!(a
-            .messages
-            .iter()
-            .any(|m| m.role == Role::System && m.content.contains("free tier")));
-    }
-
-    /// The registry entries must still be reachable at their new positions.
-    #[test]
-    fn the_registry_providers_are_still_selectable_after_the_free_tier() {
+    fn every_registry_provider_is_selectable_from_the_picker() {
         for p in providers::PROVIDERS {
             let mut a = app();
             type_str(&mut a, "/provider");
@@ -3718,75 +3633,18 @@ mod tests {
         }
     }
 
+    /// The entry past the registry is the custom-endpoint wizard, not a
+    /// provider -- an off-by-one here would index the registry out of bounds.
     #[test]
-    fn enrolment_applies_the_gateway_endpoint_and_token() {
-        with_isolated_home(|| {
-            let mut a = app();
-            a.free_tier_enrolled(crate::freetier::Enrolled {
-                endpoint: "https://gw.example".to_string(),
-                device_token: "dt_ref.secret".to_string(),
-                model: "free-model".to_string(),
-                fallback_id: "fb".to_string(),
-                daily_limit_usd: 0.25,
-            });
-
-            assert_eq!(a.config.llm.endpoint, "https://gw.example");
-            assert_eq!(a.config.llm.api_key, "dt_ref.secret");
-            assert_eq!(a.config.llm.model, "free-model");
-            assert_eq!(a.config.llm.provider, "free-tier");
-            assert_eq!(a.config.free_tier.device_token, "dt_ref.secret");
-            assert!(crate::freetier::is_free_tier(&a.config));
-            assert!(a.free_tier_status.contains("$0.25"));
-
-            // Persisted, like every other provider switch.
-            let reloaded = crate::config::Config::load().expect("config should load");
-            assert_eq!(reloaded.free_tier.device_token, "dt_ref.secret");
-        });
-    }
-
-    /// A free tier that cannot be reached must not leave the user with no
-    /// working endpoint.
-    #[test]
-    fn a_failed_enrolment_leaves_the_previous_provider_intact() {
+    fn the_entry_after_the_registry_opens_the_custom_endpoint_wizard() {
         let mut a = app();
-        a.config.llm.endpoint = "https://api.deepseek.com".to_string();
-        a.config.llm.api_key = "sk-mine".to_string();
-        a.config.llm.provider = "deepseek".to_string();
-
-        a.free_tier_failed("gateway unreachable".to_string());
-
-        assert_eq!(a.config.llm.endpoint, "https://api.deepseek.com");
-        assert_eq!(a.config.llm.api_key, "sk-mine");
-        assert_eq!(a.config.llm.provider, "deepseek");
-        let err = a.messages.iter().find(|m| m.role == Role::Error).expect("an error");
-        assert!(err.content.contains("unchanged"), "{}", err.content);
-    }
-
-    /// Switching to the free tier and back must both work, or the picker entry
-    /// is a one-way door.
-    #[test]
-    fn a_user_can_switch_to_the_free_tier_and_back_to_their_own_key() {
-        with_isolated_home(|| {
-            let mut a = app();
-            a.free_tier_enrolled(crate::freetier::Enrolled {
-                endpoint: "https://gw.example".to_string(),
-                device_token: "dt_a.b".to_string(),
-                model: "free-model".to_string(),
-                fallback_id: "fb".to_string(),
-                daily_limit_usd: 0.25,
-            });
-            assert!(crate::freetier::is_free_tier(&a.config));
-
-            a.apply_llm_config(
-                "deepseek".to_string(),
-                "https://api.deepseek.com".to_string(),
-                "deepseek-v4-flash".to_string(),
-                "sk-my-own".to_string(),
-            );
-            assert!(!crate::freetier::is_free_tier(&a.config), "own key wins");
-            // The token is kept, so switching back does not mint a new device.
-            assert_eq!(a.config.free_tier.device_token, "dt_a.b");
-        });
+        type_str(&mut a, "/provider");
+        a.handle_key(key(KeyCode::Enter));
+        for _ in 0..providers::PROVIDERS.len() {
+            a.handle_key(key(KeyCode::Down));
+        }
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.overlay, Some(Overlay::CustomEndpoint(CustomStep::Endpoint)));
     }
 
     #[test]

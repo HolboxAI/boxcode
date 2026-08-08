@@ -454,16 +454,6 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         app.config.llm.endpoint.clone(),
         theme::muted(),
     ));
-    // What this install is running on, and what that buys -- stated before the
-    // first prompt rather than discovered by hitting a limit.
-    if !app.free_tier_status.is_empty() {
-        let unavailable = app.free_tier_status.starts_with("unavailable");
-        lines.push(field(
-            "plan",
-            app.free_tier_status.clone(),
-            Style::default().fg(if unavailable { theme::p().warning } else { theme::p().muted }),
-        ));
-    }
     if !app.workspace_status.is_empty() {
         let alarming = app.workspace_status.contains("UNATTENDED");
         let colour = if alarming {
@@ -736,10 +726,8 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
     match &app.overlay {
         None => {}
         Some(Overlay::ProviderPicker { selected }) => {
-            // Free tier first: it is the only option that needs nothing from
-            // the user, so it should not be the one they scroll past.
-            let mut items: Vec<String> = vec![crate::app::FREE_TIER_LABEL.to_string()];
-            items.extend(providers::PROVIDERS.iter().map(|p| p.label.to_string()));
+            let mut items: Vec<String> =
+                providers::PROVIDERS.iter().map(|p| p.label.to_string()).collect();
             items.push("Custom endpoint...".to_string());
             render_picker(f, area, " Select a provider ", &items, *selected);
         }
@@ -1293,9 +1281,9 @@ mod tests {
         let cases = [
             ("Daily limit reached — requests 5 of 5.", "Daily limit reached", "◔"),
             (
-                "The free tier has reached its capacity for today and is paused.",
-                "Free tier at capacity",
-                "◍",
+                "The reply hit the 16384-token output cap and was cut off.",
+                "Reply cut off",
+                "✂",
             ),
             (
                 "This conversation is too long for the model's context window.",
@@ -1318,27 +1306,27 @@ mod tests {
         }
     }
 
-    /// A spent allowance and a fleet-wide outage need different remedies, so
-    /// they must not share a hint.
+    /// A hint has to name the remedy for the failure it sits under, not a
+    /// generic one -- that is the whole reason failures are classified.
     #[test]
     fn the_hint_names_the_remedy_that_actually_applies() {
-        let mut own = App::new(crate::config::Config::default());
-        own.greeted = true;
-        own.messages.push(crate::app::Message::new(
+        let mut spent = App::new(crate::config::Config::default());
+        spent.greeted = true;
+        spent.messages.push(crate::app::Message::new(
             Role::Error,
-            "Daily free-tier limit reached ($0.25 of $0.25).",
+            "Daily limit reached — requests 5 of 5.",
         ));
-        let out = rendered_text(&mut own, 100, 30);
+        let out = rendered_text(&mut spent, 100, 30);
         assert!(out.contains("/quota"), "should point at the user's own limits: {out}");
 
-        let mut paused = App::new(crate::config::Config::default());
-        paused.greeted = true;
-        paused.messages.push(crate::app::Message::new(
+        let mut full = App::new(crate::config::Config::default());
+        full.greeted = true;
+        full.messages.push(crate::app::Message::new(
             Role::Error,
-            "The free tier has reached its capacity for today and is paused.",
+            "This conversation is too long for the model's context window.",
         ));
-        let out = rendered_text(&mut paused, 100, 30);
-        assert!(out.contains("Not caused by you"), "must not blame the user: {out}");
+        let out = rendered_text(&mut full, 100, 30);
+        assert!(out.contains("/new"), "should point at the command that clears it: {out}");
     }
 
     #[test]
