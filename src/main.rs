@@ -2,8 +2,6 @@ mod app;
 mod config;
 mod danger;
 mod dateutil;
-mod device;
-mod freetier;
 mod llm;
 mod notice;
 mod providers;
@@ -79,15 +77,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     }
 
-    let mut config = Config::load()?;
+    let config = Config::load()?;
     // Before anything is drawn: the colours depend on the terminal's
     // background, and asking for that needs the terminal to itself, with
     // no alternate screen up and nothing else reading stdin.
     theme::init(theme::resolve_mode(&config.ui.theme));
 
-    // Enrol before the terminal is touched, so a slow or unreachable gateway is
-    // an ordinary line on stdout rather than a frozen alternate screen.
-    let free_tier_status = enrol_free_tier(&mut config).await;
     let (workspace, workspace_status) = open_workspace(&config);
 
     // Detached, not awaited: a slow or unreachable telemetry endpoint must
@@ -103,7 +98,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config);
-    app.free_tier_status = free_tier_status;
     // Loaded before the first prompt so a limit already spent today is in force
     // from the start, not after the first request slips through.
     if app.config.quota.enabled {
@@ -182,31 +176,6 @@ async fn run_app<B: ratatui::backend::Backend>(
         // Drain every token that has arrived; doing only one per frame caps
         // throughput at ~60 tokens/sec and looks like the app is stalling.
         while let Ok((id, event)) = rx.try_recv() {
-            // The budget lookup belongs to no request, so the stale-id guard
-            // must not apply to it: a user who submits a prompt while the
-            // lookup is in flight would otherwise silently lose the answer.
-            match event {
-                // None of these belong to a request, so the stale-id guard
-                // below must not apply: a user who submits a prompt while
-                // enrolment is in flight would otherwise lose the result.
-                StreamEvent::FreeTierBudget(budget) => {
-                    app.free_tier_budget_updated(*budget);
-                    continue;
-                }
-                StreamEvent::FreeTierBudgetUnavailable(reason) => {
-                    app.free_tier_budget_unavailable(reason);
-                    continue;
-                }
-                StreamEvent::FreeTierEnrolled(e) => {
-                    app.free_tier_enrolled(*e);
-                    continue;
-                }
-                StreamEvent::FreeTierFailed(reason) => {
-                    app.free_tier_failed(reason);
-                    continue;
-                }
-                _ => {}
-            }
             if id != app.request_id {
                 continue; // stale: belongs to a cancelled request
             }
@@ -215,12 +184,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                 StreamEvent::ToolCalls(calls) => app.request_tools(calls),
                 StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
                 StreamEvent::Usage(u) => app.record_exact_usage(u),
-                StreamEvent::FreeTierBudget(_)
-                | StreamEvent::FreeTierBudgetUnavailable(_)
-                | StreamEvent::FreeTierEnrolled(_)
-                | StreamEvent::FreeTierFailed(_) => {
-                    unreachable!("handled before the stale-id guard")
-                }
                 StreamEvent::Done => app.finish_stream(),
                 StreamEvent::Notice(note) => app.note(note),
                 StreamEvent::Error(err) => app.fail_stream(err),
@@ -240,52 +203,6 @@ async fn run_app<B: ratatui::backend::Backend>(
         if app.quota_dirty {
             app.quota.save();
             app.quota_dirty = false;
-        }
-
-        // Free-tier budget refresh. Spawned rather than awaited: this runs on
-        // the render loop, and a gateway that takes ten seconds to answer must
-        // not freeze the UI for ten seconds. The answer comes back as an event.
-        if app.enrol_requested {
-            app.enrol_requested = false;
-            // Runs on a clone: `App` owns the real config, so the answer comes
-            // back as an event rather than being written from another task.
-            let mut cfg = app.config.clone();
-            cfg.free_tier.enabled = true;
-            cfg.llm.api_key.clear(); // enrol regardless of the key in use now
-            cfg.free_tier.device_token.clear();
-            let tx_enrol = tx.clone();
-            tokio::spawn(async move {
-                let event = match freetier::register(&mut cfg).await {
-                    Ok(enrolment) => StreamEvent::FreeTierEnrolled(Box::new(freetier::Enrolled {
-                        endpoint: cfg.llm.endpoint.clone(),
-                        device_token: cfg.free_tier.device_token.clone(),
-                        model: cfg.llm.model.clone(),
-                        fallback_id: cfg.free_tier.fallback_id.clone(),
-                        daily_limit_usd: enrolment.daily_limit_usd,
-                    })),
-                    Err(e) => StreamEvent::FreeTierFailed(e),
-                };
-                let _ = tx_enrol.send((0, event)).await;
-            });
-        }
-
-        if app.refresh_budget {
-            app.refresh_budget = false;
-            if freetier::is_free_tier(&app.config) {
-                let config = app.config.clone();
-                let id = app.request_id;
-                let tx_budget = tx.clone();
-                tokio::spawn(async move {
-                    // Both outcomes are reported. A readout waiting on this
-                    // answer has to be released either way, or `/quota` prints
-                    // nothing at all when the gateway is unreachable.
-                    let event = match freetier::fetch_budget(&config).await {
-                        Ok(budget) => StreamEvent::FreeTierBudget(Box::new(budget)),
-                        Err(e) => StreamEvent::FreeTierBudgetUnavailable(e),
-                    };
-                    let _ = tx_budget.send((id, event)).await;
-                });
-            }
         }
 
         // Fire a pending request.
@@ -372,46 +289,6 @@ async fn run_app<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-/// Enrol in the free tier if this install needs it, returning a line for the
-/// welcome screen.
-///
-/// Every failure degrades to a notice rather than an error: offline, blocked by
-/// a proxy, or gateway down -- the app still starts, and still works for anyone
-/// with their own key. An empty string means there is nothing worth saying.
-async fn enrol_free_tier(config: &mut Config) -> String {
-    if freetier::is_free_tier(config) {
-        // Ask rather than remember: the limit is a server-side setting that can
-        // change at any time, so anything cached at enrolment would be a number
-        // that only looks authoritative.
-        return match freetier::fetch_budget(config).await {
-            Ok(budget) => budget.summary(),
-            Err(_) => format!("Free tier — {}", config.llm.model),
-        };
-    }
-    if !freetier::should_register(config) {
-        return String::new();
-    }
-
-    println!("Setting up the free tier (no sign-in needed)…");
-    match freetier::register(config).await {
-        Ok(enrolment) => {
-            // Persist so the next launch reuses this device rather than enrolling
-            // again -- and so the budget is not reset by a restart.
-            if let Err(e) = config.save() {
-                eprintln!("Warning: could not save the device token ({e}). It will enrol again next launch.");
-            }
-            format!(
-                "Free tier — {} · ${:.2}/day, resets at UTC midnight",
-                enrolment.model, enrolment.daily_limit_usd
-            )
-        }
-        Err(e) => {
-            eprintln!("Free tier unavailable: {e}");
-            format!("unavailable — {e}")
-        }
-    }
-}
-
 fn print_help() {
     println!(
         "tuisample-code {VERSION}
@@ -457,13 +334,6 @@ COMMANDS (type in the input box, press Enter):
     /quota clear          Remove your own limits
     /quota override       Keep working past today's limit
     /quota reset          Cancel an override
-
-FREE TIER (a fresh install with no API key enrols anonymously and gets a small
-           daily budget on one model -- no sign-in. Only a hash of a hardware
-           id is sent; prompts are never logged. Configuring your own key opts
-           out entirely and sends traffic straight to your provider):
-    TUISAMPLE_FREE_TIER       Set to 0 to never contact the gateway
-    TUISAMPLE_GATEWAY         Point at a different gateway (e.g. staging)
 
 DAILY LIMITS (optional, off by default -- every limit is 0 = no limit, so this
               only counts until you set one. See [quota] in config.toml):

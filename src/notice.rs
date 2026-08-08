@@ -13,10 +13,10 @@
 //! - Red: something is wrong that you did not cause -- a rejected key, an
 //!   unreachable endpoint, a provider fault.
 //!
-//! Classification works off markers this crate and the gateway both control
-//! (see `markers`), rather than guessing from free prose. The tests feed the
-//! real strings the app produces through `classify`, so a reworded message
-//! that stops matching fails the build instead of silently going grey.
+//! Classification works off markers this crate controls (see `markers`), rather
+//! than guessing from free prose. The tests feed the real strings the app
+//! produces through `classify`, so a reworded message that stops matching fails
+//! the build instead of silently going grey.
 
 use crate::theme;
 use ratatui::style::{Modifier, Style};
@@ -24,14 +24,6 @@ use ratatui::style::{Modifier, Style};
 /// Substrings that classification keys on. Constants rather than literals at
 /// the match site, so the producer and the classifier are edited together.
 pub mod markers {
-    /// Codes the gateway returns in its OpenAI-shaped error bodies.
-    pub const GATEWAY_DEVICE_LIMIT: &str = "daily_limit_reached";
-    pub const GATEWAY_PAUSED: &str = "free_tier_paused";
-    pub const GATEWAY_BAD_TOKEN: &str = "invalid_token";
-    pub const GATEWAY_NO_TOKEN: &str = "missing_token";
-    pub const GATEWAY_BLOCKED: &str = "device_blocked";
-    pub const GATEWAY_IP_LIMITED: &str = "registration_rate_limited";
-
     /// What providers call a conversation that no longer fits.
     pub const CONTEXT_EXCEEDED: &str = "context_length_exceeded";
     pub const CONTEXT_MAXIMUM: &str = "maximum context length";
@@ -47,13 +39,8 @@ pub mod markers {
 /// What kind of thing went wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// This user's own allowance for the day is spent -- either the local
-    /// `[quota]` ceiling or the free tier's per-device budget.
+    /// This user's own `[quota]` allowance for the day is spent.
     DailyLimit,
-    /// The shared free tier is out of capacity for everyone, not just you.
-    /// Distinct from `DailyLimit` because the remedy is different: waiting or
-    /// using your own key, rather than raising your own limit.
-    ProviderCapacity,
     /// The conversation no longer fits in the model's context window.
     ContextFull,
     /// The reply hit the output cap mid-sentence.
@@ -66,8 +53,6 @@ pub enum Kind {
     Offline,
     /// The provider answered, with a failure.
     Provider,
-    /// This device is not allowed to use the free tier.
-    Refused,
     /// Anything not recognised. Rendered as a plain error rather than
     /// mislabelled as something specific.
     Other,
@@ -77,14 +62,10 @@ impl Kind {
     /// Amber for "expected, you can act on it"; red for "something is wrong".
     pub fn color(self) -> ratatui::style::Color {
         match self {
-            Kind::DailyLimit
-            | Kind::ProviderCapacity
-            | Kind::ContextFull
-            | Kind::Truncated
-            | Kind::RateLimited => theme::p().warning,
-            Kind::Auth | Kind::Offline | Kind::Provider | Kind::Refused | Kind::Other => {
-                theme::p().danger
+            Kind::DailyLimit | Kind::ContextFull | Kind::Truncated | Kind::RateLimited => {
+                theme::p().warning
             }
+            Kind::Auth | Kind::Offline | Kind::Provider | Kind::Other => theme::p().danger,
         }
     }
 
@@ -96,14 +77,12 @@ impl Kind {
     pub fn icon(self) -> &'static str {
         match self {
             Kind::DailyLimit => "◔",
-            Kind::ProviderCapacity => "◍",
             Kind::ContextFull => "▣",
             Kind::Truncated => "✂",
             Kind::Auth => "⚿",
             Kind::RateLimited => "⏳",
             Kind::Offline => "⊘",
             Kind::Provider => "⚠",
-            Kind::Refused => "⊗",
             Kind::Other => "✗",
         }
     }
@@ -112,14 +91,12 @@ impl Kind {
     pub fn headline(self) -> &'static str {
         match self {
             Kind::DailyLimit => "Daily limit reached",
-            Kind::ProviderCapacity => "Free tier at capacity",
             Kind::ContextFull => "Conversation too long",
             Kind::Truncated => "Reply cut off",
             Kind::Auth => "Not authorised",
             Kind::RateLimited => "Rate limited",
             Kind::Offline => "Endpoint unreachable",
             Kind::Provider => "Provider error",
-            Kind::Refused => "Not eligible",
             Kind::Other => "Error",
         }
     }
@@ -132,38 +109,28 @@ impl Kind {
     pub fn hint(self) -> Option<&'static str> {
         match self {
             Kind::DailyLimit => Some(
-                "Resets at UTC midnight · /quota to see the numbers · /provider to use your own key",
+                "Resets at UTC midnight · /quota to see the numbers · /quota override to keep going",
             ),
-            Kind::ProviderCapacity => {
-                Some("Not caused by you. Try later, or /provider to use your own key")
-            }
             Kind::ContextFull => Some("/new starts a fresh conversation and clears the history"),
             Kind::Truncated => Some("Raise max_tokens under [llm], or ask for smaller pieces"),
             Kind::Auth => Some("/provider to set a working key"),
             Kind::RateLimited => Some("Wait a moment and send again"),
             Kind::Offline => Some("Check your connection, then /provider to confirm the endpoint"),
-            Kind::Provider | Kind::Refused | Kind::Other => None,
+            Kind::Provider | Kind::Other => None,
         }
     }
 }
 
 /// Work out what a failure message is about.
 ///
-/// Ordered most specific first: a gateway body naming `free_tier_paused` also
-/// contains the word "limit", so matching loosely would file a fleet-wide
-/// outage as the user's own spent allowance and send them to raise a limit that
-/// is not the problem.
+/// Ordered most specific first: several of these bodies contain the words the
+/// looser rules below match on, so a rule that fires early would file a
+/// specific failure under a generic heading and offer the wrong remedy.
 pub fn classify(text: &str) -> Kind {
     use markers as m;
     let lower = text.to_lowercase();
 
-    if text.contains(m::GATEWAY_PAUSED) || lower.contains("free tier has reached its capacity") {
-        return Kind::ProviderCapacity;
-    }
-    if text.contains(m::GATEWAY_DEVICE_LIMIT)
-        || text.contains(m::LOCAL_LIMIT)
-        || lower.contains("daily free-tier limit reached")
-    {
+    if text.contains(m::LOCAL_LIMIT) {
         return Kind::DailyLimit;
     }
     if text.contains(m::CONTEXT_EXCEEDED)
@@ -176,20 +143,11 @@ pub fn classify(text: &str) -> Kind {
     if lower.contains(m::TRUNCATED) {
         return Kind::Truncated;
     }
-    if text.contains(m::GATEWAY_BLOCKED) || lower.contains("not eligible for the free tier") {
-        return Kind::Refused;
-    }
-    if text.contains(m::GATEWAY_BAD_TOKEN)
-        || text.contains(m::GATEWAY_NO_TOKEN)
-        || lower.contains("no longer registered")
-        || lower.contains("invalid api key")
-        || lower.contains("http 401")
-        || lower.contains("http 403")
+    if lower.contains("invalid api key") || lower.contains("http 401") || lower.contains("http 403")
     {
         return Kind::Auth;
     }
-    if text.contains(m::GATEWAY_IP_LIMITED) || lower.contains("http 429") || lower.contains("rate limit")
-    {
+    if lower.contains("http 429") || lower.contains("rate limit") {
         return Kind::RateLimited;
     }
     if text.contains(m::UNREACHABLE) || lower.contains("connection") || lower.contains("dns") {
@@ -217,57 +175,30 @@ mod tests {
                  Type /quota override to keep going today",
                 Kind::DailyLimit,
             ),
-            // llm.rs, from the gateway's 402
-            (
-                "Daily free-tier limit reached ($0.25 of $0.25). Resets at 2026-08-07T00:00:00.000Z.\n\n\
-                 The free tier resets at UTC midnight.",
-                Kind::DailyLimit,
-            ),
-            // llm.rs, from the gateway's 503
-            (
-                "The free tier has reached its capacity for today and is paused.\n\n\
-                 Add your own API key with /provider to continue immediately.",
-                Kind::ProviderCapacity,
-            ),
             // llm.rs truncation notice
             (
                 "The reply hit the 16384-token output cap and was cut off. Raise `max_tokens`.",
                 Kind::Truncated,
             ),
-            // llm.rs, invalidated device token
+            // llm.rs, a key the provider rejected
             (
-                "This device is no longer registered for the free tier. Restart the app to enrol again.",
+                "HTTP 401 Unauthorized from https://api.deepseek.com/v1/chat/completions",
                 Kind::Auth,
+            ),
+            // llm.rs, provider rate limit
+            (
+                "Too many requests.\n\nThis is a rate limit, not a fault -- wait a moment and try again.",
+                Kind::RateLimited,
             ),
             // llm.rs connectivity
             (
                 "Could not reach http://localhost:8000/v1/chat/completions: error trying to connect",
                 Kind::Offline,
             ),
-            // gateway, blocked device
-            (
-                r#"{"error":{"code":"device_blocked","message":"This device is not eligible for the free tier."}}"#,
-                Kind::Refused,
-            ),
-            // gateway, registration rate limit
-            (
-                r#"{"error":{"code":"registration_rate_limited","message":"Too many new devices."}}"#,
-                Kind::RateLimited,
-            ),
         ];
         for (text, expected) in cases {
             assert_eq!(classify(text), *expected, "misclassified: {text}");
         }
-    }
-
-    /// The one that matters most: a fleet-wide outage must not be filed as the
-    /// user's own spent allowance, or they are sent to raise a limit that is
-    /// not the problem.
-    #[test]
-    fn a_capacity_outage_is_not_mistaken_for_a_personal_limit() {
-        let paused = r#"{"error":{"code":"free_tier_paused","message":"The free tier has reached its capacity for today and is paused."}}"#;
-        assert_eq!(classify(paused), Kind::ProviderCapacity);
-        assert_ne!(classify(paused), Kind::DailyLimit);
     }
 
     #[test]
@@ -294,7 +225,7 @@ mod tests {
     /// unreadable.
     #[test]
     fn actionable_kinds_are_amber_and_faults_are_red() {
-        for k in [Kind::DailyLimit, Kind::ProviderCapacity, Kind::ContextFull, Kind::Truncated] {
+        for k in [Kind::DailyLimit, Kind::ContextFull, Kind::Truncated, Kind::RateLimited] {
             assert_eq!(k.color(), theme::p().warning, "{k:?} is expected, not a fault");
         }
         for k in [Kind::Auth, Kind::Offline, Kind::Provider, Kind::Other] {
@@ -306,14 +237,12 @@ mod tests {
     fn every_kind_has_a_distinct_icon_and_headline() {
         let all = [
             Kind::DailyLimit,
-            Kind::ProviderCapacity,
             Kind::ContextFull,
             Kind::Truncated,
             Kind::Auth,
             Kind::RateLimited,
             Kind::Offline,
             Kind::Provider,
-            Kind::Refused,
             Kind::Other,
         ];
         let icons: std::collections::HashSet<_> = all.iter().map(|k| k.icon()).collect();
