@@ -198,7 +198,12 @@ fn dot() -> String {
 }
 
 fn default_max_tokens() -> u32 {
-    16384
+    // The ceiling on one *reply*, not on the conversation. 16k was already
+    // generous for chat and still too small for the thing this tool is
+    // actually asked to do -- write a whole file, or a deck, in one go. A
+    // reply cut off mid-token costs the entire turn, so the cap is set above
+    // what any single answer plausibly needs rather than close to it.
+    32768
 }
 
 fn default_command_timeout() -> u64 {
@@ -567,6 +572,17 @@ mod tests {
         )
         .expect("should parse");
         assert!(parsed.tools.auto_approve_read_only);
+    }
+
+    /// The reply cap is the difference between a whole generated file and one
+    /// truncated mid-token, and a truncated reply costs the entire turn. It is
+    /// deliberately well above what any single answer needs.
+    #[test]
+    fn the_default_reply_cap_is_generous_enough_for_a_whole_file() {
+        assert_eq!(LlmConfig::default().max_tokens, 32768);
+        // And a config written before this key existed still gets it.
+        let parsed: Config = toml::from_str("[llm]\nendpoint = \"http://x\"\n").expect("parses");
+        assert_eq!(parsed.llm.max_tokens, 32768);
     }
 
     #[test]
