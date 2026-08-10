@@ -3,7 +3,7 @@
 # The PowerShell counterpart to install.sh: `curl | bash` doesn't work in
 # native PowerShell (no bash, and `|` pipes objects, not text), so Windows
 # users need their own entry point --
-#   irm https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.ps1 | iex
+#   irm https://boxcode.sh/install.ps1 | iex
 # is that platform's equivalent one-liner (Invoke-RestMethod | Invoke-Expression).
 #
 # Unlike install.sh, there is no source-build fallback here: building Rust on
@@ -383,7 +383,7 @@ function Main {
     Write-Host '2. Open a new shell (so the updated PATH takes effect), then run:'
     Write-Host '   boxcode'
     Write-Host ''
-    Write-Host 'For more info: https://github.com/HolboxAI/boxcode'
+    Write-Host 'For more info: https://boxcode.sh'
 }
 
 if ($MyInvocation.InvocationName -ne '.') {

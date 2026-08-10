@@ -53,7 +53,7 @@ export BOXCODE_API_KEY=sk-...
 ### 4. Install Script Testing
 ```bash
 # This requires Cargo to be installed
-bash <(curl -fsSL https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.sh)
+bash <(curl -fsSL https://boxcode.sh/install.sh)
 ```
 
 **Error: "Rust/Cargo not found"?**
