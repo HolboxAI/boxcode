@@ -805,6 +805,26 @@ fn tool_approval_lines(
     remaining: usize,
     inner: usize,
 ) -> (&'static str, Vec<Line<'static>>) {
+    let (title, body, footer) = tool_approval_parts(app, action, remaining, inner);
+    let mut lines = body;
+    lines.extend(footer);
+    (title, lines)
+}
+
+/// The prompt split into the part that may scroll and the part that must not.
+///
+/// `footer` is the y/n choice and its key hint. It is drawn into rows reserved
+/// at the bottom of the block rather than appended to the content, because a
+/// `Paragraph` clips from the bottom: a command or a file preview long enough
+/// to fill the box used to push the only instructions for answering it clean
+/// off the screen. The keys still worked, which made it worse -- nothing on
+/// screen said what to press.
+fn tool_approval_parts(
+    app: &App,
+    action: &Action,
+    remaining: usize,
+    inner: usize,
+) -> (&'static str, Vec<Line<'static>>, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
 
     // A destructive command gets a banner before anything else. The prompt for
@@ -1005,12 +1025,16 @@ fn tool_approval_lines(
         ),
         Span::styled(" skip", theme::faint()),
     ]));
-    lines.push(Line::from(Span::styled(
+    // The last two lines built above are the y/n choice; they become the
+    // footer, with the key hint appended.
+    let split = lines.len().saturating_sub(2);
+    let mut footer = lines.split_off(split);
+    footer.push(Line::from(Span::styled(
         "  ↑↓ choose · enter confirm · esc skip",
         theme::faint(),
     )));
 
-    (title, lines)
+    (title, lines, footer)
 }
 
 /// Draws the approval prompt into its reserved region at the bottom of the
@@ -1025,7 +1049,7 @@ fn render_tool_approval_inline(
     remaining: usize,
 ) {
     let inner = area.width.saturating_sub(4).max(1) as usize;
-    let (title, lines) = tool_approval_lines(app, action, remaining, inner);
+    let (title, body, mut footer) = tool_approval_parts(app, action, remaining, inner);
 
     let destructive = matches!(action, Action::Command { command, .. }
         if crate::danger::classify(command, Path::new(&app.workspace_root)).is_dangerous());
@@ -1044,7 +1068,73 @@ fn render_tool_approval_inline(
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
         .padding(Padding::new(1, 1, 0, 0));
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    let content = block.inner(area);
+    f.render_widget(block, area);
+    if content.height == 0 {
+        return;
+    }
+
+    // The footer gets its rows first and keeps them whatever the body does.
+    let footer_height = (footer.len() as u16).min(content.height);
+    let body_height = content.height - footer_height;
+
+    if body_height > 0 {
+        let body_area = Rect { height: body_height, ..content };
+        let scroll = approval_scroll(app, body.len(), body_height);
+        f.render_widget(
+            Paragraph::new(body.clone()).scroll((scroll, 0)),
+            body_area,
+        );
+
+        // Say so when there is more, and which way -- an approval box that
+        // silently hides half a command is how someone approves the half they
+        // could see.
+        let hidden_below = body.len().saturating_sub(body_height as usize + scroll as usize);
+        // Only mention the scroll keys when there is something to scroll --
+        // an unconditional hint is noise on the short prompts, which are most
+        // of them.
+        if (scroll > 0 || hidden_below > 0) && !footer.is_empty() {
+            let last = footer.len() - 1;
+            footer[last] = Line::from(Span::styled(
+                "  ↑↓ choose · enter confirm · esc skip · PgUp/PgDn scroll",
+                theme::faint(),
+            ));
+        }
+        if scroll > 0 || hidden_below > 0 {
+            let marker = match (scroll > 0, hidden_below > 0) {
+                (true, true) => format!(" ↕ {hidden_below} more "),
+                (false, true) => format!(" ↓ {hidden_below} more "),
+                (true, false) => " ↑ top ".to_string(),
+                (false, false) => String::new(),
+            };
+            let strip = Rect {
+                y: body_area.bottom().saturating_sub(1),
+                height: 1,
+                ..body_area
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(marker, theme::faint())))
+                    .alignment(Alignment::Right),
+                strip,
+            );
+        }
+    }
+
+    let footer_area = Rect {
+        y: content.bottom() - footer_height,
+        height: footer_height,
+        ..content
+    };
+    f.render_widget(Paragraph::new(footer), footer_area);
+}
+
+/// The body's scroll offset, clamped to what there actually is to scroll.
+///
+/// Clamped here rather than where the key is handled: only the renderer knows
+/// how tall the box ended up, and that changes with the terminal.
+fn approval_scroll(app: &App, body_len: usize, body_height: u16) -> u16 {
+    let max = body_len.saturating_sub(body_height as usize) as u16;
+    app.approval_scroll.min(max)
 }
 
 /// Centers a popup sized to its content within `area`, clamped so it never
@@ -1892,6 +1982,102 @@ mod tests {
         assert!(!rendered.contains("Assistant:"), "{rendered}");
     }
 
+    /// Regression: a long command or file preview filled the box and pushed the
+    /// y/n choice clean off the bottom. The keys still worked, which made it
+    /// worse -- nothing on screen said what to press.
+    #[test]
+    fn the_answer_keys_stay_visible_however_long_the_content_is() {
+        for (label, action) in [
+            (
+                "long command",
+                Action::Command {
+                    command: (1..=60)
+                        .map(|i| format!("--flag-number-{i}=some-fairly-long-value"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    purpose: Some("a purpose line as well".into()),
+                },
+            ),
+            (
+                "long file",
+                Action::Write {
+                    path: "src/generated.rs".into(),
+                    content: (1..=200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+                },
+            ),
+        ] {
+            let mut app = App::new(crate::config::Config::default());
+            app.greeted = true;
+            app.workspace_root = "/tmp/project".into();
+            app.overlay = Some(Overlay::ToolApproval { action, remaining: 0 });
+
+            for (w, h) in [(80, 24), (120, 40), (60, 12)] {
+                let rendered = rendered_text(&mut app, w, h);
+                assert!(
+                    rendered.contains("y run") || rendered.contains("y write"),
+                    "{label} at {w}x{h}: the answer keys were pushed off screen"
+                );
+                assert!(
+                    rendered.contains("enter confirm"),
+                    "{label} at {w}x{h}: the key hint was pushed off screen"
+                );
+            }
+        }
+    }
+
+    /// Content that does not fit has to say so, or someone approves the half
+    /// they happened to be shown.
+    #[test]
+    fn overflowing_content_advertises_that_there_is_more() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.workspace_root = "/tmp/project".into();
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Write {
+                path: "big.txt".into(),
+                content: (1..=200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+            },
+            remaining: 0,
+        });
+
+        let rendered = rendered_text(&mut app, 80, 24);
+        assert!(rendered.contains("more"), "expected a 'N more' marker: {rendered}");
+    }
+
+    /// Scrolling has to actually move the content, and stop at the end rather
+    /// than running off into blank space.
+    #[test]
+    fn scrolling_reveals_later_content_and_clamps_at_the_bottom() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.workspace_root = "/tmp/project".into();
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Write {
+                path: "big.txt".into(),
+                content: (1..=40).map(|i| format!("marker{i}")).collect::<Vec<_>>().join("\n"),
+            },
+            remaining: 0,
+        });
+
+        let top = rendered_text(&mut app, 80, 24);
+        assert!(top.contains("marker1"), "{top}");
+
+        app.approval_scroll = 6;
+        let scrolled = rendered_text(&mut app, 80, 24);
+        assert_ne!(top, scrolled, "PageDown must move the content");
+        // The keys survive scrolling too.
+        assert!(scrolled.contains("y write"), "{scrolled}");
+
+        // Far past the end clamps rather than scrolling into emptiness.
+        app.approval_scroll = 9_999;
+        let bottom = rendered_text(&mut app, 80, 24);
+        assert!(bottom.contains("y write"), "{bottom}");
+        assert!(
+            bottom.trim().len() > 40,
+            "clamping failed; the box scrolled past its content: {bottom}"
+        );
+    }
+
     /// The command must appear verbatim: approving something you cannot read is
     /// not approval.
     #[test]
@@ -2005,6 +2191,7 @@ mod tests {
         assert!(rendered.contains("y search"), "the keys must say search");
     }
 }
+
 
 
 
