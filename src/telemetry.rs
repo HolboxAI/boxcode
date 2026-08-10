@@ -58,7 +58,10 @@ fn telemetry_url_given(env_override: Option<&str>) -> Option<String> {
 }
 
 fn state_dir() -> Option<PathBuf> {
-    crate::paths::state_dir()
+    // Via `config`, not derived here: that is the one place that inherits the
+    // pre-rename directory, and a module that builds the path itself would
+    // create `~/.boxcode` first and quietly strand the old one.
+    Some(crate::config::Config::config_dir())
 }
 
 fn device_id_path() -> Option<PathBuf> {

@@ -61,7 +61,11 @@ impl Deployment {
 }
 
 fn history_path() -> Option<PathBuf> {
-    crate::paths::state_file("deployments.jsonl")
+    // Via `config`, not derived here: that is the one place that inherits the
+    // pre-rename directory, and a module that builds the path itself would
+    // create `~/.boxcode` first and quietly strand the old one.
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(crate::config::Config::config_dir().join("deployments.jsonl"))
 }
 
 /// Seconds since the epoch, or 0 if the clock is unreadable. Only ever used to

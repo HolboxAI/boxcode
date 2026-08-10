@@ -619,7 +619,9 @@ legibility.
 - **Esc** — Cancel ongoing request
 - **↑ / ↓** — Recall previous prompts. Inside a multi-line prompt they move
   between its lines first, so a stray ↑ can't swallow what you were writing
-- **PgUp / PgDn** — Scroll the transcript
+- **Your terminal's own scrollback** — the session is printed as ordinary
+  output, so the wheel, text selection and your terminal's search all work on
+  it, and it is still there after you quit
 - **Ctrl-A / Ctrl-E** — Jump to start / end of line
 - **Ctrl-W** — Delete previous word
 - **Ctrl-U / Ctrl-K** — Delete to start / end of line

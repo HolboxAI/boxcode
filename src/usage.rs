@@ -20,7 +20,11 @@ struct Record {
 }
 
 fn usage_path() -> Option<PathBuf> {
-    crate::paths::state_file("usage.jsonl")
+    // Still a guard, not a path: with no home directory at all there is
+    // nowhere to keep state, and falling back to the working directory would
+    // scatter it wherever the app happened to be launched.
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(crate::config::Config::config_dir().join("usage.jsonl"))
 }
 
 /// Appends one record for a turn that streamed `approx_tokens`. A no-op for

@@ -132,7 +132,11 @@ impl DailyQuota {
     }
 
     fn path() -> Option<PathBuf> {
-        crate::paths::state_file("quota.json")
+        // Still a guard, not a path: with no home directory at all there is
+    // nowhere to keep state, and falling back to the working directory would
+    // scatter it wherever the app happened to be launched.
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        Some(crate::config::Config::config_dir().join("quota.json"))
     }
 
     /// Today's counters. Every failure -- missing, unreadable, corrupt -- reads

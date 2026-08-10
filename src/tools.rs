@@ -1007,7 +1007,11 @@ except Exception as exc:
 /// set), which the caller treats the same as any other reason a fallback
 /// isn't available.
 fn embedded_python_path() -> Option<PathBuf> {
-    let base = crate::paths::state_dir()?.join("python");
+    // Still a guard, not a path: with no home directory at all there is
+    // nowhere to keep state, and falling back to the working directory would
+    // scatter it wherever the app happened to be launched.
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let base = crate::config::Config::config_dir().join("python");
     let candidate = if cfg!(windows) {
         base.join("python.exe")
     } else {

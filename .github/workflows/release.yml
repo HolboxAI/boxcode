@@ -98,9 +98,18 @@ jobs:
           path: all-artifacts
 
       - name: Prepare release assets
+        # Also published under the pre-rename name. An installer already on
+        # someone's machine only knows to ask for `tuisample-code-$os-$arch`;
+        # without a copy under that name it finds nothing in the release and
+        # silently falls back to building from source. Drop this duplication
+        # once installs from before the rename are gone.
         run: |
           mkdir -p release-assets
           find all-artifacts -type f -exec cp {} release-assets/ \;
+          for f in release-assets/boxcode-*; do
+            [ -e "$f" ] || continue
+            cp "$f" "release-assets/$(basename "$f" | sed 's/^boxcode-/tuisample-code-/')"
+          done
           ls -la release-assets/
 
       - name: Generate checksums
