@@ -516,7 +516,7 @@ echo ""
 echo "2. Run boxcode:"
 echo "   boxcode"
 echo ""
-echo "📖 For more info: https://github.com/HolboxAI/boxcode"
+echo "📖 For more info: https://boxcode.sh"
 echo ""
 }
 
