@@ -151,6 +151,10 @@ pub struct App {
     /// every new prompt starts back on "yes" to match bare-Enter's long-
     /// standing meaning.
     pub approval_selected: bool,
+    /// How far the approval prompt's body is scrolled. Reset for every new
+    /// prompt: carrying an offset from the last one would open the next
+    /// half-way down a different command.
+    pub approval_scroll: u16,
     pub config: Config,
     pub should_exit: bool,
     /// Set once the user has interacted, so the welcome panel gives way to the transcript.
@@ -250,6 +254,7 @@ impl App {
             scroll: 0,
             follow_tail: true,
             approval_selected: true,
+            approval_scroll: 0,
             config,
             should_exit: false,
             greeted: false,
@@ -664,6 +669,7 @@ impl App {
                         action,
                         remaining: self.pending_tools.len().saturating_sub(1),
                     });
+                    self.approval_scroll = 0;
                     self.approval_selected = true;
                     self.state = AppState::AwaitingApproval;
                     return;
@@ -1042,6 +1048,21 @@ impl App {
         if matches!(key.code, KeyCode::Up | KeyCode::Down) {
             self.approval_selected = !self.approval_selected;
             return;
+        }
+        // Scrolling the command being approved is deliberately not on Up/Down:
+        // those already move the y/n choice, and a prompt you cannot answer is
+        // worse than one you cannot fully read. `ui` clamps the offset against
+        // the real content height, so overshooting here is harmless.
+        match key.code {
+            KeyCode::PageUp => {
+                self.approval_scroll = self.approval_scroll.saturating_sub(5);
+                return;
+            }
+            KeyCode::PageDown => {
+                self.approval_scroll = self.approval_scroll.saturating_add(5);
+                return;
+            }
+            _ => {}
         }
 
         let decision = match key.code {
