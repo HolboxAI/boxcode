@@ -27,7 +27,9 @@ use crossterm::terminal::{
 };
 use llm::StreamEvent;
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::layout::Rect;
+use ratatui::widgets::Widget;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::error::Error;
 use std::io;
 use std::time::Duration;
@@ -92,10 +94,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tokio::spawn(telemetry::ping_active_if_new_day(VERSION));
 
     let enhanced = setup_terminal()?;
-    install_panic_hook(enhanced);
 
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
+    // An inline viewport owns only the bottom strip; everything above it is
+    // ordinary terminal output. `VIEWPORT_ROWS` is fixed because ratatui takes
+    // the inline height at construction -- which is workable precisely because
+    // the approval prompt scrolls inside its own box rather than growing.
+    const VIEWPORT_ROWS: u16 = 12;
+    // Setting up an inline viewport asks the terminal where the cursor is and
+    // waits for the answer. Practically every terminal replies -- it is a far
+    // older and better-supported query than the OSC background one that had to
+    // be removed for hanging -- but "practically every" is not "every", and a
+    // terminal that stays silent must not leave the app unable to start at all.
+    //
+    // So: fall back to the full screen. That loses the scrollback this whole
+    // change exists to provide, which is worth saying out loud rather than
+    // failing silently, but it does start.
+    let (mut terminal, alternate_screen) = match Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(VIEWPORT_ROWS),
+        },
+    ) {
+        Ok(terminal) => (terminal, false),
+        Err(e) => {
+            eprintln!(
+                "Note: this terminal did not report its cursor position ({e}), so session \
+                 history will not go to its scrollback."
+            );
+            crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+            (Terminal::new(backend)?, true)
+        }
+    };
+    install_panic_hook(enhanced, alternate_screen);
 
     let mut app = App::new(config);
     // Loaded before the first prompt so a limit already spent today is in force
@@ -112,7 +143,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let result = run_app(&mut terminal, &mut app, workspace.as_ref(), tx, &mut rx).await;
 
-    restore_terminal(enhanced)?;
+    restore_terminal(enhanced, alternate_screen)?;
     if let Err(e) = &result {
         eprintln!("Error: {e}");
     }
@@ -125,6 +156,82 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// A workspace that cannot be opened must not stop the app: it still works as a
 /// plain chat client, just without file access, so the failure degrades to a
 /// notice on the welcome screen instead of a startup error.
+/// Print any newly-finished messages above the viewport.
+///
+/// `insert_before` needs the height up front, so each message is laid out
+/// twice: once to count the lines, once to draw them. That is cheap next to
+/// the alternative of guessing and either clipping the message or leaving a
+/// gap.
+fn flush_to_scrollback<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> io::Result<()> {
+    if app.welcome_flushed && app.drainable().is_empty() && app.streamed_ready().is_none() {
+        return Ok(());
+    }
+    let width = terminal.size()?.width;
+    // Same gutter the viewport uses, so a message does not shift sideways as
+    // it crosses from one to the other.
+    let text_width = width.saturating_sub(3).max(1) as usize;
+
+    if !app.welcome_flushed {
+        let lines = ui::welcome_lines(app, text_width);
+        let height = lines.len() as u16;
+        terminal.insert_before(height, |buf| {
+            let area = Rect { x: 0, y: 0, width, height };
+            ratatui::widgets::Paragraph::new(lines)
+                .block(
+                    ratatui::widgets::Block::default()
+                        .padding(ratatui::widgets::Padding::new(2, 1, 0, 0)),
+                )
+                .render(area, buf);
+        })?;
+        app.welcome_flushed = true;
+    }
+
+    // Push finished lines of the in-flight reply up as they complete, so a long
+    // answer scrolls the terminal like ordinary output instead of being trimmed
+    // to whatever fits the strip at the bottom.
+    if let Some(ready) = app.streamed_ready() {
+        let text = ready.to_string();
+        let lines: Vec<_> = ui::wrapped_lines(text.trim_end_matches('\n'), text_width);
+        if !lines.is_empty() {
+            let height = lines.len() as u16;
+            terminal.insert_before(height, |buf| {
+                let area = Rect { x: 0, y: 0, width, height };
+                ratatui::widgets::Paragraph::new(lines)
+                    .block(
+                        ratatui::widgets::Block::default()
+                            .padding(ratatui::widgets::Padding::new(2, 1, 0, 0)),
+                    )
+                    .render(area, buf);
+            })?;
+        }
+        app.stream_printed += text.len();
+    }
+
+    let pending: Vec<_> = app.drainable().to_vec();
+    for msg in pending {
+        let lines = ui::message_lines(&msg, text_width);
+        if lines.is_empty() {
+            app.flushed += 1;
+            continue;
+        }
+        let height = lines.len() as u16;
+        terminal.insert_before(height, |buf| {
+            let area = Rect { x: 0, y: 0, width, height };
+            ratatui::widgets::Paragraph::new(lines)
+                .block(
+                    ratatui::widgets::Block::default()
+                        .padding(ratatui::widgets::Padding::new(2, 1, 0, 0)),
+                )
+                .render(area, buf);
+        })?;
+        app.flushed += 1;
+    }
+    Ok(())
+}
+
 fn open_workspace(config: &Config) -> (Option<Workspace>, String) {
     if !config.tools.enabled {
         return (None, "off (enabled = false in config.toml)".to_string());
@@ -156,6 +263,10 @@ async fn run_app<B: ratatui::backend::Backend>(
     rx: &mut mpsc::Receiver<(u64, StreamEvent)>,
 ) -> Result<(), Box<dyn Error>> {
     loop {
+        // Hand finished messages to the terminal before drawing. Once printed
+        // they are the terminal's -- its scrollback, its selection, its search
+        // -- and this loop never touches them again.
+        flush_to_scrollback(terminal, app)?;
         terminal.draw(|f| ui::render(f, app))?;
 
         // Keyboard / paste input.
@@ -356,7 +467,12 @@ KEYS:
 fn setup_terminal() -> Result<bool, Box<dyn Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Deliberately no alternate screen. That buffer has no scrollback of its
+    // own, so everything the session had ever printed became unreachable the
+    // moment it left the viewport -- and vanished entirely on exit. Staying on
+    // the normal buffer hands the history to the terminal, where the wheel,
+    // text selection and the terminal's own search already work.
+    crossterm::execute!(stdout, EnableBracketedPaste)?;
 
     // Optional: lets terminals that support it distinguish Shift/Ctrl-Enter.
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
@@ -369,22 +485,25 @@ fn setup_terminal() -> Result<bool, Box<dyn Error>> {
     Ok(enhanced)
 }
 
-fn restore_terminal(enhanced: bool) -> Result<(), Box<dyn Error>> {
+fn restore_terminal(enhanced: bool, alternate_screen: bool) -> Result<(), Box<dyn Error>> {
     let mut stdout = io::stdout();
     if enhanced {
         let _ = crossterm::execute!(stdout, PopKeyboardEnhancementFlags);
     }
-    crossterm::execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen)?;
+    crossterm::execute!(stdout, DisableBracketedPaste)?;
+    if alternate_screen {
+        crossterm::execute!(stdout, LeaveAlternateScreen)?;
+    }
     disable_raw_mode()?;
     Ok(())
 }
 
-/// Without this a panic leaves the terminal in raw mode on the alternate screen,
-/// with the backtrace invisible.
-fn install_panic_hook(enhanced: bool) {
+/// Without this a panic leaves the terminal in raw mode, with the backtrace
+/// invisible -- and on the alternate screen too, when that fallback is in use.
+fn install_panic_hook(enhanced: bool, alternate_screen: bool) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = restore_terminal(enhanced);
+        let _ = restore_terminal(enhanced, alternate_screen);
         default_hook(info);
     }));
 }
