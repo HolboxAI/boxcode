@@ -271,8 +271,6 @@ fn mode_from_colorfgbg(value: Option<&str>) -> Option<Mode> {
 
 // ---- glyphs -------------------------------------------------------------------
 
-/// The mark that stands in for the app itself.
-pub const LOGO: &str = "◈";
 /// Prefix on the line the user typed.
 pub const USER_MARK: &str = "❯";
 /// Prefix inside the prompt box.

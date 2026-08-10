@@ -1,4 +1,4 @@
-use crate::app::{App, AppState, CustomStep, Overlay, Role};
+use crate::app::{App, AppState, CustomStep, Message, Overlay, Role};
 use crate::providers;
 use crate::theme;
 use crate::tools::Action;
@@ -50,29 +50,31 @@ pub fn render(f: &mut Frame, app: &mut App) {
         (command_matches.len() as u16 + 2).min(8)
     };
 
+    // The viewport is a strip at the bottom of the real terminal, not a whole
+    // screen: finished messages have already been printed above it and belong
+    // to the terminal's scrollback now. What is left here is the turn in
+    // progress and the controls -- everything that still changes.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(5),
+            Constraint::Min(0),
             Constraint::Length(menu_height),
             Constraint::Length(bottom_height),
             Constraint::Length(1),
         ])
         .split(size);
 
-    render_header(f, chunks[0], app);
-    render_messages(f, chunks[1], app);
+    render_live(f, chunks[0], app);
     if !command_matches.is_empty() {
-        render_command_menu(f, chunks[2], app, &command_matches);
+        render_command_menu(f, chunks[1], app, &command_matches);
     }
     match &approval {
         Some((action, remaining)) => {
-            render_tool_approval_inline(f, chunks[3], app, action, *remaining)
+            render_tool_approval_inline(f, chunks[2], app, action, *remaining)
         }
-        None => render_input(f, chunks[3], app),
+        None => render_input(f, chunks[2], app),
     }
-    render_footer(f, chunks[4], app);
+    render_footer(f, chunks[3], app);
 
     // Everything else here (pickers, text prompts) is a one-shot choice made
     // before a turn even starts, with no transcript underneath it yet to stay
@@ -97,31 +99,6 @@ fn adapt_colors_for_terminal(f: &mut Frame) {
     }
 }
 
-/// A single quiet line: the mark on the left, the model on the right.
-///
-/// Deliberately understated. The endpoint and the working directory are on the
-/// welcome panel where they are read once; repeating them across the top of
-/// every frame competes with the transcript for attention and wins, which is
-/// exactly backwards.
-fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    let left = Line::from(Span::styled(
-        format!(" {}", theme::LOGO),
-        theme::accent_bold(),
-    ));
-    f.render_widget(Paragraph::new(left), area);
-
-    // The welcome panel names the model in its own column; repeating it in the
-    // header while that panel is up says the same thing twice on one screen.
-    let on_welcome = !app.greeted && app.messages.is_empty();
-    let model = format!("{} ", app.config.llm.model);
-    if !on_welcome && (model.chars().count() as u16) < area.width.saturating_sub(20) {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(model, theme::faint())))
-                .alignment(Alignment::Right),
-            area,
-        );
-    }
-}
 
 /// The transcript, drawn without a box around it.
 ///
@@ -130,211 +107,196 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 /// session should feel like. The two-column indent does the job the border was
 /// doing -- separating the stream from the edge of the screen -- at a quarter
 /// of the visual weight.
-fn render_messages(f: &mut Frame, area: Rect, app: &mut App) {
-    const GUTTER: usize = 2;
-    let width = area.width.saturating_sub(GUTTER as u16 + 1).max(1) as usize;
+/// Plain assistant prose as drawable lines, wrapped to `width`. Shared with
+/// the streaming flush so a paragraph looks identical whether it was printed
+/// line-by-line as it arrived or all at once when the turn ended.
+pub fn wrapped_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    wrap(text, width)
+        .into_iter()
+        .map(|w| Line::from(Span::styled(w, theme::text())))
+        .collect()
+}
+
+/// One transcript message as drawable lines.
+///
+/// Split out of the renderer so the very same lines can be pushed into the
+/// terminal's own scrollback (see `main`'s flush loop) and drawn live. If these
+/// two ever diverged, a message would change appearance the moment it scrolled
+/// out of the viewport.
+pub fn message_lines(msg: &Message, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
-    if !app.greeted && app.messages.is_empty() {
-        lines.extend(welcome_lines(app, width));
-
-        // Unlike the transcript below, this never sticks to the bottom --
-        // the mascot and identity fields belong on screen first, not
-        // whatever happens to be last. But it does need to be reachable at
-        // all: on a short terminal (or once enough commands/warnings
-        // accumulate that the content no longer fits, which is exactly what
-        // adding /new and /usage here did to a 22-row test terminal), the
-        // unscrolled tail -- including "no API key configured" -- was
-        // silently clipped with no way to see it. PageDown already sets
-        // app.scroll generically; this just has to honour and clamp it.
-        let viewport = area.height as usize;
-        let max_scroll = lines.len().saturating_sub(viewport) as u16;
-        app.scroll = app.scroll.min(max_scroll);
-
-        f.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().padding(Padding::new(GUTTER as u16, 1, 0, 0)))
-                .scroll((app.scroll, 0)),
-            area,
-        );
-        if app.scroll < max_scroll && area.height > 0 {
-            let more = Line::from(Span::styled(" ↓ more ", theme::faint()));
-            let hint_area = Rect {
-                x: area.x,
-                y: area.bottom().saturating_sub(1),
-                width: area.width,
-                height: 1,
-            };
-            f.render_widget(Paragraph::new(more).alignment(Alignment::Right), hint_area);
-        }
-        return;
+    // Nothing left to draw: a reply whose text was already streamed out line by
+    // line arrives here empty, and blank lines in the scrollback are noise.
+    if msg.body().trim().is_empty() && msg.tool_calls.is_empty() {
+        return lines;
     }
 
-    lines.push(Line::from(""));
-    for msg in &app.messages {
-        // Tool activity is scaffolding, not conversation: one dim line each,
-        // no speaker label and no blank separator, so a run of six reads as a
-        // compact block rather than three screens of transcript. The full
-        // result still goes to the model -- it is just not drawn.
-        if msg.role == Role::Tool {
-            for (i, wrapped) in wrap(msg.body(), width.saturating_sub(2))
-                .into_iter()
-                .enumerate()
-            {
-                let marker = if i == 0 { theme::TOOL_MARK } else { " " };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{marker} "), Style::default().fg(theme::p().faint)),
-                    Span::styled(wrapped, role_style(Role::Tool)),
-                ]));
-            }
-            continue;
-        }
-        // An assistant turn that was nothing but tool calls has no prose to
-        // show; the calls speak for themselves on the lines that follow.
-        if msg.role == Role::Assistant
-            && !msg.tool_calls.is_empty()
-            && msg.content.trim().is_empty()
+    // Tool activity is scaffolding, not conversation: one dim line each,
+    // no speaker label and no blank separator, so a run of six reads as a
+    // compact block rather than three screens of transcript. The full
+    // result still goes to the model -- it is just not drawn.
+    if msg.role == Role::Tool {
+        for (i, wrapped) in wrap(msg.body(), width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
         {
-            continue;
-        }
-
-        // A user turn keeps a marker -- it's the one place the human's own
-        // words appear verbatim, and a "> " quote prefix reads as "you typed
-        // this" without naming a speaker. The assistant's prose gets none:
-        // narration and tool activity share one continuous stream, the way
-        // Claude Code renders a turn, rather than a labelled reply to a
-        // labelled question. System/Error stay labelled -- they're status
-        // events, not a side of the conversation.
-        match msg.role {
-            Role::User => {
-                // Padded to the full width on purpose: a background only
-                // colours the cells a span actually occupies, so without this
-                // the block would be ragged down its right edge, tracking the
-                // length of each wrapped line instead of forming one shape.
-                // The marker stays outside the block so the block starts at a
-                // consistent column on every line, wrapped or not.
-                let text_width = width.saturating_sub(2);
-                for (i, wrapped) in wrap(msg.body(), text_width).into_iter().enumerate() {
-                    let marker = if i == 0 { theme::USER_MARK } else { " " };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{marker} "), role_style(Role::User)),
-                        Span::styled(
-                            format!("{wrapped:<text_width$}"),
-                            theme::user_turn(),
-                        ),
-                    ]));
-                }
-            }
-            Role::Assistant => {
-                for wrapped in wrap(msg.body(), width) {
-                    lines.push(Line::from(Span::styled(wrapped, theme::text())));
-                }
-            }
-            Role::Error => {
-                // Classified rather than uniformly red: "you have used today's
-                // allowance" and "the endpoint is unreachable" are different
-                // situations, and a wall of identical red trains people to stop
-                // reading the one that mattered.
-                let kind = crate::notice::classify(msg.body());
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{} ", kind.icon()), kind.style()),
-                    Span::styled(kind.headline(), kind.style()),
-                ]));
-                for wrapped in wrap(msg.body(), width.saturating_sub(2).max(1)) {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(wrapped, theme::text()),
-                    ]));
-                }
-                if let Some(hint) = kind.hint() {
-                    for wrapped in wrap(hint, width.saturating_sub(4).max(1)) {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled("→ ", Style::default().fg(kind.color())),
-                            Span::styled(wrapped, theme::faint()),
-                        ]));
-                    }
-                }
-            }
-            Role::System => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{}: ", msg.role.label()),
-                    role_style(msg.role),
-                )]));
-                for wrapped in wrap(msg.body(), width) {
-                    lines.push(Line::from(Span::styled(wrapped, theme::text())));
-                }
-            }
-            Role::Tool => unreachable!("handled above"),
-        }
-        lines.push(Line::from(""));
-    }
-
-    if app.state == AppState::ExecutingTools {
-        for call in &app.running_tools {
-            let label = crate::tools::describe_action(call)
-                .map(|a| a.label())
-                .unwrap_or_else(|| call.function.name.clone());
+            let marker = if i == 0 { theme::TOOL_MARK } else { " " };
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{} ", theme::TOOL_MARK),
-                    Style::default().fg(theme::p().faint),
-                ),
-                Span::styled(label, role_style(Role::Tool)),
+                Span::styled(format!("{marker} "), Style::default().fg(theme::p().faint)),
+                Span::styled(wrapped, role_style(Role::Tool)),
             ]));
         }
+        // Tool lines get no trailing blank: a run of six should read as one
+        // compact block, not six separated ones.
+        return lines;
+    }
+    // An assistant turn that was nothing but tool calls has no prose to
+    // show; the calls speak for themselves on the lines that follow.
+    if msg.role == Role::Assistant
+        && !msg.tool_calls.is_empty()
+        && msg.content.trim().is_empty()
+    {
+        return Vec::new();
     }
 
-    if app.state == AppState::Streaming && !app.streaming_response.is_empty() {
-        for wrapped in wrap(&app.streaming_response, width) {
-            lines.push(Line::from(Span::styled(wrapped, theme::text())));
+    // A user turn keeps a marker -- it's the one place the human's own
+    // words appear verbatim, and a "> " quote prefix reads as "you typed
+    // this" without naming a speaker. The assistant's prose gets none:
+    // narration and tool activity share one continuous stream, the way
+    // Claude Code renders a turn, rather than a labelled reply to a
+    // labelled question. System/Error stay labelled -- they're status
+    // events, not a side of the conversation.
+    match msg.role {
+        Role::User => {
+            // Padded to the full width on purpose: a background only
+            // colours the cells a span actually occupies, so without this
+            // the block would be ragged down its right edge, tracking the
+            // length of each wrapped line instead of forming one shape.
+            // The marker stays outside the block so the block starts at a
+            // consistent column on every line, wrapped or not.
+            let text_width = width.saturating_sub(2);
+            for (i, wrapped) in wrap(msg.body(), text_width).into_iter().enumerate() {
+                let marker = if i == 0 { theme::USER_MARK } else { " " };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} "), role_style(Role::User)),
+                    Span::styled(
+                        format!("{wrapped:<text_width$}"),
+                        theme::user_turn(),
+                    ),
+                ]));
+            }
         }
-    }
-
-    // The live status sits at the end of the transcript rather than in the
-    // footer, so the thing you are waiting on appears where you are already
-    // looking -- directly above the prompt, in the flow of the turn.
-    if let Some(status) = activity_line(app) {
-        if app.state == AppState::Streaming && !app.streaming_response.is_empty() {
-            lines.push(Line::from(""));
+        Role::Assistant => {
+            for wrapped in wrap(msg.body(), width) {
+                lines.push(Line::from(Span::styled(wrapped, theme::text())));
+            }
         }
-        lines.push(status);
+        Role::Error => {
+            // Classified rather than uniformly red: "you have used today's
+            // allowance" and "the endpoint is unreachable" are different
+            // situations, and a wall of identical red trains people to stop
+            // reading the one that mattered.
+            let kind = crate::notice::classify(msg.body());
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", kind.icon()), kind.style()),
+                Span::styled(kind.headline(), kind.style()),
+            ]));
+            for wrapped in wrap(msg.body(), width.saturating_sub(2).max(1)) {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(wrapped, theme::text()),
+                ]));
+            }
+            if let Some(hint) = kind.hint() {
+                for wrapped in wrap(hint, width.saturating_sub(4).max(1)) {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("→ ", Style::default().fg(kind.color())),
+                        Span::styled(wrapped, theme::faint()),
+                    ]));
+                }
+            }
+        }
+        Role::System => {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{}: ", msg.role.label()),
+                role_style(msg.role),
+            )]));
+            for wrapped in wrap(msg.body(), width) {
+                lines.push(Line::from(Span::styled(wrapped, theme::text())));
+            }
+        }
+        Role::Tool => unreachable!("handled above"),
     }
     lines.push(Line::from(""));
 
-    // Clamp the scroll offset to the content, and stick to the bottom while the
-    // user has not scrolled away. No border any more, so the whole area is
-    // viewport -- an off-by-two here silently hides the newest two lines.
-    let viewport = area.height as usize;
-    let max_scroll = lines.len().saturating_sub(viewport) as u16;
-    if app.follow_tail {
-        app.scroll = max_scroll;
-    } else {
-        app.scroll = app.scroll.min(max_scroll);
-        if app.scroll == max_scroll {
-            app.follow_tail = true;
+    lines.push(Line::from(""));
+    lines
+}
+
+/// The part of the transcript that is still moving: the welcome panel before
+/// anything has been said, then whatever the current turn has produced so far.
+///
+/// Anything finished has already been printed above the viewport, so drawing it
+/// here too would show it twice.
+fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
+    const GUTTER: u16 = 2;
+    if area.height == 0 {
+        return;
+    }
+    let width = area.width.saturating_sub(GUTTER + 1).max(1) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    {
+        // Messages the flush loop has not taken yet -- during a turn that is
+        // everything it produced, since flushing waits for the turn to end.
+        for msg in app.messages.iter().skip(app.flushed) {
+            lines.extend(message_lines(msg, width));
+        }
+        if app.state == AppState::ExecutingTools {
+            for call in &app.running_tools {
+                let label = crate::tools::describe_action(call)
+                    .map(|a| a.label())
+                    .unwrap_or_else(|| call.function.name.clone());
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", theme::TOOL_MARK),
+                        Style::default().fg(theme::p().faint),
+                    ),
+                    Span::styled(label, role_style(Role::Tool)),
+                ]));
+            }
+        }
+        if app.state == AppState::Streaming {
+            // Only the tail: everything before `stream_printed` is already
+            // above the viewport, in the terminal's scrollback.
+            let unprinted = app
+                .streaming_response
+                .get(app.stream_printed..)
+                .unwrap_or_default();
+            if !unprinted.is_empty() {
+                lines.extend(wrapped_lines(unprinted, width));
+            }
+        }
+        if let Some(status) = activity_line(app) {
+            lines.push(status);
         }
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().padding(Padding::new(GUTTER as u16, 1, 0, 0)))
-        .scroll((app.scroll, 0));
+    // Only the tail fits, and the tail is the part that is still arriving --
+    // the rest is a moment away from being printed above anyway.
+    let height = area.height as usize;
+    let skip = lines.len().saturating_sub(height);
+    let shown: Vec<Line> = lines.into_iter().skip(skip).collect();
 
-    f.render_widget(paragraph, area);
-
-    // A quiet marker that there is more above, since without a border there is
-    // no title bar left to say so.
-    if app.scroll < max_scroll && area.height > 0 {
-        let more = Line::from(Span::styled(" ↓ more ", theme::faint()));
-        let hint_area = Rect {
-            x: area.x,
-            y: area.bottom().saturating_sub(1),
-            width: area.width,
-            height: 1,
-        };
-        f.render_widget(Paragraph::new(more).alignment(Alignment::Right), hint_area);
-    }
+    f.render_widget(
+        Paragraph::new(shown)
+            .block(Block::default().padding(Padding::new(GUTTER, 1, 0, 0))),
+        area,
+    );
 }
+
 
 /// The spinner line: what the app is doing, how long it has been doing it, and
 /// how to stop it. `None` when nothing is running.
@@ -384,7 +346,7 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
 /// aligned list. One glance should answer the three questions someone actually
 /// has on launch -- which model, where do commands run, what do I type -- and
 /// then get out of the way, because the first prompt replaces all of it.
-fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+pub fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from("")];
 
     // Beside the mascot: the wordmark, what this is, and who is using it.
@@ -1301,7 +1263,6 @@ mod tests {
     use super::*;
     use crate::app::Message;
     use crate::llm::{FunctionCall, ToolCall};
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1337,6 +1298,22 @@ mod tests {
             matches.len()
         );
         matches[0].clone()
+    }
+
+    /// The welcome panel is printed into the terminal's scrollback rather than
+    /// drawn in the viewport, so these assert on the lines that get printed --
+    /// which is exactly what `main`'s flush loop hands to `insert_before`.
+    fn welcome_text(app: &App, width: usize) -> String {
+        welcome_lines(app, width)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn rendered_text(app: &mut App, w: u16, h: u16) -> String {
@@ -1525,7 +1502,7 @@ mod tests {
         }
     }
 
-    /// The welcome screen answers the three launch questions -- which model,
+    /// The welcome panel answers the three launch questions -- which model,
     /// where do commands run, what do I type -- in one glance.
     #[test]
     fn the_welcome_screen_shows_the_identity_the_mascot_and_the_tips() {
@@ -1536,27 +1513,16 @@ mod tests {
         let mut app = App::new(cfg);
         app.workspace_status = "/srv/project".to_string();
 
-        // Tall enough for the whole screen: on a short terminal the tips fall
-        // below the fold, which is deliberate -- they are the least important
-        // thing on it -- but it is not what this test is checking.
-        let rendered = rendered_text(&mut app, 100, 30);
+        let shown = welcome_text(&app, 96);
 
-        assert!(rendered.contains("Welcome back"), "{rendered}");
-        assert!(
-            rendered.contains(env!("CARGO_PKG_VERSION")),
-            "the version banner: {rendered}"
-        );
-        assert!(rendered.contains("deepseek-chat"), "{rendered}");
-        assert!(
-            rendered.contains("/srv/project"),
-            "where commands run: {rendered}"
-        );
-        assert!(rendered.contains("waits for your approval"), "{rendered}");
-        assert!(
-            rendered.contains(theme::MASCOT[2]),
-            "the mascot: {rendered}"
-        );
+        assert!(shown.contains("Welcome back"), "{shown}");
+        assert!(shown.contains(env!("CARGO_PKG_VERSION")), "{shown}");
+        assert!(shown.contains("deepseek-chat"), "{shown}");
+        assert!(shown.contains("/srv/project"), "{shown}");
+        assert!(shown.contains("waits for your approval"), "{shown}");
+        assert!(shown.contains(theme::MASCOT[2]), "{shown}");
     }
+
 
     /// It is a launch screen, not furniture: the first prompt must replace it
     /// with the transcript entirely.
@@ -1575,73 +1541,60 @@ mod tests {
 
     /// Beside the mascot there is only room for the wordmark on a wide
     /// terminal. Narrower than that the two collide, so the text stacks below
-    /// it instead of overlapping it -- and nothing is lost either way.
+    /// it instead of overlapping -- and nothing is lost either way.
     #[test]
     fn a_narrow_terminal_stacks_the_wordmark_below_the_mascot() {
         let mut app = App::new(crate::config::Config::default());
         app.workspace_status = "/srv".to_string();
 
-        let row_of = |app: &mut App, w: u16, needle: &str| -> usize {
-            let mut terminal = Terminal::new(TestBackend::new(w, 30)).unwrap();
-            terminal.draw(|f| render(f, app)).unwrap();
-            let buffer = terminal.backend().buffer().clone();
-            (0..30)
-                .find(|&y| {
-                    (0..w)
-                        .map(|x| buffer.get(x, y).symbol())
-                        .collect::<String>()
-                        .contains(needle)
-                })
-                .unwrap_or_else(|| panic!("{needle:?} not found at width {w}")) as usize
+        let row_of = |width: usize, needle: &str| -> usize {
+            welcome_text(&app, width)
+                .lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} not found at width {width}"))
         };
 
         // Wide: the wordmark shares its row with the mascot's first line.
-        assert_eq!(
-            row_of(&mut app, 100, "tuisample-code"),
-            row_of(&mut app, 100, theme::MASCOT[0])
-        );
+        assert_eq!(row_of(96, "tuisample-code"), row_of(96, theme::MASCOT[0]));
         // Narrow: it has moved below the mascot's last line.
         assert!(
-            row_of(&mut app, 46, "tuisample-code") > row_of(&mut app, 46, theme::MASCOT[4]),
+            row_of(42, "tuisample-code") > row_of(42, theme::MASCOT[4]),
             "the wordmark should stack under the mascot on a narrow terminal"
         );
     }
 
+
     /// An unconfigured setup has to say so on the launch screen, not fail on
-    /// the first prompt. 30 rows, not 22: with four commands listed now
-    /// instead of two, 22 rows clips the warning below the fold on this
-    /// content -- still reachable by scrolling (see the dedicated test for
-    /// that), but this test is about the content existing at all, on a
-    /// terminal height realistic enough not to need scrolling for it.
+    /// the first prompt.
     #[test]
     fn a_missing_api_key_is_reported_on_the_welcome_screen() {
-        let mut app = App::new(crate::config::Config::default());
-        let rendered = rendered_text(&mut app, 100, 30);
+        let app = App::new(crate::config::Config::default());
+        let shown = welcome_text(&app, 96);
 
-        assert!(rendered.contains("Before you start"), "{rendered}");
-        assert!(rendered.contains("TUISAMPLE_API_KEY"), "{rendered}");
+        assert!(shown.contains("Before you start"), "{shown}");
+        assert!(shown.contains("TUISAMPLE_API_KEY"), "{shown}");
     }
 
-    /// Regression: the welcome screen used to render with no scroll applied
-    /// at all, so on a short terminal (or once enough content accumulated,
-    /// which is exactly what adding /new and /usage to the command list
-    /// did) the tail -- including the API-key warning -- was silently
-    /// clipped with no way to reach it. It must now be reachable via the
-    /// same PageDown that already scrolls the ordinary transcript.
+
+    /// Regression, reframed: the setup warning used to be clipped off the
+    /// bottom of a short welcome panel with no way to reach it. The panel is
+    /// now printed into the terminal's scrollback instead of drawn into a
+    /// viewport, so nothing about it can be clipped -- but it still has to
+    /// actually be in what gets printed, however much else is on it.
     #[test]
-    fn a_clipped_welcome_screen_warning_is_reachable_by_scrolling() {
+    fn the_setup_warning_is_always_part_of_the_printed_welcome() {
         let mut app = App::new(crate::config::Config::default());
-        let short = rendered_text(&mut app, 100, 22);
-        assert!(
-            !short.contains("TUISAMPLE_API_KEY"),
-            "this test's premise is that 22 rows clips the warning -- it didn't: {short}"
-        );
-        assert!(short.contains("more"), "a hint that there's more below should show: {short}");
+        app.workspace_status = "/srv/project".to_string();
 
-        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-        let scrolled = rendered_text(&mut app, 100, 22);
-        assert!(scrolled.contains("TUISAMPLE_API_KEY"), "{scrolled}");
+        for width in [42, 60, 96, 200] {
+            let shown = welcome_text(&app, width);
+            assert!(
+                shown.contains("TUISAMPLE_API_KEY"),
+                "the setup warning went missing at width {width}: {shown}"
+            );
+        }
     }
+
 
     /// The user's own turns sit on a raised block so scrolling back finds
     /// "where did I ask that" by shape rather than by reading. It has to be a
