@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>boxcode — a coding assistant that lives in your terminal</title>
+<meta name="description" content="boxcode is a terminal coding assistant. It reads your files, runs your commands, and asks before every one. Install with a single line.">
+<meta name="theme-color" content="#0B0A14" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#FBFAFE" media="(prefers-color-scheme: light)">
+
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://boxcode.sh/">
+<meta property="og:title" content="boxcode">
+<meta property="og:description" content="A coding assistant that lives in your terminal. Every command waits for your approval.">
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 13 13'%3E%3Crect width='13' height='13' rx='2.8' fill='%230B0A14'/%3E%3Cg fill='%23A78BFA' transform='translate(1.55 2.5) scale(0.76)'%3E%3Crect width='3' height='1.68'/%3E%3Crect x='10' width='3' height='1.68'/%3E%3Crect y='2' width='13' height='1.68'/%3E%3Crect y='4' width='2' height='1.68'/%3E%3Crect x='4' y='4' width='5' height='1.68'/%3E%3Crect x='11' y='4' width='2' height='1.68'/%3E%3Crect y='6' width='13' height='1.68'/%3E%3Crect x='2' y='8' width='3' height='1.68'/%3E%3Crect x='8' y='8' width='3' height='1.68'/%3E%3C/g%3E%3C/svg%3E">
+
+<script>document.documentElement.classList.add("js");</script>
+
+<style>
+/* ─────────────────────────────────────────────────────────────
+   boxcode.sh
+   Type   : monospace as the display face (the subject is a
+            terminal), system grotesque for prose.
+   Colour : the app's own identity, lifted from src/theme.rs --
+            violet and sky, on neutrals biased the same way. Violet
+            is the only accent; sky appears solely inside the
+            terminal, which is the one place the app uses it.
+   Layout : one narrow column, hairline rules, a lot of air.
+   ───────────────────────────────────────────────────────────── */
+
+:root {
+  /* light — the complete palette lives here (mirrors LIGHT in theme.rs) */
+  --bg:        #FBFAFE;
+  --bg-deep:   #F2EFFC;
+  --panel:     #FFFFFF;
+  --line:      #E2DEF2;
+  --line-soft: #EDEAF9;
+  --text:      #1E1B4B;
+  --muted:     #5C6A80;
+  --faint:     #64748B;
+  --accent:    #5B21B6;
+  --accent-lo: rgba(91, 33, 182, 0.09);
+  --accent-hi: rgba(91, 33, 182, 0.22);
+  --term-bg:   #14122B;
+  --term-text: #E8ECF4;
+  --term-mute: #808EA4;
+  --term-accent:#A78BFA;
+  --term-user: #7DC4E8;
+  --shadow:    0 1px 2px rgba(30,27,75,.06), 0 12px 40px -18px rgba(30,27,75,.30);
+
+  --ff-mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --ff-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  --shell: 78rem;   /* the page shell — uses the screen */
+  --measure: 38ch;  /* prose never gets wider than this, whatever the shell does */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:        #0B0A14;
+    --bg-deep:   #06050C;
+    --panel:     #14121F;
+    --line:      #262138;
+    --line-soft: #1C1829;
+    --text:      #E8ECF4;
+    --muted:     #8A94AA;
+    --faint:     #6E788C;
+    --accent:    #A78BFA;
+    --accent-lo: rgba(167, 139, 250, 0.10);
+    --accent-hi: rgba(167, 139, 250, 0.28);
+    --term-bg:   #0E0C1A;
+    --term-text: #E8ECF4;
+    --term-mute: #6E788C;
+    --term-accent:#A78BFA;
+    --term-user: #6FB6DC;
+    --shadow:    0 1px 2px rgba(0,0,0,.4), 0 20px 60px -24px rgba(0,0,0,.8);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg:        #0B0A14;
+  --bg-deep:   #06050C;
+  --panel:     #14121F;
+  --line:      #262138;
+  --line-soft: #1C1829;
+  --text:      #E8ECF4;
+  --muted:     #8A94AA;
+  --faint:     #6E788C;
+  --accent:    #A78BFA;
+  --accent-lo: rgba(167, 139, 250, 0.10);
+  --accent-hi: rgba(167, 139, 250, 0.28);
+  --term-bg:   #0E0C1A;
+  --term-text: #E8ECF4;
+  --term-mute: #6E788C;
+  --term-accent:#A78BFA;
+  --term-user: #6FB6DC;
+  --shadow:    0 1px 2px rgba(0,0,0,.4), 0 20px 60px -24px rgba(0,0,0,.8);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  -webkit-text-size-adjust: 100%;
+  scroll-behavior: smooth;
+  scroll-padding-top: 1.5rem;
+}
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--ff-sans);
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+/* the ambient wash that follows the pointer — barely there, but it
+   makes the ground feel lit rather than painted */
+.aura {
+  position: fixed;
+  inset: -20vmax;
+  pointer-events: none;
+  z-index: 0;
+  background: radial-gradient(
+    38vmax 38vmax at var(--mx, 50%) var(--my, 22%),
+    var(--accent-lo), transparent 68%);
+  opacity: 0;
+  transition: opacity 1.4s var(--ease);
+}
+.ready .aura { opacity: 1; }
+
+a { color: inherit; text-decoration: none; }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+.wrap {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: var(--shell);
+  margin-inline: auto;
+  padding-inline: clamp(1.25rem, 5vw, 4rem);
+}
+
+/* ── the mark ────────────────────────────────────────────────
+   The 13x5 block character from the app's welcome screen
+   (src/theme.rs), drawn the way a terminal actually renders it:
+   each row is its own bar with the line-gap between them, and
+   the ▟ ▙ ▜ ▛ glyphs are quadrant-cut corners, not full blocks.
+   Paths rather than glyphs so it holds its shape at any size and
+   its parts can move independently. */
+
+.mark-art {
+  width: auto;
+  flex: none;
+  fill: currentColor;
+  overflow: visible;
+}
+.mark-art .ears,
+.mark-art .legs > *,
+.mark-art .eyes {
+  transition: transform .6s var(--ease), opacity .45s var(--ease);
+}
+.mark-art .eyes { fill: var(--accent); opacity: 0; }
+
+/* it notices you: ears prick up, legs take half a step, eyes light */
+.mark:hover .mark-art .ears,
+.lockup:hover .mark-art .ears { transform: translateY(-.62px); }
+.mark:hover .mark-art .legs > :first-child,
+.lockup:hover .mark-art .legs > :first-child { transform: translate(-.55px, .28px); }
+.mark:hover .mark-art .legs > :last-child,
+.lockup:hover .mark-art .legs > :last-child { transform: translate(.55px, .28px); }
+.mark:hover .mark-art .eyes,
+.lockup:hover .mark-art .eyes { opacity: 1; }
+
+/* ── nav ─────────────────────────────────────────────────── */
+
+.nav {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-block: 1.75rem;
+}
+
+.mark {
+  display: inline-flex;
+  align-items: center;
+  gap: .55rem;
+  font-family: var(--ff-mono);
+  font-size: .95rem;
+  letter-spacing: -.02em;
+}
+.mark .mark-art { height: 1.5rem; }
+
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 1.4rem;
+  font-family: var(--ff-mono);
+  font-size: .78rem;
+  color: var(--muted);
+}
+
+/* the link underline grows from the left, then retreats to the right */
+.ln { position: relative; padding-block: 2px; transition: color .3s var(--ease); }
+.ln::after {
+  content: "";
+  position: absolute;
+  left: 0; bottom: 0;
+  height: 1px;
+  width: 100%;
+  background: currentColor;
+  transform: scaleX(0);
+  transform-origin: right;
+  transition: transform .4s var(--ease);
+}
+.ln:hover { color: var(--text); }
+.ln:hover::after { transform: scaleX(1); transform-origin: left; }
+
+/* ── hero ────────────────────────────────────────────────── */
+
+/* One column on a phone; on a real screen the terminal moves up beside
+   the pitch instead of leaving half the viewport empty. */
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: clamp(2.75rem, 6vw, 4.5rem);
+  padding-block: clamp(3rem, 10vh, 6.5rem) 0;
+}
+
+@media (min-width: 62rem) {
+  .hero { grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); }
+}
+
+.eyebrow {
+  font-family: var(--ff-mono);
+  font-size: .72rem;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin: 0 0 1.6rem;
+}
+
+/* mark and wordmark are one lockup, laid out the way the app draws them:
+   the character on the left, its name to the right */
+h1 {
+  display: flex;
+  align-items: center;
+  gap: .34em;
+  font-family: var(--ff-mono);
+  font-size: clamp(2.5rem, 8.5vw, 4.25rem);
+  font-weight: 500;
+  letter-spacing: -.055em;
+  line-height: .95;
+  margin: 0;
+}
+h1 .mark-art { height: 1.02em; }
+
+h1 .cursor {
+  display: inline-block;
+  width: .09em;
+  height: .78em;
+  margin-left: .1em;
+  vertical-align: baseline;
+  background: var(--accent);
+  animation: blink 1.15s steps(1, end) infinite;
+}
+@keyframes blink { 0%, 55% { opacity: 1 } 56%, 100% { opacity: 0 } }
+
+.lede {
+  max-width: var(--measure);
+  margin: 1.6rem 0 0;
+  font-size: 1.075rem;
+  color: var(--muted);
+  text-wrap: pretty;
+}
+.lede strong { color: var(--text); font-weight: 500; }
+
+/* ── install module ──────────────────────────────────────── */
+
+.install { margin-top: 2.75rem; }
+
+.tabs {
+  position: relative;
+  display: inline-flex;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  margin-bottom: .85rem;
+}
+
+.tabs .pill {
+  position: absolute;
+  top: 3px; left: 0;
+  height: calc(100% - 6px);
+  border-radius: 7px;
+  background: var(--bg-deep);
+  box-shadow: inset 0 0 0 1px var(--line-soft);
+  transition: transform .55s var(--ease), width .55s var(--ease);
+  pointer-events: none;
+}
+
+.tab {
+  position: relative;
+  z-index: 1;
+  appearance: none;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  padding: .42rem .85rem;
+  font-family: var(--ff-mono);
+  font-size: .76rem;
+  letter-spacing: .01em;
+  color: var(--faint);
+  border-radius: 7px;
+  transition: color .35s var(--ease);
+}
+.tab:hover { color: var(--muted); }
+.tab[aria-pressed="true"] { color: var(--text); }
+
+/* the command line itself — the one thing on the page that must be
+   unmistakably clickable */
+.cmd {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  transition: border-color .45s var(--ease), box-shadow .45s var(--ease), transform .45s var(--ease);
+}
+.cmd::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 30%, var(--accent-lo) 50%, transparent 70%);
+  transform: translateX(-120%);
+  pointer-events: none;
+}
+.cmd.flash::before { animation: sweep .85s var(--ease); }
+@keyframes sweep { to { transform: translateX(120%); } }
+
+.cmd:hover {
+  border-color: var(--accent-hi);
+  box-shadow: var(--shadow), 0 0 0 4px var(--accent-lo);
+  transform: translateY(-1px);
+}
+
+.cmd-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  padding: .95rem 1rem;
+  font-family: var(--ff-mono);
+  font-size: .875rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.cmd-text::-webkit-scrollbar { display: none; }
+
+.cmd-text .sigil {
+  color: var(--accent);
+  user-select: none;
+  flex: none;
+}
+.cmd-text code { white-space: nowrap; }
+
+.copy {
+  flex: none;
+  appearance: none;
+  cursor: pointer;
+  border: 0;
+  border-left: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  width: 3.25rem;
+  display: grid;
+  place-items: center;
+  transition: background .35s var(--ease), color .35s var(--ease);
+}
+.copy:hover { background: var(--accent-lo); color: var(--accent); }
+.copy svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.copy .tick { stroke-dasharray: 20; stroke-dashoffset: 20; }
+.copy.done { color: var(--accent); }
+.copy.done .box { opacity: 0; transform: scale(.85); }
+.copy.done .tick { stroke-dashoffset: 0; }
+.copy .box, .copy .tick { transition: opacity .3s var(--ease), transform .3s var(--ease), stroke-dashoffset .4s var(--ease) .05s; }
+.copy .stack { display: grid; }
+.copy .stack > * { grid-area: 1 / 1; }
+
+.note {
+  margin: .85rem 0 0;
+  font-family: var(--ff-mono);
+  font-size: .74rem;
+  line-height: 1.7;
+  color: var(--faint);
+}
+.note a { color: var(--muted); border-bottom: 1px solid var(--line); transition: color .3s var(--ease), border-color .3s var(--ease); }
+.note a:hover { color: var(--accent); border-color: var(--accent-hi); }
+
+/* ── terminal ────────────────────────────────────────────── */
+
+.term-shell {
+  border-radius: 14px;
+  background: var(--term-bg);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  transition: transform .7s var(--ease), box-shadow .7s var(--ease);
+}
+.term-shell:hover { transform: translateY(-3px); box-shadow: var(--shadow), 0 0 0 4px var(--accent-lo); }
+
+.term-bar {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  padding: .7rem .9rem;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+}
+.term-bar i {
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: rgba(255,255,255,.14);
+  transition: background .5s var(--ease);
+}
+.term-shell:hover .term-bar i:nth-child(1) { background: #E05C4B; }
+.term-shell:hover .term-bar i:nth-child(2) { background: #D9A63D; }
+.term-shell:hover .term-bar i:nth-child(3) { background: #4FAF6D; }
+.term-bar span {
+  margin-left: auto;
+  font-family: var(--ff-mono);
+  font-size: .68rem;
+  color: var(--term-mute);
+  letter-spacing: .06em;
+}
+
+.term-body {
+  margin: 0;
+  padding: 1.15rem 1.15rem 1.4rem;
+  font-family: var(--ff-mono);
+  font-size: .8rem;
+  line-height: 1.75;
+  color: var(--term-text);
+  overflow-x: auto;
+  white-space: pre;
+}
+.term-body .p  { color: var(--term-user); }   /* the app draws your own input in sky */
+.term-body .d  { color: var(--term-mute); }
+.term-body .k  { color: var(--term-accent); }
+.term-body .caret {
+  display: inline-block;
+  width: .5em; height: 1em;
+  vertical-align: text-bottom;
+  background: var(--term-accent);
+  opacity: 0;
+}
+.term-shell.typing .caret { opacity: 1; animation: blink 1.05s steps(1, end) infinite; }
+
+/* the transcript is visible by default and only hidden once JS is there
+   to print it back out — a dead script must never leave a blank window */
+.term-line { display: block; }
+.term-shell.typed .term-line { opacity: 1; }
+
+/* ── rows ────────────────────────────────────────────────── */
+
+.rows {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  margin-top: clamp(4rem, 12vh, 7rem);
+  border-top: 1px solid var(--line-soft);
+}
+
+.row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1.9rem minmax(0, 1fr);
+  gap: 0 .9rem;
+  align-content: start;
+  padding: 1.5rem .9rem;
+  border-bottom: 1px solid var(--line-soft);
+  transition: padding-left .5s var(--ease);
+}
+.row::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 -1px;
+  background: var(--accent-lo);
+  opacity: 0;
+  transition: opacity .45s var(--ease);
+  pointer-events: none;
+}
+.row:hover { padding-left: 1.5rem; }
+.row:hover::before { opacity: 1; }
+
+@media (min-width: 62rem) {
+  .rows {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .row {
+    border-bottom: 0;
+    border-left: 1px solid var(--line-soft);
+    padding-block: 2.4rem 2.6rem;
+  }
+  .row:first-child { border-left: 0; }
+}
+
+.row .rune {
+  font-family: var(--ff-mono);
+  font-size: .95rem;
+  line-height: 1.75;
+  color: var(--faint);
+  transition: color .45s var(--ease), transform .45s var(--ease);
+}
+.row:hover .rune { color: var(--accent); transform: translateX(2px); }
+
+.row h2 {
+  margin: 0;
+  font-family: var(--ff-mono);
+  font-size: .92rem;
+  font-weight: 500;
+  letter-spacing: -.01em;
+}
+.row p { margin: .3rem 0 0; font-size: .93rem; color: var(--muted); text-wrap: pretty; }
+.row code {
+  font-family: var(--ff-mono);
+  font-size: .86em;
+  color: var(--text);
+  background: var(--bg-deep);
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  padding: .05em .35em;
+}
+
+/* ── footer ──────────────────────────────────────────────── */
+
+.foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .35rem 1.4rem;
+  padding-block: 2.5rem 3.5rem;
+  font-family: var(--ff-mono);
+  font-size: .72rem;
+  color: var(--faint);
+}
+.foot .sep { margin-left: auto; }
+
+/* ── entrance ────────────────────────────────────────────── */
+
+.js .rise {
+  opacity: 0;
+  transform: translateY(14px);
+  filter: blur(6px);
+}
+.ready .rise {
+  opacity: 1;
+  transform: none;
+  filter: none;
+  transition:
+    opacity .9s var(--ease) var(--d, 0s),
+    transform .9s var(--ease) var(--d, 0s),
+    filter .9s var(--ease) var(--d, 0s);
+}
+
+.js .watch { opacity: 0; transform: translateY(18px); }
+.watch.in {
+  opacity: 1;
+  transform: none;
+  transition: opacity .8s var(--ease), transform .8s var(--ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+  .rise, .watch { opacity: 1; transform: none; filter: none; }
+  .aura { display: none; }
+}
+
+@media (max-width: 30rem) {
+  .nav-links { gap: 1rem; }
+  .nav-links .hide-sm { display: none; }
+  .cmd-text { font-size: .8rem; }
+}
+</style>
+</head>
+<body>
+
+<div class="aura" aria-hidden="true"></div>
+
+<header class="wrap nav" id="top">
+  <a class="mark" href="#top" aria-label="Back to top">
+    <svg class="mark-art" viewBox="0 0 13 9.68" aria-hidden="true" focusable="false">
+      <g class="ears"><path d="M.5 0H2.5V.84H3V1.68H0V.84H.5Z"/><path d="M10.5 0H12.5V.84H13V1.68H10V.84H10.5Z"/></g>
+      <path d="M0 2H13V2.84H12.5V3.68H.5V2.84H0Z"/>
+      <rect y="4" width="2" height="1.68"/><rect x="4" y="4" width="5" height="1.68"/><rect x="11" y="4" width="2" height="1.68"/>
+      <path d="M0 6H13V6.84H12.5V7.68H.5V6.84H0Z"/>
+      <g class="legs"><path d="M2 8H5V8.84H4.5V9.68H2.5V8.84H2Z"/><path d="M8 8H11V8.84H10.5V9.68H8.5V8.84H8Z"/></g>
+      <g class="eyes"><rect x="2" y="4" width="2" height="1.68"/><rect x="9" y="4" width="2" height="1.68"/></g>
+    </svg>
+    <span>boxcode</span>
+  </a>
+  <nav class="nav-links">
+    <a class="ln hide-sm" href="https://github.com/HolboxAI/boxcode#readme">Docs</a>
+    <a class="ln" href="https://github.com/HolboxAI/boxcode/releases">Releases</a>
+    <a class="ln" href="https://github.com/HolboxAI/boxcode">GitHub</a>
+  </nav>
+</header>
+
+<main>
+  <section class="wrap hero">
+   <div class="pitch">
+    <p class="eyebrow rise" style="--d:.05s">Rust · terminal · v1.0.0</p>
+
+    <h1 class="rise lockup" style="--d:.12s">
+      <svg class="mark-art" viewBox="0 0 13 9.68" aria-hidden="true" focusable="false">
+        <g class="ears"><path d="M.5 0H2.5V.84H3V1.68H0V.84H.5Z"/><path d="M10.5 0H12.5V.84H13V1.68H10V.84H10.5Z"/></g>
+        <path d="M0 2H13V2.84H12.5V3.68H.5V2.84H0Z"/>
+        <rect y="4" width="2" height="1.68"/><rect x="4" y="4" width="5" height="1.68"/><rect x="11" y="4" width="2" height="1.68"/>
+        <path d="M0 6H13V6.84H12.5V7.68H.5V6.84H0Z"/>
+        <g class="legs"><path d="M2 8H5V8.84H4.5V9.68H2.5V8.84H2Z"/><path d="M8 8H11V8.84H10.5V9.68H8.5V8.84H8Z"/></g>
+        <g class="eyes"><rect x="2" y="4" width="2" height="1.68"/><rect x="9" y="4" width="2" height="1.68"/></g>
+      </svg>
+      <span>boxcode<span class="cursor" aria-hidden="true"></span></span>
+    </h1>
+
+    <p class="lede rise" style="--d:.2s">
+      A coding assistant that lives in your terminal. It reads your files and runs
+      your commands — and <strong>waits for you before every one</strong>.
+    </p>
+
+    <div class="install rise" style="--d:.3s">
+      <div class="tabs" role="group" aria-label="Choose your platform">
+        <span class="pill" aria-hidden="true"></span>
+        <button class="tab" type="button" aria-pressed="true" data-os="unix">macOS · Linux</button>
+        <button class="tab" type="button" aria-pressed="false" data-os="win">Windows</button>
+      </div>
+
+      <div class="cmd" id="cmdline">
+        <div class="cmd-text">
+          <span class="sigil" aria-hidden="true" id="sigil">$</span>
+          <code id="cmd-code">curl -fsSL https://boxcode.sh/install.sh | bash</code>
+        </div>
+        <button class="copy" id="copy" aria-label="Copy install command">
+          <span class="stack" aria-hidden="true">
+            <svg viewBox="0 0 24 24" class="box"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>
+            <svg viewBox="0 0 24 24"><path class="tick" d="M5 13l4 4L19 7"/></svg>
+          </span>
+        </button>
+      </div>
+
+      <p class="note">
+        Downloads a checksum-verified prebuilt binary — no Rust toolchain needed.
+        Already installed? <a href="https://github.com/HolboxAI/boxcode#4-update">boxcode --upgrade</a>.
+      </p>
+    </div>
+   </div>
+
+    <div class="term-shell watch" id="term">
+      <div class="term-bar" aria-hidden="true"><i></i><i></i><i></i><span>boxcode</span></div>
+<pre class="term-body" id="term-body"><span class="term-line"><span class="p">❯</span> add a health check endpoint</span>
+<span class="term-line"> </span>
+<span class="term-line">I'll add it to the router and run the tests.</span>
+<span class="term-line"> </span>
+<span class="term-line"><span class="d">╭ Run this command? ───────────────────────╮</span></span>
+<span class="term-line"><span class="d">│</span>  <span class="k">$ cargo test</span>                            <span class="d">│</span></span>
+<span class="term-line"><span class="d">│</span>  in ~/project                            <span class="d">│</span></span>
+<span class="term-line"><span class="d">│</span>  <span class="k">y</span> run  ·  <span class="k">n</span> skip  ·  <span class="k">esc</span> skip           <span class="d">│</span></span>
+<span class="term-line"><span class="d">╰──────────────────────────────────────────╯</span></span><span class="caret" aria-hidden="true"></span></pre>
+    </div>
+  </section>
+
+  <section class="wrap rows">
+    <article class="row watch">
+      <span class="rune" aria-hidden="true">y/n</span>
+      <div>
+        <h2>You approve every write and every command</h2>
+        <p>Each one stops and waits. There is deliberately no "allow everything" key —
+        and genuinely catastrophic commands are refused outright, never offered for approval.</p>
+      </div>
+    </article>
+
+    <article class="row watch">
+      <span class="rune" aria-hidden="true">↯</span>
+      <div>
+        <h2>Any OpenAI-compatible endpoint</h2>
+        <p>Run <code>/provider</code> to pick one and paste a key, or point
+        <code>BOXCODE_ENDPOINT</code> at something self-hosted. Nothing is hardcoded to one vendor.</p>
+      </div>
+    </article>
+
+    <article class="row watch">
+      <span class="rune" aria-hidden="true">▚</span>
+      <div>
+        <h2>It's just your terminal</h2>
+        <p>The session prints as ordinary output, so your scrollback, selection and search
+        all still work — and it's still there after you quit.</p>
+      </div>
+    </article>
+  </section>
+</main>
+
+<footer class="wrap foot">
+  <span>MIT</span>
+  <a class="ln" href="https://github.com/HolboxAI/boxcode">HolboxAI/boxcode</a>
+  <span class="sep">boxcode.sh</span>
+</footer>
+
+<script>
+(function () {
+  var COMMANDS = {
+    unix: { sigil: "$",  text: "curl -fsSL https://boxcode.sh/install.sh | bash" },
+    win:  { sigil: ">",  text: "irm https://boxcode.sh/install.ps1 | iex" }
+  };
+
+  var tabs   = Array.prototype.slice.call(document.querySelectorAll(".tab"));
+  var pill   = document.querySelector(".pill");
+  var code   = document.getElementById("cmd-code");
+  var sigil  = document.getElementById("sigil");
+  var cmd    = document.getElementById("cmdline");
+  var copy   = document.getElementById("copy");
+
+  function movePill(el) {
+    pill.style.width = el.offsetWidth + "px";
+    pill.style.transform = "translateX(" + el.offsetLeft + "px)";
+  }
+
+  function select(os, animate) {
+    tabs.forEach(function (t) {
+      var on = t.dataset.os === os;
+      t.setAttribute("aria-pressed", on ? "true" : "false");
+      if (on) {
+        if (!animate) pill.style.transition = "none";
+        movePill(t);
+        if (!animate) requestAnimationFrame(function () { pill.style.transition = ""; });
+      }
+    });
+    code.textContent = COMMANDS[os].text;
+    sigil.textContent = COMMANDS[os].sigil;
+  }
+
+  tabs.forEach(function (t) {
+    t.addEventListener("click", function () { select(t.dataset.os, true); });
+  });
+
+  // Preselect the platform the visitor is actually on, so the command
+  // under the cursor is already the right one.
+  var isWin = /Win/i.test(navigator.platform || "") || /Windows/i.test(navigator.userAgent || "");
+  select(isWin ? "win" : "unix", false);
+  window.addEventListener("resize", function () {
+    var on = tabs.filter(function (t) { return t.getAttribute("aria-pressed") === "true"; })[0];
+    if (on) movePill(on);
+  });
+
+  var resetTimer;
+  function copied() {
+    copy.classList.add("done");
+    cmd.classList.remove("flash");
+    void cmd.offsetWidth;
+    cmd.classList.add("flash");
+    clearTimeout(resetTimer);
+    resetTimer = setTimeout(function () { copy.classList.remove("done"); }, 1800);
+  }
+
+  copy.addEventListener("click", function () {
+    var text = code.textContent;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(copied, fallback);
+    } else {
+      fallback();
+    }
+    function fallback() {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); copied(); } catch (e) {}
+      document.body.removeChild(ta);
+    }
+  });
+
+  // Ambient wash follows the pointer.
+  var raf = 0, mx = 50, my = 22;
+  window.addEventListener("pointermove", function (e) {
+    mx = (e.clientX / window.innerWidth) * 100;
+    my = (e.clientY / window.innerHeight) * 100;
+    if (raf) return;
+    raf = requestAnimationFrame(function () {
+      document.documentElement.style.setProperty("--mx", mx + "%");
+      document.documentElement.style.setProperty("--my", my + "%");
+      raf = 0;
+    });
+  }, { passive: true });
+
+  // Scroll reveals, and the terminal transcript printing itself out once.
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var term = document.getElementById("term");
+  var lines = Array.prototype.slice.call(term.querySelectorAll(".term-line"));
+  if (!reduced) lines.forEach(function (line) { line.style.opacity = "0"; });
+
+  function printTranscript() {
+    if (reduced) { term.classList.add("typed"); return; }
+    term.classList.add("typing");
+    lines.forEach(function (line, i) {
+      setTimeout(function () {
+        line.style.transition = "opacity .18s linear";
+        line.style.opacity = "1";
+        if (i === lines.length - 1) {
+          setTimeout(function () { term.classList.remove("typing"); }, 900);
+        }
+      }, 260 + i * 130);
+    });
+  }
+
+  if ("IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) return;
+        entry.target.classList.add("in");
+        if (entry.target === term) printTranscript();
+        io.unobserve(entry.target);
+      });
+    }, { rootMargin: "0px 0px -12% 0px", threshold: .18 });
+    document.querySelectorAll(".watch").forEach(function (el) { io.observe(el); });
+  } else {
+    document.querySelectorAll(".watch").forEach(function (el) { el.classList.add("in"); });
+    term.classList.add("typed");
+  }
+
+  requestAnimationFrame(function () { document.body.classList.add("ready"); });
+})();
+</script>
+</body>
+</html>

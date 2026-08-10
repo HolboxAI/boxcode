@@ -1,11 +1,15 @@
 # boxcode
 
-Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-compatible LLM endpoint.
+A coding assistant that lives in your terminal. It reads your files and runs
+your commands — and waits for you before every one. Connects to any
+OpenAI-compatible LLM endpoint.
+
+**[boxcode.sh](https://boxcode.sh)**
 
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v0.8.0
+  ▟█▙       ▟█▙    boxcode  v1.0.0
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -48,13 +52,19 @@ the prompt, where you're already looking:
 
 macOS / Linux:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.sh | bash
+curl -fsSL https://boxcode.sh/install.sh | bash
 ```
 
 Windows (PowerShell):
 ```powershell
-irm https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.ps1 | iex
+irm https://boxcode.sh/install.ps1 | iex
 ```
+
+`boxcode.sh` serves the very same `install.sh`/`install.ps1` that sit in this
+repo — it is published from `main` by `.github/workflows/pages.yml`, not
+maintained as a second copy. If you'd rather fetch from GitHub directly,
+`https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.sh` still
+works and always will.
 
 Downloads a prebuilt binary for your platform (macOS/Linux/Windows,
 x86_64/arm64) from the latest
@@ -391,6 +401,7 @@ Clean, modular structure for easy feature additions:
 - `src/telemetry.rs` — Anonymous install/daily-active pings, disabled by default
 - `src/dateutil.rs` — Calendar-date helpers shared by the two above
 - `telemetry-worker.js` — The Cloudflare Worker that `telemetry.rs`/`install.sh` ping and that serves the public view
+- `docs/index.html` — The [boxcode.sh](https://boxcode.sh) landing page, deployed with the installers by `.github/workflows/pages.yml`
 
 ## What's Next
 
