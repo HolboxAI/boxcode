@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-V" | "--version" => {
-                println!("tuisample-code {VERSION}");
+                println!("boxcode {VERSION}");
                 return Ok(());
             }
             "-h" | "--help" => {
@@ -402,11 +402,11 @@ async fn run_app<B: ratatui::backend::Backend>(
 
 fn print_help() {
     println!(
-        "tuisample-code {VERSION}
+        "boxcode {VERSION}
 Terminal UI for an OpenAI-compatible LLM endpoint.
 
 USAGE:
-    tuisample-code [FLAGS]
+    boxcode [FLAGS]
 
 FLAGS:
     -V, --version    Print version and exit
@@ -414,16 +414,16 @@ FLAGS:
     -u, --upgrade    Update to the latest release
     -f, --force      With --upgrade: reinstall even if already up to date
 
-CONFIG (environment overrides ~/.tuisample-code/config.toml):
-    TUISAMPLE_ENDPOINT    Base URL, e.g. https://llm.internal:8443
-    TUISAMPLE_MODEL       Model name
-    TUISAMPLE_API_KEY     Bearer token
+CONFIG (environment overrides ~/.boxcode/config.toml):
+    BOXCODE_ENDPOINT    Base URL, e.g. https://llm.internal:8443
+    BOXCODE_MODEL       Model name
+    BOXCODE_API_KEY     Bearer token
 
 TOOLS (read_file, write_file, run_command; writes and commands need your
        approval each time -- see the [tools] table in config.toml):
-    TUISAMPLE_WORKSPACE       Directory these operate in (default: cwd)
-    TUISAMPLE_TOOLS_ENABLED   Set to 0 to send no tool schema at all
-    TUISAMPLE_TOOLS_APPROVAL  Set to 0 to stop asking before each write/command.
+    BOXCODE_WORKSPACE       Directory these operate in (default: cwd)
+    BOXCODE_TOOLS_ENABLED   Set to 0 to send no tool schema at all
+    BOXCODE_TOOLS_APPROVAL  Set to 0 to stop asking before each write/command.
                               For scripted testing only -- it hands the model
                               unattended file and shell access.
                               See the [tools] table in config.toml for
@@ -431,7 +431,7 @@ TOOLS (read_file, write_file, run_command; writes and commands need your
                               max_output_bytes, max_steps.
 
 UPGRADE:
-    TUISAMPLE_UPGRADE_URL_BASE
+    BOXCODE_UPGRADE_URL_BASE
                           Fetch updates from a fork or internal mirror
                           instead of github.com
 
@@ -448,10 +448,10 @@ COMMANDS (type in the input box, press Enter):
 
 DAILY LIMITS (optional, off by default -- every limit is 0 = no limit, so this
               only counts until you set one. See [quota] in config.toml):
-    TUISAMPLE_QUOTA_ENABLED         Set to 0 to disable counting entirely
-    TUISAMPLE_MAX_REQUESTS_PER_DAY  Requests before prompts are refused
-    TUISAMPLE_MAX_TOKENS_PER_DAY    Prompt + completion tokens per UTC day
-    TUISAMPLE_MAX_USD_PER_DAY       Spend per UTC day; needs [quota.pricing]
+    BOXCODE_QUOTA_ENABLED         Set to 0 to disable counting entirely
+    BOXCODE_MAX_REQUESTS_PER_DAY  Requests before prompts are refused
+    BOXCODE_MAX_TOKENS_PER_DAY    Prompt + completion tokens per UTC day
+    BOXCODE_MAX_USD_PER_DAY       Spend per UTC day; needs [quota.pricing]
                                     entries for the models you use, or cost
                                     cannot be computed and reads as unpriced
 

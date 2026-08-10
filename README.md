@@ -1,11 +1,11 @@
-# tuisample-code
+# boxcode
 
 Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-compatible LLM endpoint.
 
 ```
  ◈
 
-  ▟█▙       ▟█▙    tuisample-code  v0.8.0
+  ▟█▙       ▟█▙    boxcode  v0.8.0
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -15,7 +15,7 @@ Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-
 
   model     deepseek-chat
   endpoint  https://api.deepseek.com
-  cwd       ~/Desktop/HolboxAI/tuisample-code
+  cwd       ~/Desktop/HolboxAI/boxcode
 
   /provider switch provider or endpoint
   /model    switch model
@@ -48,17 +48,17 @@ the prompt, where you're already looking:
 
 macOS / Linux:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HolboxAI/tuisample-code/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.sh | bash
 ```
 
 Windows (PowerShell):
 ```powershell
-irm https://raw.githubusercontent.com/HolboxAI/tuisample-code/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.ps1 | iex
 ```
 
 Downloads a prebuilt binary for your platform (macOS/Linux/Windows,
 x86_64/arm64) from the latest
-[release](https://github.com/HolboxAI/tuisample-code/releases) and verifies it
+[release](https://github.com/HolboxAI/boxcode/releases) and verifies it
 against a published checksum — no Rust toolchain needed, installed in
 seconds. Also installs Python's `ddgs` package if it's missing, since
 `web_search` needs it.
@@ -74,26 +74,26 @@ Rust yourself and run `cargo build --release`, or use WSL with the regular
 
 Or build from source yourself:
 ```bash
-git clone https://github.com/HolboxAI/tuisample-code
-cd tuisample-code
+git clone https://github.com/HolboxAI/boxcode
+cd boxcode
 cargo build --release
-./target/release/tuisample-code
+./target/release/boxcode
 ```
 
 ### 2. Configure
 
-Fastest way: launch `tuisample-code` and type `/provider` — pick a provider from the
+Fastest way: launch `boxcode` and type `/provider` — pick a provider from the
 list (arrow keys, Enter), then pick a model. If you already have that provider's
 conventional API key exported (e.g. `DEEPSEEK_API_KEY` for DeepSeek,
 `OPENAI_API_KEY` for OpenAI — pattern is `{PROVIDER}_API_KEY`), it's picked up
 automatically; otherwise you're prompted to paste or type it (input hidden). The
-choice is written to `~/.tuisample-code/config.toml` so it's remembered next launch.
+choice is written to `~/.boxcode/config.toml` so it's remembered next launch.
 Not on the list, or pointing at a self-hosted/internal endpoint? Pick
 **"Custom endpoint..."** at the bottom of the list instead — you'll be walked
 through endpoint, model, and API key manually, same as filling in the file by hand.
 
 Alternatively, skip the picker and set environment variables or write
-`~/.tuisample-code/config.toml` directly:
+`~/.boxcode/config.toml` directly:
 
 ```toml
 [llm]
@@ -104,21 +104,21 @@ api_key = "sk_company_xxx"
 
 Or use environment variables:
 ```bash
-export TUISAMPLE_ENDPOINT=https://llm.company.internal:8443
-export TUISAMPLE_MODEL=company-llm-70b-v1.2
-export TUISAMPLE_API_KEY=sk_company_xxx
+export BOXCODE_ENDPOINT=https://llm.company.internal:8443
+export BOXCODE_MODEL=company-llm-70b-v1.2
+export BOXCODE_API_KEY=sk_company_xxx
 ```
 
 ### 3. Run
 
 ```bash
-tuisample-code
+boxcode
 ```
 
 ### 4. Update
 
 ```bash
-tuisample-code --upgrade
+boxcode --upgrade
 ```
 
 Checks `main` for a newer version and, if there is one, reinstalls in place —
@@ -126,7 +126,7 @@ no need to dig out the curl command again. It removes stale copies from other
 directories on your `$PATH` and confirms the shell resolves to the new build.
 
 `main` can also carry changes that haven't been given a new version number yet.
-To rebuild from the latest source regardless, use `tuisample-code --upgrade
+To rebuild from the latest source regardless, use `boxcode --upgrade
 --force`.
 
 > Upgrading from 0.2.0 or earlier? Those builds predate this flag — run the
@@ -137,7 +137,7 @@ internal mirror serving the same `Cargo.toml` and `install.sh`/`install.ps1`
 (whichever your platform uses):
 
 ```bash
-export TUISAMPLE_UPGRADE_URL_BASE=https://git.company.internal/tuisample-code/raw/main
+export BOXCODE_UPGRADE_URL_BASE=https://git.company.internal/boxcode/raw/main
 ```
 
 ## Running commands, and reading/writing files
@@ -248,7 +248,7 @@ max_output_bytes = 65536  # ceiling on one command's output
 max_steps = 10            # command rounds per prompt before the model must answer
 ```
 
-Per-run: `TUISAMPLE_WORKSPACE=/path/to/project`, `TUISAMPLE_TOOLS_ENABLED=0`.
+Per-run: `BOXCODE_WORKSPACE=/path/to/project`, `BOXCODE_TOOLS_ENABLED=0`.
 
 > **`require_approval = false` hands the model an unattended shell** on your
 > machine. It exists for scripted testing. If you set it, the welcome screen
@@ -325,39 +325,39 @@ variables override values in `config.toml`.
   model picker for it.
 - **`/model`** — Re-picks just the model for whichever provider is currently
   configured, without going through `/provider` again. If no provider has been
-  set yet (e.g. you're only using `TUISAMPLE_*` env vars or a custom endpoint),
+  set yet (e.g. you're only using `BOXCODE_*` env vars or a custom endpoint),
   this shows an inline error telling you to run `/provider` first.
 - **`/new`** — Forgets the current conversation. The configured provider and
   model are untouched; only the message history and tool-step count reset.
-- **`/usage`** — Prints your token usage from `~/.tuisample-code/usage.jsonl`:
+- **`/usage`** — Prints your token usage from `~/.boxcode/usage.jsonl`:
   today, the last 7 days, and all time. This is local and per-install only —
   there is no login, so it is the only place this number exists; nothing here
   is ever sent anywhere (see "Anonymous usage pings" below for the one thing
   that is).
 
-`/provider` and `/model` write the result to `~/.tuisample-code/config.toml`
+`/provider` and `/model` write the result to `~/.boxcode/config.toml`
 and apply it immediately — no restart needed, even mid-session.
 
 ### Anonymous usage pings
 
 There is no login, so there is no way to attribute usage to a person — what
 this app can see instead is a random ID generated once per install
-(`~/.tuisample-code/device_id`), which labels a machine, not a person. Two
+(`~/.boxcode/device_id`), which labels a machine, not a person. Two
 things, and only these two things, ever leave your machine:
 
 - `install.sh`/`install.ps1` sends one `install` ping on a fresh install or an
   `--upgrade`.
 - The app itself sends one `active` ping per calendar day (UTC) it's actually
-  used, checked against `~/.tuisample-code/last_active` so a long session
+  used, checked against `~/.boxcode/last_active` so a long session
   doesn't send more than one.
 
 Each ping carries only `{anon_id, event, version, os, date}` — no prompts, no
 file paths, no command text, no conversation content. Both are silent,
 best-effort, and never block startup or fail an install: see `src/telemetry.rs`
 and the `ping_install`/`Send-InstallPing` functions in `install.sh`/`install.ps1`.
-`TUISAMPLE_TELEMETRY_URL=""` disables it on macOS/Linux; PowerShell cannot
+`BOXCODE_TELEMETRY_URL=""` disables it on macOS/Linux; PowerShell cannot
 represent an explicitly-blank environment variable (`$env:X = ''` deletes it
-outright), so use `TUISAMPLE_TELEMETRY_URL=off` on Windows instead.
+outright), so use `BOXCODE_TELEMETRY_URL=off` on Windows instead.
 
 **The aggregate counts are public**: [tui-telemetry.dhruvm307.workers.dev](https://tui-telemetry.dhruvm307.workers.dev)
 shows total installs, distinct anonymous devices seen, and daily-active counts,
@@ -365,7 +365,7 @@ live. That page is also the entire ingestion endpoint (see
 `telemetry-worker.js` in the repo root) — it's as publicly *writable* as it is
 readable, so treat the numbers as self-reported, not verified.
 
-Set `TUISAMPLE_TELEMETRY_URL=""` (explicitly blank, not just unset) before
+Set `BOXCODE_TELEMETRY_URL=""` (explicitly blank, not just unset) before
 installing or running the binary to opt out entirely.
 
 This is entirely separate from `/usage` above, which never leaves your
@@ -406,7 +406,7 @@ Clean, modular structure for easy feature additions:
 cargo build --release
 
 # Run with debug logging
-RUST_LOG=debug tuisample-code
+RUST_LOG=debug boxcode
 
 # Test (if you add tests)
 cargo test

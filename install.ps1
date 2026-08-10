@@ -1,9 +1,9 @@
-# tuisample-code installer (Windows PowerShell)
+# boxcode installer (Windows PowerShell)
 #
 # The PowerShell counterpart to install.sh: `curl | bash` doesn't work in
 # native PowerShell (no bash, and `|` pipes objects, not text), so Windows
 # users need their own entry point --
-#   irm https://raw.githubusercontent.com/HolboxAI/tuisample-code/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.ps1 | iex
 # is that platform's equivalent one-liner (Invoke-RestMethod | Invoke-Expression).
 #
 # Unlike install.sh, there is no source-build fallback here: building Rust on
@@ -22,12 +22,12 @@ $ErrorActionPreference = 'Stop'
 
 # Where release assets and checksums are published. Overridable so a fork or
 # an internal mirror can serve its own builds -- mirrors install.sh's own
-# TUISAMPLE_RELEASE_API_BASE.
+# BOXCODE_RELEASE_API_BASE.
 function Get-ReleaseApiBase {
-    if ($env:TUISAMPLE_RELEASE_API_BASE) {
-        return $env:TUISAMPLE_RELEASE_API_BASE
+    if ($env:BOXCODE_RELEASE_API_BASE) {
+        return $env:BOXCODE_RELEASE_API_BASE
     }
-    return 'https://api.github.com/repos/HolboxAI/tuisample-code'
+    return 'https://api.github.com/repos/HolboxAI/boxcode'
 }
 
 # Only `x86_64` is actually built by release.yml today; this still reports
@@ -119,16 +119,16 @@ $PythonStandaloneVersion = '3.12.13'
 function Get-PythonStandaloneBaseUrl {
     # A function re-evaluated on every call, not a variable fixed once at
     # dot-source time -- same reason Get-ReleaseApiBase above is one: a
-    # test (or a fork) that sets $env:TUISAMPLE_PYTHON_STANDALONE_URL after
+    # test (or a fork) that sets $env:BOXCODE_PYTHON_STANDALONE_URL after
     # this file has already been dot-sourced needs that to actually take
     # effect.
-    if ($env:TUISAMPLE_PYTHON_STANDALONE_URL) {
-        return $env:TUISAMPLE_PYTHON_STANDALONE_URL
+    if ($env:BOXCODE_PYTHON_STANDALONE_URL) {
+        return $env:BOXCODE_PYTHON_STANDALONE_URL
     }
     return 'https://github.com/astral-sh/python-build-standalone/releases/download'
 }
 
-# Only x86_64 -- release.yml does not build a Windows arm64 tuisample-code
+# Only x86_64 -- release.yml does not build a Windows arm64 boxcode
 # either, so there is no reason to promise a Windows arm64 Python here.
 function Get-PythonStandaloneTarget {
     param([string] $Arch)
@@ -137,7 +137,7 @@ function Get-PythonStandaloneTarget {
 }
 
 function Get-EmbeddedPythonDir {
-    Join-Path $env:USERPROFILE '.tuisample-code\python'
+    Join-Path $env:USERPROFILE '.boxcode\python'
 }
 
 # Downloads and extracts a self-contained Python for machines with no system
@@ -157,7 +157,7 @@ function Install-EmbeddedPython {
     }
 
     $url = "$(Get-PythonStandaloneBaseUrl)/$PythonStandaloneRelease/cpython-$PythonStandaloneVersion+$PythonStandaloneRelease-$target-install_only_stripped.tar.gz"
-    $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-python-$PID"
+    $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-python-$PID"
     Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
     $archive = Join-Path $tmpDir 'python.tar.gz'
@@ -246,7 +246,7 @@ function Install-Ddgs {
 # Anonymous "an install happened" ping -- the PowerShell counterpart to
 # install.sh's ping_install and telemetry.rs's own `active` ping, which this
 # binary hasn't run yet to send. A random id in
-# $env:USERPROFILE\.tuisample-code\device_id labels this machine, not the
+# $env:USERPROFILE\.boxcode\device_id labels this machine, not the
 # person running it, and is the same file/format telemetry.rs itself reads
 # and reuses later rather than generating a second, conflicting id.
 #
@@ -276,7 +276,7 @@ function Send-InstallPing {
     # afterwards), so by the time this function runs, "explicitly blank" and
     # "never touched" are already indistinguishable. `off` is therefore the
     # one reliable way to disable sending on this platform.
-    $override = $env:TUISAMPLE_TELEMETRY_URL
+    $override = $env:BOXCODE_TELEMETRY_URL
     if ($override -and $override.Trim().ToLowerInvariant() -eq 'off') {
         return
     }
@@ -286,7 +286,7 @@ function Send-InstallPing {
     }
 
     try {
-        $stateDir = Join-Path $env:USERPROFILE '.tuisample-code'
+        $stateDir = Join-Path $env:USERPROFILE '.boxcode'
         New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
         $idFile = Join-Path $stateDir 'device_id'
         if (-not (Test-Path $idFile) -or -not (Get-Content $idFile -Raw -ErrorAction SilentlyContinue)) {
@@ -312,16 +312,16 @@ function Send-InstallPing {
 }
 
 function Main {
-    Write-Host 'Installing tuisample-code...'
+    Write-Host 'Installing boxcode...'
     Write-Host ''
 
     $arch = Get-Arch
-    $assetName = "tuisample-code-windows-$arch.exe"
-    $installDir = Join-Path $env:LOCALAPPDATA 'Programs\tuisample-code'
-    $installedAt = Join-Path $installDir 'tuisample-code.exe'
+    $assetName = "boxcode-windows-$arch.exe"
+    $installDir = Join-Path $env:LOCALAPPDATA 'Programs\boxcode'
+    $installedAt = Join-Path $installDir 'boxcode.exe'
 
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-    $tempDest = Join-Path $installDir 'tuisample-code.exe.new'
+    $tempDest = Join-Path $installDir 'boxcode.exe.new'
 
     Write-Host "Looking for a prebuilt $arch binary..."
     try {
@@ -338,7 +338,7 @@ function Main {
         throw 'no prebuilt binary available'
     }
 
-    # Move-Item -Force replaces the destination even while tuisample-code.exe
+    # Move-Item -Force replaces the destination even while boxcode.exe
     # (the very binary being replaced, under --upgrade) is running -- Windows
     # allows renaming an in-use executable's directory entry even though it
     # blocks overwriting its content directly, the same reason install.sh's
@@ -357,10 +357,10 @@ function Main {
         Write-Host "Added $installDir to your PATH (open a new shell for it to take effect)."
     }
 
-    $resolved = Get-Command tuisample-code -ErrorAction SilentlyContinue | Select-Object -First 1
+    $resolved = Get-Command boxcode -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($resolved -and $resolved.Source -ne $installedAt) {
         Write-Host ''
-        Write-Host "WARNING: 'tuisample-code' currently resolves to $($resolved.Source),"
+        Write-Host "WARNING: 'boxcode' currently resolves to $($resolved.Source),"
         Write-Host "  but this build was installed to $installedAt."
         Write-Host '  Remove the other copy, or fix your PATH order, or you will keep'
         Write-Host '  running the old version.'
@@ -376,14 +376,14 @@ function Main {
     Write-Host ''
     Write-Host 'Next steps:'
     Write-Host '1. Configure your LLM endpoint:'
-    Write-Host '   $env:TUISAMPLE_ENDPOINT = "https://api.openai.com"'
-    Write-Host '   $env:TUISAMPLE_MODEL = "gpt-4"'
-    Write-Host '   $env:TUISAMPLE_API_KEY = "sk-..."'
+    Write-Host '   $env:BOXCODE_ENDPOINT = "https://api.openai.com"'
+    Write-Host '   $env:BOXCODE_MODEL = "gpt-4"'
+    Write-Host '   $env:BOXCODE_API_KEY = "sk-..."'
     Write-Host ''
     Write-Host '2. Open a new shell (so the updated PATH takes effect), then run:'
-    Write-Host '   tuisample-code'
+    Write-Host '   boxcode'
     Write-Host ''
-    Write-Host 'For more info: https://github.com/HolboxAI/tuisample-code'
+    Write-Host 'For more info: https://github.com/HolboxAI/boxcode'
 }
 
 if ($MyInvocation.InvocationName -ne '.') {

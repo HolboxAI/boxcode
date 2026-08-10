@@ -69,20 +69,20 @@ if ($null -ne $savedArchitew6432) { $env:PROCESSOR_ARCHITEW6432 = $savedArchitew
 $fixtureRelease = [PSCustomObject]@{
     tag_name = 'v0.9.0'
     assets   = @(
-        [PSCustomObject]@{ name = 'tuisample-code-linux-x86_64'; browser_download_url = 'https://example.com/linux-x86_64' }
-        [PSCustomObject]@{ name = 'tuisample-code-windows-x86_64.exe'; browser_download_url = 'https://example.com/windows-x86_64.exe' }
+        [PSCustomObject]@{ name = 'boxcode-linux-x86_64'; browser_download_url = 'https://example.com/linux-x86_64' }
+        [PSCustomObject]@{ name = 'boxcode-windows-x86_64.exe'; browser_download_url = 'https://example.com/windows-x86_64.exe' }
         [PSCustomObject]@{ name = 'SHA256SUMS.txt'; browser_download_url = 'https://example.com/sums' }
     )
 }
 
-$url = Get-AssetDownloadUrl -Release $fixtureRelease -AssetName 'tuisample-code-windows-x86_64.exe'
+$url = Get-AssetDownloadUrl -Release $fixtureRelease -AssetName 'boxcode-windows-x86_64.exe'
 if ($url -eq 'https://example.com/windows-x86_64.exe') {
     Test-Pass 'Get-AssetDownloadUrl finds the right asset URL'
 } else {
     Test-Fail "Get-AssetDownloadUrl returned wrong URL: $url"
 }
 
-$missing = Get-AssetDownloadUrl -Release $fixtureRelease -AssetName 'tuisample-code-windows-arm64.exe'
+$missing = Get-AssetDownloadUrl -Release $fixtureRelease -AssetName 'boxcode-windows-arm64.exe'
 if ($null -eq $missing) {
     Test-Pass 'Get-AssetDownloadUrl returns $null for an asset that is not in the release'
 } else {
@@ -93,12 +93,12 @@ if ($null -eq $missing) {
 # A bad API base must fail fast and leave nothing behind, the exact shape of
 # "no release has been published yet" that Main must recover from with a
 # clear error rather than a stack trace or a half-written file.
-$env:TUISAMPLE_RELEASE_API_BASE = 'http://127.0.0.1:1'
-$badDest = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-test-should-not-exist-$PID.exe"
+$env:BOXCODE_RELEASE_API_BASE = 'http://127.0.0.1:1'
+$badDest = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-test-should-not-exist-$PID.exe"
 Remove-Item -Force $badDest -ErrorAction SilentlyContinue
 $start = Get-Date
 try {
-    Get-PrebuiltBinary -AssetName 'tuisample-code-linux-x86_64' -Dest $badDest
+    Get-PrebuiltBinary -AssetName 'boxcode-linux-x86_64' -Dest $badDest
     Test-Fail 'Get-PrebuiltBinary should have thrown when the API is unreachable'
 } catch {
     Test-Pass 'Get-PrebuiltBinary throws when the API is unreachable'
@@ -114,15 +114,15 @@ if ($elapsed -lt 5) {
 } else {
     Test-Fail "a refused connection should fail fast, took ${elapsed}s"
 }
-Remove-Item Env:\TUISAMPLE_RELEASE_API_BASE -ErrorAction SilentlyContinue
+Remove-Item Env:\BOXCODE_RELEASE_API_BASE -ErrorAction SilentlyContinue
 
 # --- Get-PrebuiltBinary: the real thing -----------------------------------------
 # Against the actual published release, same convention as tools.rs's and
 # install.sh's own "real thing, skipped if unreachable" tests.
-$realDest = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-test-real-$PID.exe"
+$realDest = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-test-real-$PID.exe"
 Remove-Item -Force $realDest -ErrorAction SilentlyContinue
 try {
-    Get-PrebuiltBinary -AssetName 'tuisample-code-windows-x86_64.exe' -Dest $realDest
+    Get-PrebuiltBinary -AssetName 'boxcode-windows-x86_64.exe' -Dest $realDest
     if ((Get-Item $realDest).Length -gt 0) {
         Test-Pass 'Get-PrebuiltBinary downloads and checksum-verifies the real released binary'
     } else {
@@ -134,13 +134,13 @@ try {
 Remove-Item -Force $realDest -ErrorAction SilentlyContinue
 
 # --- Send-InstallPing -----------------------------------------------------------
-$fakeHome = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-test-home-$PID"
+$fakeHome = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-test-home-$PID"
 Remove-Item -Recurse -Force $fakeHome -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
 $env:USERPROFILE = $fakeHome
-$idFile = Join-Path $fakeHome '.tuisample-code\device_id'
+$idFile = Join-Path $fakeHome '.boxcode\device_id'
 
-$env:TUISAMPLE_TELEMETRY_URL = 'off'
+$env:BOXCODE_TELEMETRY_URL = 'off'
 Send-InstallPing -Version '9.9.9'
 if (Test-Path $idFile) {
     Test-Fail 'the "off" sentinel should disable sending'
@@ -148,7 +148,7 @@ if (Test-Path $idFile) {
     Test-Pass 'the "off" sentinel disables sending'
 }
 
-$env:TUISAMPLE_TELEMETRY_URL = 'http://127.0.0.1:1/nowhere'
+$env:BOXCODE_TELEMETRY_URL = 'http://127.0.0.1:1/nowhere'
 $start = Get-Date
 Send-InstallPing -Version ''
 $elapsed = ((Get-Date) - $start).TotalSeconds
@@ -168,7 +168,7 @@ if ($firstId -eq $secondId) {
 }
 
 Remove-Item -Recurse -Force $fakeHome -ErrorAction SilentlyContinue
-Remove-Item Env:\TUISAMPLE_TELEMETRY_URL -ErrorAction SilentlyContinue
+Remove-Item Env:\BOXCODE_TELEMETRY_URL -ErrorAction SilentlyContinue
 
 # --- Get-PythonStandaloneTarget -------------------------------------------------
 # Deterministic and pure -- no reason for this one to depend on the network
@@ -187,13 +187,13 @@ if ($null -eq (Get-PythonStandaloneTarget -Arch 'arm64')) {
 # --- Install-EmbeddedPython: failure path ---------------------------------------
 # A bad base URL must fail fast and leave nothing behind, the same
 # "no release reachable" shape Get-PrebuiltBinary's own failure test covers.
-$badPythonHome = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-badpython-$PID"
+$badPythonHome = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-badpython-$PID"
 Remove-Item -Recurse -Force $badPythonHome -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $badPythonHome | Out-Null
 $env:USERPROFILE = $badPythonHome
 $env:PROCESSOR_ARCHITECTURE = 'AMD64'
 Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
-$env:TUISAMPLE_PYTHON_STANDALONE_URL = 'http://127.0.0.1:1'
+$env:BOXCODE_PYTHON_STANDALONE_URL = 'http://127.0.0.1:1'
 $start = Get-Date
 if (Install-EmbeddedPython) {
     Test-Fail 'Install-EmbeddedPython should have failed against an unreachable URL'
@@ -211,7 +211,7 @@ if (Test-Path (Get-EmbeddedPythonDir)) {
 } else {
     Test-Pass 'a failed download leaves nothing behind'
 }
-Remove-Item Env:\TUISAMPLE_PYTHON_STANDALONE_URL -ErrorAction SilentlyContinue
+Remove-Item Env:\BOXCODE_PYTHON_STANDALONE_URL -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force $badPythonHome -ErrorAction SilentlyContinue
 
 # --- Install-EmbeddedPython: the real thing --------------------------------------
@@ -222,7 +222,7 @@ Remove-Item -Recurse -Force $badPythonHome -ErrorAction SilentlyContinue
 # the download/extraction pipeline for real and stops there; Install-Ddgs's
 # own logic once a Python is found is exercised separately below with a
 # stand-in that this OS can actually run.
-$realPythonHome = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-realpython-$PID"
+$realPythonHome = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-realpython-$PID"
 Remove-Item -Recurse -Force $realPythonHome -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $realPythonHome | Out-Null
 $env:USERPROFILE = $realPythonHome
@@ -252,9 +252,9 @@ Remove-Item -Recurse -Force $realPythonHome -ErrorAction SilentlyContinue
 # as already installed and never touches the network, so this exercises
 # Install-Ddgs's real fallback *logic* deterministically, without needing a
 # real Windows python.exe this OS could never execute anyway.
-$fallbackHome = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-fallback-$PID"
+$fallbackHome = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-fallback-$PID"
 Remove-Item -Recurse -Force $fallbackHome -ErrorAction SilentlyContinue
-$fakeEmbeddedDir = Join-Path $fallbackHome '.tuisample-code\python'
+$fakeEmbeddedDir = Join-Path $fallbackHome '.boxcode\python'
 New-Item -ItemType Directory -Force -Path $fakeEmbeddedDir | Out-Null
 $fakePythonExe = Join-Path $fakeEmbeddedDir 'python.exe'
 # On Unix (this test's actual host, whatever the platform under test), a
@@ -286,7 +286,7 @@ $env:PROCESSOR_ARCHITECTURE = 'AMD64'
 # tools the fake python.exe stand-in above needs once its own shebang hands
 # control to /bin/sh. Same fix tests/install_script_test.sh's own
 # ensure_ddgs_available tests already needed for the identical reason.
-$curatedPathDir = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-curated-path-$PID"
+$curatedPathDir = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-curated-path-$PID"
 Remove-Item -Recurse -Force $curatedPathDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $curatedPathDir | Out-Null
 foreach ($tool in @('touch', 'dirname')) {
@@ -314,14 +314,14 @@ Remove-Item Env:\PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue
 Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
 
 # --- Main: full end-to-end run, sandboxed ---------------------------------------
-$sandboxHome = Join-Path ([System.IO.Path]::GetTempPath()) "tuisample-ps1-test-sandbox-$PID"
+$sandboxHome = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-test-sandbox-$PID"
 $sandboxAppData = Join-Path $sandboxHome 'LocalAppData'
 Remove-Item -Recurse -Force $sandboxHome -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $sandboxAppData | Out-Null
 
 $env:USERPROFILE = $sandboxHome
 $env:LOCALAPPDATA = $sandboxAppData
-$env:TUISAMPLE_TELEMETRY_URL = 'off'
+$env:BOXCODE_TELEMETRY_URL = 'off'
 # A normal 64-bit Windows machine reports AMD64 -- without pinning this,
 # Get-Arch reads whatever this machine's own PROCESSOR_ARCHITECTURE
 # actually is, which is unset entirely on Linux/macOS. That would make this
@@ -332,7 +332,7 @@ $env:PROCESSOR_ARCHITECTURE = 'AMD64'
 Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
 try {
     Main
-    $installedExe = Join-Path $sandboxAppData 'Programs\tuisample-code\tuisample-code.exe'
+    $installedExe = Join-Path $sandboxAppData 'Programs\boxcode\boxcode.exe'
     if ((Test-Path $installedExe) -and (Get-Item $installedExe).Length -gt 0) {
         Test-Pass 'Main runs end-to-end and installs a real, non-empty binary'
     } else {
@@ -342,7 +342,7 @@ try {
     Write-Host "SKIP: Main end-to-end test ($_)"
 }
 Remove-Item -Recurse -Force $sandboxHome -ErrorAction SilentlyContinue
-Remove-Item Env:\TUISAMPLE_TELEMETRY_URL -ErrorAction SilentlyContinue
+Remove-Item Env:\BOXCODE_TELEMETRY_URL -ErrorAction SilentlyContinue
 Remove-Item Env:\PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue
 
 if ($failed) {

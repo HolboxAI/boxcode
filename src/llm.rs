@@ -297,7 +297,7 @@ async fn run(
 
     let response = req.send().await.map_err(|e| {
         if e.is_connect() || e.is_timeout() {
-            format!("Could not reach {url}: {e}\nCheck TUISAMPLE_ENDPOINT / config.toml.")
+            format!("Could not reach {url}: {e}\nCheck BOXCODE_ENDPOINT / config.toml.")
         } else {
             format!("Request to {url} failed: {e}")
         }
@@ -339,7 +339,7 @@ async fn run(
         // The most likely cause of a 400 the moment file tools ship is an
         // endpoint that does not implement tool calling, so name the fix.
         let hint = if status == reqwest::StatusCode::BAD_REQUEST && sent_tools {
-            "\n\nIf this endpoint does not support tool calling, disable file tools:\nset `enabled = false` under [tools] in ~/.tuisample-code/config.toml."
+            "\n\nIf this endpoint does not support tool calling, disable file tools:\nset `enabled = false` under [tools] in ~/.boxcode/config.toml."
         } else {
             ""
         };
@@ -447,7 +447,7 @@ async fn run(
                 request_id,
                 StreamEvent::Notice(format!(
                     "The reply hit the {max_tokens}-token output cap and was cut off. \
-                     Raise `max_tokens` under [llm] in ~/.tuisample-code/config.toml, \
+                     Raise `max_tokens` under [llm] in ~/.boxcode/config.toml, \
                      or ask for the work in smaller pieces."
                 )),
             ))
