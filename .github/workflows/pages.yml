@@ -1,0 +1,64 @@
+name: Pages
+
+# Publishes boxcode.sh: the landing page in `docs/`, plus the two installers
+# from the repo root served at their own paths, so
+#
+#   curl -fsSL https://boxcode.sh/install.sh | bash
+#   irm https://boxcode.sh/install.ps1 | iex
+#
+# fetch exactly the scripts that live at `install.sh`/`install.ps1` on main.
+# They are copied in at deploy time rather than duplicated under `docs/` --
+# a second copy in the tree is a copy that drifts.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'install.sh'
+      - 'install.ps1'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race; the newest push wins.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp -R docs/. _site/            # index.html, CNAME, .nojekyll
+          cp install.sh install.ps1 _site/
+          chmod 0644 _site/install.sh _site/install.ps1
+          ls -la _site
+
+      - name: Check the installers survived the copy
+        run: |
+          head -1 _site/install.sh | grep -q '^#!/bin/bash'
+          grep -q 'boxcode' _site/install.ps1
+          grep -q 'boxcode.sh/install.sh' _site/index.html
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
