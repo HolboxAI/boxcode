@@ -151,6 +151,20 @@ pub struct App {
     /// every new prompt starts back on "yes" to match bare-Enter's long-
     /// standing meaning.
     pub approval_selected: bool,
+    /// How many of `messages` have already been printed into the terminal's own
+    /// scrollback. Everything below this index is the terminal's to keep and
+    /// must never be drawn again; everything at or above it still belongs to
+    /// the live viewport.
+    pub flushed: usize,
+    /// Whether the welcome panel has been printed above the viewport. It is
+    /// static and taller than the viewport, so it is printed once as ordinary
+    /// output rather than redrawn into a strip that cannot hold it.
+    pub welcome_flushed: bool,
+    /// How many bytes of the reply currently streaming in have already been
+    /// printed above the viewport. Streaming text is pushed up line by line as
+    /// it completes, so a long answer scrolls the terminal the way ordinary
+    /// output does instead of being squeezed into the strip at the bottom.
+    pub stream_printed: usize,
     /// How far the approval prompt's body is scrolled. Reset for every new
     /// prompt: carrying an offset from the last one would open the next
     /// half-way down a different command.
@@ -254,6 +268,9 @@ impl App {
             scroll: 0,
             follow_tail: true,
             approval_selected: true,
+            flushed: 0,
+            welcome_flushed: false,
+            stream_printed: 0,
             approval_scroll: 0,
             config,
             should_exit: false,
@@ -1143,6 +1160,30 @@ impl App {
     /// failure -- currently only "your answer was truncated". Pushed as a
     /// System message so it reads as status, and kept out of `history` so the
     /// model is never told about our own plumbing.
+    /// Messages that are finished and can be handed to the terminal.
+    ///
+    /// Every message in `messages` is complete by construction: a reply still
+    /// arriving lives in `streaming_response` and is only pushed here once the
+    /// turn ends. So these go out immediately -- and they must, or the prompt
+    /// you typed is printed *after* the answer to it, because the answer
+    /// streams out while the prompt sits waiting for the turn to finish.
+    /// The finished lines of the in-flight reply that have not been printed yet.
+    ///
+    /// Only whole lines: the last one is still being written, and printing it
+    /// would mean printing it again, longer, on the next frame.
+    pub fn streamed_ready(&self) -> Option<&str> {
+        if self.state != AppState::Streaming {
+            return None;
+        }
+        let rest = self.streaming_response.get(self.stream_printed..)?;
+        let end = rest.rfind('\n')? + 1;
+        Some(&rest[..end])
+    }
+
+    pub fn drainable(&self) -> &[Message] {
+        &self.messages[self.flushed.min(self.messages.len())..]
+    }
+
     pub fn note(&mut self, note: String) {
         self.messages.push(Message::new(Role::System, note));
         self.follow_tail = true;
@@ -1172,7 +1213,19 @@ impl App {
         let budget_spent = self.tool_steps >= self.config.tools.max_steps;
 
         if !prose.trim().is_empty() {
-            self.messages.push(Message::new(Role::Assistant, prose));
+            // Whatever was already streamed above the viewport must not be
+            // printed a second time. `content` still carries the whole reply --
+            // that is what goes on the wire and the model must see all of it --
+            // while `display` carries only the part the terminal has not had
+            // yet. Trimming `content` here would quietly truncate the
+            // conversation the model is working from.
+            let already_printed = self.stream_printed.min(prose.len());
+            let remainder = prose[already_printed..].to_string();
+            let mut message = Message::new(Role::Assistant, prose);
+            if already_printed > 0 {
+                message.display = Some(remainder);
+            }
+            self.messages.push(message);
         } else if !leaked && response.trim().is_empty() {
             self.messages.push(Message::new(
                 Role::Error,
@@ -1217,6 +1270,7 @@ impl App {
         // and every byte of a tool call.
         self.pending_usage
             .push((tokens.total() as usize, self.config.llm.model.clone()));
+        self.stream_printed = 0;
         self.busy_started = None;
         self.state = AppState::AwaitingInput;
     }
@@ -3580,6 +3634,65 @@ mod tests {
         assert_eq!(a.input_buffer, "old one");
     }
 
+    /// Regression: the prompt you typed was printed *after* the answer to it.
+    /// Held back until the turn ended, it queued behind a reply that had been
+    /// streaming into the scrollback the whole time. Completed messages have to
+    /// go out immediately -- they are complete the moment they are pushed.
+    #[test]
+    fn a_finished_message_is_printed_without_waiting_for_the_turn_to_end() {
+        let mut a = app();
+        a.messages.push(Message::new(Role::User, "a question"));
+
+        a.state = AppState::Streaming;
+        assert_eq!(
+            a.drainable().len(),
+            1,
+            "the prompt must print before the reply that answers it"
+        );
+        a.state = AppState::ExecutingTools;
+        assert_eq!(a.drainable().len(), 1, "and while commands run");
+    }
+
+    /// The in-flight reply is the one thing that is *not* in `messages` yet, so
+    /// it cannot be printed early by accident -- it streams out separately, a
+    /// completed line at a time.
+    #[test]
+    fn only_whole_lines_of_a_streaming_reply_are_printed() {
+        let mut a = app();
+        a.state = AppState::Streaming;
+
+        a.streaming_response = "no newline yet".to_string();
+        assert_eq!(a.streamed_ready(), None, "a half-written line must wait");
+
+        a.streaming_response = "first line\nsecond half".to_string();
+        assert_eq!(
+            a.streamed_ready(),
+            Some("first line\n"),
+            "only the finished line goes out"
+        );
+
+        a.stream_printed = "first line\n".len();
+        assert_eq!(a.streamed_ready(), None, "and never twice");
+    }
+
+    /// `flushed` is what stops a message being printed twice: once the flush
+    /// loop has taken it, it belongs to the terminal and this app never draws
+    /// it again.
+    #[test]
+    fn a_message_is_offered_to_the_scrollback_only_once() {
+        let mut a = app();
+        a.state = AppState::AwaitingInput;
+        a.messages.push(Message::new(Role::User, "one"));
+        a.messages.push(Message::new(Role::Assistant, "two"));
+
+        assert_eq!(a.drainable().len(), 2);
+        a.flushed = 2; // what the flush loop does after printing them
+        assert!(a.drainable().is_empty(), "already-printed messages must not repeat");
+
+        a.messages.push(Message::new(Role::User, "three"));
+        assert_eq!(a.drainable().len(), 1, "only the new one");
+    }
+
     #[test]
     fn page_up_and_page_down_still_scroll_the_transcript() {
         let mut a = app();
@@ -3911,4 +4024,5 @@ mod tests {
         }
     }
 }
+
 
