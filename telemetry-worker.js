@@ -1,4 +1,4 @@
-// tuisample-code anonymous install/usage telemetry — Cloudflare Worker
+// boxcode anonymous install/usage telemetry — Cloudflare Worker
 //
 // One URL, two directions:
 //   POST { anon_id, event, version, os, date? }  -> logs one event
@@ -12,12 +12,12 @@
 //
 // Setup (no local install, all in the Cloudflare dashboard):
 //   1. dash.cloudflare.com -> Workers & Pages -> Create -> Create Worker
-//   2. Name it (e.g. "tuisample-telemetry"), deploy the default stub first
+//   2. Name it (e.g. "boxcode-telemetry"), deploy the default stub first
 //   3. Edit code -> delete the stub -> paste this whole file -> Deploy
 //   4. Worker's Settings -> Bindings -> Add binding -> KV Namespace
 //        - Create a new namespace (e.g. "TELEMETRY")
 //        - Variable name: EVENTS  <- must match the binding name used below
-//   5. Copy the worker's URL (https://tuisample-telemetry.<you>.workers.dev)
+//   5. Copy the worker's URL (https://boxcode-telemetry.<you>.workers.dev)
 //        - POST to it from install.sh / the binary
 //        - GET it in a browser (or link it in the README) for the public view
 
@@ -99,7 +99,7 @@ async function handleView(env) {
     .join("");
 
   const html = `<!doctype html>
-<html><head><meta charset="utf-8"><title>tuisample-code — anonymous usage</title>
+<html><head><meta charset="utf-8"><title>boxcode — anonymous usage</title>
 <style>
   body { font-family: -apple-system, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
   .stats { display: flex; gap: 2rem; margin-bottom: 2rem; }
@@ -111,7 +111,7 @@ async function handleView(env) {
   p.note { color: #666; font-size: 0.85rem; }
 </style></head>
 <body>
-  <h1>tuisample-code — anonymous usage</h1>
+  <h1>boxcode — anonymous usage</h1>
   <p class="note">Anonymous, self-reported install/active counts. No login, no IP, no device identity, no conversation content -- see the README for exactly what's collected.</p>
   <div class="stats">
     <div class="stat"><b>${installs.length}</b>install pings</div>

@@ -25,7 +25,7 @@ fn test_cargo_available() {
 fn test_config_files_exist() {
     // Check if we can create config directory
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let config_dir = format!("{}/.tuisample-code", home);
+    let config_dir = format!("{}/.boxcode", home);
 
     // Should be able to create the directory
     let result = std::fs::create_dir_all(&config_dir);

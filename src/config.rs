@@ -17,6 +17,43 @@ pub struct Config {
     /// Same again for `[ui]`.
     #[serde(default)]
     pub ui: UiConfig,
+    /// Same again for `[deploy]`.
+    #[serde(default)]
+    pub deploy: DeployConfig,
+}
+
+/// Settings for `/deploy`. See `src/deploy/`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeployConfig {
+    /// Off removes `/deploy` and `/deployments` from the command list
+    /// entirely, for anyone who would rather this feature did not exist.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Whether a missing provider CLI may be installed from inside the app.
+    /// `false` does not make the flow fail silently -- it explains what to
+    /// install and stops. Nothing is ever installed without confirmation
+    /// regardless of this setting; this only controls whether the offer is
+    /// made at all, for machines where global installs are somebody else's
+    /// decision.
+    #[serde(default = "yes")]
+    pub allow_cli_install: bool,
+    /// How many past deployments `/deployments` prints.
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
+}
+
+fn default_history_limit() -> usize {
+    10
+}
+
+impl Default for DeployConfig {
+    fn default() -> Self {
+        Self {
+            enabled: yes(),
+            allow_cli_install: yes(),
+            history_limit: default_history_limit(),
+        }
+    }
 }
 
 /// Optional daily ceilings. See `quota.rs`.
@@ -262,27 +299,27 @@ impl Config {
 
         // Environment variables win over the file, so exporting a key works even
         // when a stale config.toml is on disk.
-        if let Some(v) = env_var("TUISAMPLE_ENDPOINT") {
+        if let Some(v) = env_var("ENDPOINT") {
             config.llm.endpoint = v;
         }
-        if let Some(v) = env_var("TUISAMPLE_MODEL") {
+        if let Some(v) = env_var("MODEL") {
             config.llm.model = v;
         }
-        if let Some(v) = env_var("TUISAMPLE_API_KEY") {
+        if let Some(v) = env_var("API_KEY") {
             config.llm.api_key = v;
         }
-        if let Some(v) = env_var("TUISAMPLE_WORKSPACE") {
+        if let Some(v) = env_var("WORKSPACE") {
             config.tools.workspace = v;
         }
-        if let Some(v) = env_var("TUISAMPLE_TOOLS_ENABLED") {
+        if let Some(v) = env_var("TOOLS_ENABLED") {
             config.tools.enabled = truthy(&v);
         }
-        if let Some(v) = env_var("TUISAMPLE_QUOTA_ENABLED") {
+        if let Some(v) = env_var("QUOTA_ENABLED") {
             config.quota.enabled = truthy(&v);
         }
         for (name, slot) in [
-            ("TUISAMPLE_MAX_REQUESTS_PER_DAY", 0),
-            ("TUISAMPLE_MAX_TOKENS_PER_DAY", 1),
+            ("MAX_REQUESTS_PER_DAY", 0),
+            ("MAX_TOKENS_PER_DAY", 1),
         ] {
             if let Some(v) = env_var(name) {
                 if let Ok(n) = v.trim().parse::<u64>() {
@@ -293,12 +330,12 @@ impl Config {
                 }
             }
         }
-        if let Some(v) = env_var("TUISAMPLE_MAX_USD_PER_DAY") {
+        if let Some(v) = env_var("MAX_USD_PER_DAY") {
             if let Ok(n) = v.trim().parse::<f64>() {
                 config.quota.max_usd_per_day = n;
             }
         }
-        if let Some(v) = env_var("TUISAMPLE_TOOLS_APPROVAL") {
+        if let Some(v) = env_var("TOOLS_APPROVAL") {
             config.tools.require_approval = truthy(&v);
         }
 
@@ -349,6 +386,10 @@ impl Config {
             self.tools.python_bin = default_python_bin();
         }
         self.tools.search_timeout_secs = self.tools.search_timeout_secs.clamp(1, 300);
+
+        // A history limit of 0 would make `/deployments` print a heading and
+        // nothing else, which reads as a broken command rather than a setting.
+        self.deploy.history_limit = self.deploy.history_limit.clamp(1, 200);
     }
 
     /// Nonsense quota settings are clamped rather than obeyed. A warn threshold
@@ -371,7 +412,7 @@ impl Config {
         let mut warnings = Vec::new();
         if self.llm.api_key.is_empty() {
             warnings.push(
-                "No API key set. Export TUISAMPLE_API_KEY or add api_key to ~/.tuisample-code/config.toml."
+                "No API key set. Export BOXCODE_API_KEY or add api_key to ~/.boxcode/config.toml."
                     .to_string(),
             );
         }
@@ -398,10 +439,8 @@ impl Config {
     }
 
     pub fn config_path() -> PathBuf {
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        home.join(".tuisample-code").join("config.toml")
+        crate::paths::state_file("config.toml")
+            .unwrap_or_else(|| PathBuf::from("config.toml"))
     }
 }
 
@@ -412,11 +451,10 @@ fn truthy(value: &str) -> bool {
     )
 }
 
-fn env_var(name: &str) -> Option<String> {
-    match std::env::var(name) {
-        Ok(v) if !v.trim().is_empty() => Some(v),
-        _ => None,
-    }
+/// `BOXCODE_<suffix>`, falling back to the deprecated `BOXCODE_<suffix>`.
+/// See `paths::env_var`.
+fn env_var(suffix: &str) -> Option<String> {
+    crate::paths::env_var(suffix)
 }
 
 impl Default for LlmConfig {
@@ -471,11 +509,11 @@ mod tests {
     #[test]
     fn save_then_load_round_trips_all_llm_fields_including_provider() {
         with_isolated_home(|| {
-            // TUISAMPLE_* env vars win over the file (by design), so a developer
+            // BOXCODE_* env vars win over the file (by design), so a developer
             // machine that happens to have one exported must not leak into this
             // assertion.
             let saved_env: Vec<(&str, Option<String>)> =
-                ["TUISAMPLE_ENDPOINT", "TUISAMPLE_MODEL", "TUISAMPLE_API_KEY"]
+                ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY"]
                     .iter()
                     .map(|&k| (k, std::env::var(k).ok()))
                     .collect();
@@ -486,6 +524,7 @@ mod tests {
             let config = Config {
                 quota: QuotaConfig::default(),
                 ui: UiConfig::default(),
+                deploy: DeployConfig::default(),
                 llm: LlmConfig {
                     endpoint: "https://api.deepseek.com".to_string(),
                     model: "deepseek-v4-pro".to_string(),
@@ -536,7 +575,34 @@ mod tests {
             assert!(loaded.tools.require_approval);
             assert_eq!(loaded.tools.python_bin, "python3");
             assert_eq!(loaded.tools.search_timeout_secs, 20);
+            // ...and the same again for `[deploy]`, added later still.
+            assert!(loaded.deploy.enabled);
+            assert!(loaded.deploy.allow_cli_install);
+            assert_eq!(loaded.deploy.history_limit, 10);
         });
+    }
+
+    /// A `[deploy]` table someone half-filled in by hand must still get the
+    /// safe defaults for the keys they left out.
+    #[test]
+    fn a_partial_deploy_table_defaults_the_rest() {
+        let parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"http://x\"\n\n[deploy]\nallow_cli_install = false\n",
+        )
+        .expect("should parse");
+        assert!(!parsed.deploy.allow_cli_install);
+        assert!(parsed.deploy.enabled);
+        assert_eq!(parsed.deploy.history_limit, 10);
+    }
+
+    /// A limit of zero would make `/deployments` print a heading and nothing
+    /// else, which reads as a broken command rather than a setting.
+    #[test]
+    fn a_zero_history_limit_is_clamped_to_something_usable() {
+        let mut config = Config::default();
+        config.deploy.history_limit = 0;
+        config.normalize();
+        assert_eq!(config.deploy.history_limit, 1);
     }
 
     /// Same again for a config that has a `[tools]` table but no `python_bin`

@@ -1,6 +1,6 @@
 [package]
-name = "tuisample-code"
-version = "0.9.4"
+name = "boxcode"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]

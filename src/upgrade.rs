@@ -1,4 +1,4 @@
-//! `tuisample-code --upgrade` — pull the latest build without having to
+//! `boxcode --upgrade` — pull the latest build without having to
 //! remember (or re-paste) the curl one-liner.
 //!
 //! The install itself is delegated to `install.sh` (or, on Windows,
@@ -18,14 +18,14 @@ use std::error::Error;
 use std::process::Command;
 use std::time::Duration;
 
-const REPO: &str = "HolboxAI/tuisample-code";
+const REPO: &str = "HolboxAI/boxcode";
 const BRANCH: &str = "main";
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 /// Where to fetch `Cargo.toml` and `install.sh` from. Overridable so a fork or
 /// an internal mirror (this tool is often run somewhere with no route to
 /// github.com) can serve its own builds.
-const URL_BASE_ENV: &str = "TUISAMPLE_UPGRADE_URL_BASE";
+const URL_BASE_ENV: &str = "BOXCODE_UPGRADE_URL_BASE";
 
 fn join_url(base: &str, path: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), path)
@@ -52,7 +52,7 @@ async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(30))
-        .user_agent(format!("tuisample-code/{CURRENT}"))
+        .user_agent(format!("boxcode/{CURRENT}"))
         .build()?;
 
     match fetch_latest_version(&client).await {
@@ -67,7 +67,7 @@ async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
             println!();
             println!("main can also carry changes that haven't been given a new version");
             println!("number yet. To rebuild from the latest source regardless, run:");
-            println!("    tuisample-code --upgrade --force");
+            println!("    boxcode --upgrade --force");
             return Ok(());
         }
         Err(e) => {
@@ -82,7 +82,7 @@ async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
     let script = fetch_installer(&client, windows).await?;
 
     let script_path = std::env::temp_dir().join(format!(
-        "tuisample-code-install-{}.{}",
+        "boxcode-install-{}.{}",
         std::process::id(),
         installer_extension(windows)
     ));
@@ -99,7 +99,7 @@ async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
             let interpreter = interpreter_name(windows);
             Err(format!(
                 "--upgrade needs `{interpreter}` on PATH, and it wasn't found. \
-                 Reinstall manually: https://github.com/HolboxAI/tuisample-code"
+                 Reinstall manually: https://github.com/HolboxAI/boxcode"
             )
             .into())
         }
@@ -180,9 +180,9 @@ async fn fetch_installer(client: &reqwest::Client, windows: bool) -> Result<Stri
 /// stray HTML/JSON are trivially told apart.
 fn looks_like_installer(body: &str, windows: bool) -> bool {
     if windows {
-        body.trim_start().starts_with('#') && body.contains("tuisample-code")
+        body.trim_start().starts_with('#') && body.contains("boxcode")
     } else {
-        body.starts_with("#!") && body.contains("tuisample-code")
+        body.starts_with("#!") && body.contains("boxcode")
     }
 }
 
@@ -239,7 +239,7 @@ mod tests {
     fn reads_the_version_from_the_package_table() {
         let manifest = "\
 [package]
-name = \"tuisample-code\"
+name = \"boxcode\"
 version = \"0.3.0\"
 edition = \"2021\"
 ";
@@ -253,7 +253,7 @@ edition = \"2021\"
         // report a dependency's version as the app's.
         let manifest = "\
 [package]
-name = \"tuisample-code\"
+name = \"boxcode\"
 version = \"0.3.0\"
 
 [dependencies]
@@ -305,14 +305,14 @@ version = \"9.9.9\"
         let github = format!("https://raw.githubusercontent.com/{REPO}/{BRANCH}");
         assert_eq!(
             join_url(&github, "install.sh"),
-            "https://raw.githubusercontent.com/HolboxAI/tuisample-code/main/install.sh"
+            "https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.sh"
         );
         assert_eq!(join_url("http://mirror.internal/", "Cargo.toml"), "http://mirror.internal/Cargo.toml");
     }
 
     #[test]
     fn only_a_real_installer_reaches_bash() {
-        assert!(looks_like_installer("#!/bin/bash\ninstall tuisample-code\n", false));
+        assert!(looks_like_installer("#!/bin/bash\ninstall boxcode\n", false));
         // What a captive portal or an error page would return.
         assert!(!looks_like_installer("<html><body>Sign in to continue</body></html>", false));
         assert!(!looks_like_installer("404: Not Found", false));
@@ -326,7 +326,7 @@ version = \"9.9.9\"
     /// a captive-portal page or an error blob to PowerShell instead.
     #[test]
     fn only_a_real_installer_reaches_powershell() {
-        assert!(looks_like_installer("# tuisample-code installer\nWrite-Host 'hi'\n", true));
+        assert!(looks_like_installer("# boxcode installer\nWrite-Host 'hi'\n", true));
         assert!(!looks_like_installer("<html><body>Sign in to continue</body></html>", true));
         assert!(!looks_like_installer("404: Not Found", true));
         // Right leading comment, wrong script.
@@ -405,12 +405,12 @@ version = \"9.9.9\"
     #[tokio::test]
     async fn upgrade_end_to_end() {
         let marker =
-            std::env::temp_dir().join(format!("tuisample-upgrade-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("boxcode-upgrade-test-{}", std::process::id()));
         let installer = format!(
-            "#!/bin/bash\n# stand-in for the tuisample-code installer\necho ran > \"{}\"\n",
+            "#!/bin/bash\n# stand-in for the boxcode installer\necho ran > \"{}\"\n",
             marker.display()
         );
-        let manifest = |version: &str| format!("[package]\nname = \"tuisample-code\"\nversion = \"{version}\"\n");
+        let manifest = |version: &str| format!("[package]\nname = \"boxcode\"\nversion = \"{version}\"\n");
         let ran = || marker.exists();
         let reset = || {
             let _ = std::fs::remove_file(&marker);
@@ -482,7 +482,7 @@ version = \"9.9.9\"
             return;
         };
 
-        let shim_dir = std::env::temp_dir().join(format!("tuisample-pwsh-shim-{}", std::process::id()));
+        let shim_dir = std::env::temp_dir().join(format!("boxcode-pwsh-shim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&shim_dir);
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
         let shim_path = shim_dir.join("powershell.exe");
@@ -492,17 +492,17 @@ version = \"9.9.9\"
         std::fs::copy(&real_interpreter, &shim_path).expect("copy shim");
 
         let marker =
-            std::env::temp_dir().join(format!("tuisample-upgrade-windows-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("boxcode-upgrade-windows-test-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         // PowerShell, not batch: `install.ps1` is what actually ships.
         let installer = format!(
-            "# tuisample-code installer (test stand-in)\nSet-Content -Path '{}' -Value 'ran'\n",
+            "# boxcode installer (test stand-in)\nSet-Content -Path '{}' -Value 'ran'\n",
             marker.display()
         );
-        let manifest = "[package]\nname = \"tuisample-code\"\nversion = \"99.0.0\"\n";
+        let manifest = "[package]\nname = \"boxcode\"\nversion = \"99.0.0\"\n";
         let base = serve_repo(manifest.to_string(), installer).await;
 
-        let script_path = std::env::temp_dir().join(format!("tuisample-code-install-{}.ps1", std::process::id()));
+        let script_path = std::env::temp_dir().join(format!("boxcode-install-{}.ps1", std::process::id()));
         // Mirrors fetch_installer's download, minus the HTTP round trip --
         // the point of this test is proving the *interpreter invocation*
         // works for real, which fetch_installer's own logic already has

@@ -57,17 +57,17 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/tuisample-code artifacts/tuisample-code-${{ matrix.os }}-${{ matrix.arch }}
-          chmod +x artifacts/tuisample-code-${{ matrix.os }}-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/boxcode artifacts/boxcode-${{ matrix.os }}-${{ matrix.arch }}
+          chmod +x artifacts/boxcode-${{ matrix.os }}-${{ matrix.arch }}
 
       - name: Rename binary (Windows)
         if: runner.os == 'Windows'
         run: |
           mkdir artifacts
-          copy target\${{ matrix.target }}\release\tuisample-code.exe artifacts\tuisample-code-${{ matrix.os }}-${{ matrix.arch }}.exe
+          copy target\${{ matrix.target }}\release\boxcode.exe artifacts\boxcode-${{ matrix.os }}-${{ matrix.arch }}.exe
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tuisample-code-${{ matrix.os }}-${{ matrix.arch }}
+          name: boxcode-${{ matrix.os }}-${{ matrix.arch }}
           path: artifacts/

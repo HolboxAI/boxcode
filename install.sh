@@ -3,30 +3,36 @@ set -e
 
 # Where release assets and checksums are published. Overridable so a fork or
 # an internal mirror can serve its own builds -- mirrors how upgrade.rs lets
-# TUISAMPLE_UPGRADE_URL_BASE redirect its own fetches.
-RELEASE_API_BASE="${TUISAMPLE_RELEASE_API_BASE:-https://api.github.com/repos/HolboxAI/tuisample-code}"
+# BOXCODE_UPGRADE_URL_BASE redirect its own fetches.
+RELEASE_API_BASE="${BOXCODE_RELEASE_API_BASE:-https://api.github.com/repos/HolboxAI/boxcode}"
 
-# Remove any other "tuisample-code" executable found on $PATH so a stale
+# Remove any other "boxcode" executable found on $PATH so a stale
 # build from a previous install can't shadow (or be shadowed by) the one we
 # just installed, regardless of which directory it ended up in.
+# Removes copies of this tool that the shell might resolve to instead of the
+# one just installed -- including the pre-1.0 `tuisample-code` name, which is
+# the whole reason an upgrade can appear to do nothing: the new binary lands
+# correctly and the shell keeps running the old one under its old name.
 sweep_path_for_stale_copies() {
   local installed_at="$1"
-  local dir candidate found=0
+  local dir candidate name found=0
   local saved_ifs="$IFS"
   IFS=':'
   for dir in $PATH; do
     IFS="$saved_ifs"
     [ -n "$dir" ] || continue
-    candidate="$dir/tuisample-code"
-    if [ -f "$candidate" ] && [ "$candidate" != "$installed_at" ]; then
-      found=1
-      echo "🧹 Removing stale copy on PATH: $candidate"
-      if [ -w "$dir" ]; then
-        rm -f "$candidate" || echo "⚠️  Could not remove it. Run: rm $candidate"
-      else
-        sudo rm -f "$candidate" || echo "⚠️  Could not remove it. Run: sudo rm $candidate"
+    for name in boxcode tuisample-code; do
+      candidate="$dir/$name"
+      if [ -f "$candidate" ] && [ "$candidate" != "$installed_at" ]; then
+        found=1
+        echo "🧹 Removing stale copy on PATH: $candidate"
+        if [ -w "$dir" ]; then
+          rm -f "$candidate" || echo "⚠️  Could not remove it. Run: rm $candidate"
+        else
+          sudo rm -f "$candidate" || echo "⚠️  Could not remove it. Run: sudo rm $candidate"
+        fi
       fi
-    fi
+    done
     IFS=':'
   done
   IFS="$saved_ifs"
@@ -35,16 +41,16 @@ sweep_path_for_stale_copies() {
 
 # Fire a single, best-effort "an install happened" ping -- the bash-side
 # counterpart to telemetry.rs's `active` ping, which this binary hasn't run
-# yet to send. Anonymous: a random ID written to $HOME/.tuisample-code/device_id
+# yet to send. Anonymous: a random ID written to $HOME/.boxcode/device_id
 # that labels this machine, not the person running it -- the same file
 # telemetry.rs reads and reuses on later runs rather than generating a second,
 # conflicting ID. No other data leaves this machine from here.
 #
 # Defaults to the same endpoint telemetry.rs's DEFAULT_TELEMETRY_URL points
-# at -- keep the two in sync if that ever changes. TUISAMPLE_TELEMETRY_URL
+# at -- keep the two in sync if that ever changes. BOXCODE_TELEMETRY_URL
 # overrides it; note the missing ":" in the substitution below is deliberate,
 # not a typo -- "${VAR-default}" falls back only when the variable is unset,
-# so an explicit TUISAMPLE_TELEMETRY_URL="" still disables sending rather than
+# so an explicit BOXCODE_TELEMETRY_URL="" still disables sending rather than
 # silently reverting to the default, matching telemetry.rs's own handling of
 # an explicit blank override. Every failure mode -- no uuidgen, no curl,
 # network down, endpoint unreachable -- is swallowed either way. This must
@@ -53,10 +59,10 @@ sweep_path_for_stale_copies() {
 ping_install() {
   local binary="$1"
   local default_url="https://tui-telemetry.dhruvm307.workers.dev"
-  local url="${TUISAMPLE_TELEMETRY_URL-$default_url}"
+  local url="${BOXCODE_TELEMETRY_URL-$default_url}"
   [ -n "$url" ] || return 0
 
-  local state_dir="$HOME/.tuisample-code"
+  local state_dir="$HOME/.boxcode"
   local id_file="$state_dir/device_id"
   mkdir -p "$state_dir" 2>/dev/null || return 0
 
@@ -111,7 +117,7 @@ PYTHON_STANDALONE_VERSION="3.12.13"
 # this at an unreachable host to exercise the "couldn't get one" path
 # deterministically and without a real download, and lets a fork/mirror
 # serve its own copy.
-PYTHON_STANDALONE_BASE_URL="${TUISAMPLE_PYTHON_STANDALONE_URL:-https://github.com/astral-sh/python-build-standalone/releases/download}"
+PYTHON_STANDALONE_BASE_URL="${BOXCODE_PYTHON_STANDALONE_URL:-https://github.com/astral-sh/python-build-standalone/releases/download}"
 
 # Maps this script's own os/arch onto python-build-standalone's target
 # triples. Empty output (not an error) for anything it doesn't publish a
@@ -132,7 +138,7 @@ python_standalone_target() {
 # install.sh ever having to edit config.toml -- see embedded_python_path()
 # there.
 embedded_python_dir() {
-  echo "$HOME/.tuisample-code/python"
+  echo "$HOME/.boxcode/python"
 }
 
 # Downloads and extracts a self-contained Python into embedded_python_dir,
@@ -159,7 +165,7 @@ install_embedded_python() {
 
   # Extracted into $tmp -- the same directory the archive itself just
   # downloaded into, and NOT $(dirname "$dir") directly. $dir is always
-  # ".../.tuisample-code/python", so $(dirname "$dir")/python always
+  # ".../.boxcode/python", so $(dirname "$dir")/python always
   # equals $dir itself; extracting straight there and then trying to `mv`
   # the result onto $dir would be moving a path onto itself, which mv
   # correctly refuses ("cannot move to a subdirectory of itself") -- caught
@@ -235,7 +241,7 @@ ensure_ddgs_available() {
 
 # Put a binary at $dest, replacing whatever is there.
 #
-# Writing straight over the destination breaks `tuisample-code --upgrade`: that
+# Writing straight over the destination breaks `boxcode --upgrade`: that
 # runs this script from the very binary being replaced, and on Linux writing to
 # a running executable fails with ETXTBSY. So write a sibling temp file and
 # rename it over the target — rename swaps the inode atomically, leaving the
@@ -263,7 +269,7 @@ install_binary() {
 # was before, only faster when a matching binary exists.
 
 # Maps `uname -s`/`uname -m` onto the asset-name components release.yml uses
-# (`tuisample-code-$os-$arch`). Isolated in their own functions, rather than
+# (`boxcode-$os-$arch`). Isolated in their own functions, rather than
 # inlined into main, purely so tests can shadow the `uname` builtin and drive
 # every branch without needing to run on five different machines.
 detect_os() {
@@ -341,7 +347,7 @@ sha256_of() {
 # reason to abort the install, so this function itself never calls `exit`.
 fetch_prebuilt_binary() {
   local os="$1" arch="$2" dest="$3"
-  local asset_name="tuisample-code-$os-$arch"
+  local asset_name="boxcode-$os-$arch"
 
   local release_json
   release_json=$(curl -fsSL -m 15 "$RELEASE_API_BASE/releases/latest" 2>/dev/null) || return 1
@@ -375,7 +381,7 @@ fetch_prebuilt_binary() {
 }
 
 main() {
-echo "🚀 Installing tuisample-code..."
+echo "🚀 Installing boxcode..."
 echo ""
 
 TEMP_DIR=$(mktemp -d)
@@ -387,7 +393,7 @@ ARCH_NAME=$(detect_arch)
 
 if [ "$OS_NAME" != "unsupported" ] && [ "$ARCH_NAME" != "unsupported" ]; then
   echo "🔍 Looking for a prebuilt $OS_NAME-$ARCH_NAME binary..."
-  CANDIDATE="$TEMP_DIR/tuisample-code"
+  CANDIDATE="$TEMP_DIR/boxcode"
   if fetch_prebuilt_binary "$OS_NAME" "$ARCH_NAME" "$CANDIDATE"; then
     BINARY_PATH="$CANDIDATE"
     echo "✓ Downloaded a prebuilt binary — no build required"
@@ -425,12 +431,12 @@ if [ -z "$BINARY_PATH" ]; then
   fi
 
   echo "📥 Cloning repository..."
-  git clone https://github.com/HolboxAI/tuisample-code.git "$TEMP_DIR/src"
+  git clone https://github.com/HolboxAI/boxcode.git "$TEMP_DIR/src"
 
-  echo "⚙️  Building tuisample-code (this takes 2-3 minutes)..."
+  echo "⚙️  Building boxcode (this takes 2-3 minutes)..."
   (cd "$TEMP_DIR/src" && cargo build --release)
 
-  BINARY_PATH="$TEMP_DIR/src/target/release/tuisample-code"
+  BINARY_PATH="$TEMP_DIR/src/target/release/boxcode"
   if [ ! -f "$BINARY_PATH" ]; then
     echo "❌ Error: Binary not found at $BINARY_PATH"
     echo "Build may have failed. Check the output above."
@@ -440,8 +446,8 @@ if [ -z "$BINARY_PATH" ]; then
 fi
 
 # Install binary
-SYSTEM_BIN=/usr/local/bin/tuisample-code
-USER_BIN="$HOME/.local/bin/tuisample-code"
+SYSTEM_BIN=/usr/local/bin/boxcode
+USER_BIN="$HOME/.local/bin/boxcode"
 
 echo "📍 Installing to /usr/local/bin..."
 if install_binary "$BINARY_PATH" "$SYSTEM_BIN" sudo; then
@@ -485,12 +491,12 @@ sweep_path_for_stale_copies "$INSTALLED_AT"
 
 # Confirm the shell actually resolves to what we just installed.
 hash -r 2>/dev/null || true
-RESOLVED=$(command -v tuisample-code || true)
+RESOLVED=$(command -v boxcode || true)
 if [ -z "$RESOLVED" ]; then
-  echo "⚠️  tuisample-code is not on your PATH yet. Open a new shell and retry."
+  echo "⚠️  boxcode is not on your PATH yet. Open a new shell and retry."
 elif [ "$RESOLVED" != "$INSTALLED_AT" ]; then
   echo ""
-  echo "⚠️  WARNING: 'tuisample-code' resolves to $RESOLVED,"
+  echo "⚠️  WARNING: 'boxcode' resolves to $RESOLVED,"
   echo "   but this build was installed to $INSTALLED_AT."
   echo "   Remove the other copy, or fix your PATH order, or you will keep"
   echo "   running the old version."
@@ -509,14 +515,14 @@ echo "✅ Installation complete!"
 echo ""
 echo "🎯 Next steps:"
 echo "1. Configure your LLM endpoint:"
-echo "   export TUISAMPLE_ENDPOINT=https://api.openai.com"
-echo "   export TUISAMPLE_MODEL=gpt-4"
-echo "   export TUISAMPLE_API_KEY=sk-..."
+echo "   export BOXCODE_ENDPOINT=https://api.openai.com"
+echo "   export BOXCODE_MODEL=gpt-4"
+echo "   export BOXCODE_API_KEY=sk-..."
 echo ""
-echo "2. Run tuisample-code:"
-echo "   tuisample-code"
+echo "2. Run boxcode:"
+echo "   boxcode"
 echo ""
-echo "📖 For more info: https://github.com/HolboxAI/tuisample-code"
+echo "📖 For more info: https://github.com/HolboxAI/boxcode"
 echo ""
 }
 

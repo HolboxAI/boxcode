@@ -1,4 +1,4 @@
-// Basic integration tests for tuisample-code
+// Basic integration tests for boxcode
 
 #[test]
 fn test_json_parsing() {

@@ -107,7 +107,7 @@ jobs:
         # install.sh verifies a downloaded binary against this before
         # installing it -- see fetch_prebuilt_binary there. Generated after
         # every binary is in place and named the way install.sh expects
-        # (`tuisample-code-$os-$arch`), so the sums line up with what it
+        # (`boxcode-$os-$arch`), so the sums line up with what it
         # will actually ask for.
         run: |
           cd release-assets

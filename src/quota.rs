@@ -1,4 +1,4 @@
-//! Optional daily spending limits -- `~/.tuisample-code/quota.json`.
+//! Optional daily spending limits -- `~/.boxcode/quota.json`.
 //!
 //! Distinct from `usage.rs`, which is the append-only history of what this
 //! install has done and never refuses anything. This is the ceiling: a small
@@ -132,8 +132,7 @@ impl DailyQuota {
     }
 
     fn path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-        Some(PathBuf::from(home).join(".tuisample-code").join("quota.json"))
+        crate::paths::state_file("quota.json")
     }
 
     /// Today's counters. Every failure -- missing, unreadable, corrupt -- reads
@@ -222,7 +221,7 @@ pub fn evaluate(quota: &DailyQuota, config: &QuotaConfig) -> Verdict {
         return Verdict::Blocked(format!(
             "Daily limit reached — {}. Resets in {} (UTC midnight).\n\
              Type /quota override to keep going today, or raise the limit under [quota] in \
-             ~/.tuisample-code/config.toml.",
+             ~/.boxcode/config.toml.",
             spent.join("; "),
             time_until_utc_midnight()
         ));
