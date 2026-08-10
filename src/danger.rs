@@ -579,9 +579,15 @@ fn redirect_risk(segment: &str, root: &Path) -> Risk {
             while j < bytes.len() && bytes[j].is_whitespace() {
                 j += 1;
             }
+            // Stop at whitespace or at punctuation the shell itself would
+            // treat as ending the target -- not just whitespace. Without this,
+            // `$(cmd 2>/dev/null)` (no space before the subshell's closing
+            // paren) reads the target as `/dev/null)`, which then fails the
+            // exact-string `/dev/null` exemption below and gets misjudged as
+            // a write to a raw device.
             let target: String = bytes[j..]
                 .iter()
-                .take_while(|c| !c.is_whitespace())
+                .take_while(|c| !c.is_whitespace() && !matches!(c, ')' | '`'))
                 .collect::<String>()
                 .trim_matches(|c| c == '\'' || c == '"')
                 .to_string();
@@ -1071,6 +1077,36 @@ mod tests {
     fn discarding_output_to_dev_null_is_ordinary() {
         assert_normal("cargo build > /dev/null");
         assert_normal("ls 2> /dev/null");
+        assert_normal("ls 2>/dev/null");
+    }
+
+    /// Regression: `2>/dev/null` glued directly to a `$(...)` subshell's
+    /// closing paren, with no space, used to have its target parsed as
+    /// `/dev/null)` -- missing the exact-string `/dev/null` exemption above
+    /// and getting misjudged as a write to a raw device. `$(` alone still
+    /// makes the command Dangerous (command substitution is opaque), but it
+    /// must not escalate all the way to Blocked over an ordinary
+    /// discard-stderr-inside-a-capture pattern.
+    #[test]
+    fn dev_null_redirect_glued_to_a_subshells_closing_paren_is_not_a_raw_device() {
+        let command = r#"out=$(gh api "repos/x/y/commits" --jq '.[0].date' 2>/dev/null)"#;
+        assert_dangerous(command);
+        assert!(
+            !matches!(risk(command), Risk::Blocked(_)),
+            "a $(...)-wrapped `2>/dev/null` must not be treated as writing to a raw device, got {:?}",
+            risk(command)
+        );
+    }
+
+    /// Same bug, backtick-flavoured command substitution instead of `$(...)`.
+    #[test]
+    fn dev_null_redirect_glued_to_a_backtick_close_is_not_a_raw_device() {
+        let command = "out=`gh api foo 2>/dev/null`";
+        assert!(
+            !matches!(risk(command), Risk::Blocked(_)),
+            "a backtick-wrapped `2>/dev/null` must not be treated as writing to a raw device, got {:?}",
+            risk(command)
+        );
     }
 
     /// With no workspace configured the absolute checks must still hold; only
