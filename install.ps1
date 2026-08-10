@@ -191,6 +191,21 @@ function Install-EmbeddedPython {
     return Test-Path (Join-Path $dir 'python.exe')
 }
 
+# Windows ships `python.exe`/`python3.exe` "App Execution Alias" stubs in
+# WindowsApps that sit on PATH by default -- even on a machine with no real
+# Python installed. Get-Command finds them like any real binary (they are
+# real files, just useless ones), so without this check Install-Ddgs below
+# would think a real Python was found, skip Install-EmbeddedPython
+# entirely, and then fail confusingly trying to pip-install into the stub.
+# See tools.rs's matching looks_like_windows_app_execution_alias_stub for
+# the runtime side of this same problem. Matched by path rather than by
+# running it, since running it can be slow or pop the Store depending on
+# Windows version/settings.
+function Test-IsAppExecutionAliasStub {
+    param([string] $Path)
+    return ($Path -like '*\WindowsApps\python.exe') -or ($Path -like '*\WindowsApps\python3.exe')
+}
+
 # `web_search` needs Python's `ddgs` package -- see tools.rs's own doc
 # comment for why it shells out to Python rather than a pure-Rust HTTP call,
 # and install.sh's ensure_ddgs_available for the Unix counterpart of this
@@ -203,8 +218,14 @@ function Install-Ddgs {
     $embedded = $false
 
     $found = Get-Command python -ErrorAction SilentlyContinue
+    if ($found -and (Test-IsAppExecutionAliasStub $found.Source)) {
+        $found = $null
+    }
     if (-not $found) {
         $found = Get-Command python3 -ErrorAction SilentlyContinue
+        if ($found -and (Test-IsAppExecutionAliasStub $found.Source)) {
+            $found = $null
+        }
     }
     if ($found) {
         $pythonPath = $found.Source
