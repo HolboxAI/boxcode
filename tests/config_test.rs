@@ -20,13 +20,13 @@ api_key = "sk-test123"
 #[test]
 fn test_env_var_fallback() {
     // Test that env vars can provide config values
-    std::env::set_var("TUISAMPLE_ENDPOINT", "https://test.local");
-    std::env::set_var("TUISAMPLE_MODEL", "test-model");
-    std::env::set_var("TUISAMPLE_API_KEY", "test-key");
+    std::env::set_var("BOXCODE_ENDPOINT", "https://test.local");
+    std::env::set_var("BOXCODE_MODEL", "test-model");
+    std::env::set_var("BOXCODE_API_KEY", "test-key");
 
-    let endpoint = std::env::var("TUISAMPLE_ENDPOINT").unwrap();
-    let model = std::env::var("TUISAMPLE_MODEL").unwrap();
-    let api_key = std::env::var("TUISAMPLE_API_KEY").unwrap();
+    let endpoint = std::env::var("BOXCODE_ENDPOINT").unwrap();
+    let model = std::env::var("BOXCODE_MODEL").unwrap();
+    let api_key = std::env::var("BOXCODE_API_KEY").unwrap();
 
     assert_eq!(endpoint, "https://test.local");
     assert_eq!(model, "test-model");

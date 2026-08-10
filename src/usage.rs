@@ -1,4 +1,4 @@
-//! Local, per-install usage history -- `~/.tuisample-code/usage.jsonl`, one
+//! Local, per-install usage history -- `~/.boxcode/usage.jsonl`, one
 //! line per completed turn.
 //!
 //! This is the only usage record that exists anywhere. There is no login and
@@ -20,8 +20,11 @@ struct Record {
 }
 
 fn usage_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".tuisample-code").join("usage.jsonl"))
+    // Still a guard, not a path: with no home directory at all there is
+    // nowhere to keep state, and falling back to the working directory would
+    // scatter it wherever the app happened to be launched.
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(crate::config::Config::config_dir().join("usage.jsonl"))
 }
 
 /// Appends one record for a turn that streamed `approx_tokens`. A no-op for

@@ -262,27 +262,27 @@ impl Config {
 
         // Environment variables win over the file, so exporting a key works even
         // when a stale config.toml is on disk.
-        if let Some(v) = env_var("TUISAMPLE_ENDPOINT") {
+        if let Some(v) = env_var("BOXCODE_ENDPOINT") {
             config.llm.endpoint = v;
         }
-        if let Some(v) = env_var("TUISAMPLE_MODEL") {
+        if let Some(v) = env_var("BOXCODE_MODEL") {
             config.llm.model = v;
         }
-        if let Some(v) = env_var("TUISAMPLE_API_KEY") {
+        if let Some(v) = env_var("BOXCODE_API_KEY") {
             config.llm.api_key = v;
         }
-        if let Some(v) = env_var("TUISAMPLE_WORKSPACE") {
+        if let Some(v) = env_var("BOXCODE_WORKSPACE") {
             config.tools.workspace = v;
         }
-        if let Some(v) = env_var("TUISAMPLE_TOOLS_ENABLED") {
+        if let Some(v) = env_var("BOXCODE_TOOLS_ENABLED") {
             config.tools.enabled = truthy(&v);
         }
-        if let Some(v) = env_var("TUISAMPLE_QUOTA_ENABLED") {
+        if let Some(v) = env_var("BOXCODE_QUOTA_ENABLED") {
             config.quota.enabled = truthy(&v);
         }
         for (name, slot) in [
-            ("TUISAMPLE_MAX_REQUESTS_PER_DAY", 0),
-            ("TUISAMPLE_MAX_TOKENS_PER_DAY", 1),
+            ("BOXCODE_MAX_REQUESTS_PER_DAY", 0),
+            ("BOXCODE_MAX_TOKENS_PER_DAY", 1),
         ] {
             if let Some(v) = env_var(name) {
                 if let Ok(n) = v.trim().parse::<u64>() {
@@ -293,12 +293,12 @@ impl Config {
                 }
             }
         }
-        if let Some(v) = env_var("TUISAMPLE_MAX_USD_PER_DAY") {
+        if let Some(v) = env_var("BOXCODE_MAX_USD_PER_DAY") {
             if let Ok(n) = v.trim().parse::<f64>() {
                 config.quota.max_usd_per_day = n;
             }
         }
-        if let Some(v) = env_var("TUISAMPLE_TOOLS_APPROVAL") {
+        if let Some(v) = env_var("BOXCODE_TOOLS_APPROVAL") {
             config.tools.require_approval = truthy(&v);
         }
 
@@ -371,7 +371,7 @@ impl Config {
         let mut warnings = Vec::new();
         if self.llm.api_key.is_empty() {
             warnings.push(
-                "No API key set. Export TUISAMPLE_API_KEY or add api_key to ~/.tuisample-code/config.toml."
+                "No API key set. Export BOXCODE_API_KEY or add api_key to ~/.boxcode/config.toml."
                     .to_string(),
             );
         }
@@ -398,10 +398,21 @@ impl Config {
     }
 
     pub fn config_path() -> PathBuf {
-        let home = std::env::var("HOME")
+        Self::config_dir().join("config.toml")
+    }
+
+    /// Where this install keeps its state.
+    ///
+    /// Calls `adopt_legacy_dir` on the way past, so the very first thing any
+    /// caller does is inherit the old directory if there is one.
+    pub fn config_dir() -> PathBuf {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        home.join(".tuisample-code").join("config.toml")
+            .unwrap_or_else(|| PathBuf::from("."));
+        let dir = home.join(".boxcode");
+        adopt_legacy_dir(&home, &dir);
+        dir
     }
 }
 
@@ -412,7 +423,43 @@ fn truthy(value: &str) -> bool {
     )
 }
 
+/// Take over `~/.tuisample-code` when this install has no directory of its own.
+///
+/// Renamed rather than copied, and only when there is nothing to overwrite, so
+/// this can run on every launch and does exactly nothing after the first.
+///
+/// Without it the rename silently costs every existing user their API key and
+/// their free-tier device token -- and the token is the painful one: the device
+/// re-enrols as brand new, which reads to the gateway as someone farming fresh
+/// daily budgets rather than as the same machine after an upgrade.
+fn adopt_legacy_dir(home: &std::path::Path, dir: &std::path::Path) {
+    if dir.exists() {
+        return;
+    }
+    let legacy = home.join(".tuisample-code");
+    if !legacy.is_dir() {
+        return;
+    }
+    // A failure here is not worth interrupting startup for: the app carries on
+    // with a fresh directory, which is exactly what would have happened anyway.
+    let _ = std::fs::rename(&legacy, dir);
+}
+
+/// Read `BOXCODE_*`, falling back to the `TUISAMPLE_*` name it replaced.
+///
+/// The old names stay readable so a shell profile, a CI job or an intern's
+/// half-remembered setup keeps working across the rename. The new name wins
+/// when both are set, so migrating is a matter of adding the new one rather
+/// than having to find and remove the old.
 fn env_var(name: &str) -> Option<String> {
+    if let Some(value) = read_env(name) {
+        return Some(value);
+    }
+    let legacy = name.strip_prefix("BOXCODE_")?;
+    read_env(&format!("TUISAMPLE_{legacy}"))
+}
+
+fn read_env(name: &str) -> Option<String> {
     match std::env::var(name) {
         Ok(v) if !v.trim().is_empty() => Some(v),
         _ => None,
@@ -471,11 +518,11 @@ mod tests {
     #[test]
     fn save_then_load_round_trips_all_llm_fields_including_provider() {
         with_isolated_home(|| {
-            // TUISAMPLE_* env vars win over the file (by design), so a developer
+            // BOXCODE_* env vars win over the file (by design), so a developer
             // machine that happens to have one exported must not leak into this
             // assertion.
             let saved_env: Vec<(&str, Option<String>)> =
-                ["TUISAMPLE_ENDPOINT", "TUISAMPLE_MODEL", "TUISAMPLE_API_KEY"]
+                ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY"]
                     .iter()
                     .map(|&k| (k, std::env::var(k).ok()))
                     .collect();
@@ -583,6 +630,86 @@ mod tests {
         // And a config written before this key existed still gets it.
         let parsed: Config = toml::from_str("[llm]\nendpoint = \"http://x\"\n").expect("parses");
         assert_eq!(parsed.llm.max_tokens, 32768);
+    }
+
+    /// The rename must not cost anyone their settings. The painful one is the
+    /// free-tier device token: losing it re-enrols the machine as brand new,
+    /// which reads to the gateway as someone farming fresh daily budgets rather
+    /// than as the same machine after an upgrade.
+    #[test]
+    fn the_pre_rename_directory_is_adopted_on_first_run() {
+        with_isolated_home(|| {
+            let home = PathBuf::from(std::env::var("HOME").unwrap());
+            let legacy = home.join(".tuisample-code");
+            std::fs::create_dir_all(&legacy).unwrap();
+            std::fs::write(
+                legacy.join("config.toml"),
+                "[llm]\nendpoint = \"https://api.deepseek.com\"\nmodel = \"kept\"\napi_key = \"sk-kept\"\n",
+            )
+            .unwrap();
+            std::fs::write(legacy.join("device_id"), "device-kept").unwrap();
+
+            let dir = Config::config_dir();
+            assert!(dir.ends_with(".boxcode"), "{dir:?}");
+            assert!(!legacy.exists(), "the old directory should have been moved, not copied");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("device_id")).unwrap(),
+                "device-kept",
+                "the free-tier identity must survive the rename"
+            );
+
+            for key in ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY"] {
+                std::env::remove_var(key);
+            }
+            let loaded = Config::load().expect("the adopted config still loads");
+            assert_eq!(loaded.llm.model, "kept");
+            assert_eq!(loaded.llm.api_key, "sk-kept");
+        });
+    }
+
+    /// Adopting must never clobber a directory this install already has.
+    #[test]
+    fn an_existing_directory_is_never_overwritten_by_the_old_one() {
+        with_isolated_home(|| {
+            let home = PathBuf::from(std::env::var("HOME").unwrap());
+            std::fs::create_dir_all(home.join(".boxcode")).unwrap();
+            std::fs::write(home.join(".boxcode/device_id"), "current").unwrap();
+            std::fs::create_dir_all(home.join(".tuisample-code")).unwrap();
+            std::fs::write(home.join(".tuisample-code/device_id"), "stale").unwrap();
+
+            let dir = Config::config_dir();
+            assert_eq!(std::fs::read_to_string(dir.join("device_id")).unwrap(), "current");
+            assert!(
+                home.join(".tuisample-code").exists(),
+                "the old directory is left alone once there is a current one"
+            );
+        });
+    }
+
+    /// A shell profile, a CI job or an intern's half-remembered setup should
+    /// keep working across the rename.
+    #[test]
+    fn the_old_environment_variable_names_still_work() {
+        with_isolated_home(|| {
+            for key in ["BOXCODE_MODEL", "TUISAMPLE_MODEL"] {
+                std::env::remove_var(key);
+            }
+            std::env::set_var("TUISAMPLE_MODEL", "from-the-old-name");
+            assert_eq!(
+                Config::load().unwrap().llm.model,
+                "from-the-old-name",
+                "the pre-rename variable must still be honoured"
+            );
+
+            // ...and the new name wins when both are set, so migrating means
+            // adding the new one rather than hunting down the old.
+            std::env::set_var("BOXCODE_MODEL", "from-the-new-name");
+            assert_eq!(Config::load().unwrap().llm.model, "from-the-new-name");
+
+            for key in ["BOXCODE_MODEL", "TUISAMPLE_MODEL"] {
+                std::env::remove_var(key);
+            }
+        });
     }
 
     #[test]

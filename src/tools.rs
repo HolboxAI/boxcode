@@ -295,7 +295,7 @@ pub fn schemas() -> Vec<Value> {
 pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_available: bool) -> String {
     if !tools_available {
         return format!(
-            "You are tuisample-code, a terminal coding assistant working in {}.\n\
+            "You are boxcode, a terminal coding assistant working in {}.\n\
              You have used up this turn's command budget. Answer the user now, in text, \
              from what you have already seen. Do not ask to run anything else.",
             workspace.root().display()
@@ -320,7 +320,7 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
     };
 
     format!(
-        "You are tuisample-code, a terminal coding assistant.\n\n\
+        "You are boxcode, a terminal coding assistant.\n\n\
          Working directory: {}\n\
          Operating system: {os} — shell commands run through `{shell_name} {shell_flag}`\n\n\
          Tools:\n\
@@ -904,8 +904,11 @@ except Exception as exc:
 /// set), which the caller treats the same as any other reason a fallback
 /// isn't available.
 fn embedded_python_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    let base = PathBuf::from(home).join(".tuisample-code").join("python");
+    // Still a guard, not a path: with no home directory at all there is
+    // nowhere to keep state, and falling back to the working directory would
+    // scatter it wherever the app happened to be launched.
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let base = crate::config::Config::config_dir().join("python");
     let candidate = if cfg!(windows) {
         base.join("python.exe")
     } else {
@@ -2283,7 +2286,7 @@ mod tests {
     /// async test): this test's entire premise is "no interpreter can be
     /// found, not even a fallback", which the real machine running the
     /// suite may not actually be in -- an earlier test run's embedded
-    /// Python left genuinely installed at the real `~/.tuisample-code/
+    /// Python left genuinely installed at the real `~/.boxcode/
     /// python` (deliberately, the same way a real ddgs reinstall is left in
     /// place elsewhere in this file) would otherwise make this assertion
     /// false on a second run, exactly as happened while writing this.
@@ -2348,7 +2351,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
 
         let fake_home = tempfile::tempdir().expect("temp home");
-        let embedded_bin_dir = fake_home.path().join(".tuisample-code").join("python").join("bin");
+        let embedded_bin_dir = fake_home.path().join(".boxcode").join("python").join("bin");
         std::fs::create_dir_all(&embedded_bin_dir).unwrap();
         let embedded_python = embedded_bin_dir.join("python3");
         std::fs::write(

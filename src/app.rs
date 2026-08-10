@@ -947,7 +947,7 @@ impl App {
             && self.config.quota.price_for(&self.config.llm.model).is_none();
 
         let saved = match self.config.save() {
-            Ok(()) => "Saved to ~/.tuisample-code/config.toml.",
+            Ok(()) => "Saved to ~/.boxcode/config.toml.",
             Err(_) => "Active for this session, but could not be written to config.toml.",
         };
         let mut text = format!("Your daily limit is now {described}. {saved}");
@@ -1242,7 +1242,7 @@ impl App {
                     "Stopped after {} tool rounds — the per-turn command budget. The model \
                      tried to keep going and wrote its next command out as text, so nothing \
                      ran. Say \"continue\", or raise `max_steps` under [tools] in \
-                     ~/.tuisample-code/config.toml.",
+                     ~/.boxcode/config.toml.",
                     self.tool_steps
                 )
             } else {
@@ -1258,7 +1258,7 @@ impl App {
                 format!(
                     "Stopped after {} tool rounds — the per-turn command budget. Say \
                      \"continue\" to keep going, or raise `max_steps` under [tools] in \
-                     ~/.tuisample-code/config.toml.",
+                     ~/.boxcode/config.toml.",
                     self.tool_steps
                 ),
             ));
@@ -1687,7 +1687,7 @@ impl App {
     ///
     /// Any test that reaches this function MUST wrap the call in
     /// `config::test_support::with_isolated_home`, or it will write to the real
-    /// developer/CI `~/.tuisample-code/config.toml`.
+    /// developer/CI `~/.boxcode/config.toml`.
     fn apply_llm_config(&mut self, provider: String, endpoint: String, model: String, api_key: String) {
         self.config.llm.provider = provider;
         self.config.llm.endpoint = endpoint;

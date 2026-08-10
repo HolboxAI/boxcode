@@ -20,7 +20,7 @@
 //! that logs each ping to Workers KV and serves a public HTML view of the
 //! aggregate counts at the same URL over GET -- no login collects it, so
 //! nothing here is more sensitive than what that page already shows anyone.
-//! `TUISAMPLE_TELEMETRY_URL` overrides `DEFAULT_TELEMETRY_URL` below, e.g. to
+//! `BOXCODE_TELEMETRY_URL` overrides `DEFAULT_TELEMETRY_URL` below, e.g. to
 //! point a fork or a local test run at a different endpoint. A blank value
 //! either way disables sending entirely -- every function in this module is a
 //! silent no-op in that case, by construction, not by remembering to check a
@@ -30,7 +30,7 @@ use crate::dateutil;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const TELEMETRY_URL_ENV: &str = "TUISAMPLE_TELEMETRY_URL";
+const TELEMETRY_URL_ENV: &str = "BOXCODE_TELEMETRY_URL";
 const DEFAULT_TELEMETRY_URL: &str = "https://tui-telemetry.dhruvm307.workers.dev";
 
 fn telemetry_url() -> Option<String> {
@@ -58,8 +58,10 @@ fn telemetry_url_given(env_override: Option<&str>) -> Option<String> {
 }
 
 fn state_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".tuisample-code"))
+    // Via `config`, not derived here: that is the one place that inherits the
+    // pre-rename directory, and a module that builds the path itself would
+    // create `~/.boxcode` first and quietly strand the old one.
+    Some(crate::config::Config::config_dir())
 }
 
 fn device_id_path() -> Option<PathBuf> {
