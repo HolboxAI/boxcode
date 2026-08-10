@@ -15,7 +15,7 @@ cargo test --all
 
 ### 2. System Requirements Tests
 - ✅ Cargo/Rust must be installed
-- ✅ Config directory can be created (~/.tuisample-code)
+- ✅ Config directory can be created (~/.boxcode)
 - ✅ Env var format validation
 
 **These will SKIP if requirements aren't met** (not failures)
@@ -34,12 +34,12 @@ Before testing, you need:
 cargo build --release
 
 # Set environment variables
-export TUISAMPLE_ENDPOINT=https://api.openai.com
-export TUISAMPLE_MODEL=gpt-4
-export TUISAMPLE_API_KEY=sk-...
+export BOXCODE_ENDPOINT=https://api.openai.com
+export BOXCODE_MODEL=gpt-4
+export BOXCODE_API_KEY=sk-...
 
 # Run the application
-./target/release/tuisample-code
+./target/release/boxcode
 ```
 
 #### Expected Behavior
@@ -53,7 +53,7 @@ export TUISAMPLE_API_KEY=sk-...
 ### 4. Install Script Testing
 ```bash
 # This requires Cargo to be installed
-bash <(curl -fsSL https://raw.githubusercontent.com/HolboxAI/tuisample-code/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.sh)
 ```
 
 **Error: "Rust/Cargo not found"?**
@@ -65,7 +65,7 @@ GitHub Actions runs:
 - `cargo test --all` - Unit tests
 - `cargo clippy` - Linter suggestions
 
-**Status:** View at https://github.com/HolboxAI/tuisample-code/actions
+**Status:** View at https://github.com/HolboxAI/boxcode/actions
 
 ## What's NOT Tested Yet
 - Interactive terminal UI (hard to automate)
@@ -79,9 +79,9 @@ These require manual testing with a real LLM endpoint.
 | Error | Cause | Fix |
 |-------|-------|-----|
 | "Rust/Cargo not found" | Rust not installed | Install from https://rustup.rs/ |
-| "Could not connect to endpoint" | LLM endpoint invalid | Check TUISAMPLE_ENDPOINT env var |
-| "Authentication failed" | Invalid API key | Check TUISAMPLE_API_KEY env var |
-| "Cannot find model" | Model name typo | Check TUISAMPLE_MODEL env var |
+| "Could not connect to endpoint" | LLM endpoint invalid | Check BOXCODE_ENDPOINT env var |
+| "Authentication failed" | Invalid API key | Check BOXCODE_API_KEY env var |
+| "Cannot find model" | Model name typo | Check BOXCODE_MODEL env var |
 
 ## Adding New Tests
 When adding features:

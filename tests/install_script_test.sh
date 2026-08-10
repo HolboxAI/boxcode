@@ -1,7 +1,7 @@
 #!/bin/bash
 # Exercises install.sh's stale-binary PATH sweep in isolation: no cargo
 # build, no sudo, no network. Regression test for the bug where a stale
-# `tuisample-code` binary elsewhere on $PATH (not just /usr/local/bin or
+# `boxcode` binary elsewhere on $PATH (not just /usr/local/bin or
 # ~/.local/bin) could keep shadowing a freshly installed build.
 set -euo pipefail
 
@@ -22,29 +22,29 @@ dir_installed="$workdir/installed"
 mkdir -p "$dir_a" "$dir_b" "$dir_installed"
 
 # Stale copies sitting in directories the old installer never knew to check.
-echo "old-a" > "$dir_a/tuisample-code"
-chmod +x "$dir_a/tuisample-code"
-echo "old-b" > "$dir_b/tuisample-code"
-chmod +x "$dir_b/tuisample-code"
+echo "old-a" > "$dir_a/boxcode"
+chmod +x "$dir_a/boxcode"
+echo "old-b" > "$dir_b/boxcode"
+chmod +x "$dir_b/boxcode"
 
 # The binary we just installed — must never be touched by the sweep.
-echo "new" > "$dir_installed/tuisample-code"
-chmod +x "$dir_installed/tuisample-code"
+echo "new" > "$dir_installed/boxcode"
+chmod +x "$dir_installed/boxcode"
 
 # Deliberately an isolated PATH: the test directories plus bare-minimum
 # system dirs for `rm` itself -- never the real $PATH, or the sweep would
 # delete real binaries (as happened once while writing this test).
 PATH="$dir_installed:$dir_a:$dir_b:/bin:/usr/bin" \
-  sweep_path_for_stale_copies "$dir_installed/tuisample-code"
+  sweep_path_for_stale_copies "$dir_installed/boxcode"
 
-[ -f "$dir_a/tuisample-code" ] && fail "stale copy in $dir_a should have been removed"
-[ -f "$dir_b/tuisample-code" ] && fail "stale copy in $dir_b should have been removed"
-[ -f "$dir_installed/tuisample-code" ] || fail "the newly installed binary must not be removed"
+[ -f "$dir_a/boxcode" ] && fail "stale copy in $dir_a should have been removed"
+[ -f "$dir_b/boxcode" ] && fail "stale copy in $dir_b should have been removed"
+[ -f "$dir_installed/boxcode" ] || fail "the newly installed binary must not be removed"
 
 echo "PASS: sweep_path_for_stale_copies removes stale copies elsewhere on \$PATH but keeps the installed one"
 
 # --- install_binary ---------------------------------------------------------
-# `tuisample-code --upgrade` runs this installer from the very binary being
+# `boxcode --upgrade` runs this installer from the very binary being
 # replaced. Writing over the destination in place fails with ETXTBSY on Linux,
 # so install_binary must swap the inode by rename instead.
 
@@ -73,12 +73,12 @@ if [ "$(id -u)" -ne 0 ]; then
   unwritable="$workdir/unwritable"
   mkdir -p "$unwritable"
   chmod 500 "$unwritable"
-  if install_binary "$bin_dir/src" "$unwritable/tuisample-code" 2>/dev/null; then
+  if install_binary "$bin_dir/src" "$unwritable/boxcode" 2>/dev/null; then
     chmod 700 "$unwritable"
     fail "install_binary should return non-zero when the destination is unwritable"
   fi
   chmod 700 "$unwritable"
-  [ -z "$(ls "$unwritable"/tuisample-code.new.* 2>/dev/null)" ] ||
+  [ -z "$(ls "$unwritable"/boxcode.new.* 2>/dev/null)" ] ||
     fail "failed install should not leave a temp file behind"
 fi
 
@@ -90,7 +90,7 @@ echo "PASS: install_binary replaces a running binary by rename and cleans up on 
 # explicit blank override, and must never fail the install itself even when a
 # URL is configured but nothing is listening.
 #
-# Deliberately does NOT test "an unset TUISAMPLE_TELEMETRY_URL reaches the
+# Deliberately does NOT test "an unset BOXCODE_TELEMETRY_URL reaches the
 # real production endpoint" by actually letting that curl fire -- these tests
 # run on every `cargo test`/CI pass, and that would mean every test run sends
 # a real ping to production. The URL-resolution logic itself (unset falls
@@ -105,7 +105,7 @@ fake_home=$(mktemp -d)
 fake_bin="$workdir/fake-binary"
 cat > "$fake_bin" <<'EOF'
 #!/bin/bash
-echo "tuisample-code 9.9.9"
+echo "boxcode 9.9.9"
 EOF
 chmod +x "$fake_bin"
 
@@ -113,12 +113,12 @@ chmod +x "$fake_bin"
 # now a real, non-blank endpoint. This is "${VAR-default}" (no colon) rather
 # than "${VAR:-default}" specifically so this case is reachable at all: the
 # colon form can't distinguish "unset" from "set to empty".
-TUISAMPLE_TELEMETRY_URL="" HOME="$fake_home" ping_install "$fake_bin" ||
+BOXCODE_TELEMETRY_URL="" HOME="$fake_home" ping_install "$fake_bin" ||
   fail "ping_install must return 0 even when explicitly disabled"
-[ -f "$fake_home/.tuisample-code/device_id" ] &&
+[ -f "$fake_home/.boxcode/device_id" ] &&
   fail "an explicitly blank override must disable sending despite a non-blank default"
 
-echo "PASS: ping_install is disabled by an explicit blank TUISAMPLE_TELEMETRY_URL override"
+echo "PASS: ping_install is disabled by an explicit blank BOXCODE_TELEMETRY_URL override"
 
 # Enabled, but pointing at nothing reachable: must still return success and
 # must still create the device id (idempotently, for install.sh's own use and
@@ -128,16 +128,16 @@ echo "PASS: ping_install is disabled by an explicit blank TUISAMPLE_TELEMETRY_UR
 rm -rf "$fake_home"
 mkdir -p "$fake_home"
 start=$(date +%s)
-TUISAMPLE_TELEMETRY_URL="http://127.0.0.1:1/nowhere" HOME="$fake_home" ping_install "$fake_bin" ||
+BOXCODE_TELEMETRY_URL="http://127.0.0.1:1/nowhere" HOME="$fake_home" ping_install "$fake_bin" ||
   fail "ping_install must return 0 even when the endpoint is unreachable"
 elapsed=$(( $(date +%s) - start ))
-[ -f "$fake_home/.tuisample-code/device_id" ] || fail "device id must be created once enabled"
-[ -s "$fake_home/.tuisample-code/device_id" ] || fail "device id file must not be empty"
+[ -f "$fake_home/.boxcode/device_id" ] || fail "device id must be created once enabled"
+[ -s "$fake_home/.boxcode/device_id" ] || fail "device id file must not be empty"
 [ "$elapsed" -lt 2 ] || fail "ping_install must not block on the network (took ${elapsed}s)"
 
-first_id=$(cat "$fake_home/.tuisample-code/device_id")
-TUISAMPLE_TELEMETRY_URL="http://127.0.0.1:1/nowhere" HOME="$fake_home" ping_install "$fake_bin"
-second_id=$(cat "$fake_home/.tuisample-code/device_id")
+first_id=$(cat "$fake_home/.boxcode/device_id")
+BOXCODE_TELEMETRY_URL="http://127.0.0.1:1/nowhere" HOME="$fake_home" ping_install "$fake_bin"
+second_id=$(cat "$fake_home/.boxcode/device_id")
 [ "$first_id" = "$second_id" ] || fail "an existing device id must be reused, not regenerated"
 
 rm -rf "$fake_home"
@@ -179,10 +179,10 @@ fixture_release_json='{
   "tag_name": "v0.9.0",
   "assets": [
     {
-      "url": "https://api.github.com/repos/HolboxAI/tuisample-code/releases/assets/1",
+      "url": "https://api.github.com/repos/HolboxAI/boxcode/releases/assets/1",
       "id": 1,
       "node_id": "RA_1",
-      "name": "tuisample-code-linux-x86_64",
+      "name": "boxcode-linux-x86_64",
       "label": null,
       "content_type": "application/octet-stream",
       "state": "uploaded",
@@ -190,13 +190,13 @@ fixture_release_json='{
       "download_count": 0,
       "created_at": "2026-08-06T00:00:00Z",
       "updated_at": "2026-08-06T00:00:00Z",
-      "browser_download_url": "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/tuisample-code-linux-x86_64"
+      "browser_download_url": "https://github.com/HolboxAI/boxcode/releases/download/v0.9.0/boxcode-linux-x86_64"
     },
     {
-      "url": "https://api.github.com/repos/HolboxAI/tuisample-code/releases/assets/2",
+      "url": "https://api.github.com/repos/HolboxAI/boxcode/releases/assets/2",
       "id": 2,
       "node_id": "RA_2",
-      "name": "tuisample-code-macos-aarch64",
+      "name": "boxcode-macos-aarch64",
       "label": null,
       "content_type": "application/octet-stream",
       "state": "uploaded",
@@ -204,10 +204,10 @@ fixture_release_json='{
       "download_count": 0,
       "created_at": "2026-08-06T00:00:00Z",
       "updated_at": "2026-08-06T00:00:00Z",
-      "browser_download_url": "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/tuisample-code-macos-aarch64"
+      "browser_download_url": "https://github.com/HolboxAI/boxcode/releases/download/v0.9.0/boxcode-macos-aarch64"
     },
     {
-      "url": "https://api.github.com/repos/HolboxAI/tuisample-code/releases/assets/3",
+      "url": "https://api.github.com/repos/HolboxAI/boxcode/releases/assets/3",
       "id": 3,
       "node_id": "RA_3",
       "name": "SHA256SUMS.txt",
@@ -218,24 +218,24 @@ fixture_release_json='{
       "download_count": 0,
       "created_at": "2026-08-06T00:00:00Z",
       "updated_at": "2026-08-06T00:00:00Z",
-      "browser_download_url": "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/SHA256SUMS.txt"
+      "browser_download_url": "https://github.com/HolboxAI/boxcode/releases/download/v0.9.0/SHA256SUMS.txt"
     }
   ]
 }'
 
-url=$(asset_download_url "$fixture_release_json" "tuisample-code-linux-x86_64")
-[ "$url" = "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/tuisample-code-linux-x86_64" ] ||
+url=$(asset_download_url "$fixture_release_json" "boxcode-linux-x86_64")
+[ "$url" = "https://github.com/HolboxAI/boxcode/releases/download/v0.9.0/boxcode-linux-x86_64" ] ||
   fail "expected the linux-x86_64 asset's URL, got: $url"
 
-url=$(asset_download_url "$fixture_release_json" "tuisample-code-macos-aarch64")
-[ "$url" = "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/tuisample-code-macos-aarch64" ] ||
+url=$(asset_download_url "$fixture_release_json" "boxcode-macos-aarch64")
+[ "$url" = "https://github.com/HolboxAI/boxcode/releases/download/v0.9.0/boxcode-macos-aarch64" ] ||
   fail "expected the macos-aarch64 asset's URL, got: $url"
 
 url=$(asset_download_url "$fixture_release_json" "SHA256SUMS.txt")
-[ "$url" = "https://github.com/HolboxAI/tuisample-code/releases/download/v0.9.0/SHA256SUMS.txt" ] ||
+[ "$url" = "https://github.com/HolboxAI/boxcode/releases/download/v0.9.0/SHA256SUMS.txt" ] ||
   fail "expected the checksums asset's URL, got: $url"
 
-url=$(asset_download_url "$fixture_release_json" "tuisample-code-windows-x86_64.exe")
+url=$(asset_download_url "$fixture_release_json" "boxcode-windows-x86_64.exe")
 [ -z "$url" ] || fail "an asset that is not in the release must resolve to nothing, got: $url"
 
 echo "PASS: asset_download_url finds the right asset's URL in a real-shaped release response"
@@ -246,7 +246,7 @@ echo "PASS: asset_download_url finds the right asset's URL in a real-shaped rele
 # re-testing sha256sum/shasum itself.
 
 sum_file="$workdir/sum-target"
-echo -n "tuisample-code" > "$sum_file"
+echo -n "boxcode" > "$sum_file"
 computed=$(sha256_of "$sum_file")
 if command -v sha256sum &> /dev/null; then
   reference=$(sha256sum "$sum_file" | awk '{print $1}')
@@ -366,7 +366,7 @@ unset -f python3
 # behind -- this test's whole point is exercising what happens when
 # uname/curl/etc. genuinely cannot be found, which never even gets reached
 # once an embedded Python already satisfies the check first.
-rm -rf "$HOME/.tuisample-code/python"
+rm -rf "$HOME/.boxcode/python"
 no_python_dir="$workdir/no-python-path"
 mkdir -p "$no_python_dir"
 out=$(PATH="$no_python_dir" ensure_ddgs_available 2>/dev/null)
@@ -379,13 +379,13 @@ echo "PASS: ensure_ddgs_available fails gracefully, not silently, on a maximally
 # itself needs (uname, curl, tar, mkdir, mv, rm) is present, python3 alone is
 # not -- proving detect_os/detect_arch resolve a real target here (unlike the
 # test above), so this is actually exercising "downloading failed", not
-# "couldn't even tell what to download". TUISAMPLE_PYTHON_STANDALONE_URL
+# "couldn't even tell what to download". BOXCODE_PYTHON_STANDALONE_URL
 # points at a refused connection so this stays fast and network-independent.
 #
 # Forced clean slate again, same reason as the test above -- each test
 # clears it independently rather than relying on running right after one
 # that already did, so reordering this file can never quietly break either.
-rm -rf "$HOME/.tuisample-code/python"
+rm -rf "$HOME/.boxcode/python"
 curated_path_dir="$workdir/no-python3-but-otherwise-normal"
 mkdir -p "$curated_path_dir"
 for tool in uname curl tar gzip mkdir dirname mv rm cp chmod mktemp; do
@@ -393,10 +393,10 @@ for tool in uname curl tar gzip mkdir dirname mv rm cp chmod mktemp; do
   ln -sf "$tool_path" "$curated_path_dir/$tool"
 done
 start=$(date +%s)
-# PYTHON_STANDALONE_BASE_URL directly, not TUISAMPLE_PYTHON_STANDALONE_URL --
+# PYTHON_STANDALONE_BASE_URL directly, not BOXCODE_PYTHON_STANDALONE_URL --
 # the latter is only consulted once, at source time, to compute the
 # former's default (same reason the fetch_prebuilt_binary test above
-# overrides RELEASE_API_BASE directly rather than its TUISAMPLE_ env var).
+# overrides RELEASE_API_BASE directly rather than its BOXCODE_ env var).
 out=$(PATH="$curated_path_dir" PYTHON_STANDALONE_BASE_URL="http://127.0.0.1:1" ensure_ddgs_available)
 elapsed=$(( $(date +%s) - start ))
 # Not silent -- it did genuinely try, and says so -- but must end with the
@@ -425,7 +425,7 @@ echo "PASS: ensure_ddgs_available is a silent no-op when python3 is missing and 
 # perfectly fine thing for this machine to end up with, the same way the
 # ddgs-reinstall test above leaves ddgs genuinely installed rather than
 # reverting it.
-embedded_python_dir="$HOME/.tuisample-code/python"
+embedded_python_dir="$HOME/.boxcode/python"
 rm -rf "$embedded_python_dir"
 
 real_out=$(PATH="$curated_path_dir" ensure_ddgs_available 2>&1)
