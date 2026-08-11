@@ -387,6 +387,21 @@ function Main {
         Write-Host '  running the old version.'
     }
 
+    # The pre-1.0 name. Left on PATH it is not merely clutter: it is a whole
+    # second copy of this tool, on an older version, that keeps working under
+    # the name people already have in their shell history.
+    $legacy = Get-Command tuisample-code -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($legacy) {
+        Write-Host ''
+        Write-Host "Found the old 'tuisample-code' binary at $($legacy.Source)."
+        try {
+            Remove-Item -Force $legacy.Source -ErrorAction Stop
+            Write-Host '  Removed it. boxcode replaces it.'
+        } catch {
+            Write-Host "  Could not remove it. Delete it yourself: Remove-Item -Force $($legacy.Source)"
+        }
+    }
+
     Install-Ddgs
 
     $version = (& $installedAt --version 2>$null)

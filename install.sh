@@ -9,24 +9,30 @@ RELEASE_API_BASE="${BOXCODE_RELEASE_API_BASE:-https://api.github.com/repos/Holbo
 # Remove any other "boxcode" executable found on $PATH so a stale
 # build from a previous install can't shadow (or be shadowed by) the one we
 # just installed, regardless of which directory it ended up in.
+# Removes copies of this tool that the shell might resolve to instead of the
+# one just installed -- including the pre-1.0 `tuisample-code` name, which is
+# the whole reason an upgrade can appear to do nothing: the new binary lands
+# correctly and the shell keeps running the old one under its old name.
 sweep_path_for_stale_copies() {
   local installed_at="$1"
-  local dir candidate found=0
+  local dir candidate name found=0
   local saved_ifs="$IFS"
   IFS=':'
   for dir in $PATH; do
     IFS="$saved_ifs"
     [ -n "$dir" ] || continue
-    candidate="$dir/boxcode"
-    if [ -f "$candidate" ] && [ "$candidate" != "$installed_at" ]; then
-      found=1
-      echo "🧹 Removing stale copy on PATH: $candidate"
-      if [ -w "$dir" ]; then
-        rm -f "$candidate" || echo "⚠️  Could not remove it. Run: rm $candidate"
-      else
-        sudo rm -f "$candidate" || echo "⚠️  Could not remove it. Run: sudo rm $candidate"
+    for name in boxcode tuisample-code; do
+      candidate="$dir/$name"
+      if [ -f "$candidate" ] && [ "$candidate" != "$installed_at" ]; then
+        found=1
+        echo "🧹 Removing stale copy on PATH: $candidate"
+        if [ -w "$dir" ]; then
+          rm -f "$candidate" || echo "⚠️  Could not remove it. Run: rm $candidate"
+        else
+          sudo rm -f "$candidate" || echo "⚠️  Could not remove it. Run: sudo rm $candidate"
+        fi
       fi
-    fi
+    done
     IFS=':'
   done
   IFS="$saved_ifs"

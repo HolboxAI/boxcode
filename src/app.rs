@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::danger;
+use crate::deploy::{self, DeployAction, DeployEvent, DeploySession, Stage};
 use crate::llm::{ChatMessage, ToolCall};
 use crate::providers;
 use crate::tools::{self, ToolOutcome};
@@ -111,6 +112,10 @@ pub enum Overlay {
         /// How many more calls are queued behind this one.
         remaining: usize,
     },
+    /// `/deploy`. A marker only: the flow is long-lived and streams output, so
+    /// its state lives in `App::deploy` rather than in this variant. Every
+    /// other overlay is one question with one answer and carries its own data.
+    Deploy,
 }
 
 /// Sequential manual entry used when the user picks "Custom endpoint..." instead
@@ -135,6 +140,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/compact", "summarise the conversation to free up context"),
     ("/usage", "what today cost, and the history"),
     ("/quota", "what is left today, and your own limits"),
+    ("/deploy", "ship this project to Vercel or Netlify"),
+    ("/deployments", "recent deployments from this machine"),
 ];
 
 /// Roughly how many characters one token is worth.
@@ -240,6 +247,10 @@ pub struct ContextSize {
     /// The `CHARS_PER_TOKEN` estimate of what they occupy.
     pub approx_tokens: usize,
 }
+/// The commands `[deploy] enabled = false` removes. Listed here rather than
+/// checked ad hoc at each call site, so turning the feature off cannot leave
+/// one of them reachable through the autocomplete while the other is gone.
+const DEPLOY_COMMANDS: &[&str] = &["/deploy", "/deployments"];
 
 pub struct App {
     pub state: AppState,
@@ -346,6 +357,10 @@ pub struct App {
     /// One line for the welcome screen describing where commands will run, or
     /// why the tool is off. Set by `main` once the workspace has been resolved.
     pub workspace_status: String,
+    /// Things that happened before the first frame and are worth saying once:
+    /// the v1.0.0 state migration, and any deprecated `BOXCODE_*` variable
+    /// still being relied on. Shown on the welcome screen, then gone.
+    pub startup_notices: Vec<String>,
     /// The resolved working directory, shown on the approval prompt so it is
     /// always clear *where* a command is about to run.
     pub workspace_root: String,
@@ -389,6 +404,20 @@ pub struct App {
     /// `include_usage` is on), which is why it supplements the estimate rather
     /// than replacing it.
     pub last_prompt_tokens: Option<usize>,
+    /// `Some` while `/deploy` is running. Holds the whole flow -- see
+    /// `deploy::service`, which is a pure state machine for the same reason
+    /// `pending_usage` is a queue: `App` performs no I/O of its own.
+    pub deploy: Option<DeploySession>,
+    /// Work the deployment flow wants done, waiting for the event loop to
+    /// spawn it. Drained by `main.rs` exactly like `approved_tools`.
+    pub deploy_action: Option<DeployAction>,
+    /// Abort handle for the deployment command in flight, used by Esc. The
+    /// child is killed on drop, so aborting the task kills the process too.
+    pub deploy_abort: Option<tokio::task::AbortHandle>,
+    /// The `deploy_project` call the running deployment is answering, when the
+    /// model asked for it rather than the user typing `/deploy`. `Some` means
+    /// a turn is waiting on this flow to finish.
+    pub deploy_tool_call: Option<ToolCall>,
 }
 
 impl App {
@@ -426,6 +455,7 @@ impl App {
             warned_today: false,
             quota_dirty: false,
             workspace_status: String::new(),
+            startup_notices: Vec::new(),
             workspace_root: String::new(),
             prompt_history: Vec::new(),
             history_index: None,
@@ -434,7 +464,22 @@ impl App {
             compacting: false,
             compact_before: None,
             last_prompt_tokens: None,
+            deploy: None,
+            deploy_action: None,
+            deploy_abort: None,
+            deploy_tool_call: None,
         }
+    }
+
+    /// Every command this build offers, with the ones `[deploy] enabled =
+    /// false` removes taken out. The single source for both the autocomplete
+    /// menu and the welcome screen's list.
+    pub fn available_commands(&self) -> Vec<(&'static str, &'static str)> {
+        COMMANDS
+            .iter()
+            .filter(|(name, _)| self.config.deploy.enabled || !DEPLOY_COMMANDS.contains(name))
+            .copied()
+            .collect()
     }
 
     pub fn is_busy(&self) -> bool {
@@ -463,10 +508,9 @@ impl App {
             return Vec::new();
         }
         let typed = self.input_buffer.trim();
-        COMMANDS
-            .iter()
+        self.available_commands()
+            .into_iter()
             .filter(|(name, _)| name.starts_with(typed))
-            .copied()
             .collect()
     }
 
@@ -521,6 +565,8 @@ impl App {
                         "/compact" => self.start_compaction(),
                         "/usage" => self.show_usage(),
                         "/quota" => self.show_quota(),
+                        "/deploy" => self.open_deploy(),
+                        "/deployments" => self.show_deployments(),
                         other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
                     }
                 } else {
@@ -812,7 +858,11 @@ impl App {
     /// `Sending` if everything was refused (the model still gets told, and can
     /// answer without it).
     fn advance_approvals(&mut self) {
-        while let Some(call) = self.pending_tools.front() {
+        // Cloned off the front rather than borrowed: several of the decisions
+        // below mutate `self` (starting a deployment, pushing a message), and
+        // a live borrow into `pending_tools` would forbid all of them.
+        while let Some(call) = self.pending_tools.front().cloned() {
+            let call = &call;
             // Refused outright, and never put in front of the user at all.
             // Offering `rm -rf /` as a y/n question is itself the bug: it takes
             // one mistyped keystroke to accept, and there is no undo. There is
@@ -836,7 +886,22 @@ impl App {
                 continue;
             }
             match tools::describe_action(call) {
-                Some(action) => {
+                Some(mut action) => {
+                    // Detection runs once here rather than in `describe_action`
+                    // (which has no workspace) or in `ui.rs` (which would redo
+                    // it on every frame, 60 times a second, to draw one line).
+                    if let tools::Action::Deploy { summary, .. } = &mut action {
+                        *summary = deploy::detect::detect(Path::new(&self.workspace_root))
+                            .ok()
+                            .map(|profile| {
+                                format!(
+                                    "{} · {} · {}",
+                                    profile.framework.label(),
+                                    profile.build_command.as_deref().unwrap_or("no build"),
+                                    profile.output_dir.as_deref().unwrap_or("output handled by the provider"),
+                                )
+                            });
+                    }
                     self.overlay = Some(Overlay::ToolApproval {
                         action,
                         remaining: self.pending_tools.len().saturating_sub(1),
@@ -872,12 +937,8 @@ impl App {
     /// would actually run in.
     pub fn risk_of(&self, call: &ToolCall) -> danger::Risk {
         match tools::describe_action(call) {
-            Some(tools::Action::Command { command, .. }) => {
-                danger::classify(&command, Path::new(&self.workspace_root))
-            }
-            // Reads and writes are already confined to the workspace by
-            // `tools::resolve_in_workspace`, and cannot invoke a shell.
-            _ => danger::Risk::Normal,
+            Some(action) => tools::action_risk(&action, Path::new(&self.workspace_root)),
+            None => danger::Risk::Normal,
         }
     }
 
@@ -1414,7 +1475,16 @@ impl App {
         };
 
         if allowed {
-            self.approved_tools.push(call);
+            // A deployment the model asked for is handed to the same flow
+            // `/deploy` uses, rather than run headlessly by `tools::execute`:
+            // that is the only way the things it may need mid-run -- consent
+            // to install a CLI, and the terminal itself for a browser login --
+            // can happen at all. Strictly after the approval above, so the
+            // deployment can never begin without one.
+            match self.deploy_takes_over(call) {
+                None => return,
+                Some(call) => self.approved_tools.push(call),
+            }
         } else {
             self.push_tool_outcome(tools::declined(&call));
         }
@@ -1831,6 +1901,377 @@ impl App {
         }
     }
 
+    // ---- /deploy ---------------------------------------------------------
+
+    /// Start the deployment flow for a `deploy_project` call the user has just
+    /// approved. Returns `None` when it took the call, or hands it back to be
+    /// run as an ordinary tool when it did not.
+    ///
+    /// Declines -- leaving it to the ordinary runner, which reports back why --
+    /// when it is not the only call in the batch. A
+    /// deployment owns the screen from here until it finishes, so running it
+    /// interleaved with other tool calls would mean two things claiming the
+    /// same turn. Rare enough to refuse plainly rather than sequence.
+    fn deploy_takes_over(&mut self, call: ToolCall) -> Option<ToolCall> {
+        let Some(tools::Action::Deploy { provider, production, .. }) = tools::describe_action(&call)
+        else {
+            return Some(call);
+        };
+        // Nothing else may be in flight: this owns the screen until it is done.
+        if !self.pending_tools.is_empty() || !self.approved_tools.is_empty() {
+            return Some(call);
+        }
+        let Some(provider_id) = deploy::provider_by_id(&provider).map(|p| p.id()) else {
+            return Some(call);
+        };
+        if !self.config.deploy.enabled || self.workspace_root.is_empty() {
+            return Some(call);
+        }
+        let Ok(profile) = deploy::detect::detect(Path::new(&self.workspace_root)) else {
+            return Some(call);
+        };
+
+        for warning in &profile.warnings {
+            self.messages
+                .push(Message::new(Role::System, warning.clone()));
+        }
+
+        let (session, action) = DeploySession::for_agent(
+            profile,
+            deploy::service::DeployPolicy {
+                allow_cli_install: self.config.deploy.allow_cli_install,
+            },
+            provider_id,
+            if production {
+                deploy::Target::Production
+            } else {
+                deploy::Target::Preview
+            },
+        );
+        self.deploy = Some(session);
+        self.deploy_tool_call = Some(call);
+        self.overlay = Some(Overlay::Deploy);
+        // The turn is still running: the model is waiting on this call, and
+        // the spinner and Esc behaviour should say so.
+        self.state = AppState::ExecutingTools;
+        self.queue_deploy_action(action);
+        None
+    }
+
+    /// `/deploy` -- inspect the project, then walk through shipping it.
+    ///
+    /// Detection runs here, before a provider has been chosen: it is a handful
+    /// of file reads, so the answer is on screen by the time the provider
+    /// picker is, and it works with no CLI installed and nobody signed in.
+    fn open_deploy(&mut self) {
+        self.greeted = true;
+        self.follow_tail = true;
+
+        if !self.config.deploy.enabled {
+            self.messages.push(Message::new(
+                Role::Error,
+                "Deployment is turned off (`enabled = false` under [deploy] in \
+                 ~/.boxcode/config.toml).",
+            ));
+            return;
+        }
+        // The project is the directory commands already run in. With tools off
+        // there is no such directory, and inventing one would deploy something
+        // the user never pointed at.
+        if self.workspace_root.is_empty() {
+            self.messages.push(Message::new(
+                Role::Error,
+                "No project directory. /deploy ships the directory this app was launched in, \
+                 which needs [tools] enabled in ~/.boxcode/config.toml.",
+            ));
+            return;
+        }
+
+        match deploy::detect::detect(Path::new(&self.workspace_root)) {
+            Ok(profile) => {
+                // Worth seeing before choosing anything, and the transcript is
+                // where it stays readable after the overlay closes.
+                for warning in &profile.warnings {
+                    self.messages
+                        .push(Message::new(Role::System, warning.clone()));
+                }
+                self.deploy = Some(DeploySession::new(
+                    profile,
+                    deploy::service::DeployPolicy {
+                        allow_cli_install: self.config.deploy.allow_cli_install,
+                    },
+                ));
+                self.overlay = Some(Overlay::Deploy);
+            }
+            Err(e) => self
+                .messages
+                .push(Message::new(Role::Error, e.to_string())),
+        }
+    }
+
+    /// `/deployments` -- what this machine has shipped, newest first.
+    fn show_deployments(&mut self) {
+        self.greeted = true;
+        self.follow_tail = true;
+        let entries = deploy::history::recent(self.config.deploy.history_limit);
+
+        if entries.is_empty() {
+            self.messages.push(Message::new(
+                Role::System,
+                "No deployments yet. /deploy ships this project to Vercel or Netlify.",
+            ));
+            return;
+        }
+
+        let mut lines = vec!["Recent deployments (this machine only)".to_string()];
+        for entry in entries {
+            lines.push(String::new());
+            lines.push(format!("  {}  ({})", entry.project, entry.date));
+            lines.push(format!(
+                "    {} · {} · {}",
+                entry.provider,
+                entry.target,
+                entry.summary()
+            ));
+            if !entry.env_keys.is_empty() {
+                // Names only. Values were never stored -- see `deploy::history`.
+                lines.push(format!("    env: {}", entry.env_keys.join(", ")));
+            }
+            if let Some(detail) = &entry.detail {
+                lines.push(format!("    {detail}"));
+            }
+        }
+        self.messages
+            .push(Message::new(Role::System, lines.join("\n")));
+    }
+
+    /// Keys while the deployment overlay is up.
+    ///
+    /// Three screens with three key sets, kept apart by the stage rather than
+    /// by a separate overlay variant each: a menu takes ↑/↓/Enter, a text
+    /// prompt takes typing, and a running step takes only Esc.
+    fn handle_deploy_key(&mut self, key: KeyEvent) {
+        if self.deploy.is_none() {
+            self.overlay = None;
+            return;
+        }
+        let stage = self
+            .deploy
+            .as_ref()
+            .expect("just checked")
+            .stage
+            .clone();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // The two stages that have to reach past the session -- to the abort
+        // handle, and to closing the overlay -- are handled before the session
+        // is borrowed mutably at all.
+        match stage {
+            Stage::Working(_) => {
+                if key.code == KeyCode::Esc {
+                    // Aborting the task drops the future, and the child is
+                    // spawned with `kill_on_drop`, so this stops the real
+                    // process rather than just stopping us listening to it.
+                    if let Some(handle) = self.deploy_abort.take() {
+                        handle.abort();
+                    }
+                    if self.deploy.as_mut().expect("just checked").back() {
+                        self.close_deploy();
+                    }
+                }
+                // Every other key is ignored rather than queued, so a keystroke
+                // typed at a spinner cannot answer a question that appears a
+                // second later.
+                return;
+            }
+            Stage::Finished => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                    self.close_deploy();
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let mut close = false;
+        let session = self.deploy.as_mut().expect("just checked");
+        let action = match stage {
+            Stage::Prompt(_) => match key.code {
+                KeyCode::Enter => session.submit_prompt(),
+                KeyCode::Esc => {
+                    close = session.back();
+                    None
+                }
+                KeyCode::Backspace => {
+                    delete_before_in(&mut session.input, &mut session.input_cursor);
+                    None
+                }
+                KeyCode::Delete => {
+                    delete_after_in(&mut session.input, &mut session.input_cursor);
+                    None
+                }
+                KeyCode::Left => {
+                    session.input_cursor = prev_char_boundary(&session.input, session.input_cursor);
+                    None
+                }
+                KeyCode::Right => {
+                    session.input_cursor = next_char_boundary(&session.input, session.input_cursor);
+                    None
+                }
+                KeyCode::Home => {
+                    session.input_cursor = 0;
+                    None
+                }
+                KeyCode::End => {
+                    session.input_cursor = session.input.len();
+                    None
+                }
+                KeyCode::Char('u') if ctrl => {
+                    session.input.drain(..session.input_cursor);
+                    session.input_cursor = 0;
+                    None
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    insert_into(&mut session.input, &mut session.input_cursor, &c.to_string());
+                    None
+                }
+                _ => None,
+            },
+
+            Stage::Menu(_) => match key.code {
+                KeyCode::Up => {
+                    session.move_selection(-1);
+                    None
+                }
+                KeyCode::Down => {
+                    session.move_selection(1);
+                    None
+                }
+                KeyCode::Enter => session.select(),
+                KeyCode::Esc => {
+                    close = session.back();
+                    None
+                }
+                // `y`/`n` on a two-choice screen, matching the tool-approval
+                // prompt's shortcuts. Only where there are exactly two options,
+                // so it can never mean something different from what is shown.
+                KeyCode::Char('y') | KeyCode::Char('Y') if session.options().len() == 2 => {
+                    session.selected = 0;
+                    session.select()
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if session.options().len() == 2 => {
+                    session.selected = 1;
+                    session.select()
+                }
+                _ => None,
+            },
+
+            // Handled above, before the session was borrowed.
+            Stage::Working(_) | Stage::Finished => None,
+        };
+
+        if close {
+            self.close_deploy();
+        }
+        self.queue_deploy_action(action);
+    }
+
+    /// A result or a log line from a deployment command.
+    pub fn handle_deploy_event(&mut self, event: DeployEvent) {
+        let Some(session) = self.deploy.as_mut() else {
+            return;
+        };
+        let action = session.on_event(event);
+        self.queue_deploy_action(action);
+    }
+
+    /// Hand work to the event loop, or write history, depending on what the
+    /// flow asked for. History is the one thing done here rather than in
+    /// `main.rs`, because it is a single append with nothing to stream.
+    fn queue_deploy_action(&mut self, action: Option<DeployAction>) {
+        match action {
+            Some(DeployAction::Record(entry)) => {
+                // Recorded through the event loop like everything else that
+                // touches disk, so `App`'s own tests never write to a real
+                // `$HOME` -- see `pending_usage`'s doc comment.
+                self.deploy_action = Some(DeployAction::Record(entry));
+            }
+            Some(other) => self.deploy_action = Some(other),
+            None => {}
+        }
+        self.follow_tail = true;
+
+        // A deployment the model asked for closes itself the moment it is
+        // settled, rather than waiting to be dismissed: the model is mid-turn
+        // and cannot answer until this call does. A user-driven one stays up,
+        // because there is nothing waiting on it.
+        let settled = self
+            .deploy
+            .as_ref()
+            .is_some_and(|session| session.driven_by_model && session.stage == Stage::Finished);
+        if settled {
+            self.close_deploy();
+        }
+    }
+
+    /// Close the overlay and leave a line in the transcript saying how it went,
+    /// so the outcome survives the panel disappearing.
+    fn close_deploy(&mut self) {
+        if let Some(handle) = self.deploy_abort.take() {
+            handle.abort();
+        }
+        let Some(session) = self.deploy.take() else {
+            self.overlay = None;
+            return;
+        };
+
+        // Answering the model comes first: it is waiting on this call, and a
+        // `tool_calls` entry left unanswered invalidates the whole conversation
+        // for every later request -- see `settle_unanswered_tool_calls`.
+        if let Some(call) = self.deploy_tool_call.take() {
+            let label = tools::describe_action(&call)
+                .map(|action| action.label())
+                .unwrap_or_else(|| call.function.name.clone());
+            let display = match (&session.url, &session.failure) {
+                (Some(url), _) => format!("{label} — {url}"),
+                (None, Some(_)) => format!("{label} — failed"),
+                (None, None) => format!("{label} — cancelled"),
+            };
+            self.push_tool_outcome(tools::ToolOutcome {
+                call_id: call.id.clone(),
+                display,
+                content: session.report(),
+            });
+            self.overlay = None;
+            self.follow_tail = true;
+            self.greeted = true;
+            // Back around, so the model can say what happened in its own words.
+            self.state = AppState::Sending;
+            return;
+        }
+
+        let provider = session.provider_label();
+        let message = match (&session.url, &session.failure) {
+            (Some(url), _) => Message::new(
+                Role::System,
+                format!(
+                    "Deployed {} to {provider} ({}).\n{url}",
+                    session.project_name,
+                    session.target.label().to_lowercase()
+                ),
+            ),
+            (None, Some(reason)) => Message::new(
+                Role::Error,
+                format!("Deployment of {} to {provider} did not finish.\n{reason}", session.project_name),
+            ),
+            (None, None) => Message::new(Role::System, "Deployment cancelled.".to_string()),
+        };
+        self.messages.push(message);
+        self.overlay = None;
+        self.follow_tail = true;
+        self.greeted = true;
+    }
+
     fn handle_overlay_key(&mut self, key: KeyEvent) {
         let overlay = match self.overlay.take() {
             Some(o) => o,
@@ -1852,6 +2293,12 @@ impl App {
             approval @ Overlay::ToolApproval { .. } => {
                 self.overlay = Some(approval);
                 self.handle_command_approval_key(key);
+            }
+            // Put back for the same reason: the flow decides for itself when
+            // it is over, and it is `close_deploy` that clears this.
+            Overlay::Deploy => {
+                self.overlay = Some(Overlay::Deploy);
+                self.handle_deploy_key(key);
             }
         }
     }
@@ -2273,6 +2720,437 @@ mod tests {
         let mut app = App::new(Config::default());
         app.config.tools.auto_approve_read_only = false;
         app
+    }
+
+    // ---- /deploy ---------------------------------------------------------
+
+    /// An app whose workspace is a real, deployable project directory.
+    fn app_in_project() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"my-app","scripts":{"build":"vite build"},"devDependencies":{"vite":"5"}}"#,
+        )
+        .unwrap();
+        let mut app = app();
+        app.workspace_root = dir.path().display().to_string();
+        (dir, app)
+    }
+
+    #[test]
+    fn deploy_detects_the_project_and_opens_the_provider_picker() {
+        let (_dir, mut app) = app_in_project();
+        type_str(&mut app, "/deploy");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.overlay, Some(Overlay::Deploy));
+        let session = app.deploy.as_ref().expect("a session must exist");
+        assert_eq!(session.profile.framework.label(), "Vite");
+        assert_eq!(session.project_name, "my-app");
+        assert_eq!(session.stage, Stage::Menu(deploy::Menu::Provider));
+        // Detection alone must not start any work.
+        assert!(app.deploy_action.is_none());
+    }
+
+    /// `/deploy` ships the directory commands already run in. With tools off
+    /// there is no such directory, and inventing one would deploy something
+    /// the user never pointed at.
+    #[test]
+    fn deploy_without_a_workspace_explains_itself_rather_than_guessing() {
+        let mut app = app();
+        app.workspace_root.clear();
+        type_str(&mut app, "/deploy");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.deploy.is_none());
+        assert!(app.overlay.is_none());
+        let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(shown.contains("No project directory"), "{shown}");
+    }
+
+    #[test]
+    fn deploy_in_a_directory_with_nothing_to_ship_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+        let mut app = app();
+        app.workspace_root = dir.path().display().to_string();
+
+        type_str(&mut app, "/deploy");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.deploy.is_none());
+        let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(shown.contains("nothing to build or serve"), "{shown}");
+    }
+
+    /// Turning the feature off has to remove it from the command list too, or
+    /// it stays discoverable through the autocomplete and then refuses.
+    #[test]
+    fn disabling_deployment_removes_both_of_its_commands() {
+        let mut app = app();
+        app.config.deploy.enabled = false;
+        let names: Vec<&str> = app.available_commands().iter().map(|(n, _)| *n).collect();
+        assert!(!names.contains(&"/deploy"), "{names:?}");
+        assert!(!names.contains(&"/deployments"), "{names:?}");
+        assert!(names.contains(&"/provider"), "the rest must survive: {names:?}");
+
+        app.input_buffer = "/dep".to_string();
+        assert!(app.matching_commands().is_empty());
+    }
+
+    /// The overlay owns every key while it is up: none of the normal editing
+    /// or submit logic may see them.
+    #[test]
+    fn the_deployment_overlay_intercepts_keys_and_walks_the_flow() {
+        let (_dir, mut app) = app_in_project();
+        type_str(&mut app, "/deploy");
+        app.handle_key(key(KeyCode::Enter));
+
+        // Typing goes nowhere near the prompt box.
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(app.input_buffer.is_empty(), "the overlay must swallow typing");
+
+        // Down then Enter picks the second provider.
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let session = app.deploy.as_ref().expect("session");
+        assert_eq!(session.provider_id, Some("netlify"));
+        assert_eq!(session.stage, Stage::Menu(deploy::Menu::Confirm));
+    }
+
+    /// `y`/`n` on a two-choice screen, matching the tool-approval prompt.
+    #[test]
+    fn a_two_choice_deployment_screen_takes_y_and_n_directly() {
+        let (_dir, mut app) = app_in_project();
+        type_str(&mut app, "/deploy");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter)); // Vercel → confirm
+
+        app.handle_key(key(KeyCode::Char('n')));
+        // "No" ends the attempt without running anything.
+        assert!(app.deploy_action.is_none());
+        assert_eq!(
+            app.deploy.as_ref().map(|s| s.stage.clone()),
+            Some(Stage::Finished)
+        );
+    }
+
+    /// Esc on the first screen closes the whole thing, and the transcript says
+    /// what happened -- the panel disappearing must not take the outcome with it.
+    #[test]
+    fn closing_the_overlay_leaves_the_outcome_in_the_transcript() {
+        let (_dir, mut app) = app_in_project();
+        type_str(&mut app, "/deploy");
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.deploy.is_none());
+        assert!(app.overlay.is_none());
+        let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(shown.contains("cancelled"), "{shown}");
+    }
+
+    /// A finished deployment's URL has to survive the panel closing: it is the
+    /// one thing anyone wants out of the whole flow.
+    #[test]
+    fn a_successful_deployment_leaves_its_url_in_the_transcript() {
+        let (_dir, mut app) = app_in_project();
+        type_str(&mut app, "/deploy");
+        app.handle_key(key(KeyCode::Enter));
+        if let Some(session) = app.deploy.as_mut() {
+            session.provider_id = Some("vercel");
+            session.stage = Stage::Finished;
+            session.url = Some("https://my-app.vercel.app".to_string());
+        }
+        app.handle_key(key(KeyCode::Enter)); // close
+
+        let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(shown.contains("https://my-app.vercel.app"), "{shown}");
+        assert!(shown.contains("Vercel"), "{shown}");
+    }
+
+    /// Esc while something is running stops it. The abort handle is what kills
+    /// the child process, so dropping it without aborting would leave a build
+    /// running with nothing listening.
+    #[test]
+    fn escape_during_a_running_step_aborts_the_work() {
+        let (_dir, mut app) = app_in_project();
+        type_str(&mut app, "/deploy");
+        app.handle_key(key(KeyCode::Enter));
+        if let Some(session) = app.deploy.as_mut() {
+            session.provider_id = Some("vercel");
+            session.stage = Stage::Working(deploy::service::Step::Deploying);
+        }
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.deploy_abort.is_none(), "the handle must be taken and aborted");
+        assert_eq!(
+            app.deploy.as_ref().map(|s| s.stage.clone()),
+            Some(Stage::Finished)
+        );
+    }
+
+    /// Nothing a deployment carries may reach the transcript, which is the one
+    /// part of this app that persists on screen.
+    #[test]
+    fn no_deployment_secret_ever_reaches_the_transcript() {
+        let (_dir, mut app) = app_in_project();
+        type_str(&mut app, "/deploy");
+        app.handle_key(key(KeyCode::Enter));
+        if let Some(session) = app.deploy.as_mut() {
+            session.provider_id = Some("vercel");
+            session.token = Some(deploy::Secret::new("vercel_tok_do_not_leak"));
+            session.env.push(deploy::EnvVar {
+                key: "API_KEY".to_string(),
+                value: deploy::Secret::new("value_do_not_leak"),
+            });
+            session.stage = Stage::Finished;
+            session.url = Some("https://my-app.vercel.app".to_string());
+        }
+        app.handle_key(key(KeyCode::Enter)); // close
+
+        let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(!shown.contains("do_not_leak"), "a secret reached the transcript: {shown}");
+    }
+
+    /// Both feature sets survived the merge that brought them together.
+    ///
+    /// `/compact` and `/deploy` were added on separate branches and landed in
+    /// the same three places -- the registry, the dispatch match, and `App`'s
+    /// fields. A merge that resolved any of those by picking a side rather
+    /// than keeping both would still compile: the dropped command simply
+    /// stops existing, silently.
+    #[test]
+    fn the_command_registry_carries_every_feature() {
+        let names: Vec<&str> = COMMANDS.iter().map(|(n, _)| *n).collect();
+        for expected in [
+            "/provider", "/model", "/new", "/compact", "/usage", "/quota",
+            "/deploy", "/deployments",
+        ] {
+            assert!(names.contains(&expected), "{expected} is missing: {names:?}");
+        }
+        // Every one of them has to be dispatchable, or Enter does nothing.
+        let mut app = app();
+        for (name, _) in COMMANDS {
+            app.input_buffer = name.to_string();
+            assert!(
+                app.matching_commands().iter().any(|(n, _)| n == name),
+                "{name} is in the registry but unreachable from the menu"
+            );
+        }
+    }
+
+    // ---- the model asking to deploy ---------------------------------------
+
+    fn deploy_tool_call(args: &str) -> ToolCall {
+        ToolCall {
+            id: "call_deploy".to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: tools::DEPLOY_PROJECT.to_string(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    /// Approve a `deploy_project` call and return the app mid-deployment.
+    fn agent_deploy(args: &str) -> (tempfile::TempDir, App) {
+        let (dir, mut app) = app_in_project();
+        app.state = AppState::Streaming;
+        app.request_tools(vec![deploy_tool_call(args)]);
+        // The prompt is up: nothing has started yet.
+        assert_eq!(app.state, AppState::AwaitingApproval);
+        app.handle_key(key(KeyCode::Char('y')));
+        (dir, app)
+    }
+
+    /// The whole point of the rewiring: an approved deployment goes to the
+    /// same session `/deploy` drives, so everything it may need mid-run --
+    /// consent to install a CLI, the terminal for a browser login -- can
+    /// actually happen. A tool executor could do neither.
+    #[test]
+    fn an_approved_deployment_runs_through_the_interactive_flow() {
+        let (_dir, app) = agent_deploy(r#"{"provider":"vercel"}"#);
+
+        let session = app.deploy.as_ref().expect("the flow must have taken it");
+        assert!(session.driven_by_model);
+        assert_eq!(session.provider_id, Some("vercel"));
+        assert_eq!(session.target, deploy::Target::Preview);
+        // Straight to work: the model already answered every screen before it.
+        assert!(matches!(session.stage, Stage::Working(_)), "{:?}", session.stage);
+        assert_eq!(app.overlay, Some(Overlay::Deploy));
+        // The turn is still running, and the call is still owed an answer.
+        assert_eq!(app.state, AppState::ExecutingTools);
+        assert!(app.deploy_tool_call.is_some());
+        // ...and nothing was handed to the headless tool runner.
+        assert!(app.approved_tools.is_empty());
+    }
+
+    #[test]
+    fn the_model_can_ask_for_production_explicitly() {
+        let (_dir, app) = agent_deploy(r#"{"provider":"netlify","production":true}"#);
+        let session = app.deploy.as_ref().expect("session");
+        assert_eq!(session.provider_id, Some("netlify"));
+        assert_eq!(session.target, deploy::Target::Production);
+    }
+
+    /// Declining at the prompt must not start anything, and the model has to
+    /// be told so it does not simply try again.
+    #[test]
+    fn declining_the_deployment_starts_nothing_and_tells_the_model() {
+        let (_dir, mut app) = app_in_project();
+        app.state = AppState::Streaming;
+        app.request_tools(vec![deploy_tool_call(r#"{"provider":"vercel"}"#)]);
+        app.handle_key(key(KeyCode::Char('n')));
+
+        assert!(app.deploy.is_none(), "nothing may have started");
+        assert!(app.deploy_tool_call.is_none());
+        let answered: String = app
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(answered.contains("declined"), "{answered}");
+    }
+
+    /// The model is mid-turn waiting on this call, so a finished deployment
+    /// answers it and hands the turn back rather than sitting on screen.
+    #[test]
+    fn a_finished_deployment_answers_the_model_and_resumes_the_turn() {
+        let (_dir, mut app) = agent_deploy(r#"{"provider":"vercel"}"#);
+        if let Some(session) = app.deploy.as_mut() {
+            session.url = Some("https://my-app.vercel.app".to_string());
+            session.stage = Stage::Finished;
+        }
+        // Any event drives the settled check.
+        app.handle_deploy_event(deploy::DeployEvent::Log("done".to_string()));
+
+        assert!(app.deploy.is_none(), "it closes itself");
+        assert!(app.overlay.is_none());
+        assert!(app.deploy_tool_call.is_none(), "the call is answered");
+        assert_eq!(app.state, AppState::Sending, "the model gets to reply");
+
+        let answered: String = app
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(answered.contains("https://my-app.vercel.app"), "{answered}");
+        assert!(answered.contains("Tell the user the URL"), "{answered}");
+    }
+
+    /// The reason to let a model deploy at all: it sees what broke.
+    #[test]
+    fn a_failed_deployment_hands_the_model_the_reason_and_the_log() {
+        let (_dir, mut app) = agent_deploy(r#"{"provider":"vercel"}"#);
+        if let Some(session) = app.deploy.as_mut() {
+            session.failure = Some("The build command failed on Vercel.".to_string());
+            session.log.push_back("error TS2304: Cannot find name 'foo'".to_string());
+            session.stage = Stage::Finished;
+        }
+        app.handle_deploy_event(deploy::DeployEvent::Log("x".to_string()));
+
+        let answered: String = app
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(answered.contains("build command failed"), "{answered}");
+        assert!(answered.contains("TS2304"), "the log must come back: {answered}");
+        assert!(answered.contains("fix the real problem"), "{answered}");
+        assert_eq!(app.state, AppState::Sending);
+    }
+
+    /// A cancelled deployment still has to answer the call -- an unanswered
+    /// `tool_calls` entry invalidates the conversation for every later turn.
+    #[test]
+    fn cancelling_an_agent_deployment_still_answers_the_model() {
+        let (_dir, mut app) = agent_deploy(r#"{"provider":"vercel"}"#);
+        app.handle_key(key(KeyCode::Esc)); // stop it
+        app.handle_deploy_event(deploy::DeployEvent::Log("x".to_string()));
+
+        assert!(app.deploy_tool_call.is_none(), "the call must be answered");
+        let answered: String = app
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(answered.contains("cancelled"), "{answered}");
+        assert!(answered.contains("Do not retry"), "{answered}");
+    }
+
+    /// A deployment owns the screen until it finishes, so it cannot be
+    /// interleaved with other tool calls. Refused plainly rather than
+    /// sequenced -- and the refusal reaches the model, not a silent drop.
+    #[test]
+    fn a_deployment_batched_with_other_tools_is_declined_rather_than_sequenced() {
+        let (_dir, mut app) = app_in_project();
+        app.state = AppState::Streaming;
+        app.request_tools(vec![
+            ToolCall {
+                id: "call_read".to_string(),
+                kind: "function".to_string(),
+                function: crate::llm::FunctionCall {
+                    name: tools::READ_FILE.to_string(),
+                    arguments: r#"{"path":"package.json"}"#.to_string(),
+                },
+            },
+            deploy_tool_call(r#"{"provider":"vercel"}"#),
+        ]);
+
+        // Approve whatever it asks about, twice over.
+        for _ in 0..2 {
+            if app.state == AppState::AwaitingApproval {
+                app.handle_key(key(KeyCode::Char('y')));
+            }
+        }
+        assert!(app.deploy.is_none(), "the flow must not take a batched call");
+        // It falls through to the ordinary runner, which explains itself.
+        assert!(app.approved_tools.iter().any(|c| c.function.name == tools::DEPLOY_PROJECT));
+    }
+
+    #[test]
+    fn deployments_with_no_history_says_so_rather_than_printing_a_bare_heading() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut app = app();
+            type_str(&mut app, "/deployments");
+            app.handle_key(key(KeyCode::Enter));
+            let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
+            assert!(shown.contains("No deployments yet"), "{shown}");
+        });
+    }
+
+    #[test]
+    fn deployments_lists_what_was_recorded_without_any_secret() {
+        crate::config::test_support::with_isolated_home(|| {
+            deploy::history::record(&deploy::history::Deployment {
+                date: "2026-08-10".to_string(),
+                at: 1,
+                project: "my-app".to_string(),
+                path: "/Users/dev/my-app".to_string(),
+                provider: "vercel".to_string(),
+                target: "Production".to_string(),
+                status: "Success".to_string(),
+                url: Some("https://my-app.vercel.app".to_string()),
+                env_keys: vec!["API_KEY".to_string()],
+                detail: None,
+            });
+
+            let mut app = app();
+            type_str(&mut app, "/deployments");
+            app.handle_key(key(KeyCode::Enter));
+
+            let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
+            assert!(shown.contains("my-app"), "{shown}");
+            assert!(shown.contains("vercel"), "{shown}");
+            assert!(shown.contains("https://my-app.vercel.app"), "{shown}");
+            // Names, never values -- there is no value to print.
+            assert!(shown.contains("API_KEY"), "{shown}");
+        });
     }
 
     /// A quota-enabled app with `spent` requests already used today.

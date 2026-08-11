@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod danger;
 mod dateutil;
+mod deploy;
 mod llm;
 mod notice;
 mod providers;
@@ -79,6 +80,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     }
 
+    // Asked before `Config::load`, because loading is what performs the
+    // adoption (see `config::adopt_legacy_dir`) and afterwards there is
+    // nothing left to detect.
+    let migrating = config::legacy_dir_pending();
+
     let config = Config::load()?;
     // Before anything is drawn: the colours depend on the terminal's
     // background, and asking for that needs the terminal to itself, with
@@ -135,13 +141,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
         app.quota = quota::DailyQuota::load(&quota::today());
     }
     app.workspace_status = workspace_status;
+    // Said once, on the welcome screen: a migration nobody is told about is
+    // one nobody can verify.
+    if migrating {
+        app.startup_notices.push(
+            "Renamed to boxcode: your settings and history moved from ~/.tuisample-code to \
+             ~/.boxcode."
+                .to_string(),
+        );
+    }
+    for name in config::deprecated_env_vars_in_use() {
+        app.startup_notices.push(format!(
+            "{name} is deprecated. Rename it to BOXCODE_{} — the old name still works for now.",
+            name.trim_start_matches("TUISAMPLE_")
+        ));
+    }
     app.workspace_root = workspace
         .as_ref()
         .map(|ws| ws.root().display().to_string())
         .unwrap_or_default();
     let (tx, mut rx) = mpsc::channel::<(u64, StreamEvent)>(256);
+    // A second channel rather than more variants on `StreamEvent`: a
+    // deployment is not the model talking, and folding it into the LLM
+    // transport's event type would make every match there carry cases that
+    // cannot occur.
+    let (deploy_tx, mut deploy_rx) = mpsc::channel::<deploy::DeployEvent>(256);
 
-    let result = run_app(&mut terminal, &mut app, workspace.as_ref(), tx, &mut rx).await;
+    let result = run_app(
+        &mut terminal,
+        &mut app,
+        workspace.as_ref(),
+        tx,
+        &mut rx,
+        deploy_tx,
+        &mut deploy_rx,
+        enhanced,
+        alternate_screen,
+    )
+    .await;
 
     restore_terminal(enhanced, alternate_screen)?;
     if let Err(e) = &result {
@@ -255,12 +292,17 @@ fn open_workspace(config: &Config) -> (Option<Workspace>, String) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     workspace: Option<&Workspace>,
     tx: mpsc::Sender<(u64, StreamEvent)>,
     rx: &mut mpsc::Receiver<(u64, StreamEvent)>,
+    deploy_tx: mpsc::Sender<deploy::DeployEvent>,
+    deploy_rx: &mut mpsc::Receiver<deploy::DeployEvent>,
+    enhanced: bool,
+    alternate_screen: bool,
 ) -> Result<(), Box<dyn Error>> {
     loop {
         // Hand finished messages to the terminal before drawing. Once printed
@@ -298,6 +340,57 @@ async fn run_app<B: ratatui::backend::Backend>(
                 StreamEvent::Done => app.finish_stream(),
                 StreamEvent::Notice(note) => app.note(note),
                 StreamEvent::Error(err) => app.fail_stream(err),
+            }
+        }
+
+        // Deployment progress. Same shape as the token drain above, and drained
+        // to exhaustion for the same reason: a build emits output in bursts,
+        // and one line per frame would show a finished build still scrolling.
+        while let Ok(event) = deploy_rx.try_recv() {
+            app.handle_deploy_event(event);
+        }
+
+        // Work the deployment flow asked for. Spawned, never awaited inline:
+        // a build takes minutes, and running it on the event loop would freeze
+        // the whole UI -- no redraw, no spinner, no Esc.
+        if let Some(action) = app.deploy_action.take() {
+            match action {
+                deploy::DeployAction::Run { step, command, cwd } => {
+                    let deploy_tx = deploy_tx.clone();
+                    let handle = tokio::spawn(async move {
+                        let output = deploy::runner::run(&command, &cwd, Some(&deploy_tx)).await;
+                        let _ = deploy_tx
+                            .send(deploy::DeployEvent::Finished { step, output })
+                            .await;
+                    });
+                    app.deploy_abort = Some(handle.abort_handle());
+                }
+
+                // A browser login needs the real terminal: the vendor CLIs
+                // print a URL and wait, and with a closed stdin they cannot run
+                // their own prompt at all. So the TUI stands down for the
+                // duration and is rebuilt afterwards -- the same move an editor
+                // makes when it hands over to `$EDITOR`. Deliberately awaited
+                // inline rather than spawned: two things cannot own one
+                // terminal, and there is nothing to draw while it is not ours.
+                deploy::DeployAction::RunInteractive { step, command, cwd } => {
+                    restore_terminal(enhanced, alternate_screen)?;
+                    println!("\n  Handing the terminal to `{}`.", command.program);
+                    println!("  Finish signing in here; this app comes back when it is done.\n");
+
+                    let output = deploy::runner::run_interactive(&command, &cwd).await;
+
+                    setup_terminal()?;
+                    terminal.clear()?;
+                    app.handle_deploy_event(deploy::DeployEvent::Finished { step, output });
+                }
+
+                // The one deployment side effect small enough to do inline:
+                // a single append, with nothing to stream and nothing to wait
+                // for. It lives here rather than in `App` for the same reason
+                // `pending_usage` does -- `App`'s tests must not write to a
+                // real `$HOME`.
+                deploy::DeployAction::Record(entry) => deploy::history::record(&entry),
             }
         }
 
@@ -455,6 +548,15 @@ COMMANDS (type in the input box, press Enter):
     /quota clear          Remove your own limits
     /quota override       Keep working past today's limit
     /quota reset          Cancel an override
+    /deploy               Ship this directory to Vercel or Netlify
+    /deployments          Recent deployments from this machine
+
+DEPLOYMENT (see [deploy] in config.toml):
+    Uses the provider's own CLI (`vercel` / `netlify`), and offers to install
+    it if it is missing -- never without asking. Signing in hands the terminal
+    to the provider's own browser login; no secret is typed into this app.
+    Environment-variable values and tokens are never logged, shown, or written
+    to the deployment history.
 
 DAILY LIMITS (optional, off by default -- every limit is 0 = no limit, so this
               only counts until you set one. See [quota] in config.toml):

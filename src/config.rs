@@ -17,6 +17,43 @@ pub struct Config {
     /// Same again for `[ui]`.
     #[serde(default)]
     pub ui: UiConfig,
+    /// Same again for `[deploy]`.
+    #[serde(default)]
+    pub deploy: DeployConfig,
+}
+
+/// Settings for `/deploy`. See `src/deploy/`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeployConfig {
+    /// Off removes `/deploy` and `/deployments` from the command list
+    /// entirely, for anyone who would rather this feature did not exist.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Whether a missing provider CLI may be installed from inside the app.
+    /// `false` does not make the flow fail silently -- it explains what to
+    /// install and stops. Nothing is ever installed without confirmation
+    /// regardless of this setting; this only controls whether the offer is
+    /// made at all, for machines where global installs are somebody else's
+    /// decision.
+    #[serde(default = "yes")]
+    pub allow_cli_install: bool,
+    /// How many past deployments `/deployments` prints.
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
+}
+
+fn default_history_limit() -> usize {
+    10
+}
+
+impl Default for DeployConfig {
+    fn default() -> Self {
+        Self {
+            enabled: yes(),
+            allow_cli_install: yes(),
+            history_limit: default_history_limit(),
+        }
+    }
 }
 
 /// Optional daily ceilings. See `quota.rs`.
@@ -349,6 +386,10 @@ impl Config {
             self.tools.python_bin = default_python_bin();
         }
         self.tools.search_timeout_secs = self.tools.search_timeout_secs.clamp(1, 300);
+
+        // A history limit of 0 would make `/deployments` print a heading and
+        // nothing else, which reads as a broken command rather than a setting.
+        self.deploy.history_limit = self.deploy.history_limit.clamp(1, 200);
     }
 
     /// Nonsense quota settings are clamped rather than obeyed. A warn threshold
@@ -445,6 +486,37 @@ fn adopt_legacy_dir(home: &std::path::Path, dir: &std::path::Path) {
     let _ = std::fs::rename(&legacy, dir);
 }
 
+/// Whether this launch is the one that will inherit the pre-1.0 directory.
+///
+/// Has to be asked *before* anything calls `Config::config_dir`, since that is
+/// what performs the adoption. Purely so the app can say it happened: a silent
+/// migration is one the user cannot verify.
+pub fn legacy_dir_pending() -> bool {
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    else {
+        return false;
+    };
+    !home.join(".boxcode").exists() && home.join(".tuisample-code").is_dir()
+}
+
+/// Deprecated `TUISAMPLE_*` variables that are actually doing something.
+///
+/// One shadowed by its `BOXCODE_*` replacement is inert and not worth a
+/// warning -- naming it would train people to ignore the line.
+pub fn deprecated_env_vars_in_use() -> Vec<String> {
+    let mut found: Vec<String> = std::env::vars()
+        .map(|(key, _)| key)
+        .filter(|key| key.starts_with("TUISAMPLE_"))
+        .filter(|key| {
+            read_env(&format!("BOXCODE_{}", key.trim_start_matches("TUISAMPLE_"))).is_none()
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 /// Read `BOXCODE_*`, falling back to the `TUISAMPLE_*` name it replaced.
 ///
 /// The old names stay readable so a shell profile, a CI job or an intern's
@@ -533,6 +605,7 @@ mod tests {
             let config = Config {
                 quota: QuotaConfig::default(),
                 ui: UiConfig::default(),
+                deploy: DeployConfig::default(),
                 llm: LlmConfig {
                     endpoint: "https://api.deepseek.com".to_string(),
                     model: "deepseek-v4-pro".to_string(),
@@ -583,7 +656,34 @@ mod tests {
             assert!(loaded.tools.require_approval);
             assert_eq!(loaded.tools.python_bin, "python3");
             assert_eq!(loaded.tools.search_timeout_secs, 20);
+            // ...and the same again for `[deploy]`, added later still.
+            assert!(loaded.deploy.enabled);
+            assert!(loaded.deploy.allow_cli_install);
+            assert_eq!(loaded.deploy.history_limit, 10);
         });
+    }
+
+    /// A `[deploy]` table someone half-filled in by hand must still get the
+    /// safe defaults for the keys they left out.
+    #[test]
+    fn a_partial_deploy_table_defaults_the_rest() {
+        let parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"http://x\"\n\n[deploy]\nallow_cli_install = false\n",
+        )
+        .expect("should parse");
+        assert!(!parsed.deploy.allow_cli_install);
+        assert!(parsed.deploy.enabled);
+        assert_eq!(parsed.deploy.history_limit, 10);
+    }
+
+    /// A limit of zero would make `/deployments` print a heading and nothing
+    /// else, which reads as a broken command rather than a setting.
+    #[test]
+    fn a_zero_history_limit_is_clamped_to_something_usable() {
+        let mut config = Config::default();
+        config.deploy.history_limit = 0;
+        config.normalize();
+        assert_eq!(config.deploy.history_limit, 1);
     }
 
     /// Same again for a config that has a `[tools]` table but no `python_bin`

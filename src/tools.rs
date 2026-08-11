@@ -56,6 +56,7 @@ pub const LIST_DIR: &str = "list_dir";
 pub const GLOB: &str = "glob";
 pub const EDIT_FILE: &str = "edit_file";
 pub const WEB_SEARCH: &str = "web_search";
+pub const DEPLOY_PROJECT: &str = "deploy_project";
 
 /// Directories whose contents are build output or dependencies rather than the
 /// project. Walking them turns a `glob` into thousands of irrelevant results and
@@ -284,6 +285,36 @@ pub fn schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": DEPLOY_PROJECT,
+                "description":
+                    "Deploy this project to a hosting provider and get back the live URL. Detects \
+                     the framework, build command and output directory automatically, links or \
+                     creates the provider-side project, runs the build and uploads it. The user \
+                     approves before anything is deployed. If the provider's CLI is missing or \
+                     nobody is signed in, this returns a clear error and the user has to run \
+                     /deploy once first -- installing and signing in both need the terminal, \
+                     which a tool call cannot take. On failure the build log comes back with the \
+                     error, so read it and fix the real problem before retrying.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "enum": ["vercel", "netlify"],
+                            "description": "Which host to deploy to."
+                        },
+                        "production": {
+                            "type": "boolean",
+                            "description": "True for the live production URL, false (the default) for a throwaway preview. Only pass true when the user has asked for production."
+                        }
+                    },
+                    "required": ["provider"]
+                }
+            }
+        }),
     ]
 }
 
@@ -335,7 +366,9 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
            stdout and stderr.\n\
          - {WEB_SEARCH}(query, max_results): search the web, get back titles/URLs/snippets. \
            Needs Python 3 + the `ddgs` package on the user's machine -- if that's missing you'll \
-           get a clear error instead of results; tell the user plainly rather than retrying.\n\n\
+           get a clear error instead of results; tell the user plainly rather than retrying.\n\
+         - {DEPLOY_PROJECT}(provider, production): deploy this project to Vercel or Netlify and \
+           get back the live URL.\n\n\
          Rules:\n\
          - {os_hint}\n\
          - Narrate in plain sentences, not just tool calls. Before acting, say in one short \
@@ -376,6 +409,13 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
            is declined, do not retry it — take a different approach or answer without it.\n\
          - Anything that changes or deletes files is real and immediate. Be conservative and \
            prefer the narrowest action that does the job.\n\
+         - {DEPLOY_PROJECT} puts this project on the public internet. Only use it when the user \
+           asks to deploy, ship, publish or push something live. Default to a preview: pass \
+           production only when they said production or live. Anything it needs along the way -- \
+           installing the provider's CLI, signing in -- it asks the user for directly, so just \
+           call it and let it handle that. Request it on its own, never alongside other tool \
+           calls. If the build fails, the log comes back with the error: read it, fix the real \
+           problem, and only then deploy again.\n\
          - Answers appear in a terminal: keep narration to a sentence or two, not a report.",
         workspace.root().display(),
         config.command_timeout_secs,
@@ -427,6 +467,15 @@ struct WebSearchArgs {
     max_results: Option<u32>,
 }
 
+#[derive(Deserialize)]
+struct DeployArgs {
+    provider: String,
+    /// Absent means preview. A model that has not been told "production"
+    /// should not be able to reach it by omission.
+    #[serde(default)]
+    production: Option<bool>,
+}
+
 /// Bounds on how many results a single search may ask for. Below `MIN` a
 /// search would be pointless; above `MAX` it is a good way to fill the
 /// context window with snippets nobody reads.
@@ -449,6 +498,16 @@ pub enum Action {
     /// span being replaced, which is the whole reason to prefer it.
     Edit { path: String, old: String, new: String, replace_all: bool },
     Search { query: String, max_results: u32 },
+    /// Puts this project on the internet. Always approved -- see `action_risk`.
+    Deploy {
+        provider: String,
+        production: bool,
+        /// What detection made of the project, filled in by `app.rs` when the
+        /// prompt is built rather than here: `describe_action` has no
+        /// workspace to look at, and re-detecting on every frame to render one
+        /// line would be a filesystem read per redraw.
+        summary: Option<String>,
+    },
 }
 
 impl Action {
@@ -464,7 +523,37 @@ impl Action {
             Action::Glob { pattern } => format!("🔎 find {pattern}"),
             Action::Edit { path, .. } => format!("✏️ edit {path}"),
             Action::Search { query, .. } => format!("🔎 search \"{query}\""),
+            Action::Deploy { provider, production, .. } => format!(
+                "🚀 deploy → {provider} ({})",
+                if *production { "Production" } else { "Preview" }
+            ),
         }
+    }
+}
+
+/// What the guardrails make of an action, judged against the directory it
+/// would run in.
+///
+/// The one place this question is answered, so the approval prompt and the
+/// runner's own independent refusal cannot disagree about the same call.
+pub fn action_risk(action: &Action, workspace_root: &Path) -> danger::Risk {
+    match action {
+        Action::Command { command, .. } => danger::classify(command, workspace_root),
+        // A deployment always stops for an explicit decision, even with
+        // approval switched off entirely: it sends this project to a third
+        // party and puts it on the public internet, which is not something an
+        // unattended-mode setting made an hour ago should silently cover.
+        Action::Deploy { production: true, .. } => danger::Risk::Dangerous(
+            "publishes to the live production URL, replacing whatever is served there now"
+                .to_string(),
+        ),
+        Action::Deploy { .. } => danger::Risk::Dangerous(
+            "uploads this project to a third-party host and puts it on the public internet"
+                .to_string(),
+        ),
+        // Reads and writes are already confined to the workspace by
+        // `resolve_in_workspace`, and cannot invoke a shell.
+        _ => danger::Risk::Normal,
     }
 }
 
@@ -532,6 +621,19 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
                 .unwrap_or(DEFAULT_SEARCH_RESULTS)
                 .clamp(MIN_SEARCH_RESULTS, MAX_SEARCH_RESULTS);
             Some(Action::Search { query, max_results })
+        }
+        DEPLOY_PROJECT => {
+            let args: DeployArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let provider = args.provider.trim().to_ascii_lowercase();
+            // Checked here rather than at execution: an unknown provider has
+            // nothing coherent to put in front of the user, so it goes back to
+            // the model as a malformed call instead.
+            crate::deploy::provider_by_id(&provider)?;
+            Some(Action::Deploy {
+                provider,
+                production: args.production.unwrap_or(false),
+                summary: None,
+            })
         }
         _ => None,
     }
@@ -626,8 +728,8 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
     // before they can be queued, so reaching this is a bug -- but the cost of
     // the check is a string scan and the cost of missing it is an erased disk,
     // so the runner refuses independently rather than trusting its caller.
-    if let Some(Action::Command { command, .. }) = describe_action(call) {
-        if let danger::Risk::Blocked(reason) = danger::classify(&command, workspace.root()) {
+    if let Some(action) = describe_action(call) {
+        if let danger::Risk::Blocked(reason) = action_risk(&action, workspace.root()) {
             return refused_as_dangerous(call, &reason);
         }
     }
@@ -640,6 +742,7 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         GLOB => execute_glob(call, workspace),
         EDIT_FILE => execute_edit_file(call, workspace),
         WEB_SEARCH => execute_web_search(call, config).await,
+        DEPLOY_PROJECT => execute_deploy_project(call, workspace).await,
         other => outcome(
             &call.id,
             format!("⚙ {other} — unknown tool"),
@@ -1177,6 +1280,48 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
             if count == 1 { "" } else { "s" }
         ),
         clip(content.trim_end(), budget),
+    )
+}
+
+/// `deploy_project` -- reached only when the deployment flow declined the call.
+///
+/// The real work does not happen here. A well-formed deployment is intercepted
+/// in `app.rs` (see `App::deploy_takes_over`) and handed to the same session
+/// `/deploy` drives, because two things it may need mid-run cannot happen
+/// inside a tool executor: consent to install a provider CLI, which needs a
+/// prompt, and the terminal itself for a browser login, which only the event
+/// loop can hand over.
+///
+/// So this is the explanation for the cases that flow past that: arguments
+/// that describe nothing, a workspace with nothing deployable in it, or a
+/// deployment requested alongside other tool calls in one batch.
+async fn execute_deploy_project(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+    let Some(Action::Deploy { provider, .. }) = describe_action(call) else {
+        return outcome(
+            &call.id,
+            "🚀 deploy — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"provider": "vercel"}} or {{"provider": "netlify"}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+
+    // The likeliest reason the flow declined it: there is nothing here to ship.
+    if let Err(e) = crate::deploy::detect::detect(workspace.root()) {
+        return outcome(
+            &call.id,
+            format!("🚀 deploy → {provider} — nothing to deploy"),
+            format!("Error: {e}"),
+        );
+    }
+
+    outcome(
+        &call.id,
+        format!("🚀 deploy → {provider} — not started"),
+        "Error: a deployment could not be started this turn. It has to be the only tool call in \
+         the turn, because it takes over the screen until it finishes. Ask for it on its own."
+            .to_string(),
     )
 }
 
@@ -2096,8 +2241,147 @@ mod tests {
         let names: Vec<_> = schemas.iter().map(|s| s["function"]["name"].clone()).collect();
         assert_eq!(
             names,
-            vec![RUN_COMMAND, READ_FILE, WRITE_FILE, LIST_DIR, GLOB, EDIT_FILE, WEB_SEARCH]
+            vec![
+                RUN_COMMAND,
+                READ_FILE,
+                WRITE_FILE,
+                LIST_DIR,
+                GLOB,
+                EDIT_FILE,
+                WEB_SEARCH,
+                DEPLOY_PROJECT
+            ]
         );
+    }
+
+    // ---- deploy_project ----------------------------------------------------
+
+    fn deploy_call(args: Value) -> ToolCall {
+        tool_call(DEPLOY_PROJECT, args)
+    }
+
+    #[test]
+    fn a_deploy_call_describes_a_deployment_the_user_can_read() {
+        match describe_action(&deploy_call(json!({"provider": "vercel", "production": true}))) {
+            Some(Action::Deploy { provider, production, .. }) => {
+                assert_eq!(provider, "vercel");
+                assert!(production);
+            }
+            other => panic!("expected a Deploy action, got {other:?}"),
+        }
+    }
+
+    /// Absent means preview. A model that was never told "production" must not
+    /// reach it by omission.
+    #[test]
+    fn a_deploy_without_an_explicit_production_flag_is_a_preview() {
+        match describe_action(&deploy_call(json!({"provider": "netlify"}))) {
+            Some(Action::Deploy { production, .. }) => assert!(!production),
+            other => panic!("expected a Deploy action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_provider_is_not_something_the_user_is_asked_to_approve() {
+        assert!(describe_action(&deploy_call(json!({"provider": "heroku"}))).is_none());
+        assert!(describe_action(&deploy_call(json!({}))).is_none());
+    }
+
+    /// The property that makes this tool safe to hand a model: a deployment
+    /// always stops for a decision, even with approval switched off entirely.
+    #[test]
+    fn every_deployment_always_stops_for_an_explicit_decision() {
+        let root = Path::new("/Users/dev/project");
+        for production in [true, false] {
+            let action = describe_action(&deploy_call(
+                json!({"provider": "vercel", "production": production}),
+            ))
+            .expect("describes");
+            let risk = action_risk(&action, root);
+            assert!(
+                risk.is_dangerous(),
+                "production={production} must be dangerous, got {risk:?}"
+            );
+            // ...and the reason has to say which of the two it is, because the
+            // difference is the whole question being asked.
+            let reason = risk.reason().unwrap_or_default();
+            if production {
+                assert!(reason.contains("production"), "{reason}");
+            } else {
+                assert!(reason.contains("public internet"), "{reason}");
+            }
+        }
+    }
+
+    /// Reads and writes are unaffected by the new risk routing.
+    #[test]
+    fn ordinary_actions_keep_their_previous_risk() {
+        let root = Path::new("/Users/dev/project");
+        for action in [
+            Action::Read { path: "a.rs".into() },
+            Action::List { path: ".".into() },
+            Action::Glob { pattern: "**/*.rs".into() },
+            Action::Write { path: "a.rs".into(), content: String::new() },
+        ] {
+            assert_eq!(action_risk(&action, root), danger::Risk::Normal, "{action:?}");
+        }
+        // ...and a command is still judged by the classifier.
+        let rm = Action::Command { command: "rm -rf /".into(), purpose: None };
+        assert!(matches!(action_risk(&rm, root), danger::Risk::Blocked(_)));
+    }
+
+    #[tokio::test]
+    async fn deploying_a_directory_with_nothing_in_it_fails_before_touching_a_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "hi").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+
+        let out = execute(&deploy_call(json!({"provider": "vercel"})), &ws, &ToolsConfig::default()).await;
+        assert!(out.content.contains("nothing to build or serve"), "{}", out.content);
+    }
+
+    /// The flow takes a well-formed deployment before this ever runs, so what
+    /// is left is the case it declined: a deployment asked for alongside other
+    /// tool calls, which cannot be sequenced against something that owns the
+    /// screen until it finishes.
+    #[tokio::test]
+    async fn a_deployment_the_flow_declined_explains_why_rather_than_half_running() {
+        let (_dir, ws, cfg) = tree();
+        std::fs::write(
+            ws.root().join("package.json"),
+            r#"{"name":"probe-app","scripts":{"build":"vite build"},"devDependencies":{"vite":"5"}}"#,
+        )
+        .unwrap();
+
+        let out = execute(&deploy_call(json!({"provider": "vercel"})), &ws, &cfg).await;
+        assert!(out.content.contains("only tool call"), "{}", out.content);
+        assert!(out.content.contains("Ask for it on its own"), "{}", out.content);
+    }
+
+    /// The model must never be in a position to name an environment variable,
+    /// let alone invent a value for one -- those are entered by hand in
+    /// `/deploy`, where the user types them into a masked field.
+    #[test]
+    fn the_deploy_schema_gives_the_model_no_way_to_pass_a_secret() {
+        let schema = schemas()
+            .into_iter()
+            .find(|s| s["function"]["name"] == DEPLOY_PROJECT)
+            .expect("the deploy schema");
+        let properties = &schema["function"]["parameters"]["properties"];
+        let names: Vec<&str> = properties.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, vec!["production", "provider"], "no other input is accepted");
+    }
+
+    #[test]
+    fn the_system_prompt_tells_the_model_when_and_when_not_to_deploy() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true);
+        assert!(prompt.contains(DEPLOY_PROJECT), "{prompt}");
+        assert!(prompt.contains("public internet"), "{prompt}");
+        assert!(prompt.contains("Default to a preview"), "{prompt}");
+        // It should just call it: the flow asks the user for whatever it needs.
+        assert!(prompt.contains("it asks the user for directly"), "{prompt}");
+        assert!(prompt.contains("never alongside other tool calls"), "{prompt}");
     }
 
     #[test]

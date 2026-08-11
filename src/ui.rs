@@ -1,4 +1,5 @@
 use crate::app::{App, AppState, CustomStep, Message, Overlay, Role};
+use crate::deploy::{DeploySession, DeployStatus, Menu, Stage, StepState};
 use crate::providers;
 use crate::theme;
 use crate::tools::Action;
@@ -14,6 +15,13 @@ use std::path::Path;
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MAX_INPUT_HEIGHT: u16 = 10;
 const MAX_APPROVAL_HEIGHT: u16 = 24;
+/// Tall enough for every command in `app::COMMANDS` plus its border. There is
+/// a test.
+const MAX_COMMAND_MENU_HEIGHT: u16 = 14;
+/// The deployment panel is allowed to be taller than the approval prompt: it
+/// carries a checklist, a menu and a live log at the same time, and clipping
+/// the log is what makes a failed build undiagnosable.
+const MAX_DEPLOY_HEIGHT: u16 = 28;
 const MIN_POPUP_WIDTH: u16 = 40;
 const MIN_POPUP_HEIGHT: u16 = 6;
 
@@ -30,13 +38,28 @@ pub fn render(f: &mut Frame, app: &mut App) {
         _ => None,
     };
 
-    let bottom_height = match &approval {
-        Some((action, remaining)) => {
-            let inner_width = size.width.saturating_sub(4).max(1) as usize;
-            let (_, lines) = tool_approval_lines(app, action, *remaining, inner_width);
-            (lines.len() as u16 + 2).clamp(MIN_INPUT_HEIGHT, MAX_APPROVAL_HEIGHT)
+    // `/deploy` takes the same spot for the same reason: it is a conversation
+    // about what to do next, and it streams. Floating it over the transcript
+    // would hide the thing being deployed while asking about it.
+    let deploying = app.overlay == Some(Overlay::Deploy) && app.deploy.is_some();
+
+    let bottom_height = if deploying {
+        let inner_width = size.width.saturating_sub(4).max(1) as usize;
+        let lines = deployment_lines(app, inner_width);
+        // Deliberately not clamped against the terminal height: on one shorter
+        // than `MIN_INPUT_HEIGHT` that would put the ceiling below the floor,
+        // and `clamp` panics on that. `Layout` already caps a constraint at
+        // the space it actually has.
+        (lines.len() as u16 + 2).clamp(MIN_INPUT_HEIGHT, MAX_DEPLOY_HEIGHT)
+    } else {
+        match &approval {
+            Some((action, remaining)) => {
+                let inner_width = size.width.saturating_sub(4).max(1) as usize;
+                let (_, lines) = tool_approval_lines(app, action, *remaining, inner_width);
+                (lines.len() as u16 + 2).clamp(MIN_INPUT_HEIGHT, MAX_APPROVAL_HEIGHT)
+            }
+            None => input_height(app, size.width),
         }
-        None => input_height(app, size.width),
     };
 
     // Slash-command autocomplete: `matching_commands` is already empty
@@ -47,7 +70,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let menu_height: u16 = if command_matches.is_empty() {
         0
     } else {
-        (command_matches.len() as u16 + 2).min(8)
+        // The cap has to stay above the number of commands, or the last one
+        // added is silently clipped out of its own menu -- which is how a
+        // command comes to look like it does not exist.
+        (command_matches.len() as u16 + 2).min(MAX_COMMAND_MENU_HEIGHT)
     };
 
     // The viewport is a strip at the bottom of the real terminal, not a whole
@@ -68,11 +94,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if !command_matches.is_empty() {
         render_command_menu(f, chunks[1], app, &command_matches);
     }
-    match &approval {
-        Some((action, remaining)) => {
-            render_tool_approval_inline(f, chunks[2], app, action, *remaining)
+    if deploying {
+        render_deployment(f, chunks[2], app);
+    } else {
+        match &approval {
+            Some((action, remaining)) => {
+                render_tool_approval_inline(f, chunks[2], app, action, *remaining)
+            }
+            None => render_input(f, chunks[2], app),
         }
-        None => render_input(f, chunks[2], app),
     }
     render_footer(f, chunks[3], app);
 
@@ -107,14 +137,13 @@ fn adapt_colors_for_terminal(f: &mut Frame) {
 /// session should feel like. The two-column indent does the job the border was
 /// doing -- separating the stream from the edge of the screen -- at a quarter
 /// of the visual weight.
-/// Plain assistant prose as drawable lines, wrapped to `width`. Shared with
-/// the streaming flush so a paragraph looks identical whether it was printed
-/// line-by-line as it arrived or all at once when the turn ended.
+/// Assistant prose as drawable lines, wrapped to `width`, with its markdown
+/// rendered rather than shown. Shared with the streaming flush so a paragraph
+/// looks identical whether it was printed line-by-line as it arrived or all at
+/// once when the turn ended -- which is also why the markdown lives here and
+/// not at one of the two call sites.
 pub fn wrapped_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    wrap(text, width)
-        .into_iter()
-        .map(|w| Line::from(Span::styled(w, theme::text())))
-        .collect()
+    markdown_lines(text, width)
 }
 
 /// One transcript message as drawable lines.
@@ -187,11 +216,7 @@ pub fn message_lines(msg: &Message, width: usize) -> Vec<Line<'static>> {
                 ]));
             }
         }
-        Role::Assistant => {
-            for wrapped in wrap(msg.body(), width) {
-                lines.push(Line::from(Span::styled(wrapped, theme::text())));
-            }
-        }
+        Role::Assistant => lines.extend(wrapped_lines(msg.body(), width)),
         Role::Error => {
             // Classified rather than uniformly red: "you have used today's
             // allowance" and "the endpoint is unreachable" are different
@@ -305,6 +330,13 @@ fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
 /// The spinner line: what the app is doing, how long it has been doing it, and
 /// how to stop it. `None` when nothing is running.
 fn activity_line(app: &App) -> Option<Line<'static>> {
+    // The deployment panel draws its own spinner, for its own step, with its
+    // own elapsed time. Without this the transcript sat underneath it saying
+    // "Running 0 commands…" -- counting a `running_tools` list that a
+    // deployment never fills, because it is not run as an ordinary tool.
+    if app.overlay == Some(Overlay::Deploy) {
+        return None;
+    }
     let elapsed = app.busy_started.map(|t| t.elapsed());
     let secs = elapsed.map(|e| e.as_secs()).unwrap_or(0);
     let frame = theme::spinner(elapsed.unwrap_or_default());
@@ -445,14 +477,15 @@ pub fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::from(""));
-    for (name, desc) in crate::app::COMMANDS {
+    for (name, desc) in app.available_commands() {
         lines.push(Line::from(vec![
-            Span::styled(format!("{name:<10}"), theme::key()),
-            Span::styled(*desc, theme::muted()),
+            Span::styled(format!("{name:<13}"), theme::key()),
+            Span::styled(desc, theme::muted()),
         ]));
     }
 
-    let mut warnings = app.config.warnings();
+    let mut warnings = app.startup_notices.clone();
+    warnings.extend(app.config.warnings());
     if !theme::supports_truecolor() {
         warnings.push(
             "This terminal doesn't report reliable 24-bit colour support, so colours are \
@@ -668,6 +701,9 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
 /// bottom of the screen.
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let keys: &[(&str, &str)] = match &app.state {
+        // Same reasoning as the approval box below: the deployment panel
+        // prints its own keys, directly under the choices they act on.
+        _ if app.overlay == Some(Overlay::Deploy) => &[("^c", "exit")],
         // The approval box prints y/n/esc itself, directly under the command
         // they act on. Repeating them here put the same three keys on screen
         // twice, one row apart, which reads as two different prompts.
@@ -762,7 +798,7 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
         }
         // Drawn inline at the bottom of the frame by `render`, not as a
         // floating overlay -- see the comment there.
-        Some(Overlay::ToolApproval { .. }) => {}
+        Some(Overlay::ToolApproval { .. }) | Some(Overlay::Deploy) => {}
     }
 }
 
@@ -806,24 +842,27 @@ fn tool_approval_parts(
 ) -> (&'static str, Vec<Line<'static>>, Vec<Line<'static>>) {
     let mut lines: Vec<Line> = Vec::new();
 
-    // A destructive command gets a banner before anything else. The prompt for
-    // `rm -rf build` must not look identical to the one for `cargo build` --
-    // that sameness is what trains people to press `y` without reading.
-    if let Action::Command { command, .. } = action {
-        let verdict = crate::danger::classify(command, Path::new(&app.workspace_root));
-        if let Some(reason) = verdict.reason() {
+    // A consequential action gets a banner before anything else. The prompt
+    // for `rm -rf build` must not look identical to the one for `cargo build`
+    // -- that sameness is what trains people to press `y` without reading.
+    //
+    // The word differs by kind: a deployment is not destroying anything
+    // locally, and calling it "destructive" would be the same dishonesty in
+    // the other direction.
+    if let Some(reason) = crate::tools::action_risk(action, Path::new(&app.workspace_root)).reason()
+    {
+        let banner = match action {
+            Action::Deploy { .. } => "⚠  PUBLISHES",
+            _ => "⚠  DESTRUCTIVE",
+        };
+        lines.push(Line::from(Span::styled(banner, theme::danger_bold())));
+        for wrapped in wrap(reason, inner) {
             lines.push(Line::from(Span::styled(
-                "⚠  DESTRUCTIVE",
-                theme::danger_bold(),
+                wrapped,
+                Style::default().fg(theme::p().danger),
             )));
-            for wrapped in wrap(reason, inner) {
-                lines.push(Line::from(Span::styled(
-                    wrapped,
-                    Style::default().fg(theme::p().danger),
-                )));
-            }
-            lines.push(Line::from(""));
         }
+        lines.push(Line::from(""));
     }
 
     let (title, verb) = match action {
@@ -933,6 +972,25 @@ fn tool_approval_parts(
             span("replace:", old, theme::p().danger);
             span("with:", new, theme::p().success);
             (" Apply this edit? ", "edit")
+        }
+        Action::Deploy { provider, production, summary } => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "🚀 {provider} · {}",
+                    if *production { "Production" } else { "Preview" }
+                ),
+                Style::default()
+                    .fg(theme::p().text)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            // What the deployment will actually do, so "deploy this" is not a
+            // yes/no about something unspecified.
+            if let Some(summary) = summary {
+                for wrapped in wrap(summary, inner) {
+                    lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+                }
+            }
+            (" Deploy this project? ", "deploy")
         }
         Action::Search { query, max_results } => {
             lines.push(Line::from(Span::styled(
@@ -1116,6 +1174,297 @@ fn approval_scroll(app: &App, body_len: usize, body_height: u16) -> u16 {
     app.approval_scroll.min(max)
 }
 
+// ---- /deploy -------------------------------------------------------------------
+
+/// Streamed log lines kept on screen while something runs, and after the user
+/// asks to see the detail. A window, not the whole log: the panel shares the
+/// screen with the transcript, and the newest lines are the ones being read.
+const DEPLOY_LOG_LINES: usize = 8;
+const DEPLOY_LOG_LINES_EXPANDED: usize = 18;
+
+/// The deployment panel's content, shared by sizing and drawing exactly as
+/// `tool_approval_lines` is -- the frame layout needs the line count before it
+/// can allocate the region the panel is then drawn into.
+fn deployment_lines(app: &App, inner: usize) -> Vec<Line<'static>> {
+    let Some(session) = app.deploy.as_ref() else {
+        return Vec::new();
+    };
+    let mut lines: Vec<Line> = Vec::new();
+
+    // What has already happened, as a checklist. It stays on screen through
+    // every later screen, so "where did it get to" never needs scrollback.
+    for step in &session.steps {
+        let colour = match step.state {
+            StepState::Done => theme::p().success,
+            StepState::Failed => theme::p().danger,
+            StepState::Running => theme::p().accent,
+            StepState::Skipped => theme::p().faint,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", step.state.glyph()), Style::default().fg(colour)),
+            Span::styled(step.label.clone(), theme::text()),
+        ]));
+    }
+    if !session.steps.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    for (label, value) in session.summary() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label:<17}"), theme::faint()),
+            Span::styled(value, theme::text()),
+        ]));
+    }
+    if !session.summary().is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    match &session.stage {
+        Stage::Working(step) => {
+            let elapsed = session.started.map(|t| t.elapsed()).unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", theme::spinner(elapsed)), theme::accent()),
+                Span::styled(
+                    format!("{}… ", step.verb()),
+                    Style::default().fg(theme::p().accent_soft),
+                ),
+                Span::styled(
+                    format!("({}s · esc to stop)", elapsed.as_secs()),
+                    theme::faint(),
+                ),
+            ]));
+            lines.extend(log_lines(session, inner, DEPLOY_LOG_LINES));
+        }
+
+        Stage::Prompt(prompt) => {
+            // Wrapped, not clipped: these hints carry the half that says what
+            // happens to what you are about to type.
+            for wrapped in wrap(prompt.hint(), inner) {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            lines.push(Line::from(""));
+            // A masked field shows dots for what has been typed, so the length
+            // is visible and the value is not.
+            let shown = if prompt.masked() {
+                "•".repeat(session.input.chars().count())
+            } else {
+                session.input.clone()
+            };
+            lines.push(Line::from(if shown.is_empty() {
+                Span::styled("(type here)", theme::faint())
+            } else {
+                Span::styled(shown, theme::text())
+            }));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  enter confirm · esc back",
+                theme::faint(),
+            )));
+        }
+
+        Stage::Menu(menu) => {
+            if *menu == Menu::Failure {
+                if let Some(reason) = &session.failure {
+                    lines.push(Line::from(Span::styled("✖  FAILED", theme::danger_bold())));
+                    for wrapped in wrap(reason, inner) {
+                        lines.push(Line::from(Span::styled(
+                            wrapped,
+                            Style::default().fg(theme::p().danger),
+                        )));
+                    }
+                    lines.push(Line::from(""));
+                }
+                if session.show_full_log {
+                    lines.extend(log_lines(session, inner, DEPLOY_LOG_LINES_EXPANDED));
+                    lines.push(Line::from(""));
+                }
+            }
+            if *menu == Menu::InstallCli {
+                for wrapped in wrap(
+                    "The provider's CLI is not installed. Nothing is installed without your \
+                     say-so.",
+                    inner,
+                ) {
+                    lines.push(Line::from(Span::styled(wrapped, theme::muted())));
+                }
+                // The guardrails' own verdict on the install command, in the
+                // same words the ordinary command-approval prompt would use.
+                if let Some(reason) = &session.install_reason {
+                    lines.push(Line::from(Span::styled(
+                        "⚠  DESTRUCTIVE",
+                        theme::danger_bold(),
+                    )));
+                    for wrapped in wrap(reason, inner) {
+                        lines.push(Line::from(Span::styled(
+                            wrapped,
+                            Style::default().fg(theme::p().danger),
+                        )));
+                    }
+                }
+                lines.push(Line::from(""));
+            }
+
+            let options = session.options();
+            let selected = session.selected.min(options.len().saturating_sub(1));
+            for (i, option) in options.iter().enumerate() {
+                let on = i == selected;
+                lines.push(Line::from(vec![
+                    Span::styled(if on { "❯ " } else { "  " }, theme::accent()),
+                    Span::styled(
+                        option.label.clone(),
+                        if on {
+                            Style::default()
+                                .fg(theme::p().accent)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            theme::text()
+                        },
+                    ),
+                ]));
+                if let Some(detail) = &option.detail {
+                    for wrapped in wrap(detail, inner.saturating_sub(6).max(1)) {
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(wrapped, theme::faint()),
+                        ]));
+                    }
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ↑↓ choose · enter confirm · esc back",
+                theme::faint(),
+            )));
+        }
+
+        Stage::Finished => {
+            match (&session.url, &session.failure) {
+                (Some(url), _) => {
+                    lines.push(Line::from(Span::styled(
+                        "Deployment successful!",
+                        Style::default()
+                            .fg(theme::p().success)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        format!("🌐 {} URL", session.target.label()),
+                        theme::faint(),
+                    )));
+                    // Never wrapped: a URL broken across two rows cannot be
+                    // copied out of a terminal in one go, which is the only
+                    // thing anyone wants to do with it.
+                    lines.push(Line::from(Span::styled(
+                        url.clone(),
+                        Style::default()
+                            .fg(theme::p().accent)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    if let Some(detail) = &session.status_detail {
+                        lines.push(Line::from(""));
+                        for wrapped in wrap(detail, inner) {
+                            lines.push(Line::from(Span::styled(wrapped, theme::muted())));
+                        }
+                    }
+                    lines.push(Line::from(""));
+                    for wrapped in wrap(
+                        "Next: open the URL to check it, or run /deploy again to ship a change. \
+                         /deployments lists what this machine has shipped.",
+                        inner,
+                    ) {
+                        lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+                    }
+                }
+                (None, Some(reason)) => {
+                    lines.push(Line::from(Span::styled(
+                        "Deployment did not finish",
+                        theme::danger_bold(),
+                    )));
+                    for wrapped in wrap(reason, inner) {
+                        lines.push(Line::from(Span::styled(wrapped, theme::text())));
+                    }
+                }
+                (None, None) => {
+                    lines.push(Line::from(Span::styled("Nothing was deployed.", theme::muted())));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  enter close", theme::faint())));
+        }
+    }
+
+    lines
+}
+
+/// The tail of the streamed log, wrapped to the panel.
+fn log_lines(session: &DeploySession, inner: usize, budget: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if session.log.is_empty() {
+        return lines;
+    }
+    lines.push(Line::from(""));
+    let start = session.log.len().saturating_sub(budget);
+    for line in session.log.iter().skip(start) {
+        // Truncated rather than wrapped: build output is one long line per
+        // event, and wrapping it turns eight lines of log into thirty.
+        let clipped: String = line.chars().take(inner.saturating_sub(2).max(1)).collect();
+        lines.push(Line::from(vec![
+            Span::styled("  ", theme::faint()),
+            Span::styled(clipped, Style::default().fg(theme::p().tool)),
+        ]));
+    }
+    lines
+}
+
+/// Draws the deployment panel into its reserved region at the bottom of the
+/// frame -- the same placement, and the same reasoning, as the tool approval.
+fn render_deployment(f: &mut Frame, area: Rect, app: &App) {
+    let Some(session) = app.deploy.as_ref() else {
+        return;
+    };
+    let inner = area.width.saturating_sub(4).max(1) as usize;
+    let lines = deployment_lines(app, inner);
+
+    // The border colour carries the outcome, so a glance at the shape of the
+    // screen answers "did it work" before any text is read.
+    let accent = match (&session.stage, &session.finished_status) {
+        (Stage::Menu(Menu::Failure), _) => theme::p().danger,
+        (Stage::Finished, Some(DeployStatus::Success)) => theme::p().success,
+        (Stage::Finished, Some(DeployStatus::Failed)) => theme::p().danger,
+        _ => theme::p().accent,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent))
+        .title(Span::styled(
+            session.title(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    // Stick to the bottom: while a build streams, the newest lines are the
+    // ones being read, and a panel that scrolled off the top of its own region
+    // would show the beginning of a build forever.
+    let overflow = (lines.len() as u16).saturating_sub(area.height.saturating_sub(2));
+    f.render_widget(
+        Paragraph::new(lines).block(block).scroll((overflow, 0)),
+        area,
+    );
+
+    // Only a text prompt has somewhere for the caret to be. Claimed here
+    // rather than in `render_input`, which stands down while an overlay is up.
+    if let Stage::Prompt(prompt) = &session.stage {
+        if !prompt.masked() && area.height > 2 && area.width > 4 {
+            let column = session.input[..session.input_cursor].chars().count();
+            let x = area.x + 2 + (column.min(inner.saturating_sub(1))) as u16;
+            let y = area.bottom().saturating_sub(4).max(area.y + 1);
+            f.set_cursor(x, y);
+        }
+    }
+}
+
 /// Centers a popup sized to its content within `area`, clamped so it never
 /// exceeds the available space, with an absolute floor so tiny terminals don't
 /// produce an unreadably small popup.
@@ -1233,6 +1582,152 @@ fn hard_wrap(line: &str, width: usize) -> Vec<String> {
         .chunks(width)
         .map(|c| c.iter().collect::<String>())
         .collect()
+}
+
+// ---- lightweight markdown ------------------------------------------------------
+
+/// Models write markdown whether or not they are asked to, and a terminal that
+/// does not read it shows the punctuation instead of the emphasis: `**live**`
+/// where the point was *live*. Rendering a small, safe subset is less work than
+/// fighting the model's training, and degrades better -- an unmatched marker
+/// stays as literal text rather than eating the rest of the line.
+///
+/// Deliberately small. Bold, inline code, bullets and headings cover what
+/// actually shows up in a terminal answer. Italics are **not** handled: `*` and
+/// `_` appear constantly in real prose about code (`snake_case`, globs, `*args`)
+/// and a false positive there silently deletes characters, which is worse than
+/// showing one asterisk.
+///
+/// Applied per already-wrapped row, so a bold span broken across a wrap renders
+/// as two separate spans rather than one continuous one. That is a cosmetic
+/// edge, and the alternative -- styling before wrapping -- means teaching the
+/// wrapper about styled runs for very little gain.
+fn inline_markdown(line: &str, base: Style) -> Vec<Span<'static>> {
+    let code = Style::default()
+        .fg(theme::p().accent_soft)
+        .add_modifier(Modifier::BOLD);
+    let bold = base.add_modifier(Modifier::BOLD);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut plain = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+
+    // Flush whatever unstyled text has accumulated.
+    macro_rules! flush {
+        () => {
+            if !plain.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut plain), base));
+            }
+        };
+    }
+
+    while i < chars.len() {
+        let rest = &chars[i..];
+        // `**bold**`
+        if rest.starts_with(&['*', '*']) {
+            if let Some(end) = find_closer(&chars, i + 2, &['*', '*']) {
+                flush!();
+                spans.push(Span::styled(chars[i + 2..end].iter().collect::<String>(), bold));
+                i = end + 2;
+                continue;
+            }
+        }
+        // `` `code` ``
+        if chars[i] == '`' {
+            if let Some(end) = find_closer(&chars, i + 1, &['`']) {
+                flush!();
+                spans.push(Span::styled(chars[i + 1..end].iter().collect::<String>(), code));
+                i = end + 1;
+                continue;
+            }
+        }
+        plain.push(chars[i]);
+        i += 1;
+    }
+    flush!();
+
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
+}
+
+/// Render a whole message body: block markdown, then wrapping, then inline
+/// markdown per row.
+///
+/// Fenced code blocks are passed through untouched and styled as a unit —
+/// inside one, `**` and `#` are code, not formatting, and a wrapped line of
+/// code is worse than a clipped one.
+fn markdown_lines(body: &str, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut in_fence = false;
+
+    for logical in body.split('\n') {
+        if logical.trim_start().starts_with("```") {
+            // The fence itself is punctuation for a renderer, not content.
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            let code = Style::default().fg(theme::p().accent_soft);
+            for row in hard_wrap(logical, width.saturating_sub(2).max(1)) {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", theme::faint()),
+                    Span::styled(row, code),
+                ]));
+            }
+            continue;
+        }
+
+        let (text, indent, heading) = block_markdown(logical);
+        let base = if heading {
+            theme::text().add_modifier(Modifier::BOLD)
+        } else {
+            theme::text()
+        };
+        for row in wrap(&text, width.saturating_sub(indent.len())) {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if !indent.is_empty() {
+                spans.push(Span::raw(indent));
+            }
+            spans.extend(inline_markdown(&row, base));
+            lines.push(Line::from(spans));
+        }
+    }
+    lines
+}
+
+/// Where `marker` next closes, at or after `from`. `None` when it never does,
+/// which is what keeps an unmatched `*` from swallowing the rest of the line.
+fn find_closer(chars: &[char], from: usize, marker: &[char]) -> Option<usize> {
+    if from >= chars.len() {
+        return None;
+    }
+    (from..=chars.len().saturating_sub(marker.len()))
+        .find(|&i| chars[i..].starts_with(marker) && i > from)
+}
+
+/// Strip a line's block-level markdown, returning the text to draw, how far to
+/// indent it, and whether the whole line is a heading.
+///
+/// `- item` becomes `• item` because a bullet is what was meant; `### Heading`
+/// loses its hashes and gains bold, because the hashes were standing in for an
+/// emphasis the terminal can just apply.
+fn block_markdown(line: &str) -> (String, &'static str, bool) {
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+
+    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        return (format!("• {rest}"), if indent >= 2 { "    " } else { "  " }, false);
+    }
+    if trimmed.starts_with('#') {
+        let rest = trimmed.trim_start_matches('#');
+        if rest.starts_with(' ') {
+            return (rest.trim_start().to_string(), "", true);
+        }
+    }
+    (line.to_string(), "", false)
 }
 
 /// Word-wrap message text, preserving explicit newlines.
@@ -2160,6 +2655,322 @@ mod tests {
         );
         assert!(rendered.contains("y search"), "the keys must say search");
     }
+
+    // ---- /deploy ---------------------------------------------------------
+
+    /// An app sitting in the deployment overlay, at whichever stage is wanted.
+    fn deploying(stage: Stage) -> App {
+        use crate::deploy::service::tests_support;
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.workspace_root = "/Users/dev/my-app".to_string();
+        let mut session = tests_support::session("vercel");
+        session.stage = stage;
+        app.deploy = Some(session);
+        app.overlay = Some(Overlay::Deploy);
+        app
+    }
+
+    #[test]
+    fn the_provider_picker_lists_both_providers_with_the_first_highlighted() {
+        let mut app = deploying(Stage::Menu(Menu::Provider));
+        let rows = rendered_rows(&mut app, 80, 24);
+        let joined = rows.concat();
+
+        assert!(joined.contains("Select deployment provider"), "{joined}");
+        assert!(joined.contains("Vercel"), "{joined}");
+        assert!(joined.contains("Netlify"), "{joined}");
+
+        let highlighted = rows
+            .iter()
+            .find(|r| r.contains('❯') && r.contains("Vercel"))
+            .expect("the cursor should start on the first provider");
+        assert!(!highlighted.is_empty());
+    }
+
+    /// The detected project and framework are the whole point of the confirm
+    /// screen -- without them it is a yes/no about nothing.
+    #[test]
+    fn the_confirmation_screen_names_what_was_detected() {
+        let mut app = deploying(Stage::Menu(Menu::Confirm));
+        let text = rendered_text(&mut app, 80, 24);
+        assert!(text.contains("my-app"), "{text}");
+        assert!(text.contains("Vite"), "{text}");
+        assert!(text.contains("Yes"), "{text}");
+        assert!(text.contains("No"), "{text}");
+    }
+
+    #[test]
+    fn a_running_step_shows_a_spinner_its_elapsed_time_and_how_to_stop_it() {
+        let mut app = deploying(Stage::Working(crate::deploy::service::Step::Deploying));
+        if let Some(session) = app.deploy.as_mut() {
+            session.started = Some(std::time::Instant::now());
+            session.log.push_back("Building...".to_string());
+        }
+        let text = rendered_text(&mut app, 80, 24);
+        assert!(text.contains("Building and uploading"), "{text}");
+        assert!(text.contains("esc to stop"), "{text}");
+        assert!(text.contains("Building..."), "the streamed log must show: {text}");
+    }
+
+    /// The URL is the one thing anyone wants out of this screen, and a URL
+    /// broken across two rows cannot be copied out of a terminal in one go.
+    #[test]
+    fn the_success_screen_shows_the_url_unbroken() {
+        let mut app = deploying(Stage::Finished);
+        if let Some(session) = app.deploy.as_mut() {
+            session.url = Some("https://my-app.vercel.app".to_string());
+            session.finished_status = Some(DeployStatus::Success);
+        }
+        let rows = rendered_rows(&mut app, 80, 24);
+        assert!(
+            rows.iter().any(|r| r.contains("https://my-app.vercel.app")),
+            "the URL must sit on one row: {rows:?}"
+        );
+        assert!(rows.concat().contains("Deployment successful"), "{rows:?}");
+    }
+
+    /// The failure screen has to carry the reason *and* the way out, or it is
+    /// a dead end.
+    #[test]
+    fn the_failure_screen_shows_the_reason_and_the_recovery_options() {
+        let mut app = deploying(Stage::Menu(Menu::Failure));
+        if let Some(session) = app.deploy.as_mut() {
+            session.failure = Some("The build command failed on Vercel.".to_string());
+        }
+        let text = rendered_text(&mut app, 80, 30);
+        assert!(text.contains("FAILED"), "{text}");
+        assert!(text.contains("build command failed"), "{text}");
+        assert!(text.contains("View detailed logs"), "{text}");
+        assert!(text.contains("Retry deployment"), "{text}");
+        assert!(text.contains("Cancel"), "{text}");
+    }
+
+    /// The install prompt must show the exact command and the guardrails'
+    /// verdict on it -- approving something you cannot see is not approval.
+    #[test]
+    fn the_install_prompt_shows_the_command_and_why_it_is_flagged() {
+        let mut app = deploying(Stage::Menu(Menu::InstallCli));
+        if let Some(session) = app.deploy.as_mut() {
+            session.install_reason = Some("installs globally, outside the project".to_string());
+        }
+        let text = rendered_text(&mut app, 80, 24);
+        assert!(text.contains("npm install -g vercel"), "{text}");
+        assert!(text.contains("DESTRUCTIVE"), "{text}");
+        assert!(text.contains("installs globally"), "{text}");
+    }
+
+    /// The property the whole secret story rests on, asserted against real
+    /// rendered cells rather than against the data model.
+    #[test]
+    fn a_secret_value_never_reaches_the_screen() {
+        use crate::deploy::{EnvVar, Secret};
+
+        // While it is being typed...
+        let mut app = deploying(Stage::Prompt(crate::deploy::service::Prompt::EnvValue));
+        if let Some(session) = app.deploy.as_mut() {
+            session.input = "hunter2-super-secret".to_string();
+            session.input_cursor = session.input.len();
+        }
+        let typing = rendered_text(&mut app, 80, 24);
+        assert!(!typing.contains("hunter2"), "a value echoed while typing: {typing}");
+        assert!(typing.contains('•'), "it should render as dots: {typing}");
+
+        // ...and once it is set.
+        let mut app = deploying(Stage::Menu(Menu::Env));
+        if let Some(session) = app.deploy.as_mut() {
+            session.env.push(EnvVar {
+                key: "API_KEY".to_string(),
+                value: Secret::new("hunter2-super-secret"),
+            });
+        }
+        let listed = rendered_text(&mut app, 80, 24);
+        assert!(listed.contains("API_KEY"), "the name should show: {listed}");
+        assert!(!listed.contains("hunter2"), "a value leaked into the list: {listed}");
+    }
+
+    /// The same sweep the rest of the app gets: no deployment screen may panic
+    /// on a terminal too small to hold it.
+    #[test]
+    fn every_deployment_screen_renders_at_any_terminal_size() {
+        use crate::deploy::service::{Prompt, Step};
+
+        let stages = [
+            Stage::Menu(Menu::Provider),
+            Stage::Menu(Menu::Confirm),
+            Stage::Menu(Menu::Settings),
+            Stage::Menu(Menu::EditField),
+            Stage::Menu(Menu::Env),
+            Stage::Menu(Menu::Target),
+            Stage::Menu(Menu::Link),
+            Stage::Menu(Menu::InstallCli),
+            Stage::Menu(Menu::Login),
+            Stage::Menu(Menu::Failure),
+            Stage::Prompt(Prompt::Name),
+            Stage::Prompt(Prompt::Token),
+            Stage::Working(Step::Deploying),
+            Stage::Finished,
+        ];
+
+        for stage in stages {
+            let mut app = deploying(stage.clone());
+            if let Some(session) = app.deploy.as_mut() {
+                session.started = Some(std::time::Instant::now());
+                session.failure = Some("a failure long enough to need wrapping somewhere".into());
+                session.url = Some("https://a-rather-long-project-name.vercel.app".into());
+                session.show_full_log = true;
+                for i in 0..30 {
+                    session.log.push_back(format!("log line number {i} with some text"));
+                }
+            }
+            for (w, h) in [(1, 1), (2, 3), (4, 5), (10, 6), (20, 8), (40, 12), (80, 24), (200, 60)] {
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                terminal
+                    .draw(|f| render(f, &mut app))
+                    .unwrap_or_else(|e| panic!("{stage:?} at {w}x{h} failed: {e}"));
+            }
+        }
+    }
+
+    /// The transcript is the context for the question being asked, exactly as
+    /// it is for a tool approval.
+    #[test]
+    fn the_deployment_panel_leaves_the_transcript_visible_above_it() {
+        let mut app = deploying(Stage::Menu(Menu::Confirm));
+        app.messages.push(Message::new(
+            Role::User,
+            "deploy this thing for me please",
+        ));
+        let text = rendered_text(&mut app, 80, 30);
+        assert!(text.contains("deploy this thing"), "{text}");
+        assert!(text.contains("Continue with deployment"), "{text}");
+    }
+
+    /// The model can deploy too, and that prompt has to say what is about to
+    /// happen: which host, which kind of deployment, and what will be built.
+    #[test]
+    fn the_deploy_approval_prompt_distinguishes_a_preview_from_production() {
+        use crate::llm::FunctionCall;
+
+        for (production, expected) in [(false, "Preview"), (true, "Production")] {
+            let mut app = App::new(crate::config::Config::default());
+            app.greeted = true;
+            app.workspace_root = "/tmp".to_string();
+            app.state = AppState::Streaming;
+            app.request_tools(vec![ToolCall {
+                id: "c1".to_string(),
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: crate::tools::DEPLOY_PROJECT.to_string(),
+                    arguments: format!("{{\"provider\":\"vercel\",\"production\":{production}}}"),
+                },
+            }]);
+
+            let text = rendered_text(&mut app, 80, 26);
+            assert!(text.contains("Deploy this project?"), "{text}");
+            assert!(text.contains(expected), "{text}");
+            // A deployment is not destroying anything locally, so calling it
+            // "destructive" would be dishonest in the other direction.
+            assert!(text.contains("PUBLISHES"), "{text}");
+            assert!(!text.contains("DESTRUCTIVE"), "{text}");
+            // Asserted on a phrase short enough to survive wrapping: rows are
+            // padded to the full width, so a phrase split across two of them
+            // is not `contains`-able even though it renders correctly.
+            if production {
+                assert!(text.contains("live production URL"), "{text}");
+            } else {
+                assert!(text.contains("third-party host"), "{text}");
+            }
+        }
+    }
+
+    // ---- markdown ----------------------------------------------------------
+
+    /// Render one assistant message and return the visible rows.
+    fn assistant_rows(body: &str) -> Vec<String> {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.messages.push(Message::new(Role::Assistant, body));
+        rendered_rows(&mut app, 80, 24)
+    }
+
+    /// Regression: the model writes markdown whether or not it is asked to,
+    /// and the transcript showed the punctuation instead of the emphasis --
+    /// `**https://…**` with the asterisks visible.
+    #[test]
+    fn markdown_punctuation_does_not_reach_the_screen() {
+        let rows = assistant_rows(
+            "Deployed. The real URL is:\n\n\
+             **https://deploy-demo.vercel.app**\n\n\
+             Note: Vercel lists it under the **Production** environment.",
+        );
+        let joined = rows.concat();
+
+        assert!(joined.contains("https://deploy-demo.vercel.app"), "{joined}");
+        assert!(joined.contains("Production"), "{joined}");
+        assert!(!joined.contains("**"), "asterisks reached the screen: {joined}");
+    }
+
+    #[test]
+    fn inline_code_loses_its_backticks_but_keeps_its_text() {
+        let joined = assistant_rows("Check `index.html` and `vite.config.js` first.").concat();
+        assert!(joined.contains("index.html"), "{joined}");
+        assert!(joined.contains("vite.config.js"), "{joined}");
+        assert!(!joined.contains('`'), "backticks reached the screen: {joined}");
+    }
+
+    #[test]
+    fn bullets_and_headings_render_as_themselves() {
+        let joined = assistant_rows("## What I found\n\n- public/ and src/\n- index.html").concat();
+        assert!(joined.contains("What I found"), "{joined}");
+        assert!(!joined.contains('#'), "hashes reached the screen: {joined}");
+        assert!(joined.contains('•'), "a bullet should render as one: {joined}");
+        assert!(joined.contains("index.html"), "{joined}");
+    }
+
+    #[test]
+    fn a_fenced_code_block_is_shown_without_its_fences() {
+        let joined = assistant_rows("Run this:\n\n```bash\nnpm run build\n```\n\nThen deploy.").concat();
+        assert!(joined.contains("npm run build"), "{joined}");
+        assert!(!joined.contains("```"), "fences reached the screen: {joined}");
+        assert!(joined.contains("Then deploy."), "{joined}");
+    }
+
+    /// An unmatched marker must stay as text. Swallowing the rest of the line
+    /// looking for a closer that never comes would lose real content.
+    #[test]
+    fn an_unmatched_marker_is_left_alone_rather_than_eating_the_line() {
+        let joined = assistant_rows("2 * 3 is 6, and `unclosed stays put").concat();
+        assert!(joined.contains("2 * 3 is 6"), "{joined}");
+        assert!(joined.contains("unclosed stays put"), "{joined}");
+    }
+
+    /// `snake_case`, globs and `*args` are ordinary in prose about code, and a
+    /// false italic there silently deletes characters.
+    #[test]
+    fn underscores_and_lone_asterisks_in_prose_are_untouched() {
+        for body in ["use snake_case here", "pass *args through", "match **/*.rs"] {
+            let joined = assistant_rows(body).concat();
+            let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            let seen: String = joined.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(seen.contains(&stripped), "{body:?} was mangled into {joined:?}");
+        }
+    }
+
+    /// The cap on the menu's height has to stay above the number of commands.
+    /// Adding the two deployment commands pushed the list past the old cap of
+    /// 8, and the last one was silently clipped out of its own menu -- which
+    /// is how a command comes to look like it does not exist.
+    #[test]
+    fn the_command_menu_is_tall_enough_for_every_command() {
+        assert!(
+            MAX_COMMAND_MENU_HEIGHT as usize >= crate::app::COMMANDS.len() + 2,
+            "{} commands do not fit in {MAX_COMMAND_MENU_HEIGHT} rows",
+            crate::app::COMMANDS.len()
+        );
+    }
+
+
 }
 
 
