@@ -264,7 +264,7 @@ impl DeploymentProvider for VercelProvider {
         let lower = combined.to_lowercase();
         if lower.contains("not authorized") || lower.contains("forbidden") {
             return "Vercel refused the request: this account cannot deploy that project. Check \
-                    the team or scope, or run /deploy again and pick a different project."
+                    the team or scope, or try again and pick a different project."
                 .to_string();
         }
         if lower.contains("already exists") {

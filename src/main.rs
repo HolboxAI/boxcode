@@ -433,7 +433,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             let (schemas, system) = match workspace {
                 _ if app.compacting => (Vec::new(), None),
                 Some(ws) => (
-                    if budget_left { tools::schemas() } else { Vec::new() },
+                    if budget_left { tools::schemas(app.config.deploy.enabled) } else { Vec::new() },
                     Some(tools::system_prompt(ws, &app.config.tools, budget_left)),
                 ),
                 None => (Vec::new(), None),
@@ -548,15 +548,16 @@ COMMANDS (type in the input box, press Enter):
     /quota clear          Remove your own limits
     /quota override       Keep working past today's limit
     /quota reset          Cancel an override
-    /deploy               Ship this directory to Vercel or Netlify
-    /deployments          Recent deployments from this machine
 
-DEPLOYMENT (see [deploy] in config.toml):
-    Uses the provider's own CLI (`vercel` / `netlify`), and offers to install
-    it if it is missing -- never without asking. Signing in hands the terminal
-    to the provider's own browser login; no secret is typed into this app.
-    Environment-variable values and tokens are never logged, shown, or written
-    to the deployment history.
+DEPLOYMENT (ask the model, e.g. 'deploy this to Vercel'; see [deploy] in
+            config.toml):
+    Not a slash command -- a deployment needs a provider and a target to mean
+    anything, and asking carries both. Uses the provider's own CLI
+    (`vercel` / `netlify`) and offers to install it if it is missing, never
+    without asking. Signing in hands the terminal to the provider's own
+    browser login; no secret is typed into this app. Environment-variable
+    values and tokens are never logged, shown, or written to
+    ~/.boxcode/deployments.jsonl.
 
 DAILY LIMITS (optional, off by default -- every limit is 0 = no limit, so this
               only counts until you set one. See [quota] in config.toml):

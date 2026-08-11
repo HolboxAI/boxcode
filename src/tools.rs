@@ -108,9 +108,14 @@ pub fn shell() -> (&'static str, &'static str) {
     }
 }
 
-pub fn schemas() -> Vec<Value> {
+/// The tools the model is offered.
+///
+/// `deploy` gates one of them rather than filtering afterwards: a schema the
+/// model can see is one it will eventually call, and answering "that is turned
+/// off" is a worse experience than never offering it.
+pub fn schemas(deploy: bool) -> Vec<Value> {
     let (shell_name, shell_flag) = shell();
-    vec![
+    let mut out = vec![
         json!({
             "type": "function",
             "function": {
@@ -285,37 +290,43 @@ pub fn schemas() -> Vec<Value> {
                 }
             }
         }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": DEPLOY_PROJECT,
-                "description":
-                    "Deploy this project to a hosting provider and get back the live URL. Detects \
-                     the framework, build command and output directory automatically, links or \
-                     creates the provider-side project, runs the build and uploads it. The user \
-                     approves before anything is deployed. If the provider's CLI is missing or \
-                     nobody is signed in, this returns a clear error and the user has to run \
-                     /deploy once first -- installing and signing in both need the terminal, \
-                     which a tool call cannot take. On failure the build log comes back with the \
-                     error, so read it and fix the real problem before retrying.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "provider": {
-                            "type": "string",
-                            "enum": ["vercel", "netlify"],
-                            "description": "Which host to deploy to."
+    ];
+
+    if deploy {
+        out.push(
+            json!({
+                "type": "function",
+                "function": {
+                    "name": DEPLOY_PROJECT,
+                    "description":
+                        "Deploy this project to a hosting provider and get back the live URL. Detects \
+                         the framework, build command and output directory automatically, links or \
+                         creates the provider-side project, runs the build and uploads it. The user \
+                         approves before anything is deployed. If the provider's CLI is missing or \
+                         nobody is signed in, this returns a clear error and the user has to run \
+                         anything it needs -- installing the CLI, signing in -- it asks the user for \
+                         directly as it goes. On failure the build log comes back with the error, so \
+                         read it and fix the real problem before retrying.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "provider": {
+                                "type": "string",
+                                "enum": ["vercel", "netlify"],
+                                "description": "Which host to deploy to."
+                            },
+                            "production": {
+                                "type": "boolean",
+                                "description": "True for the live production URL, false (the default) for a throwaway preview. Only pass true when the user has asked for production."
+                            }
                         },
-                        "production": {
-                            "type": "boolean",
-                            "description": "True for the live production URL, false (the default) for a throwaway preview. Only pass true when the user has asked for production."
-                        }
-                    },
-                    "required": ["provider"]
+                        "required": ["provider"]
+                    }
                 }
-            }
-        }),
-    ]
+            }),
+        );
+    }
+    out
 }
 
 /// What the model is told about its situation.
@@ -2235,9 +2246,24 @@ mod tests {
         );
     }
 
+    /// `enabled = false` has to mean the model never sees the tool. A schema
+    /// it can see is one it will eventually call, and answering "that is
+    /// turned off" is a worse experience than never offering it.
+    #[test]
+    fn disabling_deployment_withholds_the_schema_entirely() {
+        let names: Vec<String> = schemas(false)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == DEPLOY_PROJECT), "{names:?}");
+        // ...and the rest are untouched.
+        assert!(names.iter().any(|n| n == RUN_COMMAND), "{names:?}");
+        assert_eq!(names.len(), schemas(true).len() - 1);
+    }
+
     #[test]
     fn the_schemas_name_exactly_the_tools_that_execute() {
-        let schemas = schemas();
+        let schemas = schemas(true);
         let names: Vec<_> = schemas.iter().map(|s| s["function"]["name"].clone()).collect();
         assert_eq!(
             names,
@@ -2363,7 +2389,7 @@ mod tests {
     /// `/deploy`, where the user types them into a masked field.
     #[test]
     fn the_deploy_schema_gives_the_model_no_way_to_pass_a_secret() {
-        let schema = schemas()
+        let schema = schemas(true)
             .into_iter()
             .find(|s| s["function"]["name"] == DEPLOY_PROJECT)
             .expect("the deploy schema");

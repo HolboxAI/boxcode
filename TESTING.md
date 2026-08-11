@@ -53,7 +53,8 @@ What is covered:
 | Command running, streaming, timeout, kill | `deploy::runner` |
 | Secrets never reaching argv, the UI, or the history | `deploy` (several) |
 | Every deployment screen rendering at every size | `ui::tests` |
-| `/deploy` and `/deployments` dispatch and key handling | `app::tests` |
+| Deployment is not reachable as a slash command | `app::tests` |
+| The panel fits a short viewport with its status line pinned | `ui::tests` |
 | The `deploy_project` tool: args, risk, refusals | `tools::tests` |
 | A deployment always stops for approval, even unattended | `tools::tests` |
 | An approved tool call hands off to the interactive flow | `app::tests` |
@@ -124,9 +125,9 @@ npm install
 BOXCODE_WORKSPACE=/tmp/deploy-demo boxcode
 ```
 
-Then type `/deploy` and walk it: pick a provider, confirm the detected Vite
-setup, skip the environment variables, choose Preview (not Production, for a
-test), and let it run.
+Then ask it: `deploy this to vercel`. Approve the prompt, and walk the panel:
+confirm the detected Vite setup, skip the environment variables, choose Preview
+(not Production, for a test), and let it run.
 
 Worth checking by hand, since no test can:
 
@@ -169,8 +170,8 @@ across terminal sizes from 1×1 upward.
 | "Could not connect to endpoint" | LLM endpoint invalid | Check BOXCODE_ENDPOINT env var |
 | "Authentication failed" | Invalid API key | Check BOXCODE_API_KEY env var |
 | "Cannot find model" | Model name typo | Check BOXCODE_MODEL env var |
-| "No project directory" on `/deploy` | `[tools] enabled = false` | Enable tools, or set `BOXCODE_WORKSPACE` |
-| "nothing to build or serve" | No `package.json` and no `index.html` | Point `/deploy` at the project directory |
+| "No project directory" when deploying | `[tools] enabled = false` | Enable tools, or set `BOXCODE_WORKSPACE` |
+| "nothing to build or serve" | No `package.json` and no `index.html` | Launch boxcode from the project directory |
 | CLI "installed but is not working" | Broken global npm install | `npm install -g vercel` again, or check `vercel --version` by hand |
 
 ## Adding New Tests
