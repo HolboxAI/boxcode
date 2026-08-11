@@ -9,7 +9,7 @@ OpenAI-compatible LLM endpoint.
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v1.0.0
+  ▟█▙       ▟█▙    boxcode  v1.0.1
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -339,6 +339,30 @@ variables override values in `config.toml`.
   this shows an inline error telling you to run `/provider` first.
 - **`/new`** — Forgets the current conversation. The configured provider and
   model are untouched; only the message history and tool-step count reset.
+- **`/compact`** — Has the model summarise the conversation so far, then
+  continues from that summary instead of the full transcript. Same problem
+  `/new` solves — the whole history is resent every turn, so a long session
+  costs more with each prompt — without the amnesia: what was established
+  survives, at the price of one summarising request. It prints what that
+  bought:
+
+  ```
+  Compacted the conversation.
+
+    before    ~18,432 tokens  ·  42 messages
+    after      ~1,240 tokens  ·  1 message
+    freed     ~17,192 tokens  ·  93% smaller
+
+  Today so far: 124,300 tokens over 37 requests, this summary included.
+  Context figures are estimates at 4 characters per token, not billed counts.
+  ```
+
+  The summary is shown in full, since it is what the model will be working
+  from next. Nothing is discarded until a usable summary comes back: an empty
+  reply, a failed request, or Esc all leave the conversation exactly as it was.
+  The request is metered like any other, and an exhausted `/quota` refuses it —
+  otherwise the cheapest way past a spent allowance would be to know this
+  command.
 - **`/usage`** — Prints your token usage from `~/.boxcode/usage.jsonl`:
   today, the last 7 days, and all time. This is local and per-install only —
   there is no login, so it is the only place this number exists; nothing here

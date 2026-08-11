@@ -33,6 +33,13 @@ pub enum Role {
     System,
     /// The result of one tool call, sent back to the model as `role: "tool"`.
     Tool,
+    /// A `/compact` summary standing in for everything that came before it.
+    ///
+    /// Deliberately its own role rather than `System`: a System message is
+    /// local commentary that `history` drops, and a summary that never reaches
+    /// the model would mean compaction silently *erased* the conversation
+    /// instead of condensing it. This one goes on the wire.
+    Summary,
 }
 
 #[derive(Clone)]
@@ -75,6 +82,7 @@ impl Role {
             Role::Error => "Error",
             Role::System => "System",
             Role::Tool => "Tool",
+            Role::Summary => "Summary",
         }
     }
 }
@@ -124,9 +132,114 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/provider", "switch provider or endpoint"),
     ("/model", "switch model"),
     ("/new", "forget the current conversation"),
+    ("/compact", "summarise the conversation to free up context"),
     ("/usage", "what today cost, and the history"),
     ("/quota", "what is left today, and your own limits"),
 ];
+
+/// Roughly how many characters one token is worth.
+///
+/// There is no tokeniser here -- the endpoint is whatever the user pointed at,
+/// and its vocabulary is not knowable from this side -- so every token figure
+/// this app produces on its own is this division, and is always shown with a
+/// `~`. Centralised so the live spinner, the usage log and `/compact`'s
+/// before/after cannot drift into three different approximations.
+pub const CHARS_PER_TOKEN: usize = 4;
+
+/// What `/compact` asks the model for.
+///
+/// Written as instructions to itself rather than as a request for a report:
+/// the reply *becomes* the conversation, so anything it leaves out is gone for
+/// good. Hence the emphasis on specifics -- a summary that says "fixed the
+/// bug" instead of naming the file has thrown away the only copy.
+const COMPACT_INSTRUCTION: &str = "\
+Summarise the conversation above so that it can replace it entirely as your context.
+
+Keep: what the user is trying to achieve, decisions taken and the reasoning \
+behind them, every file path touched and what changed in it, commands run and \
+what they produced, and anything still unfinished or agreed as a next step.
+
+Be specific. Names, paths, numbers and exact error text survive only if you \
+write them down -- the messages above will not be sent again, so anything you \
+leave out is lost. Drop pleasantries, restatements, and anything since \
+superseded.
+
+Write it as notes to yourself, not as a reply to the user, and do not comment \
+on the act of summarising.";
+
+/// Prefixed to the summary on the wire so the model reads it as context it
+/// already has rather than as something it is being asked to act on. The user
+/// never sees this line -- the transcript shows `display`, which is the
+/// summary alone.
+const SUMMARY_PREAMBLE: &str =
+    "Summary of the conversation so far. The messages it covers have been \
+removed to save context, so this is all that remains of them:";
+
+/// What `/compact` prints once the summary is in place: what the context cost,
+/// what it costs now, and what the day has cost so far.
+///
+/// Every context figure is the character estimate and is written with a `~` --
+/// the endpoint's own counts only ever describe a request already sent, so
+/// there is no counted figure for a context that has not been sent yet. Saying
+/// "before" exactly and "after" approximately would invite a comparison
+/// between two different things; both are estimates, measured the same way, so
+/// the difference between them is the honest part.
+fn compaction_readout(
+    before: &ContextSize,
+    after: &ContextSize,
+    quota: &crate::quota::DailyQuota,
+) -> String {
+    let tokens = |n: usize| format!("~{}", crate::quota::thousands(n as u64));
+    let messages = |n: usize| format!("{n} message{}", if n == 1 { "" } else { "s" });
+
+    let freed = before.approx_tokens.saturating_sub(after.approx_tokens);
+    // Integer division, deliberately rounding down: reporting 94% when it is
+    // 93.6% overstates the win, and this number exists to be trusted.
+    let percent = freed
+        .saturating_mul(100)
+        .checked_div(before.approx_tokens)
+        .unwrap_or(0);
+
+    let mut out = String::from("Compacted the conversation.\n\n");
+    out.push_str(&format!(
+        "  before  {:>9} tokens  ·  {}\n",
+        tokens(before.approx_tokens),
+        messages(before.messages)
+    ));
+    out.push_str(&format!(
+        "  after   {:>9} tokens  ·  {}\n",
+        tokens(after.approx_tokens),
+        messages(after.messages)
+    ));
+    out.push_str(&format!(
+        "  freed   {:>9} tokens  ·  {percent}% smaller\n\n",
+        tokens(freed)
+    ));
+
+    let spent = quota.prompt_tokens.saturating_add(quota.completion_tokens);
+    if spent > 0 {
+        out.push_str(&format!(
+            "Today so far: {} tokens over {} request{}, this summary included.\n",
+            crate::quota::thousands(spent),
+            quota.requests,
+            if quota.requests == 1 { "" } else { "s" }
+        ));
+    }
+    out.push_str(&format!(
+        "Context figures are estimates at {CHARS_PER_TOKEN} characters per token, not billed counts."
+    ));
+    out
+}
+
+/// How big the conversation is, in both senses that can be known here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContextSize {
+    /// Messages that actually go on the wire. Local commentary (`System`,
+    /// `Error`) is not counted, because it is never sent and so costs nothing.
+    pub messages: usize,
+    /// The `CHARS_PER_TOKEN` estimate of what they occupy.
+    pub approx_tokens: usize,
+}
 
 pub struct App {
     pub state: AppState,
@@ -253,6 +366,29 @@ pub struct App {
     /// handles the list shrinking as more is typed without needing a reset
     /// call at every mutation site.
     pub command_menu_selected: usize,
+    /// True while the request in flight is a `/compact` summarisation rather
+    /// than an ordinary turn.
+    ///
+    /// A flag on an otherwise ordinary request rather than a new `AppState`:
+    /// compaction streams, meters, cancels and fails exactly like any other
+    /// request, and only two points differ -- what `main.rs` puts on the wire,
+    /// and what `finish_stream` does with the reply. A parallel state would
+    /// have meant teaching every other match arm about a case that behaves
+    /// identically.
+    pub compacting: bool,
+    /// The conversation's size when the in-flight compaction started.
+    ///
+    /// Captured up front because the messages it measures are gone by the time
+    /// there is a summary to compare them against -- asking afterwards would
+    /// only ever report the summary's own size, twice.
+    compact_before: Option<ContextSize>,
+    /// `prompt_tokens` from the most recent request the endpoint reported them
+    /// for -- the one figure here that is counted rather than estimated.
+    ///
+    /// `None` unless the endpoint sends usage at all (most do not, unless
+    /// `include_usage` is on), which is why it supplements the estimate rather
+    /// than replacing it.
+    pub last_prompt_tokens: Option<usize>,
 }
 
 impl App {
@@ -295,6 +431,9 @@ impl App {
             history_index: None,
             history_draft: String::new(),
             command_menu_selected: 0,
+            compacting: false,
+            compact_before: None,
+            last_prompt_tokens: None,
         }
     }
 
@@ -379,6 +518,7 @@ impl App {
                         "/provider" => self.open_provider_picker(),
                         "/model" => self.open_model_picker_from_config(),
                         "/new" => self.start_new_conversation(),
+                        "/compact" => self.start_compaction(),
                         "/usage" => self.show_usage(),
                         "/quota" => self.show_quota(),
                         other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
@@ -596,6 +736,21 @@ impl App {
         // directly after the calls they answer.
         self.settle_unanswered_tool_calls("The user cancelled before this command ran.");
 
+        // Esc during a compaction abandons the summary, not the conversation.
+        if self.compacting {
+            self.abandon_compaction();
+            self.messages.push(Message::new(
+                Role::System,
+                "Compaction cancelled. The conversation is unchanged.",
+            ));
+            let tokens = self.record_quota();
+            self.pending_usage
+                .push((tokens.total() as usize, self.config.llm.model.clone()));
+            self.busy_started = None;
+            self.state = AppState::AwaitingInput;
+            return;
+        }
+
         let partial = std::mem::take(&mut self.streaming_response);
         if !partial.trim().is_empty() {
             self.messages.push(Message::new(
@@ -746,16 +901,178 @@ impl App {
         self.scroll = 0;
         self.follow_tail = true;
         self.greeted = true;
+        self.last_prompt_tokens = None;
+        // The flush cursor counts into `messages`, which just got shorter.
+        // Left where it was it would sit past the end of the new list, and
+        // `drainable` would hand back nothing -- so this notice, and every
+        // message after it, would never be printed at all.
+        self.flushed = 0;
         self.messages.push(Message::new(
             Role::System,
             "Started a new conversation. The model no longer remembers anything above this line.",
         ));
     }
 
+    /// What the conversation currently costs to send.
+    ///
+    /// Counts only what `history` actually puts on the wire -- tool-call
+    /// arguments included, since a rejected `rm -rf` still occupies the
+    /// context that carried it -- and never the local notices, which are free.
+    pub fn context_size(&self) -> ContextSize {
+        let mut chars = 0usize;
+        let mut messages = 0usize;
+        for message in &self.messages {
+            if matches!(message.role, Role::Error | Role::System) {
+                continue;
+            }
+            messages += 1;
+            chars += message.content.chars().count();
+            for call in &message.tool_calls {
+                chars +=
+                    call.function.name.chars().count() + call.function.arguments.chars().count();
+            }
+        }
+        ContextSize {
+            messages,
+            approx_tokens: chars / CHARS_PER_TOKEN,
+        }
+    }
+
+    /// `/compact` -- have the model write the conversation down to a summary,
+    /// and continue from that instead.
+    ///
+    /// The same problem `/new` solves, without the amnesia: the whole
+    /// transcript is resent every turn, so a long session costs more with each
+    /// prompt whether or not the early messages still matter. `/new` fixes the
+    /// cost by discarding everything; this pays for one summarising request in
+    /// order to keep what was actually established.
+    ///
+    /// It is a real request against a real endpoint, so it is metered, refused
+    /// by an exhausted quota, and interruptible, like any other.
+    fn start_compaction(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        self.greeted = true;
+        self.follow_tail = true;
+
+        let before = self.context_size();
+        if before.messages == 0 {
+            self.messages.push(Message::new(
+                Role::System,
+                "Nothing to compact -- there is no conversation yet.",
+            ));
+            return;
+        }
+        // A single message is already the floor; summarising it would cost a
+        // request to arrive back where it started, or slightly worse.
+        if before.messages == 1 {
+            self.messages.push(Message::new(
+                Role::System,
+                "Nothing to compact -- the conversation is already a single message.",
+            ));
+            return;
+        }
+
+        // Checked exactly as `submit` checks it. Compaction is the thing you
+        // reach for when a session has grown expensive, but it is itself a
+        // full-context request: letting it through an exhausted allowance
+        // would make the limit negotiable by whoever knew this command.
+        self.roll_quota_day();
+        if let Some(message) = self.quota_block() {
+            self.messages.push(Message::new(Role::Error, message));
+            return;
+        }
+
+        self.compact_before = Some(before);
+        self.compacting = true;
+        self.streaming_response.clear();
+        self.stream_printed = 0;
+        self.streamed_chars = 0;
+        self.tool_steps = 0;
+        self.busy_started = Some(std::time::Instant::now());
+        self.state = AppState::Sending;
+    }
+
+    /// Give up on the summary in flight without touching the conversation it
+    /// was meant to replace. Shared by every way a compaction can end badly.
+    fn abandon_compaction(&mut self) {
+        self.compacting = false;
+        self.compact_before = None;
+        self.streaming_response.clear();
+        self.stream_printed = 0;
+        self.follow_tail = true;
+    }
+
+    /// The conversation, plus the instruction to summarise it.
+    ///
+    /// No tools system prompt: this request has nothing to do but read what is
+    /// already here, and describing a workspace it must not touch would only
+    /// invite it to try.
+    pub fn compaction_history(&self) -> Vec<ChatMessage> {
+        let mut out = self.history(None);
+        out.push(ChatMessage::text("user", COMPACT_INSTRUCTION));
+        out
+    }
+
+    /// Swap the conversation for the summary the model just wrote, and report
+    /// what that bought.
+    fn finish_compaction(&mut self, summary: String) {
+        let before = self
+            .compact_before
+            .take()
+            .unwrap_or_else(|| self.context_size());
+        self.compacting = false;
+
+        let summary = summary.trim().to_string();
+        if summary.is_empty() {
+            // Nothing to put in the conversation's place, so it stays exactly
+            // as it was. Losing a session to an endpoint's empty reply would
+            // be a far worse outcome than a failed command.
+            self.messages.push(Message::new(
+                Role::Error,
+                "The endpoint returned an empty summary, so nothing was compacted. \
+                 The conversation is unchanged.",
+            ));
+            return;
+        }
+
+        self.messages.clear();
+        self.messages.push(Message {
+            role: Role::Summary,
+            // What the model sees, and what the transcript shows, differ here:
+            // the preamble is addressed to the model and would read as noise
+            // to the person who just asked for a summary.
+            content: format!("{SUMMARY_PREAMBLE}\n\n{summary}"),
+            display: Some(summary),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+        // That figure described the conversation this just replaced; carrying
+        // it forward would report the old context's size as the new one's.
+        self.last_prompt_tokens = None;
+        let after = self.context_size();
+        // Same reason as `/new`: `messages` just got shorter, so a flush
+        // cursor still pointing into the old list would suppress everything.
+        self.flushed = 0;
+        self.messages.push(Message::new(
+            Role::System,
+            compaction_readout(&before, &after, &self.quota),
+        ));
+        self.scroll = 0;
+        self.follow_tail = true;
+    }
+
     /// Exact counts from the endpoint for the turn in flight. Preferred over
     /// the character estimate wherever both exist -- an estimate is fine for a
     /// history readout and not fine for a spending limit.
     pub fn record_exact_usage(&mut self, usage: crate::llm::ApiUsage) {
+        // Kept separately from `exact_usage`, which `record_quota` consumes:
+        // this one outlives the turn, because what it measures -- how big the
+        // context actually is -- is still true after the turn ends.
+        if usage.prompt_tokens > 0 {
+            self.last_prompt_tokens = Some(usage.prompt_tokens);
+        }
         self.exact_usage = Some(usage);
     }
 
@@ -1206,6 +1523,14 @@ impl App {
         self.abort = None;
         let response = std::mem::take(&mut self.streaming_response);
 
+        // Compaction shares the whole request path and diverges only here:
+        // its reply replaces the conversation instead of being appended to it.
+        if self.compacting {
+            self.finish_compaction(response);
+            self.settle_turn();
+            return;
+        }
+
         // A model that wants a tool it has not been given writes the call out
         // as prose instead, in whatever markup it was trained on. That is not
         // an answer and must not be shown as one -- see `split_leaked_markup`.
@@ -1264,6 +1589,12 @@ impl App {
             ));
             self.follow_tail = true;
         }
+        self.settle_turn();
+    }
+
+    /// The bookkeeping every finished request shares, whatever it was for:
+    /// meter it, queue it for the usage log, and hand the keyboard back.
+    fn settle_turn(&mut self) {
         let tokens = self.record_quota();
         // The metered figure, not a second independent estimate: the log used
         // to record streamed characters alone, which misses every prompt token
@@ -1283,6 +1614,17 @@ impl App {
         self.overlay = None;
         // First, so the results land against the calls they belong to.
         self.settle_unanswered_tool_calls("The request failed before this command ran.");
+
+        // A half-written summary is not an assistant turn: appending it would
+        // add to the very context this was trying to shrink, and would leave a
+        // truncated retelling sitting alongside the real messages it retells.
+        // Drop it, and leave the conversation exactly as it was.
+        if self.compacting {
+            self.abandon_compaction();
+            self.messages.push(Message::new(Role::Error, error));
+            self.settle_turn();
+            return;
+        }
 
         let partial = std::mem::take(&mut self.streaming_response);
         if !partial.trim().is_empty() {
@@ -1326,6 +1668,10 @@ impl App {
                     tool_calls: Vec::new(),
                     tool_call_id: message.tool_call_id.clone(),
                 }),
+                // Sent as `system`, not `assistant`: it is context the model
+                // already has, not something it said, and framing it as a
+                // reply invites it to be continued rather than consulted.
+                Role::Summary => out.push(ChatMessage::text("system", message.content.clone())),
                 Role::Error | Role::System => {}
             }
         }
@@ -2312,6 +2658,262 @@ mod tests {
         }
     }
 
+    // ---- /compact --------------------------------------------------------------
+
+    /// A conversation long enough to be worth compacting, with a tool round in
+    /// it -- the calls and their results are most of what a real session's
+    /// context is actually spent on.
+    fn a_conversation() -> App {
+        let mut a = app();
+        a.messages
+            .push(Message::new(Role::User, "add a health check endpoint"));
+        let mut asked = Message::new(Role::Assistant, "I'll look at the router first.");
+        asked.tool_calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"src/router.rs"}"#.to_string(),
+            },
+        }];
+        a.messages.push(asked);
+        let mut result = Message::new(Role::Tool, "pub fn routes() -> Router { ... }".repeat(20));
+        result.tool_call_id = Some("call_1".to_string());
+        result.display = Some("src/router.rs — 40 lines".to_string());
+        a.messages.push(result);
+        a.messages
+            .push(Message::new(Role::Assistant, "Added it to the router."));
+        a
+    }
+
+    fn compact(app: &mut App) {
+        type_str(app, "/compact");
+        app.handle_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    fn slash_compact_sends_the_conversation_and_an_instruction_to_summarise_it() {
+        let mut a = a_conversation();
+        compact(&mut a);
+
+        assert!(a.compacting);
+        assert_eq!(a.state, AppState::Sending);
+
+        let sent = a.compaction_history();
+        // The conversation itself goes up -- there is nothing to summarise
+        // otherwise -- and the instruction comes last, after it.
+        assert!(sent.iter().any(|m| m
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("add a health check endpoint")));
+        let last = sent.last().expect("an instruction");
+        assert_eq!(last.role, "user");
+        assert!(last.content.as_deref().unwrap_or("").contains("Summarise"));
+    }
+
+    /// The reply replaces the conversation rather than being appended to it --
+    /// appending would make the context bigger, which is the opposite of the
+    /// point.
+    #[test]
+    fn a_finished_compaction_replaces_the_conversation_with_the_summary() {
+        let mut a = a_conversation();
+        let before = a.context_size();
+        compact(&mut a);
+
+        a.state = AppState::Streaming;
+        a.streaming_response = "User asked for a health check endpoint. Added it to \
+                                src/router.rs; tests not yet run."
+            .to_string();
+        a.finish_stream();
+
+        assert!(!a.compacting);
+        assert_eq!(a.state, AppState::AwaitingInput);
+
+        let wire = a.history(None);
+        assert_eq!(wire.len(), 1, "the summary is the whole context now");
+        assert_eq!(wire[0].role, "system");
+        let body = wire[0].content.as_deref().unwrap_or("");
+        assert!(body.contains("src/router.rs"), "{body}");
+        assert!(
+            !body.contains("add a health check endpoint"),
+            "the original messages must not still be on the wire: {body}"
+        );
+        assert!(a.context_size().approx_tokens < before.approx_tokens);
+    }
+
+    /// The transcript shows the summary itself, not the framing written for
+    /// the model's benefit.
+    #[test]
+    fn the_summary_is_shown_without_its_wire_preamble() {
+        let mut a = a_conversation();
+        compact(&mut a);
+        a.state = AppState::Streaming;
+        a.streaming_response = "Notes about the router.".to_string();
+        a.finish_stream();
+
+        let summary = a
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Summary)
+            .expect("a summary message");
+        assert_eq!(summary.body(), "Notes about the router.");
+        assert!(summary.content.contains(SUMMARY_PREAMBLE));
+    }
+
+    #[test]
+    fn compacting_reports_what_it_freed() {
+        let mut a = a_conversation();
+        compact(&mut a);
+        a.state = AppState::Streaming;
+        a.streaming_response = "Short summary.".to_string();
+        a.finish_stream();
+
+        let readout = a
+            .messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .expect("a readout");
+        for expected in ["before", "after", "freed", "% smaller"] {
+            assert!(readout.content.contains(expected), "{}", readout.content);
+        }
+        // The figures are estimates and have to read as estimates.
+        assert!(readout.content.contains('~'), "{}", readout.content);
+    }
+
+    /// Everything on screen was printed against the old, longer list. Left
+    /// where it was, the flush cursor would sit past the end of the new one and
+    /// the summary -- and every message after it -- would never be drawn.
+    #[test]
+    fn compacting_rewinds_the_flush_cursor() {
+        let mut a = a_conversation();
+        a.flushed = a.messages.len();
+        compact(&mut a);
+        a.state = AppState::Streaming;
+        a.streaming_response = "Short summary.".to_string();
+        a.finish_stream();
+
+        assert!(a.flushed <= a.messages.len());
+        assert!(!a.drainable().is_empty(), "the summary has to be printable");
+    }
+
+    /// An endpoint that answers with nothing must not be able to delete a
+    /// session. Losing the conversation is far worse than a failed command.
+    #[test]
+    fn an_empty_summary_leaves_the_conversation_alone() {
+        let mut a = a_conversation();
+        let before = a.history(None).len();
+        compact(&mut a);
+        a.state = AppState::Streaming;
+        a.streaming_response = "   \n ".to_string();
+        a.finish_stream();
+
+        assert_eq!(a.history(None).len(), before);
+        assert!(!a.compacting);
+        assert!(a.messages.iter().any(|m| m.role == Role::Error));
+    }
+
+    #[test]
+    fn a_failed_compaction_leaves_the_conversation_alone() {
+        let mut a = a_conversation();
+        let before = a.history(None).len();
+        compact(&mut a);
+        a.state = AppState::Streaming;
+        a.streaming_response = "half a summ".to_string();
+        a.fail_stream("the endpoint hung up".to_string());
+
+        assert_eq!(a.history(None).len(), before);
+        assert!(!a.compacting);
+        // The half-written summary must not have been kept as a turn: it would
+        // grow the very context this was shrinking.
+        assert!(!a.history(None).iter().any(|m| m
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("half a summ")));
+    }
+
+    #[test]
+    fn cancelling_a_compaction_leaves_the_conversation_alone() {
+        let mut a = a_conversation();
+        let before = a.history(None).len();
+        compact(&mut a);
+        a.state = AppState::Streaming;
+        a.streaming_response = "half a summ".to_string();
+        a.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(a.history(None).len(), before);
+        assert!(!a.compacting);
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert!(a
+            .messages
+            .iter()
+            .any(|m| m.role == Role::System && m.content.contains("unchanged")));
+    }
+
+    #[test]
+    fn compacting_an_empty_conversation_says_so_rather_than_spending_a_request() {
+        let mut a = app();
+        compact(&mut a);
+
+        assert!(!a.compacting);
+        assert_eq!(a.state, AppState::AwaitingInput);
+        assert!(a
+            .messages
+            .iter()
+            .any(|m| m.role == Role::System && m.content.contains("Nothing to compact")));
+    }
+
+    #[test]
+    fn slash_compact_is_ignored_mid_turn() {
+        let mut a = a_conversation();
+        a.state = AppState::Streaming;
+        type_str(&mut a, "/compact");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(!a.compacting);
+        assert_eq!(a.state, AppState::Streaming);
+    }
+
+    /// A compaction is a real request against a real endpoint, so it is
+    /// metered like one -- otherwise the cheapest way past a spent allowance
+    /// would be to know this command.
+    #[test]
+    fn a_compaction_is_metered_like_any_other_request() {
+        let mut a = a_conversation();
+        compact(&mut a);
+        a.state = AppState::Streaming;
+        a.record_exact_usage(crate::llm::ApiUsage {
+            prompt_tokens: 4_000,
+            completion_tokens: 300,
+        });
+        a.streaming_response = "Short summary.".to_string();
+        a.finish_stream();
+
+        let (tokens, _) = a.pending_usage.first().expect("the turn was logged");
+        assert_eq!(*tokens, 4_300);
+    }
+
+    /// The estimate has to count what is actually sent. Tool results are the
+    /// bulk of a working session's context, and a count that skipped them
+    /// would report a fraction of the real cost.
+    #[test]
+    fn the_context_estimate_counts_tool_traffic_and_ignores_local_notices() {
+        let mut a = app();
+        a.messages
+            .push(Message::new(Role::System, "x".repeat(4_000)));
+        a.messages
+            .push(Message::new(Role::Error, "y".repeat(4_000)));
+        assert_eq!(a.context_size().messages, 0);
+        assert_eq!(a.context_size().approx_tokens, 0);
+
+        let mut result = Message::new(Role::Tool, "z".repeat(4_000));
+        result.display = Some("a one-line summary".to_string());
+        a.messages.push(result);
+        // The whole result is on the wire even though one line is drawn.
+        assert_eq!(a.context_size().approx_tokens, 1_000);
+    }
+
     // ---- /new ------------------------------------------------------------------
 
     #[test]
@@ -2339,6 +2941,24 @@ mod tests {
 
     /// `/new` is about the conversation, not the app: losing the configured
     /// provider and model would make it useless as a cheap reset.
+    /// Same hazard as `/compact`, and it was live here first: `messages` gets
+    /// shorter, so a flush cursor left pointing into the old list swallows the
+    /// notice and everything typed after it.
+    #[test]
+    fn slash_new_rewinds_the_flush_cursor() {
+        let mut a = a_conversation();
+        a.flushed = a.messages.len();
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(a.flushed <= a.messages.len());
+        assert!(
+            !a.drainable().is_empty(),
+            "the notice has to reach the terminal"
+        );
+    }
+
     #[test]
     fn slash_new_keeps_the_configuration() {
         let mut a = app();
@@ -4024,5 +4644,6 @@ mod tests {
         }
     }
 }
+
 
 
