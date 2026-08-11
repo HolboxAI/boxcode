@@ -5,6 +5,7 @@ mod dateutil;
 mod deploy;
 mod llm;
 mod notice;
+mod plan;
 mod providers;
 mod quota;
 mod telemetry;
@@ -44,6 +45,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // piped and `--upgrade` still runs even if the config file is broken.
     let mut upgrade = false;
     let mut force = false;
+    let mut plan = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-V" | "--version" => {
@@ -56,6 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             "-u" | "--upgrade" => upgrade = true,
             "-f" | "--force" => force = true,
+            "-p" | "--plan" => plan = true,
             other => {
                 eprintln!("Unknown argument: {other}\n");
                 print_help();
@@ -135,6 +138,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     install_panic_hook(enhanced, alternate_screen);
 
     let mut app = App::new(config);
+    if plan {
+        app.mode = tools::Mode::Plan;
+    }
     // Loaded before the first prompt so a limit already spent today is in force
     // from the start, not after the first request slips through.
     if app.config.quota.enabled {
@@ -160,6 +166,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(|ws| ws.root().display().to_string())
         .unwrap_or_default();
+    // The project's plan, if it has one. Read before the welcome panel is
+    // drawn, and picked up without being asked: a `plan.md` sitting in the
+    // project is the plan, and needing a command to say so would just be a
+    // step between the file and the obvious meaning of it being there. What
+    // was found is stated on the welcome panel either way.
+    if let Some(ws) = workspace.as_ref() {
+        match plan::open(ws.root()) {
+            Some(Ok(found)) => app.adopt_plan(found),
+            Some(Err(e)) => app.note_unreadable_plan(&e),
+            None => {}
+        }
+    }
     let (tx, mut rx) = mpsc::channel::<(u64, StreamEvent)>(256);
     // A second channel rather than more variants on `StreamEvent`: a
     // deployment is not the model talking, and folding it into the LLM
@@ -408,6 +426,18 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.quota.save();
             app.quota_dirty = false;
         }
+        // Same reasoning again: `App` marks the plan dirty, this loop writes
+        // it. A failed write is reported rather than swallowed -- the whole
+        // value of an approved plan is that it is on disk, so silently not
+        // being there is the one outcome the user must not be left guessing at.
+        if app.plan_dirty {
+            app.plan_dirty = false;
+            if let Some(plan) = &app.active_plan {
+                if let Err(e) = plan.save() {
+                    app.note_plan_save_failure(&e);
+                }
+            }
+        }
 
         // Fire a pending request.
         if app.state == AppState::Sending {
@@ -433,8 +463,18 @@ async fn run_app<B: ratatui::backend::Backend>(
             let (schemas, system) = match workspace {
                 _ if app.compacting => (Vec::new(), None),
                 Some(ws) => (
-                    if budget_left { tools::schemas() } else { Vec::new() },
-                    Some(tools::system_prompt(ws, &app.config.tools, budget_left)),
+                    if budget_left {
+                        tools::schemas(app.mode, app.active_plan.is_some())
+                    } else {
+                        Vec::new()
+                    },
+                    Some(tools::system_prompt(
+                        ws,
+                        &app.config.tools,
+                        budget_left,
+                        app.mode,
+                        app.active_plan.as_ref(),
+                    )),
                 ),
                 None => (Vec::new(), None),
             };
@@ -516,6 +556,10 @@ FLAGS:
     -h, --help       Print this help and exit
     -u, --upgrade    Update to the latest release
     -f, --force      With --upgrade: reinstall even if already up to date
+    -p, --plan       Start in plan mode: the model researches and proposes a
+                       plan, and cannot write, edit, or run anything that
+                       changes the project until you approve one. Toggle it
+                       any time with /plan.
 
 CONFIG (environment overrides ~/.boxcode/config.toml):
     BOXCODE_ENDPOINT    Base URL, e.g. https://llm.internal:8443

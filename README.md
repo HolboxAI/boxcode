@@ -229,6 +229,94 @@ injected paths, not a sandbox either. Read each prompt before pressing `y`.
 Commands run with **stdin closed** and are killed after a timeout, so anything
 interactive (`vim`, a dev server, a REPL) will time out rather than hang.
 
+### Plan mode: decide the approach before anything exists
+
+Approving actions one at a time tells you *what* is about to happen, never
+*why*. The decision that actually mattered — rewrite the router, or add one
+endpoint — was made silently several prompts ago. `/plan` moves that decision
+to the front:
+
+```
+❯ /plan
+  Plan mode on. Nothing can be written, edited, or run unless it is
+  read-only — ask for what you want and you'll get a plan to approve first.
+
+❯ add rate limiting to the API
+```
+
+The model reads, lists, globs and runs read-only commands — none of which need
+approval, because none of them can do anything — and then stops with a plan:
+
+```
+╭ Start on this plan? ─────────────────────────────────────────╮
+│  Token bucket, in-process, keyed by API key.                 │
+│                                                              │
+│  - src/middleware/rate_limit.rs — new. Bucket struct,        │
+│    refill on read, 429 when empty.                           │
+│  - src/api/routes.rs — wrap the router in the new layer.     │
+│  - src/config.rs — two fields: requests_per_minute, burst.   │
+│                                                              │
+│  ❯ y start   ·   n revise                                    │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+**`n`** sends it back and leaves you in plan mode: say what was wrong and it
+proposes again. Nothing has touched your disk — a declined plan is never
+written.
+
+**`y`** saves the plan as a markdown file in your project, ends plan mode, and
+starts the work. Every write and command still asks individually, as always;
+approving a plan approves the *approach*, not a blank cheque.
+
+### The plan is a file you own
+
+An approved plan lands in `plan.md` at the top of your project as plain
+markdown, and the model ticks each step off in it as the work gets done:
+
+```markdown
+---
+title: Rate limiting for the items API
+status: in-progress
+created: 2026-08-11
+base_commit: 3c21dfb
+---
+
+## Steps
+
+- [x] 1. Add the limiter in src/rate_limit.py
+- [ ] 2. Wrap the router in src/app.py
+- [ ] 3. Add requests_per_minute + burst to src/config.py
+```
+
+Commit it if you want the approach reviewed before the code exists. Edit it by
+hand whenever you like. And next time you open boxcode in that directory, the
+plan is simply picked up — no command, nothing to select, because the file being
+there *is* the state:
+
+```
+  model     deepseek-v4-flash
+  cwd       ~/code/itemstore
+  plan      2/4 — Rate limiting for the items API
+  next      3. Add requests_per_minute + burst to src/config.py
+```
+
+Finishing with a plan is deleting the file. There is one per project, so
+approving a different plan replaces it — and the approval box says which plan it
+displaces, and how far that one got, before you can press `y`.
+
+The plan records the commit it was written against, so carrying one on after the
+project has moved warns you rather than confidently building against a codebase
+that no longer matches.
+
+While plan mode is on, `write_file` and `edit_file` are not in the tool list
+sent to the model at all, and `run_command` is narrowed to commands that cannot
+change anything. No setting reaches this — not `require_approval = false`. A
+`PLAN` tag sits in the footer for as long as it's on.
+
+`/plan` again turns it off, or start a session in it with `boxcode --plan`.
+Full details, including why `cargo build` is refused while planning:
+**[docs/plan-mode.md](docs/plan-mode.md)**.
+
 ### Some things are refused outright
 
 A third tier sits above the prompt. Genuinely catastrophic commands are never
@@ -643,6 +731,8 @@ variables override values in `config.toml`.
 
 ### Slash Commands
 
+- **`/plan`** — Toggles plan mode: the model researches and proposes a plan,
+  and cannot change anything until you approve one. See "Plan mode" above.
 - **`/deploy`** — Ships the directory you launched in to Vercel or Netlify,
   without leaving the terminal. See [Deploying](#deploying) below.
 - **`/deployments`** — Lists what this machine has deployed: project, provider,
@@ -753,6 +843,8 @@ Clean, modular structure for easy feature additions:
   - `history.rs` — `~/.boxcode/deployments.jsonl` (`/deployments`)
   - `vercel.rs` / `netlify.rs` — One file per provider
 - `telemetry-worker.js` — The Cloudflare Worker that `telemetry.rs`/`install.sh` ping and that serves the public view
+- `src/plan.rs` — The project's `plan.md`: the markdown format, progress tracking, and reading it back
+- `docs/plan-mode.md` — Plan mode: what it guarantees, how to use it, and what it deliberately does not claim
 - `docs/index.html` — The [boxcode.sh](https://boxcode.sh) landing page, deployed with the installers by `.github/workflows/pages.yml`
 
 ## What's Next
