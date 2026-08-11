@@ -218,7 +218,11 @@ pub fn message_lines(msg: &Message, width: usize) -> Vec<Line<'static>> {
                 }
             }
         }
-        Role::System => {
+        // A `/compact` summary is drawn like a status event rather than like
+        // prose: it is labelled, so it is never mistaken for a reply the model
+        // gave to something, and its own body is shown in full -- what the
+        // model will be working from next is worth being able to read.
+        Role::System | Role::Summary => {
             lines.push(Line::from(vec![Span::styled(
                 format!("{}: ", msg.role.label()),
                 role_style(msg.role),
@@ -308,6 +312,14 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
     let (verb, detail) = match app.state {
         AppState::AwaitingInput => return None,
         AppState::AwaitingApproval => return None,
+        // "Compacting" for both phases of a `/compact`: from the outside it is
+        // one operation, and watching it switch from Thinking to Responding
+        // would suggest it had started answering something.
+        AppState::Sending if app.compacting => ("Compacting".to_string(), String::new()),
+        AppState::Streaming if app.compacting => (
+            "Compacting".to_string(),
+            format!(" · summarising {} messages", app.context_size().messages),
+        ),
         AppState::Sending => ("Thinking".to_string(), String::new()),
         AppState::Streaming => {
             // See App::approx_tokens_this_turn -- the same estimate the
@@ -514,6 +526,11 @@ fn role_style(role: Role) -> Style {
             .fg(theme::p().accent)
             .add_modifier(Modifier::BOLD),
         Role::Tool => Style::default().fg(theme::p().tool),
+        // The accent, where System takes the muted tone: a summary is the
+        // conversation now, not a note about it.
+        Role::Summary => Style::default()
+            .fg(theme::p().accent)
+            .add_modifier(Modifier::BOLD),
     }
 }
 
