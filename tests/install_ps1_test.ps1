@@ -313,6 +313,28 @@ Remove-Item -Recurse -Force $fallbackHome -ErrorAction SilentlyContinue
 Remove-Item Env:\PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue
 Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
 
+# --- Test-IsAppExecutionAliasStub ------------------------------------------------
+# Pure string matching (-like, not a filesystem check), so this is testable
+# with literal Windows-shaped paths regardless of which OS is actually
+# running this test file -- unlike the Install-Ddgs fallback test above,
+# which needs a real filesystem and so is Windows-path-format-agnostic by
+# necessity instead.
+function Test-StubDetection {
+    param([string] $Path, [bool] $Expected, [string] $Description)
+    $got = Test-IsAppExecutionAliasStub $Path
+    if ($got -eq $Expected) {
+        Test-Pass "Test-IsAppExecutionAliasStub: $Description"
+    } else {
+        Test-Fail "Test-IsAppExecutionAliasStub: $Description -- expected $Expected, got $got"
+    }
+}
+
+Test-StubDetection -Path 'C:\Users\me\AppData\Local\Microsoft\WindowsApps\python.exe' -Expected $true -Description 'the python.exe stub is detected'
+Test-StubDetection -Path 'C:\Users\me\AppData\Local\Microsoft\WindowsApps\python3.exe' -Expected $true -Description 'the python3.exe stub is detected'
+Test-StubDetection -Path 'C:\Python312\python.exe' -Expected $false -Description 'a real python.org install is not flagged'
+Test-StubDetection -Path 'C:\Users\me\AppData\Local\Programs\Python\Python312\python.exe' -Expected $false -Description 'a real per-user install is not flagged'
+Test-StubDetection -Path 'C:\WindowsAppsFake\python.exe' -Expected $false -Description 'a merely-similarly-named directory is not flagged'
+
 # --- Main: full end-to-end run, sandboxed ---------------------------------------
 $sandboxHome = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-test-sandbox-$PID"
 $sandboxAppData = Join-Path $sandboxHome 'LocalAppData'

@@ -425,14 +425,24 @@ async fn run_app<B: ratatui::backend::Backend>(
             // Exact counts make the quota real; without them it falls back to the
             // same character estimate `usage.rs` uses.
             let include_usage = app.config.quota.enabled && app.config.quota.include_usage;
+            // A `/compact` request reads the conversation and writes a summary
+            // of it; it has nothing to run. Withholding the schemas is what
+            // makes that true rather than merely asked for -- and a tool call
+            // here would be worse than useless, since the history that replaces
+            // this one has nowhere to put the result it would be owed.
             let (schemas, system) = match workspace {
+                _ if app.compacting => (Vec::new(), None),
                 Some(ws) => (
                     if budget_left { tools::schemas() } else { Vec::new() },
                     Some(tools::system_prompt(ws, &app.config.tools, budget_left)),
                 ),
                 None => (Vec::new(), None),
             };
-            let history = app.history(system.as_deref());
+            let history = if app.compacting {
+                app.compaction_history()
+            } else {
+                app.history(system.as_deref())
+            };
             let tx_clone = tx.clone();
 
             let handle = tokio::spawn(async move {

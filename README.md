@@ -1,6 +1,10 @@
 # boxcode
 
-Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-compatible LLM endpoint.
+A coding assistant that lives in your terminal. It reads your files and runs
+your commands — and waits for you before every one. Connects to any
+OpenAI-compatible LLM endpoint.
+
+**[boxcode.sh](https://boxcode.sh)**
 
 > ### Renamed in v1.0.0
 >
@@ -30,7 +34,7 @@ Terminal UI for Claude Code–style AI coding assistant. Connects to any OpenAI-
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v0.8.0
+  ▟█▙       ▟█▙    boxcode  v1.0.1
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -73,13 +77,19 @@ the prompt, where you're already looking:
 
 macOS / Linux:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.sh | bash
+curl -fsSL https://boxcode.sh/install.sh | bash
 ```
 
 Windows (PowerShell):
 ```powershell
-irm https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.ps1 | iex
+irm https://boxcode.sh/install.ps1 | iex
 ```
+
+`boxcode.sh` serves the very same `install.sh`/`install.ps1` that sit in this
+repo — it is published from `main` by `.github/workflows/pages.yml`, not
+maintained as a second copy. If you'd rather fetch from GitHub directly,
+`https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.sh` still
+works and always will.
 
 Downloads a prebuilt binary for your platform (macOS/Linux/Windows,
 x86_64/arm64) from the latest
@@ -648,6 +658,30 @@ variables override values in `config.toml`.
   this shows an inline error telling you to run `/provider` first.
 - **`/new`** — Forgets the current conversation. The configured provider and
   model are untouched; only the message history and tool-step count reset.
+- **`/compact`** — Has the model summarise the conversation so far, then
+  continues from that summary instead of the full transcript. Same problem
+  `/new` solves — the whole history is resent every turn, so a long session
+  costs more with each prompt — without the amnesia: what was established
+  survives, at the price of one summarising request. It prints what that
+  bought:
+
+  ```
+  Compacted the conversation.
+
+    before    ~18,432 tokens  ·  42 messages
+    after      ~1,240 tokens  ·  1 message
+    freed     ~17,192 tokens  ·  93% smaller
+
+  Today so far: 124,300 tokens over 37 requests, this summary included.
+  Context figures are estimates at 4 characters per token, not billed counts.
+  ```
+
+  The summary is shown in full, since it is what the model will be working
+  from next. Nothing is discarded until a usable summary comes back: an empty
+  reply, a failed request, or Esc all leave the conversation exactly as it was.
+  The request is metered like any other, and an exhausted `/quota` refuses it —
+  otherwise the cheapest way past a spent allowance would be to know this
+  command.
 - **`/usage`** — Prints your token usage from `~/.boxcode/usage.jsonl`:
   today, the last 7 days, and all time. This is local and per-install only —
   there is no login, so it is the only place this number exists; nothing here
@@ -719,6 +753,7 @@ Clean, modular structure for easy feature additions:
   - `history.rs` — `~/.boxcode/deployments.jsonl` (`/deployments`)
   - `vercel.rs` / `netlify.rs` — One file per provider
 - `telemetry-worker.js` — The Cloudflare Worker that `telemetry.rs`/`install.sh` ping and that serves the public view
+- `docs/index.html` — The [boxcode.sh](https://boxcode.sh) landing page, deployed with the installers by `.github/workflows/pages.yml`
 
 ## What's Next
 

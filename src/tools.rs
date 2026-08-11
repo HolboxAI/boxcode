@@ -1020,6 +1020,25 @@ fn embedded_python_path() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// True when `output` looks like Windows' "App Execution Alias" stub rather
+/// than a real Python interpreter -- see the doc comment where this is
+/// called in `execute_web_search` for why that distinction matters. Matched
+/// by message text, not by inspecting the resolved path: `Command::new`
+/// only gets a bare name here (e.g. "python3"), so there is no path to
+/// inspect, and the stub's wording ("Python was not found; run without
+/// arguments to install from the Microsoft Store...") is specific enough
+/// that false positives from a real, differently-broken interpreter are not
+/// a realistic concern.
+fn looks_like_windows_app_execution_alias_stub(output: &std::process::Output) -> bool {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_ascii_lowercase();
+    combined.contains("was not found") && combined.contains("microsoft store")
+}
+
 /// Builds the argv `execute_web_search` runs, for whichever interpreter path
 /// it ends up trying -- factored out so falling back to the embedded Python
 /// after the configured one is not found doesn't mean reconstructing this
@@ -1071,6 +1090,40 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
     let mut tried_embedded_fallback = false;
     let output = loop {
         match tokio::time::timeout(limit, cmd.output()).await {
+            // Windows ships `python.exe`/`python3.exe` "App Execution Alias"
+            // stubs on PATH by default even when no real Python is
+            // installed -- see embedded_python_path's own doc comment and
+            // install.ps1's matching Test-IsAppExecutionAliasStub. Spawning
+            // one succeeds (it's a real, if useless, process), so the
+            // NotFound arm below never fires for it; it just prints this
+            // distinctive message instead of doing anything useful, which
+            // is the only way to tell it apart from a real interpreter that
+            // spawned fine but genuinely lacks ddgs.
+            Ok(Ok(output))
+                if !tried_embedded_fallback && looks_like_windows_app_execution_alias_stub(&output) =>
+            {
+                tried_embedded_fallback = true;
+                match embedded_python_path() {
+                    Some(embedded) => {
+                        cmd = web_search_command(embedded.as_os_str(), &query, max_results);
+                    }
+                    None => {
+                        return outcome(
+                            &call.id,
+                            format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
+                            format!(
+                                "Error: '{}' resolved to Windows' \"App Execution Alias\" stub, not \
+                                 a real Python install. web_search needs Python 3 with the `ddgs` \
+                                 package installed (pip install ddgs). Install Python from \
+                                 https://python.org, disable the alias under Settings > Apps > \
+                                 Advanced app settings > App execution aliases, or set \
+                                 tools.python_bin in config.toml to a real interpreter.",
+                                config.python_bin
+                            ),
+                        )
+                    }
+                }
+            }
             Ok(Ok(output)) => break output,
             // A script that was just written and chmod'd executable can
             // transiently report "text file busy" on some filesystems
@@ -2669,6 +2722,91 @@ mod tests {
             "expected the embedded Python fallback to have actually run, got: {}",
             out.content
         );
+    }
+
+    /// The Windows-only bug this guards against: `Command::new` spawning
+    /// the "App Execution Alias" stub does not fail like a missing binary
+    /// would (see `looks_like_windows_app_execution_alias_stub`'s own doc
+    /// comment) -- it succeeds, with garbage stdout. Modeled here with a
+    /// fake interpreter that echoes the stub's real wording instead of
+    /// relying on an actual Windows machine, the same way the sibling
+    /// `_when_configured_one_is_missing` test above models a `NotFound`
+    /// spawn without one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn web_search_falls_back_to_the_embedded_python_when_configured_one_is_the_windows_stub() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::config::test_support::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let embedded_bin_dir = fake_home.path().join(".boxcode").join("python").join("bin");
+        std::fs::create_dir_all(&embedded_bin_dir).unwrap();
+        let embedded_python = embedded_bin_dir.join("python3");
+        std::fs::write(
+            &embedded_python,
+            "#!/bin/sh\necho '{\"results\": [{\"title\": \"T\", \"href\": \"https://embedded-python-worked\", \"body\": \"B\"}]}'\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&embedded_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&embedded_python, perms).unwrap();
+
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let (dir, ws, mut cfg) = fixture();
+        cfg.python_bin = fake_interpreter(
+            dir.path(),
+            "echo 'Python was not found; run without arguments to install from the Microsoft \
+             Store, or disable this shortcut from Settings > Manage App Execution Aliases.'",
+        );
+
+        let out = execute(&search_call("rust"), &ws, &cfg).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            out.content.contains("https://embedded-python-worked"),
+            "expected the stub to be detected and the embedded Python fallback to run, got: {}",
+            out.content
+        );
+    }
+
+    /// Same stub, but with no embedded Python to fall back to -- the error
+    /// should name the actual problem (a Store stub, not a missing
+    /// install) rather than the generic "could not run" message the
+    /// `NotFound` path uses, since the stub did spawn successfully.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_windows_stub_with_no_embedded_fallback_is_explained_clearly() {
+        let _guard = crate::config::test_support::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let (dir, ws, mut cfg) = fixture();
+        cfg.python_bin = fake_interpreter(
+            dir.path(),
+            "echo 'Python was not found; run without arguments to install from the Microsoft \
+             Store, or disable this shortcut from Settings > Manage App Execution Aliases.'",
+        );
+
+        let out = execute(&search_call("rust"), &ws, &cfg).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.contains("App Execution Alias"), "{}", out.content);
+        assert!(out.content.contains("pip install ddgs"), "{}", out.content);
     }
 
     #[cfg(unix)]
