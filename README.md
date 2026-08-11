@@ -95,8 +95,14 @@ Downloads a prebuilt binary for your platform (macOS/Linux/Windows,
 x86_64/arm64) from the latest
 [release](https://github.com/HolboxAI/boxcode/releases) and verifies it
 against a published checksum — no Rust toolchain needed, installed in
-seconds. Also installs Python's `ddgs` package if it's missing, since
-`web_search` needs it.
+seconds. On macOS/Linux it also installs Python's `ddgs` package if it's
+missing, since `web_search` needs it.
+
+> **Windows: `web_search` is temporarily off.** That step is disabled in
+> `install.ps1` for now — on a machine with no Python it was failing the whole
+> install rather than just costing one feature. Everything else works; if you
+> want `web_search`, run `pip install ddgs` yourself. The code is commented
+> out, not removed.
 
 On macOS/Linux, if your platform has no prebuilt binary yet, `install.sh`
 falls back to installing Rust (if missing) and building from source instead,
