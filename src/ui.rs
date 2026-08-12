@@ -475,6 +475,38 @@ pub fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
         lines.push(field("cwd", shorten_home(&app.workspace_status), style));
     }
+    // Only when it is on -- which at this point means `--plan` was passed,
+    // since the welcome panel is printed before anything has been typed. A
+    // "mode: normal" row every launch would be a line of noise stating the
+    // default.
+    if app.mode.is_plan() {
+        lines.push(field(
+            "mode",
+            "plan — read-only until you approve a plan".to_string(),
+            Style::default()
+                .fg(theme::p().accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // Work agreed earlier, possibly in a session days ago, that this one has
+    // already picked up. Stated on the way in because the model is following
+    // it from the first prompt -- finding that out by watching it start
+    // editing files would be a nasty surprise.
+    if let Some(plan) = app.active_plan.as_ref().filter(|p| !p.is_finished()) {
+        let (done, total) = plan.progress();
+        lines.push(field(
+            "plan",
+            format!("{done}/{total} — {}", shorten(&plan.title, 40)),
+            Style::default().fg(theme::p().accent_soft),
+        ));
+        if let Some((n, step)) = plan.next_step() {
+            lines.push(field(
+                "next",
+                format!("{n}. {}", shorten(&step.description, 46)),
+                theme::muted(),
+            ));
+        }
+    }
 
     lines.push(Line::from(""));
     for (name, desc) in app.available_commands() {
@@ -484,6 +516,9 @@ pub fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ]));
     }
 
+    // `startup_notices` is also where a stale, finished, or unreadable plan
+    // lands -- see `App::adopt_plan`. None of them are fatal, but they are all
+    // things the user should know before typing rather than after.
     let mut warnings = app.startup_notices.clone();
     warnings.extend(app.config.warnings());
     if !theme::supports_truecolor() {
@@ -537,6 +572,16 @@ fn greeting_name() -> Option<String> {
 }
 
 /// `/Users/you/project` -> `~/project`, so a deep path still fits.
+/// Clip to `max` characters with an ellipsis, counting chars rather than
+/// bytes so a title with an accent in it cannot be split mid-character.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end())
+}
+
 fn shorten_home(path: &str) -> String {
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && path.starts_with(&home) => {
@@ -591,9 +636,24 @@ fn input_height(app: &App, total_width: u16) -> u16 {
 /// in this app read as the same kind of thing rather than two different ones.
 fn render_command_menu(f: &mut Frame, area: Rect, app: &App, matches: &[(&str, &str)]) {
     let selected = app.command_menu_selected.min(matches.len().saturating_sub(1));
-    let lines: Vec<Line> = matches
-        .iter()
-        .enumerate()
+
+    // `MAX_COMMAND_MENU_HEIGHT` guarantees the *cap* is never the thing that
+    // hides a command, but the viewport is twelve rows in total, so the layout
+    // can still hand this less room than the list needs. A `Paragraph` clips
+    // from the bottom, which means arrowing onto an entry past the fold moved
+    // a cursor nobody could see onto an entry nobody could read. Scroll the
+    // window instead, keeping the selection inside it whatever height we get.
+    let visible = area.height.saturating_sub(2) as usize;
+    let start = if visible == 0 {
+        0
+    } else {
+        selected
+            .saturating_sub(visible - 1)
+            .min(matches.len().saturating_sub(visible))
+    };
+    let shown = matches.iter().enumerate().skip(start).take(visible.max(1));
+
+    let lines: Vec<Line> = shown
         .map(|(i, (name, desc))| {
             let on = i == selected;
             let marker = if on { "❯ " } else { "  " };
@@ -631,6 +691,8 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
     let (text, style) = if app.input_buffer.is_empty() {
         let hint = if busy {
             "working… esc to interrupt".to_string()
+        } else if app.mode.is_plan() {
+            "Describe the change — you'll get a plan to approve first…".to_string()
         } else {
             "Ask anything, or describe a change…".to_string()
         };
@@ -718,6 +780,37 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let mut spans = vec![Span::raw("  ")];
+
+    // Plan mode is stated on every frame, not just announced when it was
+    // switched on. It changes what the next keystroke can possibly do, and
+    // the line saying so scrolls away within a few exchanges -- after which
+    // a session that quietly refuses to write anything looks like a bug.
+    if app.mode.is_plan() {
+        spans.push(Span::styled(
+            "PLAN",
+            Style::default()
+                .fg(theme::p().accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("  ·  ", theme::faint()));
+    } else if let Some(plan) = app.active_plan.as_ref().filter(|p| !p.is_finished()) {
+        // Which plan, and how far through. The model is following this whether
+        // or not the user remembers agreeing to it -- most of all in a session
+        // that resumed one written days ago.
+        let (done, total) = plan.progress();
+        spans.push(Span::styled(
+            format!("▸ {done}/{total}"),
+            Style::default()
+                .fg(theme::p().accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", shorten(&plan.title, 28)),
+            theme::faint(),
+        ));
+        spans.push(Span::styled("  ·  ", theme::faint()));
+    }
+
     for (i, (key, label)) in keys.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("  ·  ", theme::faint()));
@@ -865,7 +958,10 @@ fn tool_approval_parts(
         lines.push(Line::from(""));
     }
 
-    let (title, verb) = match action {
+    // `deny` is the word under `n`. For most actions "skip" is right -- the
+    // model goes on without that one thing. Declining a plan skips nothing;
+    // it sends the whole proposal back, so it says so.
+    let (title, verb, deny) = match action {
         Action::Command { command, purpose } => {
             if let Some(purpose) = purpose {
                 for wrapped in wrap(purpose, inner) {
@@ -881,7 +977,7 @@ fn tool_approval_parts(
                         .add_modifier(Modifier::BOLD),
                 )));
             }
-            (" Run this command? ", "run")
+            (" Run this command? ", "run", "skip")
         }
         Action::Read { path } => {
             lines.push(Line::from(Span::styled(
@@ -890,7 +986,7 @@ fn tool_approval_parts(
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
             )));
-            (" Read this file? ", "read")
+            (" Read this file? ", "read", "skip")
         }
         Action::Write { path, content } => {
             lines.push(Line::from(Span::styled(
@@ -921,7 +1017,7 @@ fn tool_approval_parts(
                     }
                 }
             }
-            (" Write this file? ", "write")
+            (" Write this file? ", "write", "skip")
         }
         Action::List { path } => {
             lines.push(Line::from(Span::styled(
@@ -930,7 +1026,7 @@ fn tool_approval_parts(
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
             )));
-            (" List this directory? ", "list")
+            (" List this directory? ", "list", "skip")
         }
         Action::Glob { pattern } => {
             lines.push(Line::from(Span::styled(
@@ -939,7 +1035,7 @@ fn tool_approval_parts(
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
             )));
-            (" Search for these files? ", "search")
+            (" Search for these files? ", "search", "skip")
         }
         // An edit shows both spans, because approving a replacement you cannot
         // see is not approval. Unlike a write it does not need the whole file --
@@ -971,7 +1067,7 @@ fn tool_approval_parts(
             };
             span("replace:", old, theme::p().danger);
             span("with:", new, theme::p().success);
-            (" Apply this edit? ", "edit")
+            (" Apply this edit? ", "edit", "skip")
         }
         Action::Deploy { provider, production, summary } => {
             lines.push(Line::from(Span::styled(
@@ -990,7 +1086,7 @@ fn tool_approval_parts(
                     lines.push(Line::from(Span::styled(wrapped, theme::faint())));
                 }
             }
-            (" Deploy this project? ", "deploy")
+            (" Deploy this project? ", "deploy", "skip")
         }
         Action::Search { query, max_results } => {
             lines.push(Line::from(Span::styled(
@@ -1006,15 +1102,125 @@ fn tool_approval_parts(
                 ),
                 theme::faint(),
             )));
-            (" Search the web? ", "search")
+            (" Search the web? ", "search", "skip")
+        }
+        // The plan is shown in full, never capped the way a file preview is.
+        // A file preview elides the tail because the file is not the decision
+        // -- "write this path" is. Here the text *is* the decision, and the
+        // part scrolled out of sight would be exactly the part nobody agreed
+        // to. The box scrolls; the plan does not get shortened.
+        Action::Plan(proposal) => {
+            lines.push(Line::from(Span::styled(
+                proposal.title.clone(),
+                Style::default()
+                    .fg(theme::p().text)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+            // Said before the plan, not after it: approving this writes a file
+            // into the user's project, and that is part of what they are
+            // agreeing to -- not a detail to discover afterwards.
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "saves to {}  ·  {} step{}",
+                    crate::plan::PLAN_FILE,
+                    proposal.steps.len(),
+                    if proposal.steps.len() == 1 { "" } else { "s" }
+                ),
+                theme::faint(),
+            )));
+
+            // There is only one plan file, so approving a *different* plan
+            // overwrites whatever is in it. That is the right behaviour -- one
+            // project, one plan -- but doing it silently would throw away work
+            // the user explicitly agreed to, so the cost is stated up front.
+            if let Some(replaced) = app
+                .active_plan
+                .as_ref()
+                .filter(|p| !p.title.trim().eq_ignore_ascii_case(proposal.title.trim()))
+            {
+                let (done, total) = replaced.progress();
+                let progress = if done > 0 {
+                    format!(" — {done}/{total} done")
+                } else {
+                    String::new()
+                };
+                for wrapped in wrap(
+                    &format!("⚠ replaces \"{}\"{progress}", replaced.title),
+                    inner,
+                ) {
+                    lines.push(Line::from(Span::styled(
+                        wrapped,
+                        Style::default().fg(theme::p().warning),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+
+            if !proposal.summary.trim().is_empty() {
+                for line in proposal.summary.lines() {
+                    if line.trim().is_empty() {
+                        lines.push(Line::from(""));
+                        continue;
+                    }
+                    for wrapped in wrap(line, inner) {
+                        lines.push(Line::from(Span::styled(wrapped, theme::text())));
+                    }
+                }
+                lines.push(Line::from(""));
+            }
+
+            // Numbered, because these are the same numbers the model reports
+            // progress against -- "step 3 done" has to point at something the
+            // user can find.
+            for (i, step) in proposal.steps.iter().enumerate() {
+                let label = format!("{}. ", i + 1);
+                let indent = " ".repeat(label.len());
+                for (n, wrapped) in wrap(step, inner.saturating_sub(label.len()).max(1))
+                    .into_iter()
+                    .enumerate()
+                {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            if n == 0 { label.clone() } else { indent.clone() },
+                            theme::accent(),
+                        ),
+                        Span::styled(wrapped, theme::text()),
+                    ]));
+                }
+            }
+
+            if !proposal.not_doing.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("Not doing", theme::faint())));
+                for item in &proposal.not_doing {
+                    for wrapped in wrap(item, inner.saturating_sub(2).max(1)) {
+                        lines.push(Line::from(Span::styled(
+                            format!("- {wrapped}"),
+                            theme::muted(),
+                        )));
+                    }
+                }
+            }
+            (" Start on this plan? ", "start", "revise")
+        }
+        // Never prompted -- `advance_approvals` records it directly -- but the
+        // renderer must stay total, and a panic here would take the UI down
+        // over a bookkeeping call.
+        Action::Progress { step, done, .. } => {
+            lines.push(Line::from(Span::styled(
+                format!("step {step} — {}", if *done { "done" } else { "blocked" }),
+                theme::text(),
+            )));
+            (" Record this? ", "record", "skip")
         }
     };
 
     lines.push(Line::from(""));
-    // A search is not scoped to the project directory the way every other
-    // action is -- showing "in <workspace>" here would claim a boundary this
-    // one doesn't actually have.
-    if !matches!(action, Action::Search { .. }) {
+    // A search is not scoped to the project directory, and a plan is not an
+    // action happening in one at all -- for both, "in <workspace>" would be
+    // claiming something untrue about what is being approved.
+    if !matches!(action, Action::Search { .. } | Action::Plan(_)) {
         lines.push(Line::from(Span::styled(
             format!("in {}", app.workspace_root),
             theme::faint(),
@@ -1060,14 +1266,14 @@ fn tool_approval_parts(
                     .add_modifier(Modifier::BOLD),
             ),
         ),
-        Span::styled(" skip", theme::faint()),
+        Span::styled(format!(" {deny}"), theme::faint()),
     ]));
     // The last two lines built above are the y/n choice; they become the
     // footer, with the key hint appended.
     let split = lines.len().saturating_sub(2);
     let mut footer = lines.split_off(split);
     footer.push(Line::from(Span::styled(
-        "  ↑↓ choose · enter confirm · esc skip",
+        format!("  ↑↓ choose · enter confirm · esc {deny}"),
         theme::faint(),
     )));
 
@@ -2251,20 +2457,48 @@ mod tests {
         app.cursor = 1;
 
         let rows = rendered_rows(&mut app, 80, 24);
-        let joined = rows.concat();
-
-        for (name, _) in crate::app::COMMANDS {
-            assert!(joined.contains(name), "{name} missing from menu: {joined}");
-        }
 
         // Two "❯"s are expected on screen at once: the menu's cursor and the
         // input box's own separate prompt marker (visible around the typed
         // "/") -- so this looks specifically for the menu's, not just any.
-        let highlighted_provider_row = rows
+        let (first_name, first_desc) = crate::app::COMMANDS[0];
+        let highlighted_row = rows
             .iter()
-            .find(|r| r.contains('❯') && r.contains("/provider"))
-            .expect("the menu's cursor should be on /provider, the first match");
-        assert!(highlighted_provider_row.contains("switch provider"), "{highlighted_provider_row}");
+            .find(|r| r.contains('❯') && r.contains(first_name))
+            .unwrap_or_else(|| {
+                panic!("the menu's cursor should be on {first_name}, the first match")
+            });
+        assert!(highlighted_row.contains(first_desc), "{highlighted_row}");
+    }
+
+    /// The viewport is twelve rows, so the menu cannot always show every
+    /// command at once. Arrowing onto one past the fold must scroll it into
+    /// view -- moving a cursor onto an entry that is never drawn reads as the
+    /// menu being stuck.
+    #[test]
+    fn the_command_menu_scrolls_to_keep_the_selection_visible() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.input_buffer = "/".to_string();
+        app.cursor = 1;
+
+        let last = crate::app::COMMANDS.len() - 1;
+        let (last_name, last_desc) = crate::app::COMMANDS[last];
+        app.command_menu_selected = last;
+
+        let rows = rendered_rows(&mut app, 80, 24);
+        let highlighted_row = rows
+            .iter()
+            .find(|r| r.contains('❯') && r.contains(last_name))
+            .unwrap_or_else(|| panic!("{last_name} should have scrolled into view"));
+        assert!(highlighted_row.contains(last_desc), "{highlighted_row}");
+
+        // Every command is reachable this way, one selection at a time.
+        for (i, (name, _)) in crate::app::COMMANDS.iter().enumerate() {
+            app.command_menu_selected = i;
+            let joined = rendered_rows(&mut app, 80, 24).concat();
+            assert!(joined.contains(name), "{name} unreachable at selection {i}");
+        }
     }
 
     /// Regression: Up/Down had no effect at an approval prompt, so the only
@@ -3055,4 +3289,166 @@ mod tests {
     }
 
 
+    // ---- plan mode ---------------------------------------------------------
+
+    /// The plan is the thing being approved, so it is shown whole. A file
+    /// preview may elide its tail because the path is the decision; here the
+    /// elided part would be exactly what nobody agreed to.
+    #[test]
+    fn a_plan_prompt_shows_the_whole_plan_and_offers_start_or_revise() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.mode = crate::tools::Mode::Plan;
+        app.state = AppState::AwaitingApproval;
+        app.workspace_root = "/tmp/project".to_string();
+
+        let steps: Vec<String> = (1..=30)
+            .map(|i| format!("step {i}: change file_{i}.rs"))
+            .collect();
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Plan(crate::tools::Proposal {
+                title: "Rate limiting for the items API".to_string(),
+                summary: "Fixed window, keyed by API key.".to_string(),
+                steps,
+                not_doing: vec!["Distributed limiting".to_string()],
+            }),
+            remaining: 0,
+        });
+
+        let rows = rendered_rows(&mut app, 80, 40);
+        let joined = rows.concat();
+
+        assert!(joined.contains("Start on this plan?"), "{joined}");
+        assert!(joined.contains("step 1:"), "{joined}");
+        assert!(
+            !joined.contains("more line"),
+            "a plan must never be elided the way a file preview is: {joined}"
+        );
+
+        // "skip" is the wrong word for declining a whole proposal.
+        assert!(joined.contains("y start"), "{joined}");
+        assert!(joined.contains("n revise"), "{joined}");
+        assert!(!joined.contains("n skip"), "{joined}");
+
+        // A plan does not happen "in" a directory the way a write does.
+        assert!(!joined.contains("in /tmp/project"), "{joined}");
+    }
+
+    /// The line announcing plan mode scrolls away within a few exchanges. What
+    /// the next keystroke can do must be legible on every frame after that.
+    #[test]
+    fn plan_mode_is_stated_on_every_frame() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+
+        let normal = rendered_rows(&mut app, 80, 24).concat();
+        assert!(!normal.contains("PLAN"), "{normal}");
+
+        app.mode = crate::tools::Mode::Plan;
+        let planning = rendered_rows(&mut app, 80, 24).concat();
+        assert!(planning.contains("PLAN"), "{planning}");
+    }
+
+    fn a_plan(title: &str, steps: &[&str], done: &[usize]) -> crate::plan::Plan {
+        let mut plan = crate::plan::Plan {
+            title: title.to_string(),
+            summary: "Fixed window.".to_string(),
+            steps: steps.iter().map(|s| crate::plan::Step::new(*s)).collect(),
+            not_doing: Vec::new(),
+            created: "2026-08-11".to_string(),
+            updated: "2026-08-11".to_string(),
+            base_commit: None,
+            model: "m".to_string(),
+            path: std::path::PathBuf::from("/tmp/project/plan.md"),
+        };
+        for &i in done {
+            plan.mark(i, true, None).unwrap();
+        }
+        plan
+    }
+
+    /// There is one plan file, so approving a different plan overwrites it.
+    /// That is intended, but doing it silently would throw away work the user
+    /// agreed to -- so the cost is on screen before they can press y.
+    #[test]
+    fn a_plan_that_replaces_another_says_what_it_costs() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::AwaitingApproval;
+        app.workspace_root = "/tmp/project".to_string();
+        app.active_plan = Some(a_plan("Rate limiting", &["one", "two", "three", "four"], &[1, 2]));
+
+        let proposal = crate::tools::Proposal {
+            title: "Refactor auth".to_string(),
+            summary: "Different work entirely.".to_string(),
+            steps: vec!["Move to refresh tokens".to_string()],
+            not_doing: Vec::new(),
+        };
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Plan(proposal.clone()),
+            remaining: 0,
+        });
+
+        let joined = rendered_rows(&mut app, 80, 30).concat();
+        assert!(joined.contains("saves to plan.md"), "{joined}");
+        assert!(joined.contains("replaces"), "{joined}");
+        assert!(joined.contains("Rate limiting"), "{joined}");
+        assert!(joined.contains("2/4 done"), "the cost is the unfinished work: {joined}");
+    }
+
+    /// Revising the plan already in hand is not a replacement, and warning
+    /// about it every time would train the warning out of meaning anything.
+    #[test]
+    fn revising_the_same_plan_is_not_flagged_as_a_replacement() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::AwaitingApproval;
+        app.workspace_root = "/tmp/project".to_string();
+        app.active_plan = Some(a_plan("Rate limiting", &["one", "two"], &[]));
+
+        app.overlay = Some(Overlay::ToolApproval {
+            action: Action::Plan(crate::tools::Proposal {
+                title: "Rate limiting".to_string(),
+                summary: "Reworked.".to_string(),
+                steps: vec!["A better first step".to_string()],
+                not_doing: Vec::new(),
+            }),
+            remaining: 0,
+        });
+
+        let joined = rendered_rows(&mut app, 80, 30).concat();
+        assert!(!joined.contains("replaces"), "{joined}");
+    }
+
+    /// The model follows the project's plan from the very first prompt.
+    /// Finding that out by watching it start editing files would be a nasty
+    /// surprise, so the welcome panel says so on the way in.
+    #[test]
+    fn the_welcome_panel_names_the_plan_already_in_the_project() {
+        let mut app = App::new(crate::config::Config::default());
+        app.active_plan = Some(a_plan(
+            "Rate limiting for the items API",
+            &["Add the limiter", "Wrap the router", "Add settings"],
+            &[1],
+        ));
+
+        let panel = welcome_text(&app, 80);
+        assert!(panel.contains("1/3"), "{panel}");
+        assert!(panel.contains("Rate limiting"), "{panel}");
+        assert!(panel.contains("Wrap the router"), "the next step: {panel}");
+
+        // And nothing about a plan when the project has none.
+        let bare = App::new(crate::config::Config::default());
+        assert!(!welcome_text(&bare, 80).contains("next"), "no plan, no rows");
+    }
+
+    #[test]
+    fn a_plan_notice_is_shown_before_anything_is_typed() {
+        let mut app = App::new(crate::config::Config::default());
+        app.startup_notices.push("plan.md was written against commit 3c21dfb".to_string());
+
+        let panel = welcome_text(&app, 80);
+        assert!(panel.contains("Before you start"), "{panel}");
+        assert!(panel.contains("3c21dfb"), "{panel}");
+    }
 }

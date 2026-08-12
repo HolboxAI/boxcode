@@ -3,7 +3,7 @@ use crate::danger;
 use crate::deploy::{self, DeployAction, DeployEvent, DeploySession, Stage};
 use crate::llm::{ChatMessage, ToolCall};
 use crate::providers;
-use crate::tools::{self, ToolOutcome};
+use crate::tools::{self, Mode, ToolOutcome};
 use crate::usage;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{HashSet, VecDeque};
@@ -134,6 +134,7 @@ pub enum CustomStep {
 /// `match` in `selected_command`'s caller; nowhere else should name a
 /// command as a string literal.
 pub const COMMANDS: &[(&str, &str)] = &[
+    ("/plan", "research first, change nothing until you approve"),
     ("/provider", "switch provider or endpoint"),
     ("/model", "switch model"),
     ("/new", "forget the current conversation"),
@@ -247,6 +248,21 @@ pub struct ContextSize {
 }
 pub struct App {
     pub state: AppState,
+    /// Whether the model may change anything yet. Session state rather than
+    /// config: it is meant to be switched on for one piece of work and off
+    /// again, so it lives here and resets with `/new`, not in `config.toml`.
+    pub mode: Mode,
+    /// The approved plan being worked through, if there is one. Set when the
+    /// user approves a proposal, or when an unfinished plan is resumed from
+    /// disk in a later session.
+    pub active_plan: Option<crate::plan::Plan>,
+    /// True when `active_plan` has changed and not yet been written.
+    ///
+    /// A flag rather than a write, for the same reason as `quota_dirty`:
+    /// `App`'s methods are exercised by several hundred unit tests, and a
+    /// hidden filesystem write inside one of them would have every test
+    /// touching the real developer machine. Only `main.rs`'s loop persists.
+    pub plan_dirty: bool,
     pub messages: Vec<Message>,
     /// Raw text of the prompt box. May contain '\n' (Alt/Shift-Enter inserts one).
     pub input_buffer: String,
@@ -417,6 +433,9 @@ impl App {
     pub fn new(config: Config) -> Self {
         Self {
             state: AppState::AwaitingInput,
+            mode: Mode::Normal,
+            active_plan: None,
+            plan_dirty: false,
             messages: Vec::new(),
             input_buffer: String::new(),
             cursor: 0,
@@ -551,6 +570,7 @@ impl App {
                     self.cursor = 0;
                     self.command_menu_selected = 0;
                     match cmd {
+                        "/plan" => self.toggle_plan_mode(),
                         "/provider" => self.open_provider_picker(),
                         "/model" => self.open_model_picker_from_config(),
                         "/new" => self.start_new_conversation(),
@@ -870,6 +890,38 @@ impl App {
                 self.follow_tail = true;
                 continue;
             }
+            // Plan mode, second: it outranks every approval setting for the
+            // same reason the block above does. A prompt the user can say yes
+            // to is not read-only, and "nothing will change until I approve a
+            // plan" has to be true without qualification or it is not worth
+            // saying. Ranked below the blocklist so a catastrophic command is
+            // still reported as blocked rather than as merely out of scope.
+            if let Some(reason) = self.plan_mode_refusal(call) {
+                let call = self.pending_tools.pop_front().expect("front just matched");
+                let label = tools::describe_action(&call)
+                    .map(|a| a.label())
+                    .unwrap_or_else(|| call.function.name.clone());
+                self.messages.push(Message::new(
+                    Role::System,
+                    format!("Plan mode — skipped {label}"),
+                ));
+                self.push_tool_outcome(tools::refused_in_plan_mode(&call, &reason));
+                self.follow_tail = true;
+                continue;
+            }
+            // Ticking a step off is bookkeeping against a plan the user has
+            // already approved, and it is resolved here rather than by the
+            // runner because it edits the live plan. Never prompted: asking
+            // permission to tick a box would make the feature unusable, and
+            // there is nothing to protect -- it writes one line to one file
+            // the user agreed to create.
+            if let Some(tools::Action::Progress { step, done, note }) =
+                tools::describe_action(call)
+            {
+                let call = self.pending_tools.pop_front().expect("front just matched");
+                self.record_progress(&call, step, done, note);
+                continue;
+            }
             if !self.needs_approval(call) {
                 let call = self.pending_tools.pop_front().expect("front just matched");
                 self.approved_tools.push(call);
@@ -923,6 +975,19 @@ impl App {
         };
     }
 
+    /// Why plan mode will not let `call` happen, or `None` if it will (which
+    /// is always the case outside plan mode).
+    pub fn plan_mode_refusal(&self, call: &ToolCall) -> Option<String> {
+        if !self.mode.is_plan() {
+            return None;
+        }
+        // A call with no coherent action is left alone: the runner answers it
+        // with a "these arguments are unusable" message, which is a more
+        // useful thing for the model to read than a refusal for something it
+        // may not even have been asking to do.
+        tools::plan_mode_block(&tools::describe_action(call)?)
+    }
+
     /// What the guardrails make of this call, judged against the directory it
     /// would actually run in.
     pub fn risk_of(&self, call: &ToolCall) -> danger::Risk {
@@ -930,6 +995,86 @@ impl App {
             Some(action) => tools::action_risk(&action, Path::new(&self.workspace_root)),
             None => danger::Risk::Normal,
         }
+    }
+
+    /// `/plan` -- turn plan mode on, or back off.
+    ///
+    /// A toggle rather than two commands because the off switch has to be
+    /// obvious: someone who turned this on and then decided to just get on
+    /// with it should not have to remember a second name, or wait for the
+    /// model to propose a plan it does not need to.
+    ///
+    /// The conversation is deliberately kept across the switch. Everything
+    /// read while planning is exactly what makes the implementation good, and
+    /// throwing it away would mean paying to read it all again.
+    fn toggle_plan_mode(&mut self) {
+        self.mode = match self.mode {
+            Mode::Normal => Mode::Plan,
+            Mode::Plan => Mode::Normal,
+        };
+        let note = match self.mode {
+            Mode::Plan =>
+                "Plan mode on. Nothing can be written, edited, or run unless it is read-only — \
+                 ask for what you want and you'll get a plan to approve first. /plan again to \
+                 turn it off.",
+            Mode::Normal =>
+                "Plan mode off. Writes and commands are available again, each one still asking \
+                 before it happens.",
+        };
+        self.messages.push(Message::new(Role::System, note));
+        self.greeted = true;
+        self.follow_tail = true;
+    }
+
+    /// Take up the plan sitting in the project, at startup.
+    ///
+    /// There is no command for this and nothing to select: a `plan.md` in the
+    /// project is the plan, so it is simply used. What the model is told about
+    /// it does not come from here -- the plan is restated in the system prompt
+    /// on every request (see `tools::system_prompt`), which is what makes it
+    /// work in a session that knows nothing about the conversation it came
+    /// from. This only records it and works out what to say on the way in.
+    pub fn adopt_plan(&mut self, plan: crate::plan::Plan) {
+        // A finished plan is left on disk -- deleting the user's file is not
+        // boxcode's call -- but it is not followed. There is nothing left to
+        // do, and restating it would invite the model to redo the work.
+        if plan.is_finished() {
+            let (_, total) = plan.progress();
+            self.startup_notices.push(format!(
+                "{} in {} is complete — all {total} steps done. Delete the file when you're \
+                 finished with it, or say what you want next and /plan will draft a fresh one.",
+                plan.title,
+                crate::plan::PLAN_FILE
+            ));
+            return;
+        }
+
+        // Warned about, never refused. A plan written against a repo that has
+        // since moved may name files that no longer exist, and a model told to
+        // follow it will do so confidently -- saying nothing is how a stale
+        // plan becomes wrong work.
+        if let Some((base, head)) = plan.stale_against(Path::new(&self.workspace_root)) {
+            self.startup_notices.push(format!(
+                "{} was written against commit {base}; the project is now on {head}. Some of \
+                 what it describes may have changed or already been done — worth checking \
+                 before it carries on.",
+                crate::plan::PLAN_FILE
+            ));
+        }
+        self.active_plan = Some(plan);
+    }
+
+    /// A `plan.md` that could not be read as a plan.
+    ///
+    /// Said out loud rather than ignored: the user is entitled to assume a
+    /// file by that name is being used, and silently working without it is the
+    /// kind of thing you only notice several turns later.
+    pub fn note_unreadable_plan(&mut self, reason: &str) {
+        self.startup_notices.push(format!(
+            "There is a {} here, but it could not be read as a plan ({reason}), so it is being \
+             ignored. Fix or remove it — approving a new plan will overwrite it.",
+            crate::plan::PLAN_FILE
+        ));
     }
 
     /// `/new` -- forget the conversation and start fresh.
@@ -943,6 +1088,11 @@ impl App {
     /// Only the conversation is cleared. Config, provider and workspace are
     /// deliberately untouched -- this is "forget what we discussed", not "reset
     /// the app".
+    ///
+    /// Plan mode is the one exception, and goes off. It is scoped to a piece
+    /// of work, not a standing preference: leaving it on across a wipe would
+    /// mean the next unrelated request silently refusing to do anything, with
+    /// the message explaining why now scrolled away above the line.
     fn start_new_conversation(&mut self) {
         self.messages.clear();
         self.streaming_response.clear();
@@ -958,9 +1108,16 @@ impl App {
         // `drainable` would hand back nothing -- so this notice, and every
         // message after it, would never be printed at all.
         self.flushed = 0;
+        let was_planning = self.mode.is_plan();
+        self.mode = Mode::Normal;
         self.messages.push(Message::new(
             Role::System,
-            "Started a new conversation. The model no longer remembers anything above this line.",
+            if was_planning {
+                "Started a new conversation, and turned plan mode off. The model no longer \
+                 remembers anything above this line."
+            } else {
+                "Started a new conversation. The model no longer remembers anything above this line."
+            },
         ));
     }
 
@@ -1392,6 +1549,13 @@ impl App {
         if self.risk_of(call).is_dangerous() {
             return true;
         }
+        // A plan is the one thing that must always be asked about. Approving
+        // it is what hands back the writing tools, so letting
+        // `require_approval = false` wave it through would turn plan mode into
+        // a formality the model dismisses on its own.
+        if matches!(tools::describe_action(call), Some(tools::Action::Plan(_))) {
+            return true;
+        }
         if !self.config.tools.require_approval {
             return false;
         }
@@ -1464,7 +1628,19 @@ impl App {
             return;
         };
 
-        if allowed {
+        // A plan is answered here and never queued for the runner: accepting
+        // it changes this struct's mode, and the runner is a spawned task with
+        // no access to it. It is also the one "tool" whose whole effect is the
+        // decision itself -- there is nothing left to execute afterwards.
+        let proposal = match tools::describe_action(&call) {
+            Some(tools::Action::Plan(proposal)) => Some(proposal),
+            _ => None,
+        };
+        let plan_rejected = proposal.is_some() && !allowed;
+
+        if let Some(proposal) = proposal {
+            self.resolve_plan(&call, proposal, allowed);
+        } else if allowed {
             // A deployment the model asked for is handed to the same flow
             // `/deploy` uses, rather than run headlessly by `tools::execute`:
             // that is the only way the things it may need mid-run -- consent
@@ -1480,6 +1656,178 @@ impl App {
         }
         self.follow_tail = true;
         self.advance_approvals();
+
+        // A rejected plan gives the turn back to the user, rather than sending
+        // the model straight round again the way every other refusal does.
+        // The model has no idea *why* the plan was wrong, so that round would
+        // be spent either guessing or asking -- both paid for, both slower
+        // than the user simply saying it. Only when nothing else was queued
+        // behind the plan: if there is real work still to run, that comes
+        // first.
+        if plan_rejected && self.state == AppState::Sending {
+            let tokens = self.record_quota();
+            self.pending_usage
+                .push((tokens.total() as usize, self.config.llm.model.clone()));
+            self.stream_printed = 0;
+            self.busy_started = None;
+            self.state = AppState::AwaitingInput;
+        }
+    }
+
+    /// Record the user's answer to a plan.
+    ///
+    /// Approval is the only moment a plan reaches disk. Nothing the model
+    /// proposes is written before this, and a revision is not written until it
+    /// too has been approved -- so the file always holds something a human
+    /// agreed to, which is the entire reason it can be trusted in a later
+    /// session.
+    ///
+    /// Either way the plan goes into the transcript. It was only ever shown
+    /// inside a popup that is now gone, and the point of approving a plan is
+    /// being able to hold the work to it afterwards.
+    fn resolve_plan(&mut self, call: &ToolCall, proposal: tools::Proposal, approved: bool) {
+        let rendered = Self::proposal_text(&proposal);
+
+        if !approved {
+            self.messages.push(Message::new(
+                Role::System,
+                format!("📋 Plan declined — still in plan mode\n\n{rendered}"),
+            ));
+            self.push_tool_outcome(tools::plan_declined(call));
+            self.messages.push(Message::new(
+                Role::System,
+                "Say what you'd like different and it'll plan again. /plan turns plan mode off \
+                 if you'd rather just get on with it.",
+            ));
+            return;
+        }
+
+        self.mode = Mode::Normal;
+
+        // There is one plan file, so approving writes to it either way. What
+        // differs is whether this is the same plan being revised -- in which
+        // case `created` is when it first existed, and survives the revision --
+        // or a different plan replacing it, which starts its own history.
+        // Matched on the title, since that is all there is to go on.
+        let previous = self
+            .active_plan
+            .as_ref()
+            .filter(|p| p.title.trim().eq_ignore_ascii_case(proposal.title.trim()));
+        let today = crate::quota::today();
+        let created = previous.map_or_else(|| today.clone(), |p| p.created.clone());
+
+        let root = Path::new(&self.workspace_root);
+        let plan = crate::plan::Plan {
+            title: proposal.title.clone(),
+            summary: proposal.summary,
+            steps: proposal.steps.iter().map(crate::plan::Step::new).collect(),
+            not_doing: proposal.not_doing,
+            created,
+            updated: today,
+            base_commit: crate::plan::head_commit(root),
+            model: self.config.llm.model.clone(),
+            path: crate::plan::path(root),
+        };
+
+        let shown = plan.display_path(root);
+        let steps = plan.steps.len();
+        self.messages.push(Message::new(
+            Role::System,
+            format!("📋 Plan approved — saved to {shown}\n\n{rendered}"),
+        ));
+        self.push_tool_outcome(tools::plan_approved(call, &shown, steps));
+        self.active_plan = Some(plan);
+        self.plan_dirty = true;
+    }
+
+    /// A proposal as the transcript shows it. Same shape as the file it is
+    /// about to become, so what was approved and what was saved read alike.
+    fn proposal_text(proposal: &tools::Proposal) -> String {
+        let mut out = String::new();
+        if !proposal.summary.trim().is_empty() {
+            out.push_str(proposal.summary.trim());
+            out.push_str("\n\n");
+        }
+        for (i, step) in proposal.steps.iter().enumerate() {
+            out.push_str(&format!("  {}. {step}\n", i + 1));
+        }
+        if !proposal.not_doing.is_empty() {
+            out.push_str("\nNot doing:\n");
+            for item in &proposal.not_doing {
+                out.push_str(&format!("  - {item}\n"));
+            }
+        }
+        out.trim_end().to_string()
+    }
+
+    /// A plan file that could not be written, reported by `main.rs`'s loop.
+    ///
+    /// The approval still stands and the work still goes ahead -- losing the
+    /// file is bad, but it is not a reason to refuse what the user agreed to.
+    /// The plan stops being active, though, because progress that cannot be
+    /// recorded must not look like progress that was.
+    pub fn note_plan_save_failure(&mut self, reason: &str) {
+        // The model was told "saved to ..." the instant the user said yes, and
+        // that is now false. `main.rs` attempts the write before it fires the
+        // next request, so nothing has gone on the wire yet and the claim can
+        // still be corrected in place -- much better than leaving a lie in the
+        // history and hoping a later message outweighs it.
+        if let Some(last) = self.messages.iter_mut().rev().find(|m| m.role == Role::Tool) {
+            last.content = tools::plan_save_failed(reason);
+            last.display = Some("📋 plan approved — but could not be saved".to_string());
+        }
+        self.messages.push(Message::new(
+            Role::Error,
+            format!(
+                "The plan could not be saved: {reason}\nThe work can still go ahead, but nothing \
+                 will be recorded to a file."
+            ),
+        ));
+        self.active_plan = None;
+        self.follow_tail = true;
+    }
+
+    /// `plan_progress` -- tick a step off the approved plan, or record why it
+    /// could not be done.
+    ///
+    /// The one thing that writes to a plan file without going back through
+    /// approval. That is deliberate and does not weaken the invariant: it
+    /// records progress *against* an agreed plan, it never changes what was
+    /// agreed. Asking permission to tick a box would be unusable.
+    fn record_progress(&mut self, call: &ToolCall, step: usize, done: bool, note: Option<String>) {
+        let root = Path::new(&self.workspace_root).to_path_buf();
+        let Some(plan) = self.active_plan.as_mut() else {
+            self.push_tool_outcome(tools::progress_failed(
+                call,
+                "there is no plan being worked on, so there is no step to record. Just do the \
+                 work and tell the user what you did.",
+            ));
+            return;
+        };
+
+        match plan.mark(step, done, note) {
+            Ok(description) => {
+                let (finished, total) = plan.progress();
+                let shown = plan.display_path(&root);
+                let complete = plan.is_finished();
+                self.push_tool_outcome(tools::progress_recorded(
+                    call,
+                    &description,
+                    done,
+                    total - finished,
+                    &shown,
+                ));
+                self.plan_dirty = true;
+                if complete {
+                    self.messages.push(Message::new(
+                        Role::System,
+                        format!("📋 Plan complete — all {total} steps done. {shown} is up to date."),
+                    ));
+                }
+            }
+            Err(reason) => self.push_tool_outcome(tools::progress_failed(call, &reason)),
+        }
+        self.follow_tail = true;
     }
 
     /// Results of the commands that ran, from the spawned runner.
@@ -3590,7 +3938,15 @@ mod tests {
     #[test]
     fn typing_narrows_the_matches_to_a_shared_prefix() {
         let mut a = app();
+        // "/p" is deliberately ambiguous -- /plan and /provider share it -- so
+        // this checks the menu keeps every match rather than guessing at one.
         type_str(&mut a, "/p");
+        let names: Vec<&str> = a.matching_commands().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["/plan", "/provider"]);
+
+        // One more character settles it.
+        let mut a = app();
+        type_str(&mut a, "/pr");
         let names: Vec<&str> = a.matching_commands().iter().map(|(n, _)| *n).collect();
         assert_eq!(names, vec!["/provider"]);
     }
@@ -3638,7 +3994,7 @@ mod tests {
         type_str(&mut a, "/");
         a.command_menu_selected = COMMANDS.len() - 1;
 
-        type_str(&mut a, "p");
+        type_str(&mut a, "pr");
         assert_eq!(a.matching_commands().len(), 1);
         assert_eq!(a.selected_command(), Some("/provider"));
     }
@@ -5198,7 +5554,681 @@ mod tests {
             std::env::set_var("DEEPSEEK_API_KEY", v);
         }
     }
+
+    // ---- plan mode ---------------------------------------------------------------
+
+    fn edit_file_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::EDIT_FILE.to_string(),
+                arguments: serde_json::json!({
+                    "path": path,
+                    "old_string": "a",
+                    "new_string": "b",
+                })
+                .to_string(),
+            },
+        }
+    }
+
+    fn plan_call(id: &str, title: &str) -> ToolCall {
+        plan_call_with(id, title, &["Add the limiter", "Wrap the router"])
+    }
+
+    fn plan_call_with(id: &str, title: &str, steps: &[&str]) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::EXIT_PLAN_MODE.to_string(),
+                arguments: serde_json::json!({
+                    "title": title,
+                    "summary": "Fixed window, keyed by API key.",
+                    "steps": steps,
+                    "not_doing": ["Distributed limiting"],
+                })
+                .to_string(),
+            },
+        }
+    }
+
+    fn progress_call(id: &str, step: usize, status: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::PLAN_PROGRESS.to_string(),
+                arguments: serde_json::json!({ "step": step, "status": status }).to_string(),
+            },
+        }
+    }
+
+    /// A planning app whose workspace is a real temporary directory, so an
+    /// approved plan has somewhere to be written.
+    fn planning_app_in(dir: &std::path::Path) -> App {
+        let mut a = planning_app();
+        a.workspace_root = dir.display().to_string();
+        a
+    }
+
+    /// An app mid-turn with plan mode on, ready for `request_tools`.
+    fn planning_app() -> App {
+        let mut a = streaming_app();
+        a.mode = Mode::Plan;
+        a
+    }
+
+    #[test]
+    fn slash_plan_toggles_the_mode_both_ways() {
+        let mut a = app();
+        assert_eq!(a.mode, Mode::Normal);
+
+        type_str(&mut a, "/plan");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.mode, Mode::Plan);
+        assert!(a.messages.last().unwrap().content.contains("Plan mode on"));
+
+        type_str(&mut a, "/plan");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.messages.last().unwrap().content.contains("Plan mode off"));
+    }
+
+    /// The core promise. A write in plan mode is not a prompt the user could
+    /// mistakenly accept -- it never becomes a prompt at all.
+    #[test]
+    fn a_write_in_plan_mode_is_refused_without_ever_asking() {
+        let mut a = planning_app();
+        a.request_tools(vec![write_file_call("call_1", "hello.py", "print('hi')\n")]);
+
+        assert_eq!(a.overlay, None, "plan mode must not offer a write for approval");
+        assert!(a.approved_tools.is_empty());
+        assert_ne!(a.state, AppState::AwaitingApproval);
+
+        let told = a
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("the model must be told why nothing happened");
+        assert!(told.content.contains("read-only"), "{}", told.content);
+        assert!(told.content.contains("exit_plan_mode"), "{}", told.content);
+    }
+
+    #[test]
+    fn an_edit_in_plan_mode_is_refused_without_ever_asking() {
+        let mut a = planning_app();
+        a.request_tools(vec![edit_file_call("call_1", "src/main.rs")]);
+
+        assert_eq!(a.overlay, None);
+        assert!(a.approved_tools.is_empty());
+    }
+
+    /// `require_approval = false` is the most permissive the app gets. Plan
+    /// mode has to outrank it, or "nothing changes until you approve a plan"
+    /// is false for exactly the configuration where it matters most.
+    #[test]
+    fn plan_mode_outranks_approval_being_switched_off_entirely() {
+        let mut a = planning_app();
+        a.config.tools.require_approval = false;
+        a.config.tools.auto_approve_read_only = true;
+
+        a.request_tools(vec![
+            write_file_call("call_1", "hello.py", "x"),
+            command_call("call_2", "cargo build"),
+        ]);
+
+        assert!(
+            a.approved_tools.is_empty(),
+            "neither the write nor the build may run in plan mode"
+        );
+    }
+
+    /// Research has to stay cheap, or nobody uses the mode. Reads, listings
+    /// and read-only commands behave exactly as they do outside it.
+    #[test]
+    fn reads_and_read_only_commands_still_work_in_plan_mode() {
+        let mut a = planning_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![
+            read_file_call("call_1", "src/main.rs"),
+            command_call("call_2", "git log --oneline"),
+        ]);
+
+        assert_eq!(a.approved_tools.len(), 2, "research must not be gated");
+        assert_eq!(a.state, AppState::ExecutingTools);
+    }
+
+    /// A command the read-only allowlist cannot vouch for is refused rather
+    /// than guessed about -- `cargo build` writes to target/.
+    #[test]
+    fn a_command_outside_the_read_only_allowlist_is_refused_in_plan_mode() {
+        let mut a = planning_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![command_call("call_1", "cargo build")]);
+
+        assert!(a.approved_tools.is_empty());
+        assert_eq!(a.overlay, None);
+    }
+
+    #[test]
+    fn a_plan_is_put_in_front_of_the_user_rather_than_run() {
+        let mut a = planning_app();
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+        match &a.overlay {
+            Some(Overlay::ToolApproval { action: tools::Action::Plan(p), .. }) => {
+                assert_eq!(p.title, "Rate limiting");
+                assert_eq!(p.steps.len(), 2);
+            }
+            other => panic!("expected a plan prompt, got {other:?}"),
+        }
+    }
+
+    /// Even with every approval switched off, the plan itself is still asked
+    /// about: approving it is what hands the writing tools back.
+    #[test]
+    fn a_plan_is_asked_about_even_with_approval_switched_off() {
+        let mut a = planning_app();
+        a.config.tools.require_approval = false;
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![plan_call("call_1", "do the thing")]);
+
+        assert_eq!(a.state, AppState::AwaitingApproval);
+    }
+
+    #[test]
+    fn approving_a_plan_ends_plan_mode_and_keeps_the_plan_on_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+        a.request_tools(vec![plan_call_with(
+            "call_1",
+            "Health check endpoint",
+            &["Add /healthz to the router"],
+        )]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(a.mode, Mode::Normal, "approving is what turns plan mode off");
+        assert_eq!(a.state, AppState::Sending, "the model gets on with it");
+
+        // The popup is gone, so the plan has to survive in the transcript --
+        // otherwise there is nothing left to hold the work to.
+        assert!(
+            a.messages.iter().any(|m| m.role == Role::System
+                && m.content.contains("Add /healthz to the router")),
+            "the approved plan must stay in the transcript"
+        );
+        let told = a.messages.iter().rev().find(|m| m.role == Role::Tool).unwrap();
+        assert!(told.content.contains("approved"), "{}", told.content);
+    }
+
+    // ---- the plan file -----------------------------------------------------
+
+    /// Approval is the only moment a plan reaches disk. This is the invariant
+    /// the whole feature rests on: whatever is in the file was agreed to.
+    #[test]
+    fn a_plan_is_only_written_once_it_has_been_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = crate::plan::path(dir.path());
+
+        let mut a = planning_app_in(dir.path());
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+        assert!(!file.exists(), "a proposal on screen must not have touched disk");
+        assert!(a.active_plan.is_none());
+        assert!(!a.plan_dirty);
+
+        // Declining still writes nothing.
+        a.handle_key(key(KeyCode::Char('n')));
+        assert!(!file.exists(), "a declined plan must not have touched disk");
+        assert!(a.active_plan.is_none());
+        assert!(!a.plan_dirty);
+
+        // Approving stages exactly one write.
+        a.state = AppState::Streaming;
+        a.request_tools(vec![plan_call("call_2", "Rate limiting")]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        let plan = a.active_plan.as_ref().expect("approval makes the plan active");
+        assert!(a.plan_dirty, "main.rs flushes it; App only marks it");
+        assert_eq!(plan.title, "Rate limiting");
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.not_doing, vec!["Distributed limiting"]);
+        assert_eq!(plan.path, file, "one project, one plan file");
+    }
+
+    /// What `App` stages must be what a later session reads back.
+    #[test]
+    fn the_approved_plan_round_trips_through_the_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        let plan = a.active_plan.clone().unwrap();
+        plan.save().expect("should save");
+
+        let back = crate::plan::Plan::load(&plan.path).expect("should load");
+        assert_eq!(back.title, "Rate limiting");
+        assert_eq!(back.steps.len(), 2);
+        assert_eq!(back.model, a.config.llm.model);
+        assert_eq!(back.status(), crate::plan::Status::Approved);
+    }
+
+    /// Re-approving updates the file already in hand rather than leaving a
+    /// trail of near-identical drafts.
+    #[test]
+    fn re_approving_updates_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+
+        a.request_tools(vec![plan_call_with("call_1", "Rate limiting", &["First shape"])]);
+        a.handle_key(key(KeyCode::Char('y')));
+        let first = a.active_plan.as_ref().unwrap().path.clone();
+        let created = a.active_plan.as_ref().unwrap().created.clone();
+
+        a.state = AppState::Streaming;
+        a.request_tools(vec![plan_call_with(
+            "call_2",
+            "Rate limiting",
+            &["Second shape", "And another step"],
+        )]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        let second = a.active_plan.as_ref().unwrap();
+        assert_eq!(second.path, first, "the same plan lives in the same file");
+        assert_eq!(second.steps.len(), 2, "the revision replaced the steps");
+        assert_eq!(second.created, created, "created is when it first existed");
+    }
+
+    /// Progress is the one thing that writes to the file without going back
+    /// through approval -- it records work against a plan, it never changes
+    /// what was agreed. Prompting for it would make the feature unusable.
+    #[test]
+    fn recording_progress_ticks_a_step_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        a.state = AppState::Streaming;
+        a.request_tools(vec![progress_call("call_2", 1, "done")]);
+
+        assert_eq!(a.overlay, None, "ticking a box must never prompt");
+        assert!(a.approved_tools.is_empty(), "it is resolved locally, not run");
+        assert!(a.plan_dirty);
+
+        let plan = a.active_plan.as_ref().unwrap();
+        assert_eq!(plan.progress(), (1, 2));
+        assert_eq!(plan.status(), crate::plan::Status::InProgress);
+    }
+
+    #[test]
+    fn a_blocked_step_records_why_rather_than_being_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        a.state = AppState::Streaming;
+        a.request_tools(vec![ToolCall {
+            id: "call_2".to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::PLAN_PROGRESS.to_string(),
+                arguments: serde_json::json!({
+                    "step": 2,
+                    "status": "blocked",
+                    "note": "needs the Redis decision",
+                })
+                .to_string(),
+            },
+        }]);
+
+        let plan = a.active_plan.as_ref().unwrap();
+        assert!(!plan.steps[1].done);
+        assert_eq!(plan.steps[1].blocked.as_deref(), Some("needs the Redis decision"));
+    }
+
+    #[test]
+    fn finishing_every_step_says_so_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        a.state = AppState::Streaming;
+        a.request_tools(vec![progress_call("call_2", 1, "done")]);
+        assert!(!a.messages.iter().any(|m| m.content.contains("Plan complete")));
+
+        a.state = AppState::Streaming;
+        a.request_tools(vec![progress_call("call_3", 2, "done")]);
+
+        assert!(a.active_plan.as_ref().unwrap().is_finished());
+        assert!(
+            a.messages.iter().any(|m| m.content.contains("Plan complete")),
+            "the end of a plan is worth saying"
+        );
+    }
+
+    /// An out-of-range step is the model's most likely mistake here, and it
+    /// must come back as something it can correct rather than a crash.
+    #[test]
+    fn recording_a_step_that_does_not_exist_tells_the_model_the_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        a.state = AppState::Streaming;
+        a.request_tools(vec![progress_call("call_2", 9, "done")]);
+
+        let told = a.messages.iter().rev().find(|m| m.role == Role::Tool).unwrap();
+        assert!(told.content.contains("no step 9"), "{}", told.content);
+        assert_eq!(a.active_plan.as_ref().unwrap().progress(), (0, 2));
+    }
+
+    #[test]
+    fn recording_progress_with_no_active_plan_is_reported_not_crashed() {
+        let mut a = streaming_app();
+        a.request_tools(vec![progress_call("call_1", 1, "done")]);
+
+        let told = a.messages.iter().rev().find(|m| m.role == Role::Tool).unwrap();
+        assert!(told.content.contains("no plan"), "{}", told.content);
+    }
+
+    /// Losing the file does not undo the approval -- the user said yes and the
+    /// work should go ahead -- but progress that cannot be recorded must not
+    /// look like progress that was.
+    #[test]
+    fn a_plan_that_could_not_be_saved_stops_being_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        assert!(a.active_plan.is_some());
+
+        a.note_plan_save_failure("permission denied");
+
+        assert!(a.active_plan.is_none());
+        assert!(a
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Error && m.content.contains("permission denied")));
+    }
+
+    /// Declining hands the turn back to the user, not straight to the model:
+    /// it has no idea what was wrong, so that round would be spent guessing.
+    #[test]
+    fn declining_a_plan_stays_in_plan_mode_and_waits_for_the_user() {
+        let mut a = planning_app();
+        a.request_tools(vec![plan_call("call_1", "rewrite everything")]);
+        a.handle_key(key(KeyCode::Char('n')));
+
+        assert_eq!(a.mode, Mode::Plan, "a declined plan does not end plan mode");
+        assert_eq!(
+            a.state,
+            AppState::AwaitingInput,
+            "the user says what was wrong before the model tries again"
+        );
+
+        let told = a.messages.iter().rev().find(|m| m.role == Role::Tool).unwrap();
+        assert!(told.content.contains("still in plan mode"), "{}", told.content);
+    }
+
+    /// Esc at an approval prompt means "no" everywhere else in the app, and a
+    /// plan is no exception -- the reflexive keypress must not start the work.
+    #[test]
+    fn esc_on_a_plan_prompt_declines_it() {
+        let mut a = planning_app();
+        a.request_tools(vec![plan_call("call_1", "rewrite everything")]);
+        a.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(a.mode, Mode::Plan);
+    }
+
+    /// Every tool call needs a matching `tool` message or the next request is
+    /// rejected by the endpoint. A plan is resolved locally and never reaches
+    /// the runner, so this is the one that is easiest to leave unanswered.
+    #[test]
+    fn a_resolved_plan_leaves_a_history_the_endpoint_will_accept() {
+        for answer in [KeyCode::Char('y'), KeyCode::Char('n')] {
+            let mut a = planning_app();
+            a.request_tools(vec![plan_call("call_1", "a plan")]);
+            a.handle_key(key(answer));
+
+            let history = a.history(None);
+            let asked: Vec<&str> = history
+                .iter()
+                .flat_map(|m| m.tool_calls.iter())
+                .map(|c| c.id.as_str())
+                .collect();
+            let answered: Vec<&str> = history
+                .iter()
+                .filter_map(|m| m.tool_call_id.as_deref())
+                .collect();
+            assert_eq!(asked, answered, "{answer:?} left a hole in the history");
+        }
+    }
+
+    #[test]
+    fn starting_a_new_conversation_turns_plan_mode_off() {
+        let mut a = app();
+        a.mode = Mode::Plan;
+
+        type_str(&mut a, "/new");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.messages.last().unwrap().content.contains("plan mode off"));
+    }
+
+    /// A blocked command is blocked for a different and much louder reason
+    /// than plan mode, and must still be reported as such.
+    #[test]
+    fn a_catastrophic_command_is_still_reported_as_blocked_in_plan_mode() {
+        let mut a = planning_app();
+        a.request_tools(vec![command_call("call_1", "rm -rf /")]);
+
+        assert!(a
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Error && m.content.contains("Blocked")));
+    }
+
+    // ---- the plan already in the project ------------------------------------
+
+    /// Write a plan straight to disk, the way an earlier session would have
+    /// left it behind.
+    fn saved_plan(root: &std::path::Path, title: &str, done: &[usize]) -> crate::plan::Plan {
+        let mut plan = crate::plan::Plan {
+            title: title.to_string(),
+            summary: "Fixed window.".to_string(),
+            steps: vec![
+                crate::plan::Step::new("Add the limiter"),
+                crate::plan::Step::new("Wrap the router"),
+            ],
+            not_doing: Vec::new(),
+            created: "2026-08-01".to_string(),
+            updated: "2026-08-01".to_string(),
+            base_commit: None,
+            model: "m".to_string(),
+            path: crate::plan::path(root),
+        };
+        for &i in done {
+            plan.mark(i, true, None).unwrap();
+        }
+        plan.save().unwrap();
+        plan
+    }
+
+    fn app_in(root: &std::path::Path) -> App {
+        let mut a = app();
+        a.workspace_root = root.display().to_string();
+        a
+    }
+
+    /// The point of the whole feature: work agreed in a conversation this
+    /// session never saw, picked back up from the file alone, with nothing to
+    /// type and nothing to select.
+    #[test]
+    fn the_projects_plan_is_picked_up_without_being_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = saved_plan(dir.path(), "Rate limiting", &[1]);
+
+        let mut a = app_in(dir.path());
+        a.adopt_plan(crate::plan::Plan::load(&saved.path).unwrap());
+
+        let plan = a.active_plan.as_ref().expect("the plan is now being followed");
+        assert_eq!(plan.title, "Rate limiting");
+        assert_eq!(plan.progress(), (1, 2));
+        assert!(a.startup_notices.is_empty(), "nothing worth warning about");
+    }
+
+    /// A finished plan is left on disk -- deleting the user's file is not
+    /// boxcode's call -- but it is not followed, or the model is invited to
+    /// redo work that is already done.
+    #[test]
+    fn a_finished_plan_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = saved_plan(dir.path(), "All done", &[1, 2]);
+
+        let mut a = app_in(dir.path());
+        a.adopt_plan(crate::plan::Plan::load(&saved.path).unwrap());
+
+        assert!(a.active_plan.is_none(), "there is nothing left to follow");
+        assert!(a.startup_notices.iter().any(|n| n.contains("complete")));
+        assert!(saved.path.exists(), "the file is the user's, not ours to delete");
+    }
+
+    /// Silently working without a file the user put there by that name is the
+    /// kind of thing you only notice several turns later.
+    #[test]
+    fn a_plan_file_that_cannot_be_read_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = app_in(dir.path());
+        a.note_unreadable_plan("this file has no title, so it is not a plan");
+
+        assert!(a.active_plan.is_none());
+        let notice = a.startup_notices.first().expect("say so");
+        assert!(notice.contains("plan.md"), "{notice}");
+        assert!(notice.contains("overwrite"), "the consequence matters: {notice}");
+    }
+
+    /// A plan written against a repo that has since moved may describe work
+    /// already done, or files that no longer exist. Warned about, never
+    /// blocked -- silence is how a stale plan becomes confidently wrong work.
+    #[test]
+    fn a_stale_plan_is_followed_but_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A real repo, so `head_commit` has something to compare against.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git should run");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "first"]);
+        let head = crate::plan::head_commit(root).expect("a repo with a commit");
+
+        let mut stale = saved_plan(root, "Written earlier", &[]);
+        stale.base_commit = Some("0000000".to_string());
+
+        let mut a = app_in(root);
+        a.adopt_plan(stale.clone());
+
+        let notice = a.startup_notices.first().expect("the ground moved");
+        assert!(notice.contains("0000000"), "{notice}");
+        assert!(notice.contains(&head), "{notice}");
+        assert!(a.active_plan.is_some(), "flagged, not refused");
+
+        // And a plan written against the current commit says nothing.
+        let mut current = stale;
+        current.base_commit = Some(head);
+        let mut b = app_in(root);
+        b.adopt_plan(current);
+        assert!(b.startup_notices.is_empty());
+    }
+
+    /// One project, one plan file. A different plan replaces what was there --
+    /// which is the intended behaviour, and the reason the approval box says
+    /// so before you press y (see the ui test).
+    #[test]
+    fn approving_a_different_plan_replaces_the_one_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        let first = a.active_plan.as_ref().unwrap().path.clone();
+        a.active_plan.as_ref().unwrap().save().unwrap();
+
+        a.mode = Mode::Plan;
+        a.state = AppState::Streaming;
+        a.request_tools(vec![plan_call("call_2", "Refactor auth")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        a.active_plan.as_ref().unwrap().save().unwrap();
+
+        assert_eq!(a.active_plan.as_ref().unwrap().path, first, "still one file");
+        assert_eq!(crate::plan::Plan::load(&first).unwrap().title, "Refactor auth");
+    }
+
+    /// A revision of the same plan keeps the date it first existed; only a
+    /// genuinely different plan starts its own history.
+    #[test]
+    fn revising_keeps_created_but_replacing_resets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        // Pretend it was agreed a while back.
+        a.active_plan.as_mut().unwrap().created = "2026-01-01".to_string();
+
+        a.mode = Mode::Plan;
+        a.state = AppState::Streaming;
+        a.request_tools(vec![plan_call_with("call_2", "Rate limiting", &["Reworked"])]);
+        a.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(a.active_plan.as_ref().unwrap().created, "2026-01-01");
+
+        a.mode = Mode::Plan;
+        a.state = AppState::Streaming;
+        a.request_tools(vec![plan_call("call_3", "Something else entirely")]);
+        a.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(
+            a.active_plan.as_ref().unwrap().created,
+            crate::quota::today(),
+            "a different plan is a new plan"
+        );
+    }
+
+    /// The model is told "saved to ..." the moment the user says yes, before
+    /// the write is attempted. When the write then fails, that claim has to be
+    /// corrected rather than left standing in the history.
+    #[test]
+    fn a_failed_save_corrects_what_the_model_was_told() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app_in(dir.path());
+        a.request_tools(vec![plan_call("call_1", "Rate limiting")]);
+        a.handle_key(key(KeyCode::Char('y')));
+
+        let before = a.messages.iter().rev().find(|m| m.role == Role::Tool).unwrap();
+        assert!(before.content.contains("saved at"), "{}", before.content);
+
+        a.note_plan_save_failure("permission denied");
+
+        let after = a.messages.iter().rev().find(|m| m.role == Role::Tool).unwrap();
+        assert!(after.content.contains("could NOT be written"), "{}", after.content);
+        assert!(!after.content.contains("saved at"), "{}", after.content);
+        assert_eq!(after.tool_call_id.as_deref(), Some("call_1"), "still answers the call");
+    }
 }
-
-
-

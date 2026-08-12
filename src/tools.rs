@@ -57,6 +57,33 @@ pub const GLOB: &str = "glob";
 pub const EDIT_FILE: &str = "edit_file";
 pub const WEB_SEARCH: &str = "web_search";
 pub const DEPLOY_PROJECT: &str = "deploy_project";
+pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
+pub const PLAN_PROGRESS: &str = "plan_progress";
+
+/// Whether the model is allowed to change anything yet.
+///
+/// This is a *capability* switch, not an approval setting. `Plan` does not
+/// mean "ask more carefully" -- approval prompts already do that, and one
+/// mistaken `y` gets through them. It means the tools that write are not on
+/// the model's list at all, so there is nothing to mistakenly approve. The
+/// only way out is `exit_plan_mode`, which puts the plan itself in front of
+/// the user as the thing being approved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Every tool available, each write and command approved as it comes.
+    #[default]
+    Normal,
+    /// Read-only. Reads, listings, globs, searches and read-only commands
+    /// work as usual; anything that could change the project is refused
+    /// before it is ever offered for approval.
+    Plan,
+}
+
+impl Mode {
+    pub fn is_plan(self) -> bool {
+        self == Mode::Plan
+    }
+}
 
 /// Directories whose contents are build output or dependencies rather than the
 /// project. Walking them turns a `glob` into thousands of irrelevant results and
@@ -108,14 +135,20 @@ pub fn shell() -> (&'static str, &'static str) {
     }
 }
 
-/// The tools the model is offered.
+/// The tool list sent to the model, for the mode the session is in.
 ///
-/// `deploy` gates one of them rather than filtering afterwards: a schema the
+/// In `Mode::Plan` the writing tools are not filtered out at the approval
+/// layer, they are never advertised in the first place: a tool the model was
+/// never told about is one it cannot decide to call. `run_command` stays --
+/// research needs `git log`, `grep`, `cargo tree` -- and is narrowed to
+/// read-only commands by `plan_mode_block` instead.
+///
+/// `deploy` is the same idea for `[deploy] enabled = false`: a schema the
 /// model can see is one it will eventually call, and answering "that is turned
-/// off" is a worse experience than never offering it.
-pub fn schemas(deploy: bool) -> Vec<Value> {
+/// off" afterwards is a worse experience than never offering it.
+pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
     let (shell_name, shell_flag) = shell();
-    let mut out = vec![
+    let mut schemas = vec![
         json!({
             "type": "function",
             "function": {
@@ -290,43 +323,148 @@ pub fn schemas(deploy: bool) -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": DEPLOY_PROJECT,
+                "description":
+                    "Deploy this project to a hosting provider and get back the live URL. Detects \
+                     the framework, build command and output directory automatically, links or \
+                     creates the provider-side project, runs the build and uploads it. The user \
+                     approves before anything is deployed, and anything it needs along the way -- \
+                     installing the provider's CLI, signing in -- it asks the user for directly \
+                     as it goes. Request it on its own, never alongside other tool calls. On \
+                     failure the build log comes back with the error, so read it and fix the real \
+                     problem before retrying.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "enum": ["vercel", "netlify"],
+                            "description": "Which host to deploy to."
+                        },
+                        "production": {
+                            "type": "boolean",
+                            "description": "True for the live production URL, false (the default) for a throwaway preview. Only pass true when the user has asked for production."
+                        }
+                    },
+                    "required": ["provider"]
+                }
+            }
+        }),
     ];
 
-    if deploy {
-        out.push(
-            json!({
-                "type": "function",
-                "function": {
-                    "name": DEPLOY_PROJECT,
-                    "description":
-                        "Deploy this project to a hosting provider and get back the live URL. Detects \
-                         the framework, build command and output directory automatically, links or \
-                         creates the provider-side project, runs the build and uploads it. The user \
-                         approves before anything is deployed. If the provider's CLI is missing or \
-                         nobody is signed in, this returns a clear error and the user has to run \
-                         anything it needs -- installing the CLI, signing in -- it asks the user for \
-                         directly as it goes. On failure the build log comes back with the error, so \
-                         read it and fix the real problem before retrying.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "provider": {
-                                "type": "string",
-                                "enum": ["vercel", "netlify"],
-                                "description": "Which host to deploy to."
-                            },
-                            "production": {
-                                "type": "boolean",
-                                "description": "True for the live production URL, false (the default) for a throwaway preview. Only pass true when the user has asked for production."
-                            }
-                        },
-                        "required": ["provider"]
-                    }
-                }
-            }),
-        );
+    if !deploy {
+        schemas.retain(|schema| schema["function"]["name"] != DEPLOY_PROJECT);
     }
-    out
+    if mode.is_plan() {
+        schemas.retain(|schema| {
+            let name = schema["function"]["name"].as_str().unwrap_or_default();
+            // `deploy_project` belongs here with the writing tools. It changes
+            // nothing in the working directory, which is exactly why it would
+            // slip past a check that only looks at files -- but it builds the
+            // project and puts it on the public internet, which is the least
+            // reversible thing this program can do.
+            name != WRITE_FILE && name != EDIT_FILE && name != DEPLOY_PROJECT
+        });
+        schemas.push(json!({
+            "type": "function",
+            "function": {
+                "name": EXIT_PLAN_MODE,
+                "description":
+                    "Present your finished plan to the user and ask to start implementing it. \
+                     You are in plan mode: nothing you do can change the project until the user \
+                     approves a plan through this tool. Call it once you have investigated \
+                     enough to say concretely what you would change. If the user approves, the \
+                     plan is SAVED AS A FILE in the project, plan mode ends, and you implement \
+                     it step by step; if they decline, you stay in plan mode -- read their \
+                     reply, revise, and propose again. Because an approved plan becomes a file \
+                     that outlives this conversation and that other people will read, write it \
+                     for someone who was not here. Do not call this to ask a question or to \
+                     report that you are blocked; say that in text instead.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "A short name for the work, e.g. 'Rate limiting for \
+                                            the items API'. Becomes the filename and the \
+                                            heading, so make it specific -- 'Fixes' or 'Changes' \
+                                            is useless six weeks later."
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "The approach, in a few sentences of markdown. WHY \
+                                            this shape rather than another, and any decision \
+                                            the user would want to disagree with. Not a restatement \
+                                            of the steps."
+                        },
+                        "steps": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "The work, in order, one entry per step. Name the file \
+                                            each step touches. Keep each to something you can \
+                                            finish and verify in one go -- these get ticked off \
+                                            one at a time as you implement, and a step like \
+                                            'build the feature' can never be honestly ticked."
+                        },
+                        "not_doing": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Things deliberately left out, and why. Optional, but \
+                                            this is where the user most often disagrees, so it is \
+                                            worth stating."
+                        }
+                    },
+                    "required": ["title", "summary", "steps"]
+                }
+            }
+        }));
+    }
+
+    // Only alongside a plan that is actually being worked through. Offered
+    // unconditionally, it becomes a tool the model calls to look diligent
+    // about work no plan ever described.
+    if active_plan {
+        schemas.push(json!({
+            "type": "function",
+            "function": {
+                "name": PLAN_PROGRESS,
+                "description":
+                    "Record that a step of the approved plan is finished, or that it cannot be. \
+                     Call this immediately after the work for a step is done and verified -- not \
+                     in a batch at the end, and never before. This writes to the plan file, so \
+                     it is how the work survives the conversation: someone picking the plan up \
+                     tomorrow sees exactly where it got to. Marking a step done that you did not \
+                     actually finish makes the file lie.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "step": {
+                            "type": "integer",
+                            "description": "Which step, numbered from 1 as they appear in the plan."
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["done", "blocked"],
+                            "description": "'done' when it is finished and verified. 'blocked' \
+                                            when it cannot be finished -- say why in `note`, and \
+                                            tell the user rather than quietly moving on."
+                        },
+                        "note": {
+                            "type": "string",
+                            "description": "Required for 'blocked': what is in the way. Recorded \
+                                            in the plan file."
+                        }
+                    },
+                    "required": ["step", "status"]
+                }
+            }
+        }));
+    }
+
+    schemas
 }
 
 /// What the model is told about its situation.
@@ -334,7 +472,13 @@ pub fn schemas(deploy: bool) -> Vec<Value> {
 /// The operating system is stated outright because the single most common way
 /// this tool fails is a model reaching for `ls` on Windows. `tools_available`
 /// goes false once the step budget is spent.
-pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_available: bool) -> String {
+pub fn system_prompt(
+    workspace: &Workspace,
+    config: &ToolsConfig,
+    tools_available: bool,
+    mode: Mode,
+    active_plan: Option<&crate::plan::Plan>,
+) -> String {
     if !tools_available {
         return format!(
             "You are boxcode, a terminal coding assistant working in {}.\n\
@@ -361,15 +505,27 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
         _ => "xdg-open",
     };
 
-    format!(
+    // The writing tools are named only when they are actually on the model's
+    // list. Describing a tool that was not sent invites a call that comes back
+    // as an error, and spends a turn discovering what the prompt could have
+    // said outright.
+    let write_tools = if mode.is_plan() {
+        String::new()
+    } else {
+        format!(
+            "- {WRITE_FILE}(path, content): create a file, or overwrite one, with new content.\n\
+             - {EDIT_FILE}(path, old_string, new_string, replace_all): replace an exact span of \
+             text in an existing file, leaving the rest untouched.\n"
+        )
+    };
+
+    let mut prompt = format!(
         "You are boxcode, a terminal coding assistant.\n\n\
          Working directory: {}\n\
          Operating system: {os} — shell commands run through `{shell_name} {shell_flag}`\n\n\
          Tools:\n\
          - {READ_FILE}(path): read a file's contents.\n\
-         - {WRITE_FILE}(path, content): create a file, or overwrite one, with new content.\n\
-         - {EDIT_FILE}(path, old_string, new_string, replace_all): replace an exact span of \
-           text in an existing file, leaving the rest untouched.\n\
+         {write_tools}\
          - {LIST_DIR}(path): list one directory. Read-only, runs without asking.\n\
          - {GLOB}(pattern): find files by path pattern, e.g. 'src/**/*.rs'. Read-only, runs \
            without asking.\n\
@@ -430,7 +586,83 @@ pub fn system_prompt(workspace: &Workspace, config: &ToolsConfig, tools_availabl
          - Answers appear in a terminal: keep narration to a sentence or two, not a report.",
         workspace.root().display(),
         config.command_timeout_secs,
-    )
+    );
+
+    if mode.is_plan() {
+        prompt.push_str(&format!(
+            "\n\nPLAN MODE — you cannot change anything yet.\n\
+             The user turned this on to think a change through before any of it happens. \
+             {WRITE_FILE} and {EDIT_FILE} are not available to you, and {RUN_COMMAND} will \
+             only run commands that cannot change anything (`ls`, `cat`, `grep`, \
+             `git status`/`diff`/`log`/`show`, and similar). Anything else is refused \
+             outright rather than shown to the user for approval.\n\
+             - Investigate first. Read the real files, list the real directories, run the \
+               real read-only commands. A plan written from a guess about what the code \
+               looks like is worth nothing.\n\
+             - Do not attempt a write, an install, a build, or a test run to \"check\" \
+               something. It will be refused, and the refusal costs a turn. If you need one \
+               to be sure, say so in the plan as a step rather than trying it.\n\
+             - When you know what you would do, call {EXIT_PLAN_MODE} with the plan. Name \
+               the files that change and what happens to each. The user reads this and \
+               decides, so write it for them, not as a note to yourself.\n\
+             - If they decline, you are still in plan mode. Read what they said, revise, and \
+               propose again -- do not repeat the same plan."
+        ));
+    }
+
+    // The plan is restated in full on every request, with each step's current
+    // state, rather than left to survive in the conversation. Two reasons: a
+    // long implementation eventually pushes the original proposal out of the
+    // window, and a plan resumed in a fresh session was never in this
+    // conversation at all.
+    if let Some(plan) = active_plan.filter(|p| !p.is_finished()) {
+        let (done, total) = plan.progress();
+        let steps: String = plan
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mark = if s.done { "[x]" } else { "[ ]" };
+                match &s.blocked {
+                    Some(why) => format!("{mark} {}. {} (blocked: {why})\n", i + 1, s.description),
+                    None => format!("{mark} {}. {}\n", i + 1, s.description),
+                }
+            })
+            .collect();
+        let not_doing = if plan.not_doing.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nExplicitly out of scope for this plan:\n{}",
+                plan.not_doing
+                    .iter()
+                    .map(|n| format!("- {n}\n"))
+                    .collect::<String>()
+            )
+        };
+
+        prompt.push_str(&format!(
+            "\n\nYOU ARE IMPLEMENTING AN APPROVED PLAN — {done}/{total} steps done.\n\
+             The user read this and agreed to it. It is saved at {}, and that file is updated as \
+             you go, so it is also what anyone picking this up later will work from.\n\n\
+             {}\n\n{steps}{not_doing}\n\
+             - Work the unticked steps in order, starting from the first one. Do not skip ahead, \
+               and do not start over on steps already ticked.\n\
+             - Call {PLAN_PROGRESS} the moment a step is genuinely finished AND verified -- one \
+               call per step, as you go. Never mark a step done you did not do; the file is what \
+               someone else will trust.\n\
+             - If a step turns out to be wrong, impossible, or already done, do NOT quietly \
+               change course. Mark it blocked with {PLAN_PROGRESS} and say so, or tell the user \
+               the plan needs revising.\n\
+             - Work beyond the plan needs asking first. The user approved this scope, not a \
+               direction.\n\
+             - When every step is ticked, say so plainly and stop.",
+            plan.path.display(),
+            plan.title,
+        ));
+    }
+
+    prompt
 }
 
 #[derive(Deserialize)]
@@ -487,6 +719,25 @@ struct DeployArgs {
     production: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct ExitPlanModeArgs {
+    title: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    steps: Vec<String>,
+    #[serde(default)]
+    not_doing: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PlanProgressArgs {
+    step: usize,
+    status: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
 /// Bounds on how many results a single search may ask for. Below `MIN` a
 /// search would be pointless; above `MAX` it is a good way to fill the
 /// context window with snippets nobody reads.
@@ -519,6 +770,29 @@ pub enum Action {
         /// line would be a filesystem read per redraw.
         summary: Option<String>,
     },
+    /// `exit_plan_mode`: the one action that changes nothing on disk *yet* and
+    /// is still always worth stopping for. Approving it hands the writing
+    /// tools back and saves the plan as a file, so it is two consequential
+    /// things at once. Resolved entirely in `app.rs` -- it never reaches the
+    /// runner.
+    Plan(Proposal),
+    /// `plan_progress`: bookkeeping against a plan the user already approved.
+    /// Also resolved in `app.rs`, since it edits the live plan.
+    Progress { step: usize, done: bool, note: Option<String> },
+}
+
+/// A plan as the model proposes it, before the user has agreed to anything.
+///
+/// Deliberately not a `plan::Plan`: that type is what lives on disk and
+/// carries dates, a base commit and per-step progress, none of which a
+/// proposal has any business inventing. The conversion happens at exactly one
+/// place -- the moment of approval.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Proposal {
+    pub title: String,
+    pub summary: String,
+    pub steps: Vec<String>,
+    pub not_doing: Vec<String>,
 }
 
 impl Action {
@@ -538,6 +812,10 @@ impl Action {
                 "🚀 deploy → {provider} ({})",
                 if *production { "Production" } else { "Preview" }
             ),
+            Action::Plan(p) => format!("📋 plan: {}", p.title),
+            Action::Progress { step, done, .. } => {
+                format!("{} step {step}", if *done { "☑" } else { "☐" })
+            }
         }
     }
 }
@@ -565,6 +843,57 @@ pub fn action_risk(action: &Action, workspace_root: &Path) -> danger::Risk {
         // Reads and writes are already confined to the workspace by
         // `resolve_in_workspace`, and cannot invoke a shell.
         _ => danger::Risk::Normal,
+    }
+}
+
+/// Why `action` cannot happen in plan mode, or `None` if it can.
+///
+/// Reads, listings, globs and web searches change nothing, so plan mode has
+/// no reason to touch them -- the point is to make research cheap, not to make
+/// the session useless. `run_command` is judged by the same `is_read_only`
+/// allowlist the approval layer already trusts, which is deliberately
+/// conservative: a command it cannot vouch for is refused rather than guessed
+/// about, since the whole promise of this mode is that nothing changes.
+///
+/// The messages are addressed to the model, not the user. Each says what to do
+/// instead, because a refusal that only says "no" gets retried.
+pub fn plan_mode_block(action: &Action) -> Option<String> {
+    match action {
+        Action::Read { .. }
+        | Action::List { .. }
+        | Action::Glob { .. }
+        | Action::Search { .. }
+        | Action::Plan(_)
+        // Cannot arise in plan mode -- there is no approved plan to record
+        // against -- but listing it keeps this match exhaustive by intent
+        // rather than by a catch-all arm that would silently allow the next
+        // writing tool somebody adds.
+        | Action::Progress { .. } => None,
+        Action::Command { command, .. } if is_read_only(command) => None,
+        Action::Write { path, .. } => Some(format!(
+            "Plan mode is read-only, so nothing was written to {path}. Describe this file and \
+             what it should contain in your plan, then call {EXIT_PLAN_MODE}."
+        )),
+        Action::Edit { path, .. } => Some(format!(
+            "Plan mode is read-only, so {path} was not changed. Describe the change in your \
+             plan, then call {EXIT_PLAN_MODE}."
+        )),
+        Action::Command { command, .. } => Some(format!(
+            "Plan mode only runs commands that cannot change anything, and `{}` is not one of \
+             them, so it was not run. Read files with {READ_FILE} and explore with \
+             {LIST_DIR}/{GLOB} instead. If this command is part of the work, make it a step in \
+             your plan and call {EXIT_PLAN_MODE}.",
+            clip(command, 60)
+        )),
+        // Nothing in the working directory changes, which is exactly why this
+        // one needs saying explicitly -- a check that only thinks about files
+        // would wave it through, and it puts the project on the public
+        // internet.
+        Action::Deploy { provider, .. } => Some(format!(
+            "Plan mode changes nothing, and deploying to {provider} would put this project on \
+             the internet, so it was not run. Make the deployment a step in your plan and call \
+             {EXIT_PLAN_MODE}."
+        )),
     }
 }
 
@@ -644,6 +973,50 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
                 provider,
                 production: args.production.unwrap_or(false),
                 summary: None,
+            })
+        }
+        EXIT_PLAN_MODE => {
+            let args: ExitPlanModeArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let title = args.title.trim().to_string();
+            let summary = args.summary.trim().to_string();
+            let steps: Vec<String> = args
+                .steps
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            // A plan with no title, or with nothing to do, is not a plan.
+            // Falling through to `None` reports the unusable arguments back to
+            // the model, which beats asking the user to approve a blank box.
+            if title.is_empty() || steps.is_empty() {
+                return None;
+            }
+            Some(Action::Plan(Proposal {
+                title,
+                summary,
+                steps,
+                not_doing: args
+                    .not_doing
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            }))
+        }
+        PLAN_PROGRESS => {
+            let args: PlanProgressArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let done = match args.status.trim().to_ascii_lowercase().as_str() {
+                "done" => true,
+                "blocked" => false,
+                // Anything else is a guess about what the model meant, and
+                // guessing wrong writes a false claim into a file the user
+                // will trust later.
+                _ => return None,
+            };
+            Some(Action::Progress {
+                step: args.step,
+                done,
+                note: args.note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
             })
         }
         _ => None,
@@ -754,6 +1127,25 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         EDIT_FILE => execute_edit_file(call, workspace),
         WEB_SEARCH => execute_web_search(call, config).await,
         DEPLOY_PROJECT => execute_deploy_project(call, workspace).await,
+        // Never reached: `app::advance_approvals` resolves this one itself,
+        // because accepting it changes `App`'s mode and the runner has no
+        // access to `App`. Handled anyway so a routing mistake produces a
+        // sentence the model can act on rather than "unknown tool", which
+        // would send it hunting for a tool it just correctly used.
+        EXIT_PLAN_MODE => outcome(
+            &call.id,
+            "📋 plan — not handled".to_string(),
+            "Error: the plan did not reach the user. Say what you were going to propose in \
+             plain text instead."
+                .to_string(),
+        ),
+        PLAN_PROGRESS => outcome(
+            &call.id,
+            "☐ progress — not handled".to_string(),
+            "Error: that step was not recorded. Carry on with the work and tell the user which \
+             steps you have finished."
+                .to_string(),
+        ),
         other => outcome(
             &call.id,
             format!("⚙ {other} — unknown tool"),
@@ -1595,6 +1987,116 @@ pub fn refused_as_dangerous(call: &ToolCall, reason: &str) -> ToolOutcome {
     )
 }
 
+/// The result for a call plan mode would not let through.
+///
+/// Deliberately milder in tone than `refused_as_dangerous`: nothing is wrong
+/// with what the model asked for, it is just not this part of the session's
+/// job. `reason` (from `plan_mode_block`) already says what to do instead.
+pub fn refused_in_plan_mode(call: &ToolCall, reason: &str) -> ToolOutcome {
+    let label = describe_action(call)
+        .map(|a| a.label())
+        .unwrap_or_else(|| call.function.name.clone());
+    outcome(
+        &call.id,
+        format!("📋 {} — not in plan mode", clip(&label, 60)),
+        reason.to_string(),
+    )
+}
+
+/// The result of the user accepting a plan. Says outright that the writing
+/// tools are back, so the next turn does not open by asking permission it has
+/// already been given.
+pub fn plan_approved(call: &ToolCall, saved_to: &str, steps: usize) -> ToolOutcome {
+    outcome(
+        &call.id,
+        format!("📋 plan approved — saved to {saved_to}"),
+        format!(
+            "The user approved the plan, and it is now saved at {saved_to}. Plan mode is over: \
+             {WRITE_FILE}, {EDIT_FILE} and the full {RUN_COMMAND} are available again, each \
+             still subject to the usual approval prompt.\n\
+             Start on step 1 now -- do not restate the plan or ask whether to begin. Call \
+             {PLAN_PROGRESS} as you finish each of the {steps} steps, so the file keeps up with \
+             the work."
+        ),
+    )
+}
+
+/// What the model should have been told, when the plan file could not be
+/// written after all.
+///
+/// The approval outcome is pushed the moment the user says yes, and the write
+/// is attempted by `main.rs` a moment later -- so a failure arrives after the
+/// model has already been told "saved to ...". This replaces that claim (see
+/// `App::note_plan_save_failure`), which is safe because nothing has gone on
+/// the wire yet.
+///
+/// A failure of the *save*, not of the approval: the user said yes, plan mode
+/// has ended, and the work should go ahead. Losing the file is bad, but it is
+/// not a reason to refuse what was agreed.
+pub fn plan_save_failed(reason: &str) -> String {
+    format!(
+        "The user approved the plan, so go ahead and implement it. The plan file could NOT be \
+         written ({reason}), so nothing said earlier about it being saved holds -- there is no \
+         file, and progress cannot be recorded. Do not call {PLAN_PROGRESS}. Tell the user the \
+         plan could not be saved, once, then get on with the work."
+    )
+}
+
+/// The result of recording a step.
+pub fn progress_recorded(
+    call: &ToolCall,
+    description: &str,
+    done: bool,
+    remaining: usize,
+    saved_to: &str,
+) -> ToolOutcome {
+    let display = if done {
+        format!("☑ {}", clip(description, 60))
+    } else {
+        format!("☐ {} — blocked", clip(description, 50))
+    };
+    let next = if remaining == 0 {
+        "That was the last step. Tell the user the plan is complete, and stop.".to_string()
+    } else {
+        format!(
+            "{remaining} step{} still to do. Carry straight on with the next unticked one.",
+            if remaining == 1 { "" } else { "s" }
+        )
+    };
+    outcome(
+        &call.id,
+        display,
+        format!("Recorded in {saved_to}. {next}"),
+    )
+}
+
+/// The result of a step number that does not exist, or a plan that is no
+/// longer active. Both are the model's mistake to correct, not the user's.
+pub fn progress_failed(call: &ToolCall, reason: &str) -> ToolOutcome {
+    outcome(
+        &call.id,
+        "☐ progress — not recorded".to_string(),
+        format!("Error: {reason}"),
+    )
+}
+
+/// The result of the user rejecting a plan. The session stays in plan mode,
+/// and the model is told so explicitly -- otherwise its next move is a write
+/// that gets refused.
+pub fn plan_declined(call: &ToolCall) -> ToolOutcome {
+    outcome(
+        &call.id,
+        "📋 plan declined — still planning".to_string(),
+        format!(
+            "The user did not approve this plan. You are still in plan mode and still cannot \
+             change anything. They will usually say what was wrong with it: read that, \
+             investigate further if you need to, and propose a revised plan with \
+             {EXIT_PLAN_MODE}. Do not send the same plan again, and do not attempt to \
+             implement it."
+        ),
+    )
+}
+
 /// The result for a call abandoned before any decision was made.
 pub fn unanswered(call: &ToolCall, reason: &str) -> ToolOutcome {
     let label = describe_action(call)
@@ -2157,7 +2659,7 @@ mod tests {
     #[test]
     fn the_system_prompt_names_the_platform_and_the_shell() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true);
+        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
 
         assert!(prompt.contains(std::env::consts::OS), "{prompt}");
         assert!(prompt.contains(shell().0), "{prompt}");
@@ -2168,7 +2670,7 @@ mod tests {
             assert!(prompt.contains("Unix-like"), "{prompt}");
         }
 
-        let exhausted = system_prompt(&ws, &cfg, false);
+        let exhausted = system_prompt(&ws, &cfg, false, Mode::Normal, None);
         assert!(exhausted.contains("Answer the user now"), "{exhausted}");
     }
 
@@ -2179,7 +2681,7 @@ mod tests {
     #[test]
     fn the_system_prompt_requires_narration_before_and_after_tool_use() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true);
+        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
 
         assert!(prompt.contains("Before acting"), "{prompt}");
         assert!(prompt.contains("After tool results come back"), "{prompt}");
@@ -2198,7 +2700,7 @@ mod tests {
     #[test]
     fn the_system_prompt_asks_for_multiple_calls_in_one_turn_rather_than_one_narrated_turn_each() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true);
+        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
 
         assert!(prompt.contains("request all of them in the same turn"), "{prompt}");
         assert!(
@@ -2213,7 +2715,7 @@ mod tests {
     #[test]
     fn the_system_prompt_requires_verifying_work_before_declaring_success() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true);
+        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
 
         assert!(prompt.contains("Verify before declaring success"), "{prompt}");
         assert!(
@@ -2234,7 +2736,7 @@ mod tests {
     #[test]
     fn the_system_prompt_offers_to_open_viewable_output_without_skipping_approval() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true);
+        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
 
         assert!(
             prompt.contains("offer to open it with"),
@@ -2251,19 +2753,36 @@ mod tests {
     /// turned off" is a worse experience than never offering it.
     #[test]
     fn disabling_deployment_withholds_the_schema_entirely() {
-        let names: Vec<String> = schemas(false)
+        let names: Vec<String> = schemas(Mode::Normal, false, false)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
             .collect();
         assert!(!names.iter().any(|n| n == DEPLOY_PROJECT), "{names:?}");
         // ...and the rest are untouched.
         assert!(names.iter().any(|n| n == RUN_COMMAND), "{names:?}");
-        assert_eq!(names.len(), schemas(true).len() - 1);
+        assert_eq!(names.len(), schemas(Mode::Normal, false, true).len() - 1);
+    }
+
+    /// The two gates are independent and must compose: plan mode withholds
+    /// deployment because it is the least reversible thing here, and
+    /// `enabled = false` withholds it because the user turned it off. Neither
+    /// may accidentally re-admit it when the other is inactive.
+    #[test]
+    fn the_deploy_gates_compose() {
+        let has_deploy = |mode, deploy| {
+            schemas(mode, false, deploy)
+                .iter()
+                .any(|s| s["function"]["name"] == DEPLOY_PROJECT)
+        };
+        assert!(has_deploy(Mode::Normal, true), "the ordinary case offers it");
+        assert!(!has_deploy(Mode::Normal, false), "turned off in config");
+        assert!(!has_deploy(Mode::Plan, true), "plan mode changes nothing");
+        assert!(!has_deploy(Mode::Plan, false), "both at once");
     }
 
     #[test]
     fn the_schemas_name_exactly_the_tools_that_execute() {
-        let schemas = schemas(true);
+        let schemas = schemas(Mode::Normal, false, true);
         let names: Vec<_> = schemas.iter().map(|s| s["function"]["name"].clone()).collect();
         assert_eq!(
             names,
@@ -2389,7 +2908,7 @@ mod tests {
     /// `/deploy`, where the user types them into a masked field.
     #[test]
     fn the_deploy_schema_gives_the_model_no_way_to_pass_a_secret() {
-        let schema = schemas(true)
+        let schema = schemas(Mode::Normal, false, true)
             .into_iter()
             .find(|s| s["function"]["name"] == DEPLOY_PROJECT)
             .expect("the deploy schema");
@@ -2401,13 +2920,241 @@ mod tests {
     #[test]
     fn the_system_prompt_tells_the_model_when_and_when_not_to_deploy() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true);
+        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
         assert!(prompt.contains(DEPLOY_PROJECT), "{prompt}");
         assert!(prompt.contains("public internet"), "{prompt}");
         assert!(prompt.contains("Default to a preview"), "{prompt}");
         // It should just call it: the flow asks the user for whatever it needs.
         assert!(prompt.contains("it asks the user for directly"), "{prompt}");
         assert!(prompt.contains("never alongside other tool calls"), "{prompt}");
+    }
+
+    // ---- plan mode ---------------------------------------------------------
+
+    /// The strongest form the guarantee takes: in plan mode the writing tools
+    /// are not on the model's list at all, so there is no call to refuse and
+    /// no prompt to mistakenly accept.
+    #[test]
+    fn plan_mode_withholds_the_writing_tools_and_offers_the_way_out() {
+        let names: Vec<String> = schemas(Mode::Plan, false, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+
+        assert!(!names.contains(&WRITE_FILE.to_string()), "{names:?}");
+        assert!(!names.contains(&EDIT_FILE.to_string()), "{names:?}");
+        assert!(names.contains(&EXIT_PLAN_MODE.to_string()), "{names:?}");
+
+        // Research is the whole point of the mode, so everything it needs
+        // stays. `run_command` included -- narrowed to read-only commands by
+        // `plan_mode_block`, not withheld.
+        for tool in [RUN_COMMAND, READ_FILE, LIST_DIR, GLOB, WEB_SEARCH] {
+            assert!(names.contains(&tool.to_string()), "{tool} missing: {names:?}");
+        }
+    }
+
+    /// Deploying changes nothing in the working directory, which is exactly
+    /// how it would slip past a plan-mode check that only thinks about files
+    /// -- and it puts the project on the public internet, which is the least
+    /// reversible thing this program does.
+    #[test]
+    fn plan_mode_withholds_and_refuses_deployment() {
+        let names: Vec<String> = schemas(Mode::Plan, false, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!names.contains(&DEPLOY_PROJECT.to_string()), "{names:?}");
+
+        // And refused by the second layer too, in case one ever arrives anyway.
+        let action = Action::Deploy {
+            provider: "vercel".to_string(),
+            production: false,
+            summary: None,
+        };
+        let reason = plan_mode_block(&action).expect("must not be allowed in plan mode");
+        assert!(reason.contains(EXIT_PLAN_MODE), "{reason}");
+    }
+
+    /// The inverse: `exit_plan_mode` must not be advertised when there is no
+    /// plan mode to exit, or the model will call it to announce intentions
+    /// nobody asked to approve.
+    #[test]
+    fn normal_mode_does_not_offer_exit_plan_mode() {
+        let names: Vec<String> = schemas(Mode::Normal, false, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!names.contains(&EXIT_PLAN_MODE.to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn plan_mode_blocks_writes_and_non_read_only_commands_only() {
+        let allowed = [
+            Action::Read { path: "src/main.rs".into() },
+            Action::List { path: ".".into() },
+            Action::Glob { pattern: "**/*.rs".into() },
+            Action::Search { query: "rust".into(), max_results: 3 },
+            Action::Plan(Proposal {
+                title: "A plan".into(),
+                summary: String::new(),
+                steps: vec!["do it".into()],
+                not_doing: Vec::new(),
+            }),
+            Action::Command { command: "git log".into(), purpose: None },
+            Action::Command { command: "grep -rn TODO src".into(), purpose: None },
+        ];
+        for action in allowed {
+            assert!(
+                plan_mode_block(&action).is_none(),
+                "{action:?} changes nothing and must stay available"
+            );
+        }
+
+        let refused = [
+            Action::Write { path: "a.py".into(), content: String::new() },
+            Action::Edit {
+                path: "a.py".into(),
+                old: "a".into(),
+                new: "b".into(),
+                replace_all: false,
+            },
+            Action::Command { command: "cargo build".into(), purpose: None },
+            Action::Command { command: "rm -rf build".into(), purpose: None },
+            // A read-only prefix chained into something else is not read-only.
+            Action::Command { command: "cat a && rm b".into(), purpose: None },
+        ];
+        for action in refused {
+            let reason = plan_mode_block(&action)
+                .unwrap_or_else(|| panic!("{action:?} must not be allowed in plan mode"));
+            // Every refusal has to say what to do instead, or the model just
+            // retries it worded differently.
+            assert!(
+                reason.contains(EXIT_PLAN_MODE),
+                "{action:?} refusal gives no way forward: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_mode_prompt_says_what_is_unavailable_and_how_to_get_out() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, true, Mode::Plan, None);
+
+        assert!(prompt.contains("PLAN MODE"), "{prompt}");
+        assert!(prompt.contains(EXIT_PLAN_MODE), "{prompt}");
+        // A tool that was not sent must not be described as available: the
+        // call would come back as an error and cost a turn to discover.
+        assert!(
+            !prompt.contains(&format!("{WRITE_FILE}(path, content)")),
+            "the prompt still advertises write_file: {prompt}"
+        );
+        assert!(
+            !prompt.contains(&format!("{EDIT_FILE}(path,")),
+            "the prompt still advertises edit_file: {prompt}"
+        );
+    }
+
+    /// A plan with no title or no steps cannot be saved as a useful file and
+    /// cannot be worked through, so it is not something to put in front of the
+    /// user -- the unusable-arguments path tells the model instead.
+    #[test]
+    fn a_plan_without_a_title_or_steps_is_not_something_to_approve() {
+        for args in [
+            json!({ "title": "   ", "summary": "s", "steps": ["a"] }),
+            json!({ "title": "Real title", "summary": "s", "steps": [] }),
+            json!({ "title": "Real title", "summary": "s", "steps": ["  ", ""] }),
+        ] {
+            let call = tool_call(EXIT_PLAN_MODE, args.clone());
+            assert_eq!(describe_action(&call), None, "{args}");
+        }
+    }
+
+    #[test]
+    fn a_plan_proposal_keeps_its_structure() {
+        let call = tool_call(
+            EXIT_PLAN_MODE,
+            json!({
+                "title": "Rate limiting",
+                "summary": "Fixed window.",
+                "steps": ["Add the limiter", "  Wrap the router  ", ""],
+                "not_doing": ["Distributed limiting", "  "],
+            }),
+        );
+        match describe_action(&call) {
+            Some(Action::Plan(p)) => {
+                assert_eq!(p.title, "Rate limiting");
+                assert_eq!(p.steps, vec!["Add the limiter", "Wrap the router"]);
+                assert_eq!(p.not_doing, vec!["Distributed limiting"]);
+            }
+            other => panic!("expected a plan, got {other:?}"),
+        }
+    }
+
+    /// `plan_progress` is only offered when there is a plan to record against.
+    #[test]
+    fn plan_progress_is_offered_only_alongside_an_active_plan() {
+        let without: Vec<String> = schemas(Mode::Normal, false, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!without.contains(&PLAN_PROGRESS.to_string()), "{without:?}");
+
+        let with: Vec<String> = schemas(Mode::Normal, true, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(with.contains(&PLAN_PROGRESS.to_string()), "{with:?}");
+    }
+
+    /// A status that is neither done nor blocked is a guess about what the
+    /// model meant, and guessing wrong writes a false claim into a file the
+    /// user will trust later.
+    #[test]
+    fn an_unrecognised_progress_status_is_refused_rather_than_guessed() {
+        let call = tool_call(PLAN_PROGRESS, json!({ "step": 1, "status": "partially" }));
+        assert_eq!(describe_action(&call), None);
+
+        let good = tool_call(PLAN_PROGRESS, json!({ "step": 2, "status": "done" }));
+        assert_eq!(
+            describe_action(&good),
+            Some(Action::Progress { step: 2, done: true, note: None })
+        );
+    }
+
+    /// The plan is restated on every request, with live step state, because a
+    /// long implementation pushes the original proposal out of the context
+    /// window and a resumed plan was never in the conversation at all.
+    #[test]
+    fn an_active_plan_is_restated_in_the_prompt_with_its_progress() {
+        let (_dir, ws, cfg) = fixture();
+        let mut plan = crate::plan::Plan {
+            title: "Rate limiting".to_string(),
+            summary: "Fixed window.".to_string(),
+            steps: vec![
+                crate::plan::Step::new("Add the limiter"),
+                crate::plan::Step::new("Wrap the router"),
+            ],
+            not_doing: vec!["Distributed limiting".to_string()],
+            created: "2026-08-11".to_string(),
+            updated: "2026-08-11".to_string(),
+            base_commit: None,
+            model: "m".to_string(),
+            path: std::path::PathBuf::from("/tmp/project/plan.md"),
+        };
+        plan.mark(1, true, None).unwrap();
+
+        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, Some(&plan));
+        assert!(prompt.contains("1/2 steps done"), "{prompt}");
+        assert!(prompt.contains("[x] 1. Add the limiter"), "{prompt}");
+        assert!(prompt.contains("[ ] 2. Wrap the router"), "{prompt}");
+        assert!(prompt.contains("Distributed limiting"), "{prompt}");
+        assert!(prompt.contains(PLAN_PROGRESS), "{prompt}");
+
+        // A finished plan is not restated: there is nothing left to follow,
+        // and repeating it invites the model to redo work.
+        plan.mark(2, true, None).unwrap();
+        let done = system_prompt(&ws, &cfg, true, Mode::Normal, Some(&plan));
+        assert!(!done.contains("IMPLEMENTING AN APPROVED PLAN"), "{done}");
     }
 
     #[test]

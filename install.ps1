@@ -402,7 +402,45 @@ function Main {
         }
     }
 
-    Install-Ddgs
+    # TEMPORARILY DISABLED -- the web_search Python/`ddgs` bootstrap.
+    #
+    # On a Windows machine with no Python this step can take the whole
+    # install down with it, rather than costing only web_search -- and it does
+    # so *after* the binary is in place and on PATH, which is the worst
+    # possible moment to stop.
+    #
+    # Install-EmbeddedPython guards the two failures you would expect: the
+    # download is in a try/catch and `tar` is checked via $LASTEXITCODE, both
+    # returning $false. What is not guarded is everything else, and
+    # `$ErrorActionPreference = 'Stop'` at the top of this file makes any one
+    # of them terminating -- the `Move-Item` of the extracted tree, and the
+    # two `New-Item` directory creations, all run bare. So an archive that
+    # does not contain a top-level `python` directory, or a directory that
+    # cannot be created, throws instead of returning, and the throw is not
+    # caught anywhere between there and Main.
+    #
+    # Disabled at the call site rather than fixed in place because those are
+    # the failures we can name, on a platform we cannot reproduce here, and an
+    # install that stops working is a worse bug than a missing feature.
+    #
+    # Nothing is deleted. Install-Ddgs, Install-EmbeddedPython,
+    # Get-PythonStandaloneTarget and Test-IsAppExecutionAliasStub are all
+    # still defined above and still exercised by tests/install_ps1_test.ps1,
+    # which dot-sources this file and calls them directly. Only this one call
+    # site is off, so restoring the feature is uncommenting one line.
+    #
+    # The accepted trade-off: web_search does not work on a fresh Windows
+    # install until the user runs `pip install ddgs` themselves. That path
+    # already fails legibly rather than obscurely -- execute_web_search in
+    # tools.rs reports that Python 3 with `ddgs` is required and tells the
+    # model to say so plainly instead of retrying.
+    #
+    # install.sh is deliberately untouched. It runs under `set -e` too, but
+    # every risky call in ensure_ddgs_available is either `|| true`'d or sits
+    # in an `if`/`elif` condition, which suspends errexit -- so on macOS/Linux
+    # a failure there really does degrade to "no web_search" instead of
+    # aborting. Unix installs keep the feature.
+    # Install-Ddgs
 
     $version = (& $installedAt --version 2>$null)
     Send-InstallPing -Version $version
