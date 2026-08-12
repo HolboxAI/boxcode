@@ -1905,14 +1905,17 @@ impl App {
     /// The finished lines of the in-flight reply that have not been printed yet.
     ///
     /// Only whole lines: the last one is still being written, and printing it
-    /// would mean printing it again, longer, on the next frame.
+    /// would mean printing it again, longer, on the next frame. And only whole
+    /// *blocks* -- see `safe_flush_end`.
     pub fn streamed_ready(&self) -> Option<&str> {
         if self.state != AppState::Streaming {
             return None;
         }
-        let rest = self.streaming_response.get(self.stream_printed..)?;
-        let end = rest.rfind('\n')? + 1;
-        Some(&rest[..end])
+        let safe = safe_flush_end(&self.streaming_response);
+        if safe <= self.stream_printed {
+            return None;
+        }
+        self.streaming_response.get(self.stream_printed..safe)
     }
 
     pub fn drainable(&self) -> &[Message] {
@@ -2855,6 +2858,58 @@ impl App {
         self.overlay_input.clear();
         self.overlay_cursor = 0;
     }
+}
+
+/// How much of the reply so far can be printed to the scrollback without
+/// cutting a construct that only means anything whole.
+///
+/// The flush loop prints completed lines the moment they arrive, which is what
+/// makes a long answer scroll like ordinary terminal output instead of being
+/// squeezed into the strip at the bottom. That is right for prose and wrong
+/// for anything spanning several lines. A markdown table is the case that
+/// exposed it: its header row was printed on its own, before the alignment row
+/// under it had even been generated, so the renderer never saw the two
+/// together and drew raw pipes -- every time, for every table. A fenced code
+/// block has the same shape of bug, since the opening fence sets a flag that
+/// the next flush, a separate call, no longer has.
+///
+/// So anything that might still be growing is held back: an unclosed fence,
+/// and any trailing run of lines containing a pipe. Nothing is lost by
+/// waiting -- the held text is printed as soon as the block finishes, or by
+/// `finish_stream` at the end of the turn, and the live viewport renders the
+/// whole unprinted tail meanwhile, so the table is on screen either way.
+fn safe_flush_end(text: &str) -> usize {
+    let mut offset = 0usize;
+    let mut safe = 0usize;
+    let mut in_fence = false;
+
+    for line in text.split_inclusive('\n') {
+        // A half-written line is never printed; the rest of the reply is
+        // behind it, so there is nothing further to consider either.
+        if !line.ends_with('\n') {
+            break;
+        }
+        let trimmed = line.trim();
+        offset += line.len();
+
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            // Safe again only once the fence has closed, taking the whole
+            // block with it.
+            if !in_fence {
+                safe = offset;
+            }
+            continue;
+        }
+        // A pipe may be a table still being written. It may equally be prose
+        // about a shell pipeline, in which case holding it costs one frame of
+        // latency and nothing else.
+        if in_fence || trimmed.contains('|') {
+            continue;
+        }
+        safe = offset;
+    }
+    safe
 }
 
 /// Markers that mean "what follows is a tool call the model wrote as prose".
@@ -3882,6 +3937,95 @@ mod tests {
         for c in s.chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
+    }
+
+    // ---- streaming a multi-line block ------------------------------------------
+
+    /// Drive the flush loop the way `main.rs` does and collect every row that
+    /// would reach the terminal, streamed rows first and the finished message
+    /// after -- which is where anything held back lands.
+    fn streamed_screen(reply: &str, width: usize) -> Vec<String> {
+        let mut app = App::new(Config::default());
+        app.state = AppState::Streaming;
+        let mut screen = Vec::new();
+        let render = |line: &ratatui::text::Line<'static>| -> String {
+            line.spans.iter().map(|s| s.content.to_string()).collect()
+        };
+
+        for token in reply.split_inclusive('\n') {
+            app.append_token(token);
+            if let Some(ready) = app.streamed_ready() {
+                let text = ready.to_string();
+                let body = text.strip_suffix('\n').unwrap_or(&text);
+                screen.extend(crate::ui::wrapped_lines(body, width).iter().map(render));
+                app.stream_printed += text.len();
+            }
+        }
+        app.finish_stream();
+        for message in app.drainable() {
+            screen.extend(crate::ui::message_lines(message, width).iter().map(render));
+        }
+        screen
+    }
+
+    /// The bug this exists for: the flush loop printed each completed line the
+    /// moment it arrived, so a table's header row went out before its
+    /// alignment row had even been generated. The renderer never saw the two
+    /// together, and every table in every reply came out as raw pipes.
+    #[test]
+    fn a_table_that_arrives_a_line_at_a_time_still_renders_as_a_table() {
+        let screen = streamed_screen(
+            "Here:\n\n| Command | Cost |\n|---------|-----:|\n| `/new` | 0 |\n\nDone.\n",
+            72,
+        );
+        let joined = screen.join("\n");
+
+        assert!(joined.contains('┌') && joined.contains('┘'), "no table drawn:\n{joined}");
+        assert!(!joined.contains("|-----"), "alignment row was printed:\n{joined}");
+        assert!(joined.contains("Command") && joined.contains("Done."), "{joined}");
+    }
+
+    /// Same shape of bug: the opening fence sets a flag that the next flush --
+    /// a separate call into the renderer -- no longer has, so the code inside
+    /// was drawn as prose and the fences themselves vanished.
+    #[test]
+    fn a_fenced_block_that_arrives_a_line_at_a_time_stays_a_block() {
+        let screen = streamed_screen("Run:\n\n```bash\n- npm run build\n```\n\nThen deploy.\n", 72);
+        let joined = screen.join("\n");
+
+        assert!(joined.contains("npm run build"), "{joined}");
+        assert!(!joined.contains("```"), "fences reached the screen:\n{joined}");
+        // Inside a fence a leading `-` is code, not a bullet.
+        assert!(!joined.contains('•'), "code was read as markdown:\n{joined}");
+        assert!(joined.contains("Then deploy."), "{joined}");
+    }
+
+    /// Holding a block back must not drop it. Everything the model wrote has
+    /// to reach the screen exactly once, whether it was flushed mid-stream or
+    /// left to `finish_stream`.
+    #[test]
+    fn nothing_held_back_is_lost_or_printed_twice() {
+        let screen = streamed_screen(
+            "One\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nTwo\n\n```\ncode\n```\n\nThree\n",
+            72,
+        );
+        let joined = screen.join("\n");
+        for expected in ["One", "Two", "Three", "code"] {
+            assert_eq!(
+                joined.matches(expected).count(),
+                1,
+                "{expected:?} should appear exactly once in:\n{joined}"
+            );
+        }
+    }
+
+    /// A reply that ends on a table has nothing after it to release the hold,
+    /// so `finish_stream` is what has to draw it.
+    #[test]
+    fn a_reply_ending_in_a_table_still_draws_it() {
+        let joined = streamed_screen("Summary:\n\n| A | B |\n|---|---|\n| 1 | 2 |\n", 72).join("\n");
+        assert!(joined.contains('┌'), "no table drawn:\n{joined}");
+        assert!(joined.contains('1') && joined.contains('2'), "{joined}");
     }
 
     // ---- /compact --------------------------------------------------------------
@@ -6555,3 +6699,5 @@ mod tests {
         assert_eq!(after.tool_call_id.as_deref(), Some("call_1"), "still answers the call");
     }
 }
+
+
