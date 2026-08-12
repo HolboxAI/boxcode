@@ -290,6 +290,12 @@ impl Config {
 
         let mut config = if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
+            // Tightened on the way past, not only on save. This file holds an
+            // API key in clear text, and the realistic user sets it once
+            // through `/provider` and never writes it again -- so a repair
+            // that only ran on save would leave almost every existing install
+            // world-readable forever.
+            harden(&config_path);
             toml::from_str::<Config>(&contents).map_err(|e| {
                 format!("{} is not valid TOML: {e}", config_path.display())
             })?
@@ -434,7 +440,12 @@ impl Config {
         }
 
         let toml_str = toml::to_string_pretty(self)?;
-        std::fs::write(&config_path, toml_str)?;
+        write_private(&config_path, &toml_str)?;
+        // Repairs a file that already existed, which the create-time mode
+        // above cannot: `OpenOptions::mode` applies only when the file is
+        // created, so every config.toml written before this change would
+        // otherwise keep the 0644 it was born with.
+        harden(&config_path);
         Ok(())
     }
 
@@ -455,6 +466,55 @@ impl Config {
         adopt_legacy_dir(&home, &dir);
         dir
     }
+}
+
+/// Write `contents` to `path`, created readable and writable by its owner and
+/// nobody else.
+///
+/// `fs::write` creates at whatever the umask allows -- 0644 on a stock macOS
+/// or Linux account, meaning every other user on the machine can read it.
+/// That is the wrong default for the one file whose job is to hold an API key
+/// in clear text.
+///
+/// The mode is set *at creation* rather than chmod'ed afterwards, so there is
+/// no window, however brief, in which the key sits on disk world-readable.
+/// That is also why `save` still calls `harden` after this: `mode` applies
+/// only when the file is created, so it does nothing for a config.toml that
+/// already exists, which is every existing install.
+fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+/// Best-effort `chmod 600`.
+///
+/// Failure is deliberately ignored. A config that could not be tightened is
+/// still a config that works, and refusing to start over a permission bit --
+/// on a filesystem that may not implement them at all (an SMB share, some
+/// FUSE mounts, a container bind) -- would be a worse bug than the exposure
+/// it is guarding against.
+///
+/// A no-op off Unix, which has no mode bits to set. Windows keeps this file
+/// under `%USERPROFILE%`, whose default ACL already excludes other
+/// non-administrator users, so the specific hole this closes does not exist
+/// there in the same form.
+fn harden(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn truthy(value: &str) -> bool {
@@ -586,6 +646,67 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::with_isolated_home;
     use super::*;
+
+    /// The file holds an API key in clear text, so nobody else on the machine
+    /// should be able to read it. `fs::write` alone would leave it at the
+    /// umask default, which is 0644 on a stock account.
+    #[cfg(unix)]
+    #[test]
+    fn saving_leaves_the_config_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        with_isolated_home(|| {
+            Config::default().save().unwrap();
+
+            let mode = std::fs::metadata(Config::config_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "got {mode:o}, expected 600");
+        });
+    }
+
+    /// Every install that predates this wrote its key at 0644 and will not
+    /// necessarily ever save again -- the usual pattern is to set the key once
+    /// through `/provider` and never touch it. Loading has to repair it, or
+    /// those files stay exposed forever.
+    #[cfg(unix)]
+    #[test]
+    fn loading_tightens_a_config_that_was_left_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        with_isolated_home(|| {
+            let path = Config::config_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "[llm]\napi_key = \"sk-exposed\"\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            Config::load().unwrap();
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "got {mode:o}, expected 600");
+        });
+    }
+
+    /// Tightening the file must not cost the contents. An overwrite that
+    /// landed on an existing 0600 file has to still replace it in full.
+    #[test]
+    fn saving_over_an_existing_config_still_replaces_its_contents() {
+        with_isolated_home(|| {
+            for key in ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY"] {
+                std::env::remove_var(key);
+            }
+            let mut config = Config::default();
+            config.llm.api_key = "sk-first".to_string();
+            config.save().unwrap();
+
+            config.llm.api_key = "sk-second".to_string();
+            config.save().unwrap();
+
+            let on_disk = std::fs::read_to_string(Config::config_path()).unwrap();
+            assert!(on_disk.contains("sk-second"), "{on_disk}");
+            assert!(!on_disk.contains("sk-first"), "{on_disk}");
+        });
+    }
 
     #[test]
     fn save_then_load_round_trips_all_llm_fields_including_provider() {
