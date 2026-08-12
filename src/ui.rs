@@ -734,26 +734,45 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme::p().accent)
         });
 
-    f.render_widget(Paragraph::new(rendered).block(block), area);
+    // Where the cursor sits in the *wrapped* text. Needed before drawing, not
+    // after, because it is also what decides how far the box is scrolled.
+    let (cursor_row, screen_col) = {
+        let (row, col) = app.cursor_position();
+        let mut wrapped_row = 0usize;
+        for (i, logical) in app.input_buffer.split('\n').enumerate() {
+            if i == row {
+                break;
+            }
+            wrapped_row += hard_wrap_rows(logical.chars().count(), width);
+        }
+        (wrapped_row + col / width, col % width)
+    };
+
+    // The box stops growing at `MAX_INPUT_HEIGHT`, so a prompt longer than
+    // that has more rows than there is room for. A `Paragraph` clips from the
+    // bottom, which meant the top of the prompt stayed pinned on screen while
+    // everything being typed happened below the fold -- and the cursor, being
+    // clamped to the last visible row, sat still while the text moved. Scroll
+    // to follow the cursor instead, exactly as the command menu does with its
+    // selection, so Up/Down walk through a long prompt and you can see where
+    // you are.
+    let total_rows = rendered.len();
+    let visible = area.height.saturating_sub(2).max(1) as usize;
+    let scroll = cursor_row
+        .saturating_sub(visible - 1)
+        .min(total_rows.saturating_sub(visible));
+
+    f.render_widget(
+        Paragraph::new(rendered).block(block).scroll((scroll as u16, 0)),
+        area,
+    );
 
     // Cursor: only meaningful while the user can actually type, and only one
     // widget may claim it per frame -- render_overlay claims it instead while
     // an overlay is active (f.set_cursor is last-write-wins).
     if !busy && app.overlay.is_none() && area.height > 2 && area.width > 2 {
-        let (row, col) = app.cursor_position();
-        let mut screen_row = 0usize;
-        for (i, logical) in app.input_buffer.split('\n').enumerate() {
-            if i == row {
-                break;
-            }
-            screen_row += hard_wrap_rows(logical.chars().count(), width);
-        }
-        screen_row += col / width;
-        let screen_col = col % width;
-
-        let max_row = area.height.saturating_sub(3) as usize;
         let x = area.x + 1 + PROMPT_GUTTER as u16 + screen_col.min(width - 1) as u16;
-        let y = area.y + 1 + screen_row.min(max_row) as u16;
+        let y = area.y + 1 + cursor_row.saturating_sub(scroll).min(visible - 1) as u16;
         f.set_cursor(x, y);
     }
 }
@@ -2292,8 +2311,16 @@ fn block_markdown(line: &str, base: Style) -> MdBlock {
 fn markdown_lines(body: &str, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_fence = false;
+    // Indexed rather than a `for` over the split: a table is several source
+    // lines that produce one drawn block, so this loop has to be able to look
+    // at the next line and then skip past what it consumed.
+    let source: Vec<&str> = body.split('\n').collect();
+    let mut i = 0;
 
-    for logical in body.split('\n') {
+    while i < source.len() {
+        let logical = source[i];
+        i += 1;
+
         if logical.trim_start().starts_with("```") {
             // The fence itself is punctuation for a renderer, not content.
             in_fence = !in_fence;
@@ -2308,6 +2335,18 @@ fn markdown_lines(body: &str, width: usize) -> Vec<Line<'static>> {
                 ]));
             }
             continue;
+        }
+
+        // A table, if this line is a row and the next one is its alignment
+        // row. Both are required: the alignment row is the only thing that
+        // distinguishes a table from a sentence with a pipe in it.
+        if logical.contains('|') {
+            if let Some(table) = parse_table(&source, i - 1) {
+                let consumed = table.consumed;
+                lines.extend(render_table(&table, width));
+                i = (i - 1) + consumed;
+                continue;
+            }
         }
 
         // A horizontal rule has no text to wrap; it is the whole line.
@@ -2335,6 +2374,231 @@ fn markdown_lines(body: &str, width: usize) -> Vec<Line<'static>> {
             lines.push(Line::from(spans));
         }
     }
+    lines
+}
+
+// ---- tables --------------------------------------------------------------------
+
+/// How a column's cells line up, taken from the table's alignment row.
+#[derive(Clone, Copy, PartialEq)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// A GitHub-flavoured pipe table, already split into cells.
+struct Table {
+    header: Vec<String>,
+    align: Vec<Align>,
+    rows: Vec<Vec<String>>,
+    /// How many source lines it occupied, so the caller can skip them.
+    consumed: usize,
+}
+
+/// Split one `| a | b |` row into its cells.
+///
+/// The outer pipes are optional, as in GFM, and `\|` is a literal pipe rather
+/// than a cell boundary -- which is the only way to put a shell pipeline or a
+/// Rust closure in a table cell.
+fn split_table_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'|') {
+            current.push('|');
+            chars.next();
+            continue;
+        }
+        if c == '|' {
+            cells.push(current.trim().to_string());
+            current = String::new();
+            continue;
+        }
+        current.push(c);
+    }
+    cells.push(current.trim().to_string());
+    cells
+}
+
+/// The `|---|:--:|--:|` row, which is what actually declares a table.
+///
+/// Every cell must be dashes with optional colons and nothing else, so an
+/// ordinary line of prose that happens to contain a pipe and a dash is not
+/// mistaken for one.
+fn parse_alignment_row(line: &str) -> Option<Vec<Align>> {
+    if !line.contains('|') || !line.contains('-') {
+        return None;
+    }
+    let cells = split_table_row(line);
+    if cells.is_empty() {
+        return None;
+    }
+    cells
+        .iter()
+        .map(|cell| {
+            let cell = cell.trim();
+            let left = cell.starts_with(':');
+            let right = cell.ends_with(':');
+            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+            if dashes.is_empty() || !dashes.chars().all(|c| c == '-') {
+                return None;
+            }
+            Some(match (left, right) {
+                (true, true) => Align::Center,
+                (false, true) => Align::Right,
+                _ => Align::Left,
+            })
+        })
+        .collect()
+}
+
+/// A table starting at `start`, or `None` if that is just a line with a pipe.
+///
+/// The header and alignment rows must agree on how many columns there are.
+/// GFM requires that too, and requiring it here is most of what stops a false
+/// positive: two unrelated lines rarely both parse *and* match in width.
+fn parse_table(source: &[&str], start: usize) -> Option<Table> {
+    let align = parse_alignment_row(source.get(start + 1)?)?;
+    let header = split_table_row(source[start]);
+    if header.len() != align.len() || header.is_empty() {
+        return None;
+    }
+
+    let mut rows = Vec::new();
+    let mut i = start + 2;
+    while let Some(line) = source.get(i) {
+        if !line.contains('|') || line.trim().is_empty() {
+            break;
+        }
+        rows.push(split_table_row(line));
+        i += 1;
+    }
+
+    Some(Table {
+        header,
+        align,
+        rows,
+        consumed: i - start,
+    })
+}
+
+/// Draw a table, fitted to `width`.
+///
+/// Column widths come from the *styled* cells, so they are measured in what
+/// gets drawn rather than in markdown source -- a header of `**Name**` is four
+/// columns wide, not eight. Anything too wide to fit is narrowed a column at a
+/// time, widest first, and the cells wrap inside their column rather than the
+/// table running off the edge of the pane.
+fn render_table(table: &Table, width: usize) -> Vec<Line<'static>> {
+    let columns = table.header.len();
+    if columns == 0 {
+        return Vec::new();
+    }
+
+    let border = theme::faint();
+    let header_style = Style::default()
+        .fg(theme::p().accent)
+        .add_modifier(Modifier::BOLD);
+
+    let head: Vec<Styled> = table
+        .header
+        .iter()
+        .map(|cell| inline_styled(cell, header_style))
+        .collect();
+    let body: Vec<Vec<Styled>> = table
+        .rows
+        .iter()
+        .map(|row| {
+            (0..columns)
+                .map(|c| {
+                    inline_styled(row.get(c).map(String::as_str).unwrap_or(""), theme::text())
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut widths: Vec<usize> = (0..columns)
+        .map(|c| {
+            let widest = body.iter().map(|row| row[c].len()).max().unwrap_or(0);
+            head[c].len().max(widest).max(1)
+        })
+        .collect();
+
+    // `│ ` opening each cell, ` ` closing the last, plus the final `│`.
+    let chrome = columns * 3 + 1;
+    let budget = width.saturating_sub(chrome).max(columns);
+    while widths.iter().sum::<usize>() > budget {
+        // Widest first; ties to the leftmost, so the shape settles instead of
+        // oscillating between two equal columns.
+        let widest = widths
+            .iter()
+            .enumerate()
+            .max_by_key(|&(index, w)| (*w, std::cmp::Reverse(index)))
+            .map(|(index, _)| index)
+            .expect("columns is non-zero");
+        if widths[widest] <= 1 {
+            break;
+        }
+        widths[widest] -= 1;
+    }
+
+    let rule = |left: &str, joint: &str, right: &str| {
+        let mut drawn = String::from(left);
+        for (index, w) in widths.iter().enumerate() {
+            if index > 0 {
+                drawn.push_str(joint);
+            }
+            drawn.push_str(&"\u{2500}".repeat(w + 2));
+        }
+        drawn.push_str(right);
+        Line::from(Span::styled(drawn, border))
+    };
+
+    let row_lines = |cells: &[Styled]| -> Vec<Line<'static>> {
+        let wrapped: Vec<Vec<Styled>> = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| wrap_styled(cell, widths[index]))
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+
+        (0..height)
+            .map(|row| {
+                let mut spans = vec![Span::styled("\u{2502}".to_string(), border)];
+                for (index, column) in wrapped.iter().enumerate() {
+                    let blank: Styled = Vec::new();
+                    let chunk = column.get(row).unwrap_or(&blank);
+                    let pad = widths[index].saturating_sub(chunk.len());
+                    let (before, after) = match table.align[index] {
+                        Align::Left => (0, pad),
+                        Align::Right => (pad, 0),
+                        Align::Center => (pad / 2, pad - pad / 2),
+                    };
+                    spans.push(Span::raw(format!(" {}", " ".repeat(before))));
+                    if !chunk.is_empty() {
+                        spans.extend(to_spans(chunk));
+                    }
+                    spans.push(Span::raw(format!("{} ", " ".repeat(after))));
+                    spans.push(Span::styled("\u{2502}".to_string(), border));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    };
+
+    let mut lines = vec![rule("\u{250c}", "\u{252c}", "\u{2510}")];
+    lines.extend(row_lines(&head));
+    lines.push(rule("\u{251c}", "\u{253c}", "\u{2524}"));
+    for row in &body {
+        lines.extend(row_lines(row));
+    }
+    lines.push(rule("\u{2514}", "\u{2534}", "\u{2518}"));
     lines
 }
 
@@ -3700,6 +3964,91 @@ mod tests {
         assert!(!joined.contains("[ ]") && !joined.contains("[x]"), "{joined}");
     }
 
+    // ---- tables ------------------------------------------------------------
+
+    fn table_rows(body: &str, width: usize) -> Vec<String> {
+        markdown_lines(body, width)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect()
+    }
+
+    const TABLE: &str = "\
+| Command | What it does | Cost |
+|---------|:------------:|-----:|
+| `/new` | Forget it | 0 |
+| `/compact` | Summarise and **keep** the gist | 1 request |";
+
+    #[test]
+    fn a_pipe_table_is_drawn_as_a_table() {
+        let rows = table_rows(TABLE, 78);
+        let joined = rows.join("\n");
+
+        assert!(joined.contains('┌') && joined.contains('┐'), "{joined}");
+        assert!(joined.contains('├') && joined.contains('┼'), "{joined}");
+        assert!(joined.contains('└') && joined.contains('┘'), "{joined}");
+        assert!(joined.contains("Command") && joined.contains("1 request"), "{joined}");
+        // The alignment row is punctuation for a renderer, not content.
+        assert!(!joined.contains("---"), "the alignment row was drawn: {joined}");
+        // Every drawn row is one rectangle: same width, top to bottom.
+        let widths: Vec<usize> = rows
+            .iter()
+            .filter(|r| r.starts_with('┌') || r.starts_with('│') || r.starts_with('├') || r.starts_with('└'))
+            .map(|r| r.chars().count())
+            .collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged table: {widths:?}");
+    }
+
+    /// Column widths are measured on what is drawn. A header of `**Name**` is
+    /// four columns wide, not eight, and cells keep their emphasis.
+    #[test]
+    fn table_cells_keep_their_inline_markdown() {
+        let spans: Vec<_> = markdown_lines(TABLE, 78)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .collect();
+        assert!(
+            spans.iter().any(|s| s.content.contains("keep")
+                && s.style.add_modifier.contains(Modifier::BOLD)),
+            "bold inside a cell was lost"
+        );
+        let joined: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(!joined.contains('*') && !joined.contains('`'), "markers drawn: {joined}");
+    }
+
+    /// A table too wide for the pane narrows and wraps inside its columns.
+    /// Letting it run off the edge would clip the last column entirely.
+    #[test]
+    fn a_wide_table_is_squeezed_to_fit_rather_than_clipped() {
+        for width in [70, 46, 30] {
+            for row in table_rows(TABLE, width) {
+                assert!(
+                    row.chars().count() <= width,
+                    "row of {} exceeds {width}: {row}",
+                    row.chars().count()
+                );
+            }
+        }
+    }
+
+    /// The alignment row is the only thing that makes a table a table. Prose
+    /// about shell pipelines is full of pipes and must stay prose.
+    #[test]
+    fn a_pipe_in_prose_is_not_a_table() {
+        let joined = table_rows("run `ls | wc -l` to count them", 70).join("\n");
+        assert!(joined.contains("ls | wc -l"), "{joined}");
+        assert!(!joined.contains('┌'), "prose became a table: {joined}");
+    }
+
+    /// `\|` is how a cell carries a pipe of its own -- a shell pipeline or a
+    /// closure -- without ending the cell.
+    #[test]
+    fn an_escaped_pipe_stays_inside_its_cell() {
+        let joined = table_rows("| Cmd | Note |\n|---|---|\n| a \\| b | two |", 60).join("\n");
+        assert!(joined.contains("a | b"), "{joined}");
+        assert!(joined.contains("two"), "{joined}");
+    }
+
     /// The URL is the only part of a link a terminal can do anything with, so
     /// it stays visible; the brackets do not.
     #[test]
@@ -3743,6 +4092,87 @@ mod tests {
             let seen: String = joined.chars().filter(|c| !c.is_whitespace()).collect();
             assert!(seen.contains(&stripped), "{body:?} was mangled into {joined:?}");
         }
+    }
+
+    // ---- a prompt taller than its box --------------------------------------
+
+    /// A prompt long enough to overflow the box, as separate lines so the
+    /// row a given line lands on is predictable.
+    fn long_prompt(lines: usize) -> String {
+        (1..=lines)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Type a long prompt, put the cursor on its last line, and draw.
+    fn input_rows_with_cursor_at_end(lines: usize) -> Vec<String> {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        let text = long_prompt(lines);
+        app.cursor = text.len();
+        app.input_buffer = text;
+        rendered_rows(&mut app, 60, 24)
+    }
+
+    /// The box stops growing at `MAX_INPUT_HEIGHT`, so anything longer used to
+    /// keep the first few lines pinned on screen while everything typed after
+    /// them happened below the fold -- with the cursor stuck on the last
+    /// visible row, not moving. The view has to follow the cursor.
+    #[test]
+    fn a_prompt_taller_than_the_box_scrolls_to_the_cursor() {
+        let rows = input_rows_with_cursor_at_end(30);
+        let joined = rows.join("\n");
+
+        assert!(
+            joined.contains("line 30"),
+            "the end of the prompt, where the cursor is, is off screen:\n{joined}"
+        );
+        assert!(
+            !joined.contains("line 01"),
+            "the box did not scroll; it is still showing the top:\n{joined}"
+        );
+    }
+
+    /// A prompt that fits must not scroll: pinning it to the bottom would make
+    /// a two-line prompt jump around inside a box with room to spare.
+    #[test]
+    fn a_prompt_that_fits_is_not_scrolled() {
+        let joined = input_rows_with_cursor_at_end(3).join("\n");
+        for expected in ["line 01", "line 02", "line 03"] {
+            assert!(joined.contains(expected), "{expected} missing:\n{joined}");
+        }
+    }
+
+    /// Walking back up a long prompt has to bring the earlier lines back into
+    /// view, or ↑ moves a cursor nobody can see.
+    ///
+    /// This guards the opposite mistake to the test above: the window must
+    /// follow the cursor in both directions, not simply pin itself to the end
+    /// of the buffer. Fixing the first bug by always scrolling to the bottom
+    /// would pass that test and fail this one.
+    #[test]
+    fn moving_the_cursor_up_a_long_prompt_scrolls_back() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        let text = long_prompt(30);
+        app.cursor = text.len();
+        app.input_buffer = text;
+        for _ in 0..29 {
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Up,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        let joined = rendered_rows(&mut app, 60, 24).join("\n");
+        assert!(
+            joined.contains("line 01"),
+            "the top of the prompt never came back:\n{joined}"
+        );
+        assert!(
+            !joined.contains("line 30"),
+            "the window stayed pinned to the end instead of following the cursor:\n{joined}"
+        );
     }
 
     /// The cap on the menu's height has to stay above the number of commands.
@@ -3922,4 +4352,5 @@ mod tests {
         assert!(panel.contains("3c21dfb"), "{panel}");
     }
 }
+
 

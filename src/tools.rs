@@ -576,7 +576,20 @@ pub fn system_prompt(
            call it and let it handle that. Request it on its own, never alongside other tool \
            calls. If the build fails, the log comes back with the error: read it, fix the real \
            problem, and only then deploy again.\n\
-         - Answers appear in a terminal: keep narration to a sentence or two, not a report.",
+         - Answers appear in a terminal: keep narration to a sentence or two, not a report.\n\
+         - That terminal renders markdown, so use it where it carries meaning and nowhere \
+           else. `**bold**` for the few words that decide something; `backticks` around every \
+           path, command, identifier and flag; `-` for an unordered list and `1.` for steps \
+           that happen in order; fenced blocks with a language tag for anything meant to be \
+           copied or run; `##` headings only when the answer really has separate sections.\n\
+         - Reach for a markdown table whenever the answer compares several things on the same \
+           few attributes -- options and what each does, files and what changed in them, \
+           before and after, flags and their defaults. Prose that repeats the same shape for \
+           every item is exactly the case a table exists for, and it is read at a glance where \
+           the sentences are not. Give it a header row and keep the cells to a few words; the \
+           pane is narrow and long cells wrap.\n\
+         - Do not use `__bold__`, HTML, images, footnotes or nested tables: they are not \
+           rendered and reach the user as raw punctuation.",
         workspace.root().display(),
         config.command_timeout_secs,
     );
