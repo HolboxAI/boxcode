@@ -195,25 +195,66 @@ const LIGHT: Palette = Palette {
 
 /// Used when the background is genuinely unknown.
 ///
-/// Mid-tone accents, chosen to clear the contrast bar against black *and*
-/// white -- so they are never invisible, at the cost of being less vivid than
-/// either tuned palette. `text`, `muted` and `faint` defer to the terminal's
-/// own foreground via `Color::Reset`, which is correct on any background by
-/// definition. `surface` still paints, so it carries its own `on_surface`.
+/// This is not a rare fallback. `COLORFGBG` is unset on Apple Terminal,
+/// iTerm2 and VS Code, and the OSC 11 query that used to ask the terminal
+/// directly was removed for hanging -- so on macOS this palette *is* the
+/// default, and a light Terminal.app profile lands here every time. It has to
+/// be good, not merely survivable.
+///
+/// Two constraints decide every value here, and both are worth writing down
+/// because together they leave very little room.
+///
+/// **One: it must work on black and white at once.** A single colour used on
+/// both tops out at 4.58:1 against the worse of the two, at relative luminance
+/// ~0.179. Anything lighter fades on white; anything darker disappears on
+/// black.
+///
+/// **Two: Apple Terminal is not trusted with truecolor** (see
+/// `supports_truecolor`), so these get snapped to the 256-colour cube by
+/// `adapt` before anyone sees them -- on exactly the terminal that most often
+/// lands on this palette. Tuning the RGB without checking the snapped result
+/// is tuning a value nobody renders: the previous colours were picked at 3:1
+/// and came out of the cube at 3.43-3.95 against white, which is the washed
+/// out light terminal that was reported.
+///
+/// So every entry below is a **fixed point of that snap** -- already a cube
+/// colour, so truecolor and 256-colour terminals render the identical thing,
+/// and what is tuned here is what is drawn. Of the 240 cube colours only 23
+/// clear 4.0:1 on both backgrounds and only 6 clear 4.5:1, and those 6 are
+/// nearly all the same violet -- taking them would have made `user`, `muted`,
+/// `tool` and `accent` indistinguishable. 4.0:1 keeping the hues apart beats
+/// 4.5:1 in monochrome, so these sit at **3.99-4.54:1 on both**, against
+/// 3.43-3.95 before.
+///
+/// `muted` gets the one genuinely neutral grey that clears the bar --
+/// `Rgb(118, 118, 118)`, whose luminance lands almost exactly on the 0.179
+/// optimum. It carries more words than anything else here (every command
+/// description on the welcome screen), and it has to read as *quieter text*,
+/// not as a second accent. An earlier revision gave it a mauve because that
+/// was the best-contrasting colour in the right luminance band; it measured
+/// well and looked wrong, colouring the descriptions purple so they competed
+/// with the violet command names beside them. `faint` takes the next grey
+/// down, which keeps the dim-then-dimmer hierarchy at the cost of stopping a
+/// hair under 4.0 (3.99) -- worth it, because it is decoration and hints
+/// rather than prose.
+///
+/// `text` still defers to the terminal's own foreground via `Color::Reset`,
+/// correct on any background by definition. `surface` paints its own
+/// background, so it carries its own `on_surface` and is checked separately.
 const NEUTRAL: Palette = Palette {
-    accent: Color::Rgb(124, 92, 230),
-    accent_soft: Color::Rgb(136, 92, 225),
-    user: Color::Rgb(43, 146, 199),
+    accent: Color::Rgb(135, 95, 215),
+    accent_soft: Color::Rgb(135, 95, 175),
+    user: Color::Rgb(0, 135, 175),
     text: Color::Reset,
-    muted: Color::Rgb(124, 134, 156),
-    faint: Color::Rgb(128, 128, 128),
-    border: Color::Rgb(128, 128, 128),
+    muted: Color::Rgb(118, 118, 118),
+    faint: Color::Rgb(108, 108, 108),
+    border: Color::Rgb(108, 108, 108),
     surface: Color::Rgb(88, 76, 140),
     on_surface: Color::Rgb(255, 255, 255),
-    tool: Color::Rgb(120, 134, 156),
-    success: Color::Rgb(13, 140, 100),
-    warning: Color::Rgb(176, 112, 8),
-    danger: Color::Rgb(211, 60, 60),
+    tool: Color::Rgb(0, 135, 135),
+    success: Color::Rgb(0, 135, 95),
+    warning: Color::Rgb(175, 95, 0),
+    danger: Color::Rgb(175, 95, 95),
 };
 
 static PALETTE: OnceLock<Palette> = OnceLock::new();
@@ -482,6 +523,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `NEUTRAL` is held to 4:1 on both backgrounds, not the 3:1 decoration
+    /// bar the test above applies to every palette.
+    ///
+    /// It is not a fallback anyone rarely sees: `COLORFGBG` is unset on Apple
+    /// Terminal, iTerm2 and VS Code, so on macOS this is the palette most
+    /// people actually get. At 3:1 it passed every test here and was still
+    /// reported as washed out on a light terminal -- 3:1 is the bar for a rule
+    /// or a border, and every colour in this list carries words.
+    ///
+    /// Not 4.5, because only 6 of the 240 cube colours reach it and they are
+    /// nearly all the same violet; taking them would have made `user`,
+    /// `muted`, `tool` and `accent` the same colour. Distinguishable at 4:1
+    /// beats monochrome at 4.5:1.
+    #[test]
+    fn the_unknown_background_palette_is_readable_as_text_on_both() {
+        const WHITE: (u8, u8, u8) = (255, 255, 255);
+        const BLACK: (u8, u8, u8) = (0, 0, 0);
+
+        for (label, color) in readable(&NEUTRAL)
+            .into_iter()
+            .chain([("border", NEUTRAL.border), ("accent", NEUTRAL.accent)])
+        {
+            let Some(fg) = rgb(color) else { continue };
+            for (side, background) in [("white", WHITE), ("black", BLACK)] {
+                let ratio = contrast(fg, background);
+                // 3.99 rather than 4.0 for one reason: `faint` is the second
+                // grey down at 3.9992, taken deliberately so it still reads
+                // dimmer than `muted`. Everything else clears 4.0 outright.
+                assert!(
+                    ratio >= 3.99,
+                    "NEUTRAL.{label} is {ratio:.2}:1 on {side}. This palette is the default \
+                     on macOS, so it needs more than the 3:1 decoration bar."
+                );
+            }
+        }
+    }
+
+    /// The one that would have let the last fix ship without working.
+    ///
+    /// Apple Terminal is not trusted with truecolor, so `adapt` snaps every
+    /// colour to the 256-colour cube before it reaches the screen -- on
+    /// exactly the terminal most likely to be using this palette. Tuning the
+    /// RGB and checking only the RGB measures a value nobody renders: a set
+    /// tuned to 4.5:1 came out of the snap at 3.69-4.13 and would have shipped
+    /// looking unchanged.
+    ///
+    /// Every `NEUTRAL` colour is therefore already a cube colour, so the snap
+    /// is the identity and what is tuned is what is drawn.
+    #[test]
+    fn the_unknown_palette_survives_the_256_colour_downgrade_unchanged() {
+        for (label, color) in readable(&NEUTRAL).into_iter().chain([
+            ("border", NEUTRAL.border),
+            ("accent", NEUTRAL.accent),
+        ]) {
+            let Some((r, g, b)) = rgb(color) else { continue };
+            let downgraded = crate::theme::adapt(Color::Indexed(nearest_256(r, g, b)));
+            // `adapt` leaves an already-indexed colour alone; the real check is
+            // that the cube entry this maps to *is* this colour.
+            let _ = downgraded;
+            let code = nearest_256(r, g, b);
+            let back = indexed_to_rgb(code);
+            assert_eq!(
+                back,
+                (r, g, b),
+                "NEUTRAL.{label} Rgb({r}, {g}, {b}) renders as {back:?} on a 256-colour \
+                 terminal. Pick a colour that is already in the cube, or the tuning here \
+                 describes something nobody sees."
+            );
+        }
+    }
+
+    /// The 256-colour value a code actually paints, for the test above.
+    fn indexed_to_rgb(code: u8) -> (u8, u8, u8) {
+        const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        if code >= 232 {
+            let v = 8 + (code as u16 - 232) * 10;
+            return (v as u8, v as u8, v as u8);
+        }
+        let i = code as usize - 16;
+        (STEPS[i / 36], STEPS[(i / 6) % 6], STEPS[i % 6])
     }
 
     /// Body text is the bulk of the screen and the thing a wrong guess hides
