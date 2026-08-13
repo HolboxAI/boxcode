@@ -34,7 +34,7 @@ OpenAI-compatible LLM endpoint.
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v1.1.2
+  ▟█▙       ▟█▙    boxcode  v1.2.0
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -158,17 +158,43 @@ boxcode
 
 ### 4. Update
 
+**It offers, you decide.** Starting `boxcode` notices when a newer release
+exists and asks:
+
+```
+⬆️  boxcode 1.2.0 is available (you have 1.1.2).
+   Install it now? [y/N]
+```
+
+`y` runs the installer and tells you to start again; anything else carries
+straight on. The default is **no** — an update prompt is not what you opened
+the terminal for, so a stray Enter gets you to work rather than replacing the
+binary underneath you.
+
+The check is deliberately unobtrusive: at most **once a day**, a **2-second**
+timeout, and completely silent when it fails or the network is unreachable.
+It never appears when stdin is not a terminal, so scripts, CI and editor
+integrations are unaffected. Turn it off with either:
+
+```toml
+[update]
+check_on_start = false
+```
+```bash
+export BOXCODE_NO_UPDATE_CHECK=1
+```
+
+To reinstall by hand at any time:
+
 ```bash
 boxcode --upgrade
 ```
 
-Checks `main` for a newer version and, if there is one, reinstalls in place —
-no need to dig out the curl command again. It removes stale copies from other
+This is now always a **force** install — it reinstalls whether or not the
+version number moved, which is what you want when `main` has changed without a
+release or the install itself looks wrong. It removes stale copies from other
 directories on your `$PATH` and confirms the shell resolves to the new build.
-
-`main` can also carry changes that haven't been given a new version number yet.
-To rebuild from the latest source regardless, use `boxcode --upgrade
---force`.
+`--force` is still accepted and now does nothing extra.
 
 > Upgrading from 0.2.0 or earlier? Those builds predate this flag — run the
 > install command from step 1 once more, and `--upgrade` works from then on.

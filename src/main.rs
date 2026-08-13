@@ -68,10 +68,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if upgrade {
+        // Always a force install. Startup now offers the upgrade whenever
+        // there is a newer release, so reaching for `--upgrade` by hand means
+        // "reinstall regardless" -- either main has moved without a version
+        // bump, or the install itself is suspect. Answering "already up to
+        // date, nothing to do" to someone who typed it deliberately is the
+        // unhelpful reading. `--force` is still accepted and now redundant.
+        let _ = force;
         // Handled here rather than returned: the default runtime handler prints
         // Err via Debug, which turns a connection failure into a wall of
         // struct-dump instead of a sentence.
-        if let Err(e) = upgrade::run(force).await {
+        if let Err(e) = upgrade::run(true).await {
             eprintln!("❌ Upgrade failed: {e}");
             std::process::exit(1);
         }
@@ -93,6 +100,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // background, and asking for that needs the terminal to itself, with
     // no alternate screen up and nothing else reading stdin.
     theme::init(theme::resolve_mode(&config.ui.theme));
+
+    // Before the terminal is taken over, so this is an ordinary question on an
+    // ordinary shell: the answer may be to run the installer, which prints its
+    // own progress and needs stdout to itself.
+    if let Some(latest) = upgrade::check_on_start(config.update.check_on_start).await {
+        if offer_upgrade(&latest).await {
+            return Ok(());
+        }
+    }
 
     let (workspace, workspace_status) = open_workspace(&config);
 
@@ -555,6 +571,52 @@ async fn run_app<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// Offer the newer release, and install it if asked to. `true` means the
+/// process should stop here rather than carry on into the app.
+///
+/// Defaults to no. An update prompt is not the thing anyone opened the
+/// terminal for, so a stray Enter must let them get on with what they were
+/// doing rather than start replacing the binary underneath them.
+async fn offer_upgrade(latest: &str) -> bool {
+    use std::io::{IsTerminal, Write};
+
+    // Nothing to prompt with. A piped or redirected stdin means a script, a
+    // CI job or an editor integration -- all of which would hang forever on a
+    // question nobody is there to answer.
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+
+    println!();
+    println!("⬆️  boxcode {latest} is available (you have {VERSION}).");
+    print!("   Install it now? [y/N] ");
+    let _ = io::stdout().flush();
+
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("   Skipped. Run `boxcode --upgrade` whenever you want it.");
+        println!();
+        return false;
+    }
+
+    println!();
+    if let Err(e) = upgrade::run(true).await {
+        // Not fatal: the install failed, but the build already here still
+        // runs, and refusing to start it would turn a missed update into an
+        // unusable tool.
+        eprintln!("❌ Upgrade failed: {e}");
+        eprintln!("   Carrying on with {VERSION}.");
+        eprintln!();
+        return false;
+    }
+    println!();
+    println!("✓ Updated to {latest}. Start boxcode again to use it.");
+    true
+}
+
 fn print_help() {
     println!(
         "boxcode {VERSION}
@@ -566,8 +628,11 @@ USAGE:
 FLAGS:
     -V, --version    Print version and exit
     -h, --help       Print this help and exit
-    -u, --upgrade    Update to the latest release
-    -f, --force      With --upgrade: reinstall even if already up to date
+    -u, --upgrade    Reinstall the latest release, whether or not the version
+                       number changed. Starting boxcode already offers an
+                       upgrade when there is a newer release, so reaching for
+                       this by hand means \"reinstall regardless\".
+    -f, --force      Accepted and now redundant: --upgrade always forces.
     -p, --plan       Start in plan mode: the model researches and proposes a
                        plan, and cannot write, edit, or run anything that
                        changes the project until you approve one. Toggle it
@@ -590,9 +655,16 @@ TOOLS (read_file, write_file, run_command; writes and commands need your
                               max_output_bytes, max_steps.
 
 UPGRADE:
+    Starting boxcode checks for a newer release at most once a day and offers
+    to install it. It answers no by default, gives up after two seconds, and
+    says nothing at all when it cannot reach the network.
+
     BOXCODE_UPGRADE_URL_BASE
                           Fetch updates from a fork or internal mirror
                           instead of github.com
+    BOXCODE_NO_UPDATE_CHECK
+                          Set to anything to skip the startup check. Same as
+                          check_on_start = false in the [update] table.
 
 COMMANDS (type in the input box, press Enter):
     /provider             Pick a provider + model + API key, saved to config.toml

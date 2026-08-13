@@ -42,6 +42,91 @@ fn raw_url(path: &str) -> String {
     join_url(&base_url(), path)
 }
 
+/// Turns the startup check off from the environment, for the cases config
+/// cannot reach: a CI job, a container, a scripted run.
+const NO_CHECK_ENV: &str = "BOXCODE_NO_UPDATE_CHECK";
+
+/// How long the startup check may take before it is abandoned.
+///
+/// Far shorter than the explicit `--upgrade` timeouts below, and deliberately:
+/// there the user asked for an upgrade and will wait for it, whereas here they
+/// asked to start the app and a slow network must not be allowed to hold that
+/// up. Two seconds is enough for a healthy request and short enough that a
+/// dead one is not felt.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn last_check_path() -> Option<std::path::PathBuf> {
+    Some(crate::config::Config::config_dir().join("last_update_check"))
+}
+
+/// Whether the once-a-day gate has already been spent.
+///
+/// Split out so the gate can be tested against a plain file, rather than by
+/// standing up an isolated `$HOME` around an async call. A missing or
+/// unreadable stamp reads as "not yet today", which is the right way round:
+/// the cost of an extra check is one request, the cost of skipping one is a
+/// user sitting on a stale build.
+fn already_checked_today(path: &std::path::Path, today: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|stamp| stamp.trim() == today)
+        .unwrap_or(false)
+}
+
+/// Whether a newer release exists, when that can be answered cheaply.
+///
+/// `None` for every reason other than "there is a newer version": checked
+/// already today, turned off, offline, timed out, a malformed manifest. None
+/// of those are worth a word on screen -- someone starting a coding assistant
+/// wants the assistant, not a report on an update check that failed.
+///
+/// Once a day rather than every launch, on the same reasoning (and with the
+/// same file-stamp trick) as `telemetry::ping_active_if_new_day`: a prompt
+/// that appears every single time is one people learn to dismiss without
+/// reading, which is worse than not asking.
+pub async fn check_on_start(enabled: bool) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    if std::env::var_os(NO_CHECK_ENV).is_some() {
+        return None;
+    }
+
+    let path = last_check_path()?;
+    check_against(&base_url(), &path, &crate::dateutil::today_string()).await
+}
+
+/// The check itself, with everything it depends on passed in.
+///
+/// Where it looks, where it stamps and what day it is are all arguments
+/// rather than globals, so the tests drive it against a local server and a
+/// temporary file. The alternative -- reaching for `$HOME` and
+/// `BOXCODE_UPGRADE_URL_BASE` from inside a test -- mutates process-wide state
+/// that every other test in this file shares, and duly broke two of them.
+async fn check_against(base: &str, stamp: &std::path::Path, today: &str) -> Option<String> {
+    if already_checked_today(stamp, today) {
+        return None;
+    }
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(CHECK_TIMEOUT)
+        .timeout(CHECK_TIMEOUT)
+        .user_agent(format!("boxcode/{CURRENT}"))
+        .build()
+        .ok()?;
+
+    let latest = fetch_version_from(&client, base).await.ok()?;
+
+    // Stamped only after a request that actually answered. A failed check
+    // must not count as today's, or one flaky morning silently skips the
+    // whole day.
+    if let Some(parent) = stamp.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(stamp, today);
+
+    version_is_newer(&latest, CURRENT).then_some(latest)
+}
+
 pub async fn run(force: bool) -> Result<(), Box<dyn Error>> {
     run_for(force, cfg!(windows)).await
 }
@@ -108,7 +193,16 @@ async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
 }
 
 async fn fetch_latest_version(client: &reqwest::Client) -> Result<String, Box<dyn Error>> {
-    let response = client.get(raw_url("Cargo.toml")).send().await?;
+    fetch_version_from(client, &base_url()).await
+}
+
+/// `fetch_latest_version` against an explicit base, so a caller that already
+/// knows where to look does not have to go back through the environment.
+async fn fetch_version_from(
+    client: &reqwest::Client,
+    base: &str,
+) -> Result<String, Box<dyn Error>> {
+    let response = client.get(join_url(base, "Cargo.toml")).send().await?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("HTTP {status} fetching Cargo.toml").into());
@@ -234,6 +328,112 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    // ---- the startup check ---------------------------------------------------
+    //
+    // Every test here asserts the check does NOTHING. That is the whole point
+    // of it: it runs on every launch, before the app the user actually asked
+    // for, so the only acceptable failure mode is silence. None of these touch
+    // the network -- they assert it never gets that far.
+
+    #[tokio::test]
+    async fn the_startup_check_is_skipped_when_switched_off() {
+        assert_eq!(check_on_start(false).await, None);
+    }
+
+    /// The escape hatch for a CI job or a container, where config may not be
+    /// reachable but the environment always is.
+    #[tokio::test]
+    async fn the_environment_can_switch_the_startup_check_off() {
+        crate::config::test_support::with_isolated_home(|| {
+            std::env::set_var(NO_CHECK_ENV, "1");
+        });
+        let verdict = check_on_start(true).await;
+        std::env::remove_var(NO_CHECK_ENV);
+        assert_eq!(verdict, None);
+    }
+
+    /// The check, end to end, against a server that says a newer release
+    /// exists. Serves the same `Cargo.toml` the real one reads, so this
+    /// exercises the fetch, the parse and the comparison rather than mocking
+    /// past them. Nothing process-global is touched: the base URL and the
+    /// stamp are arguments, so this cannot race the other tests here.
+    #[tokio::test]
+    async fn a_newer_release_is_reported_and_the_day_is_stamped() {
+        let base = serve_repo("[package]\nversion = \"99.9.9\"\n".to_string(), String::new()).await;
+        let dir = std::env::temp_dir().join("boxcode-upd-newer");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let stamp = dir.join("last_update_check");
+        let _ = std::fs::remove_file(&stamp);
+
+        let first = check_against(&base, &stamp, "2026-08-13").await;
+        // Second call, same day: the stamp the first one wrote must close the
+        // gate, or the prompt appears on every single launch.
+        let second = check_against(&base, &stamp, "2026-08-13").await;
+        // Tomorrow it opens again.
+        let tomorrow = check_against(&base, &stamp, "2026-08-14").await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(first.as_deref(), Some("99.9.9"));
+        assert_eq!(second, None, "the once-a-day gate did not close");
+        assert_eq!(tomorrow.as_deref(), Some("99.9.9"), "the gate never reopened");
+    }
+
+    /// The version the user already has must not be offered to them.
+    #[tokio::test]
+    async fn the_current_version_is_not_offered_as_an_update() {
+        let base = serve_repo(format!("[package]\nversion = \"{CURRENT}\"\n"), String::new()).await;
+        let dir = std::env::temp_dir().join("boxcode-upd-same");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let stamp = dir.join("last_update_check");
+        let _ = std::fs::remove_file(&stamp);
+
+        let verdict = check_against(&base, &stamp, "2026-08-13").await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(verdict, None);
+    }
+
+    /// An unreachable server is the common case on a laptop that just woke up,
+    /// and it must be silent -- and must NOT stamp the day, or one flaky
+    /// morning skips the check until tomorrow.
+    #[tokio::test]
+    async fn an_unreachable_server_is_silent_and_does_not_stamp_the_day() {
+        let dir = std::env::temp_dir().join("boxcode-upd-offline");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let stamp = dir.join("last_update_check");
+        let _ = std::fs::remove_file(&stamp);
+
+        // Port 1 refuses immediately; no waiting on the timeout.
+        let verdict = check_against("http://127.0.0.1:1", &stamp, "2026-08-13").await;
+
+        let stamped = stamp.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(verdict, None);
+        assert!(!stamped, "a failed check must not count as today's");
+    }
+
+    /// A prompt on every single launch is one people learn to dismiss without
+    /// reading, so a stamp from today closes the gate.
+    #[test]
+    fn a_check_already_made_today_closes_the_gate() {
+        let dir = std::env::temp_dir().join(format!("boxcode-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("last_update_check");
+
+        std::fs::write(&path, "2026-08-13\n").expect("stamp");
+        assert!(already_checked_today(&path, "2026-08-13"));
+        // Yesterday's stamp must not suppress today's check, or the feature
+        // silently stops working the day after it is first used.
+        assert!(!already_checked_today(&path, "2026-08-14"));
+
+        // A stamp that was never written, or cannot be read, means "not yet":
+        // an extra request costs one request, a skipped one leaves someone on
+        // a stale build indefinitely.
+        std::fs::remove_file(&path).expect("rm");
+        assert!(!already_checked_today(&path, "2026-08-13"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reads_the_version_from_the_package_table() {
