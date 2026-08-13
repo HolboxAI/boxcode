@@ -602,8 +602,29 @@ async fn offer_upgrade(latest: &str) -> bool {
         return false;
     }
 
+    // Said before the installer starts, not left to be discovered. It writes
+    // to /usr/local/bin via `sudo`, so on most machines a password prompt is
+    // about to appear -- and an unexplained "Password:" arriving in the middle
+    // of starting a coding assistant reads as the app having hung, which is
+    // exactly how it was reported.
     println!();
-    if let Err(e) = upgrade::run(true).await {
+    println!("   Installing to /usr/local/bin — sudo may ask for your password.");
+    println!();
+
+    let outcome = upgrade::run(true).await;
+
+    // Whatever happened, hand back a usable terminal.
+    //
+    // `sudo` switches off echo and canonical mode to read a password. If it is
+    // interrupted mid-read -- Ctrl-C, a wrong password, the user giving up --
+    // those settings can be left as they are, and the shell that follows has
+    // no line editing, no working backspace and no working Ctrl-C. The
+    // symptom is a terminal that looks frozen while echoing `^M` and `^C`,
+    // and it outlives this process, which makes it far worse than the failed
+    // upgrade that caused it.
+    restore_cooked_mode();
+
+    if let Err(e) = outcome {
         // Not fatal: the install failed, but the build already here still
         // runs, and refusing to start it would turn a missed update into an
         // unusable tool.
@@ -615,6 +636,34 @@ async fn offer_upgrade(latest: &str) -> bool {
     println!();
     println!("✓ Updated to {latest}. Start boxcode again to use it.");
     true
+}
+
+/// Put the terminal back into ordinary line-editing mode.
+///
+/// Belt and braces, and both are needed. `disable_raw_mode` undoes anything
+/// crossterm itself put in place and is a no-op otherwise; `stty sane` undoes
+/// what a *child process* left behind, which crossterm knows nothing about and
+/// cannot restore, because it never saved those settings in the first place.
+///
+/// Every failure is ignored: this runs on the path where something has already
+/// gone wrong, and a terminal that could not be reset is not a reason to also
+/// refuse to start.
+fn restore_cooked_mode() {
+    let _ = disable_raw_mode();
+
+    #[cfg(unix)]
+    {
+        use std::process::{Command, Stdio};
+        // `sane` rather than a saved-and-restored termios: this is recovering
+        // from another program's mess, so there is no earlier state of ours
+        // worth returning to -- only a known-good one.
+        let _ = Command::new("stty")
+            .arg("sane")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 fn print_help() {
@@ -747,4 +796,26 @@ fn install_panic_hook(enhanced: bool, alternate_screen: bool) {
         let _ = restore_terminal(enhanced, alternate_screen);
         default_hook(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `restore_cooked_mode` runs on the failure path, where something has
+    /// already gone wrong, and it runs in CI and under `cargo test` where
+    /// stdin is a pipe rather than a terminal. It must therefore never block,
+    /// never panic, and never care that `stty` failed -- a terminal that could
+    /// not be reset is not a reason to also refuse to start.
+    ///
+    /// The repair itself is a terminal side effect and is verified against a
+    /// real pty rather than here: an interrupted `sudo` password read clears
+    /// ECHO, ICANON and ISIG (which is precisely "Enter, backspace and Ctrl-C
+    /// stop working"), and `stty sane` restores all three.
+    #[test]
+    fn restoring_the_terminal_is_safe_when_there_is_no_terminal() {
+        restore_cooked_mode();
+        // Twice, because the failure path can reach it more than once.
+        restore_cooked_mode();
+    }
 }
