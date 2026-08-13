@@ -34,7 +34,7 @@ OpenAI-compatible LLM endpoint.
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v1.2.2
+  ▟█▙       ▟█▙    boxcode  v1.2.3
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!

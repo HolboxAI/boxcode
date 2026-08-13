@@ -112,6 +112,54 @@ jobs:
           done
           ls -la release-assets/
 
+      - name: Refuse to publish a binary that is not one
+        # v1.2.2 shipped a macOS asset that was 3.7 MB of NUL bytes. Every
+        # existing check passed it: the build job went green, `sha256sum`
+        # hashed the zeros perfectly happily, and `install.sh` then verified
+        # the corrupt download against its own corrupt checksum and installed
+        # it. The result was `zsh: exec format error` for every macOS user who
+        # upgraded, with nothing anywhere reporting a problem.
+        #
+        # A checksum only proves a file arrived intact, never that it was worth
+        # sending. This is the missing half: before anything is published, each
+        # asset has to actually be an executable for the platform it claims.
+        run: |
+          cd release-assets
+          failed=0
+          for asset in boxcode-*; do
+            [ -e "$asset" ] || continue
+            size=$(stat -c%s "$asset")
+            # A real build is megabytes. Anything tiny is a truncated upload
+            # or an HTML error page saved under a binary's name.
+            if [ "$size" -lt 1000000 ]; then
+              echo "::error::$asset is only $size bytes"
+              failed=1
+              continue
+            fi
+            # The exact v1.2.2 failure: correct size, no content.
+            if [ -z "$(tr -d '\0' < "$asset" | head -c 1)" ]; then
+              echo "::error::$asset is $size bytes of NUL -- the build produced nothing"
+              failed=1
+              continue
+            fi
+            case "$asset" in
+              *macos*)   expected="Mach-O" ;;
+              *linux*)   expected="ELF" ;;
+              *windows*) expected="PE32" ;;
+              *)         expected="" ;;
+            esac
+            if [ -n "$expected" ] && ! file -b "$asset" | grep -q "$expected"; then
+              echo "::error::$asset should be $expected but is: $(file -b "$asset")"
+              failed=1
+              continue
+            fi
+            echo "ok: $asset ($size bytes, $(file -b "$asset" | cut -c1-40))"
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "Refusing to publish a release containing a corrupt binary."
+            exit 1
+          fi
+
       - name: Generate checksums
         # install.sh verifies a downloaded binary against this before
         # installing it -- see fetch_prebuilt_binary there. Generated after
