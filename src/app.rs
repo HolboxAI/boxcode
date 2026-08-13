@@ -141,8 +141,6 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/compact", "summarise the conversation to free up context"),
     ("/usage", "what today cost, and the history"),
     ("/quota", "what is left today, and your own limits"),
-    ("/deploy", "ship this project to Vercel or Netlify"),
-    ("/deployments", "recent deployments from this machine"),
 ];
 
 /// Roughly how many characters one token is worth.
@@ -248,11 +246,6 @@ pub struct ContextSize {
     /// The `CHARS_PER_TOKEN` estimate of what they occupy.
     pub approx_tokens: usize,
 }
-/// The commands `[deploy] enabled = false` removes. Listed here rather than
-/// checked ad hoc at each call site, so turning the feature off cannot leave
-/// one of them reachable through the autocomplete while the other is gone.
-const DEPLOY_COMMANDS: &[&str] = &["/deploy", "/deployments"];
-
 pub struct App {
     pub state: AppState,
     /// Whether the model may change anything yet. Session state rather than
@@ -490,15 +483,14 @@ impl App {
         }
     }
 
-    /// Every command this build offers, with the ones `[deploy] enabled =
-    /// false` removes taken out. The single source for both the autocomplete
-    /// menu and the welcome screen's list.
+    /// Every command this build offers.
+    ///
+    /// Deployment is deliberately not among them. It needs a provider and a
+    /// target to mean anything, and asking the model ("deploy this to Vercel")
+    /// carries both -- where a bare `/deploy` would have to ask for them in
+    /// screens of its own before anything could start. See `deploy_takes_over`.
     pub fn available_commands(&self) -> Vec<(&'static str, &'static str)> {
-        COMMANDS
-            .iter()
-            .filter(|(name, _)| self.config.deploy.enabled || !DEPLOY_COMMANDS.contains(name))
-            .copied()
-            .collect()
+        COMMANDS.to_vec()
     }
 
     pub fn is_busy(&self) -> bool {
@@ -585,8 +577,6 @@ impl App {
                         "/compact" => self.start_compaction(),
                         "/usage" => self.show_usage(),
                         "/quota" => self.show_quota(),
-                        "/deploy" => self.open_deploy(),
-                        "/deployments" => self.show_deployments(),
                         other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
                     }
                 } else {
@@ -2309,93 +2299,6 @@ impl App {
         None
     }
 
-    /// `/deploy` -- inspect the project, then walk through shipping it.
-    ///
-    /// Detection runs here, before a provider has been chosen: it is a handful
-    /// of file reads, so the answer is on screen by the time the provider
-    /// picker is, and it works with no CLI installed and nobody signed in.
-    fn open_deploy(&mut self) {
-        self.greeted = true;
-        self.follow_tail = true;
-
-        if !self.config.deploy.enabled {
-            self.messages.push(Message::new(
-                Role::Error,
-                "Deployment is turned off (`enabled = false` under [deploy] in \
-                 ~/.boxcode/config.toml).",
-            ));
-            return;
-        }
-        // The project is the directory commands already run in. With tools off
-        // there is no such directory, and inventing one would deploy something
-        // the user never pointed at.
-        if self.workspace_root.is_empty() {
-            self.messages.push(Message::new(
-                Role::Error,
-                "No project directory. /deploy ships the directory this app was launched in, \
-                 which needs [tools] enabled in ~/.boxcode/config.toml.",
-            ));
-            return;
-        }
-
-        match deploy::detect::detect(Path::new(&self.workspace_root)) {
-            Ok(profile) => {
-                // Worth seeing before choosing anything, and the transcript is
-                // where it stays readable after the overlay closes.
-                for warning in &profile.warnings {
-                    self.messages
-                        .push(Message::new(Role::System, warning.clone()));
-                }
-                self.deploy = Some(DeploySession::new(
-                    profile,
-                    deploy::service::DeployPolicy {
-                        allow_cli_install: self.config.deploy.allow_cli_install,
-                    },
-                ));
-                self.overlay = Some(Overlay::Deploy);
-            }
-            Err(e) => self
-                .messages
-                .push(Message::new(Role::Error, e.to_string())),
-        }
-    }
-
-    /// `/deployments` -- what this machine has shipped, newest first.
-    fn show_deployments(&mut self) {
-        self.greeted = true;
-        self.follow_tail = true;
-        let entries = deploy::history::recent(self.config.deploy.history_limit);
-
-        if entries.is_empty() {
-            self.messages.push(Message::new(
-                Role::System,
-                "No deployments yet. /deploy ships this project to Vercel or Netlify.",
-            ));
-            return;
-        }
-
-        let mut lines = vec!["Recent deployments (this machine only)".to_string()];
-        for entry in entries {
-            lines.push(String::new());
-            lines.push(format!("  {}  ({})", entry.project, entry.date));
-            lines.push(format!(
-                "    {} · {} · {}",
-                entry.provider,
-                entry.target,
-                entry.summary()
-            ));
-            if !entry.env_keys.is_empty() {
-                // Names only. Values were never stored -- see `deploy::history`.
-                lines.push(format!("    env: {}", entry.env_keys.join(", ")));
-            }
-            if let Some(detail) = &entry.detail {
-                lines.push(format!("    {detail}"));
-            }
-        }
-        self.messages
-            .push(Message::new(Role::System, lines.join("\n")));
-    }
-
     /// Keys while the deployment overlay is up.
     ///
     /// Three screens with three key sets, kept apart by the stage rather than
@@ -3140,207 +3043,21 @@ mod tests {
         (dir, app)
     }
 
+    /// Deployment is not a slash command: it needs a provider and a target to
+    /// mean anything, and asking the model carries both. A stray `/deploy`
+    /// must therefore be an ordinary prompt, not a command that half-exists.
     #[test]
-    fn deploy_detects_the_project_and_opens_the_provider_picker() {
+    fn deployment_is_not_reachable_as_a_slash_command() {
         let (_dir, mut app) = app_in_project();
-        type_str(&mut app, "/deploy");
-        app.handle_key(key(KeyCode::Enter));
-
-        assert_eq!(app.overlay, Some(Overlay::Deploy));
-        let session = app.deploy.as_ref().expect("a session must exist");
-        assert_eq!(session.profile.framework.label(), "Vite");
-        assert_eq!(session.project_name, "my-app");
-        assert_eq!(session.stage, Stage::Menu(deploy::Menu::Provider));
-        // Detection alone must not start any work.
-        assert!(app.deploy_action.is_none());
-    }
-
-    /// `/deploy` ships the directory commands already run in. With tools off
-    /// there is no such directory, and inventing one would deploy something
-    /// the user never pointed at.
-    #[test]
-    fn deploy_without_a_workspace_explains_itself_rather_than_guessing() {
-        let mut app = app();
-        app.workspace_root.clear();
-        type_str(&mut app, "/deploy");
-        app.handle_key(key(KeyCode::Enter));
-
-        assert!(app.deploy.is_none());
-        assert!(app.overlay.is_none());
-        let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
-        assert!(shown.contains("No project directory"), "{shown}");
-    }
-
-    #[test]
-    fn deploy_in_a_directory_with_nothing_to_ship_says_so() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("notes.txt"), "hello").unwrap();
-        let mut app = app();
-        app.workspace_root = dir.path().display().to_string();
-
-        type_str(&mut app, "/deploy");
-        app.handle_key(key(KeyCode::Enter));
-
-        assert!(app.deploy.is_none());
-        let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
-        assert!(shown.contains("nothing to build or serve"), "{shown}");
-    }
-
-    /// Turning the feature off has to remove it from the command list too, or
-    /// it stays discoverable through the autocomplete and then refuses.
-    #[test]
-    fn disabling_deployment_removes_both_of_its_commands() {
-        let mut app = app();
-        app.config.deploy.enabled = false;
-        let names: Vec<&str> = app.available_commands().iter().map(|(n, _)| *n).collect();
-        assert!(!names.contains(&"/deploy"), "{names:?}");
-        assert!(!names.contains(&"/deployments"), "{names:?}");
-        assert!(names.contains(&"/provider"), "the rest must survive: {names:?}");
-
-        app.input_buffer = "/dep".to_string();
-        assert!(app.matching_commands().is_empty());
-    }
-
-    /// The overlay owns every key while it is up: none of the normal editing
-    /// or submit logic may see them.
-    #[test]
-    fn the_deployment_overlay_intercepts_keys_and_walks_the_flow() {
-        let (_dir, mut app) = app_in_project();
-        type_str(&mut app, "/deploy");
-        app.handle_key(key(KeyCode::Enter));
-
-        // Typing goes nowhere near the prompt box.
-        app.handle_key(key(KeyCode::Char('x')));
-        assert!(app.input_buffer.is_empty(), "the overlay must swallow typing");
-
-        // Down then Enter picks the second provider.
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Enter));
-        let session = app.deploy.as_ref().expect("session");
-        assert_eq!(session.provider_id, Some("netlify"));
-        assert_eq!(session.stage, Stage::Menu(deploy::Menu::Confirm));
-    }
-
-    /// `y`/`n` on a two-choice screen, matching the tool-approval prompt.
-    #[test]
-    fn a_two_choice_deployment_screen_takes_y_and_n_directly() {
-        let (_dir, mut app) = app_in_project();
-        type_str(&mut app, "/deploy");
-        app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Enter)); // Vercel → confirm
-
-        app.handle_key(key(KeyCode::Char('n')));
-        // "No" ends the attempt without running anything.
-        assert!(app.deploy_action.is_none());
-        assert_eq!(
-            app.deploy.as_ref().map(|s| s.stage.clone()),
-            Some(Stage::Finished)
-        );
-    }
-
-    /// Esc on the first screen closes the whole thing, and the transcript says
-    /// what happened -- the panel disappearing must not take the outcome with it.
-    #[test]
-    fn closing_the_overlay_leaves_the_outcome_in_the_transcript() {
-        let (_dir, mut app) = app_in_project();
-        type_str(&mut app, "/deploy");
-        app.handle_key(key(KeyCode::Enter));
-
-        app.handle_key(key(KeyCode::Esc));
-        assert!(app.deploy.is_none());
-        assert!(app.overlay.is_none());
-        let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
-        assert!(shown.contains("cancelled"), "{shown}");
-    }
-
-    /// A finished deployment's URL has to survive the panel closing: it is the
-    /// one thing anyone wants out of the whole flow.
-    #[test]
-    fn a_successful_deployment_leaves_its_url_in_the_transcript() {
-        let (_dir, mut app) = app_in_project();
-        type_str(&mut app, "/deploy");
-        app.handle_key(key(KeyCode::Enter));
-        if let Some(session) = app.deploy.as_mut() {
-            session.provider_id = Some("vercel");
-            session.stage = Stage::Finished;
-            session.url = Some("https://my-app.vercel.app".to_string());
-        }
-        app.handle_key(key(KeyCode::Enter)); // close
-
-        let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
-        assert!(shown.contains("https://my-app.vercel.app"), "{shown}");
-        assert!(shown.contains("Vercel"), "{shown}");
-    }
-
-    /// Esc while something is running stops it. The abort handle is what kills
-    /// the child process, so dropping it without aborting would leave a build
-    /// running with nothing listening.
-    #[test]
-    fn escape_during_a_running_step_aborts_the_work() {
-        let (_dir, mut app) = app_in_project();
-        type_str(&mut app, "/deploy");
-        app.handle_key(key(KeyCode::Enter));
-        if let Some(session) = app.deploy.as_mut() {
-            session.provider_id = Some("vercel");
-            session.stage = Stage::Working(deploy::service::Step::Deploying);
-        }
-
-        app.handle_key(key(KeyCode::Esc));
-        assert!(app.deploy_abort.is_none(), "the handle must be taken and aborted");
-        assert_eq!(
-            app.deploy.as_ref().map(|s| s.stage.clone()),
-            Some(Stage::Finished)
-        );
-    }
-
-    /// Nothing a deployment carries may reach the transcript, which is the one
-    /// part of this app that persists on screen.
-    #[test]
-    fn no_deployment_secret_ever_reaches_the_transcript() {
-        let (_dir, mut app) = app_in_project();
-        type_str(&mut app, "/deploy");
-        app.handle_key(key(KeyCode::Enter));
-        if let Some(session) = app.deploy.as_mut() {
-            session.provider_id = Some("vercel");
-            session.token = Some(deploy::Secret::new("vercel_tok_do_not_leak"));
-            session.env.push(deploy::EnvVar {
-                key: "API_KEY".to_string(),
-                value: deploy::Secret::new("value_do_not_leak"),
-            });
-            session.stage = Stage::Finished;
-            session.url = Some("https://my-app.vercel.app".to_string());
-        }
-        app.handle_key(key(KeyCode::Enter)); // close
-
-        let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
-        assert!(!shown.contains("do_not_leak"), "a secret reached the transcript: {shown}");
-    }
-
-    /// Both feature sets survived the merge that brought them together.
-    ///
-    /// `/compact` and `/deploy` were added on separate branches and landed in
-    /// the same three places -- the registry, the dispatch match, and `App`'s
-    /// fields. A merge that resolved any of those by picking a side rather
-    /// than keeping both would still compile: the dropped command simply
-    /// stops existing, silently.
-    #[test]
-    fn the_command_registry_carries_every_feature() {
-        let names: Vec<&str> = COMMANDS.iter().map(|(n, _)| *n).collect();
-        for expected in [
-            "/provider", "/model", "/new", "/compact", "/usage", "/quota",
-            "/deploy", "/deployments",
-        ] {
-            assert!(names.contains(&expected), "{expected} is missing: {names:?}");
-        }
-        // Every one of them has to be dispatchable, or Enter does nothing.
-        let mut app = app();
-        for (name, _) in COMMANDS {
-            app.input_buffer = name.to_string();
+        for typed in ["/deploy", "/deployments"] {
+            app.input_buffer = typed.to_string();
             assert!(
-                app.matching_commands().iter().any(|(n, _)| n == name),
-                "{name} is in the registry but unreachable from the menu"
+                app.matching_commands().is_empty(),
+                "{typed} should not autocomplete to anything"
             );
         }
+        let names: Vec<&str> = app.available_commands().iter().map(|(n, _)| *n).collect();
+        assert!(!names.iter().any(|n| n.starts_with("/deploy")), "{names:?}");
     }
 
     // ---- the model asking to deploy ---------------------------------------
@@ -3514,46 +3231,6 @@ mod tests {
         assert!(app.deploy.is_none(), "the flow must not take a batched call");
         // It falls through to the ordinary runner, which explains itself.
         assert!(app.approved_tools.iter().any(|c| c.function.name == tools::DEPLOY_PROJECT));
-    }
-
-    #[test]
-    fn deployments_with_no_history_says_so_rather_than_printing_a_bare_heading() {
-        crate::config::test_support::with_isolated_home(|| {
-            let mut app = app();
-            type_str(&mut app, "/deployments");
-            app.handle_key(key(KeyCode::Enter));
-            let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
-            assert!(shown.contains("No deployments yet"), "{shown}");
-        });
-    }
-
-    #[test]
-    fn deployments_lists_what_was_recorded_without_any_secret() {
-        crate::config::test_support::with_isolated_home(|| {
-            deploy::history::record(&deploy::history::Deployment {
-                date: "2026-08-10".to_string(),
-                at: 1,
-                project: "my-app".to_string(),
-                path: "/Users/dev/my-app".to_string(),
-                provider: "vercel".to_string(),
-                target: "Production".to_string(),
-                status: "Success".to_string(),
-                url: Some("https://my-app.vercel.app".to_string()),
-                env_keys: vec!["API_KEY".to_string()],
-                detail: None,
-            });
-
-            let mut app = app();
-            type_str(&mut app, "/deployments");
-            app.handle_key(key(KeyCode::Enter));
-
-            let shown: String = app.messages.iter().map(|m| m.content.as_str()).collect();
-            assert!(shown.contains("my-app"), "{shown}");
-            assert!(shown.contains("vercel"), "{shown}");
-            assert!(shown.contains("https://my-app.vercel.app"), "{shown}");
-            // Names, never values -- there is no value to print.
-            assert!(shown.contains("API_KEY"), "{shown}");
-        });
     }
 
     /// A quota-enabled app with `spent` requests already used today.

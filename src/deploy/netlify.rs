@@ -315,7 +315,7 @@ impl DeploymentProvider for NetlifyProvider {
         }
         if lower.contains("site not found") || lower.contains("no site id") {
             return "Netlify could not find that site. It may have been deleted, or belong to \
-                    another account — run /deploy again and pick from the current site list."
+                    another account — try again and pick from the current site list."
                 .to_string();
         }
         if lower.contains("name already exists") || lower.contains("subdomain") {

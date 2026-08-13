@@ -723,7 +723,7 @@ impl DeploySession {
                         .unwrap_or_else(|| "the provider".to_string());
                     self.fail(format!(
                         "The {binary} CLI is required to deploy and was not installed. Install it \
-                         yourself and run /deploy again."
+                         yourself, then ask again."
                     ));
                     None
                 }
@@ -969,7 +969,7 @@ impl DeploySession {
                                 self.fail(format!(
                                     "The {} CLI is missing, and its install command is one the \
                                      safety guardrails refuse to run: {reason}. Install it \
-                                     yourself and run /deploy again.",
+                                     yourself, then ask again.",
                                     provider.label()
                                 ));
                                 return None;
@@ -984,7 +984,7 @@ impl DeploySession {
                         self.fail(format!(
                             "The {} CLI is not installed, and installing from inside this app is \
                              turned off (`allow_cli_install = false` under [deploy]). Install it \
-                             yourself and run /deploy again:\n{}",
+                             yourself, then ask again:\n{}",
                             provider.label(),
                             provider.install_command().display()
                         ));
@@ -1012,7 +1012,7 @@ impl DeploySession {
                 } else {
                     self.mark_last(StepState::Failed);
                     self.fail(format!(
-                        "Installing the {} CLI failed. Install it yourself and run /deploy again:\n{}",
+                        "Installing the {} CLI failed. Install it yourself, then ask again:\n{}",
                         provider.label(),
                         provider.install_command().display()
                     ));

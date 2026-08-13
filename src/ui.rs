@@ -1411,10 +1411,28 @@ const DEPLOY_LOG_LINES_EXPANDED: usize = 18;
 /// `tool_approval_lines` is -- the frame layout needs the line count before it
 /// can allocate the region the panel is then drawn into.
 fn deployment_lines(app: &App, inner: usize) -> Vec<Line<'static>> {
+    let (_, body, footer) = deployment_parts(app, inner);
+    body.into_iter().chain(footer).collect()
+}
+
+/// The panel's content, split into a body that may scroll and a footer that
+/// never does.
+///
+/// The viewport is a fixed strip (`VIEWPORT_ROWS` in `main.rs`), so a panel
+/// that simply grew would be clipped from the bottom -- taking the spinner and
+/// the keys with it, which is exactly the half you need while something is
+/// running. So the status line and the keys are pinned, and the checklist and
+/// log scroll behind them. Same shape, and the same reasoning, as
+/// `tool_approval_parts`.
+fn deployment_parts(
+    app: &App,
+    inner: usize,
+) -> (String, Vec<Line<'static>>, Vec<Line<'static>>) {
     let Some(session) = app.deploy.as_ref() else {
-        return Vec::new();
+        return (String::new(), Vec::new(), Vec::new());
     };
     let mut lines: Vec<Line> = Vec::new();
+    let mut footer: Vec<Line> = Vec::new();
 
     // What has already happened, as a checklist. It stays on screen through
     // every later screen, so "where did it get to" never needs scrollback.
@@ -1446,8 +1464,12 @@ fn deployment_lines(app: &App, inner: usize) -> Vec<Line<'static>> {
 
     match &session.stage {
         Stage::Working(step) => {
+            // The log scrolls; the spinner does not. While a build runs this
+            // line is the whole answer to "is it stuck?", so it is pinned
+            // where it cannot be pushed off by its own output.
             let elapsed = session.started.map(|t| t.elapsed()).unwrap_or_default();
-            lines.push(Line::from(vec![
+            lines.extend(log_lines(session, inner, DEPLOY_LOG_LINES));
+            footer.push(Line::from(vec![
                 Span::styled(format!("{} ", theme::spinner(elapsed)), theme::accent()),
                 Span::styled(
                     format!("{}… ", step.verb()),
@@ -1458,7 +1480,6 @@ fn deployment_lines(app: &App, inner: usize) -> Vec<Line<'static>> {
                     theme::faint(),
                 ),
             ]));
-            lines.extend(log_lines(session, inner, DEPLOY_LOG_LINES));
         }
 
         Stage::Prompt(prompt) => {
@@ -1480,8 +1501,7 @@ fn deployment_lines(app: &App, inner: usize) -> Vec<Line<'static>> {
             } else {
                 Span::styled(shown, theme::text())
             }));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
+            footer.push(Line::from(Span::styled(
                 "  enter confirm · esc back",
                 theme::faint(),
             )));
@@ -1555,8 +1575,7 @@ fn deployment_lines(app: &App, inner: usize) -> Vec<Line<'static>> {
                     }
                 }
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
+            footer.push(Line::from(Span::styled(
                 "  ↑↓ choose · enter confirm · esc back",
                 theme::faint(),
             )));
@@ -1593,8 +1612,7 @@ fn deployment_lines(app: &App, inner: usize) -> Vec<Line<'static>> {
                     }
                     lines.push(Line::from(""));
                     for wrapped in wrap(
-                        "Next: open the URL to check it, or run /deploy again to ship a change. \
-                         /deployments lists what this machine has shipped.",
+                        "Next: open the URL to check it, or ask again to ship a change.",
                         inner,
                     ) {
                         lines.push(Line::from(Span::styled(wrapped, theme::faint())));
@@ -1613,12 +1631,11 @@ fn deployment_lines(app: &App, inner: usize) -> Vec<Line<'static>> {
                     lines.push(Line::from(Span::styled("Nothing was deployed.", theme::muted())));
                 }
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("  enter close", theme::faint())));
+            footer.push(Line::from(Span::styled("  enter close", theme::faint())));
         }
     }
 
-    lines
+    (session.title(), lines, footer)
 }
 
 /// The tail of the streamed log, wrapped to the panel.
@@ -1648,7 +1665,7 @@ fn render_deployment(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
     let inner = area.width.saturating_sub(4).max(1) as usize;
-    let lines = deployment_lines(app, inner);
+    let (title, body, footer) = deployment_parts(app, inner);
 
     // The border colour carries the outcome, so a glance at the shape of the
     // screen answers "did it work" before any text is read.
@@ -1664,27 +1681,45 @@ fn render_deployment(f: &mut Frame, area: Rect, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(accent))
         .title(Span::styled(
-            session.title(),
+            title,
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
         .padding(Padding::new(1, 1, 0, 0));
+    let content = block.inner(area);
+    f.render_widget(block, area);
+    if content.height == 0 {
+        return;
+    }
 
-    // Stick to the bottom: while a build streams, the newest lines are the
-    // ones being read, and a panel that scrolled off the top of its own region
-    // would show the beginning of a build forever.
-    let overflow = (lines.len() as u16).saturating_sub(area.height.saturating_sub(2));
-    f.render_widget(
-        Paragraph::new(lines).block(block).scroll((overflow, 0)),
-        area,
-    );
+    // The footer gets its rows first and keeps them whatever the body does.
+    let footer_height = (footer.len() as u16).min(content.height);
+    let body_height = content.height - footer_height;
+
+    if body_height > 0 {
+        // Stuck to the tail: while a build streams, the newest lines are the
+        // ones being read, and a panel anchored at the top would show the
+        // beginning of a build forever.
+        let scroll = (body.len() as u16).saturating_sub(body_height);
+        let body_area = Rect { height: body_height, ..content };
+        f.render_widget(Paragraph::new(body).scroll((scroll, 0)), body_area);
+    }
+
+    if footer_height > 0 {
+        let footer_area = Rect {
+            y: content.y + body_height,
+            height: footer_height,
+            ..content
+        };
+        f.render_widget(Paragraph::new(footer), footer_area);
+    }
 
     // Only a text prompt has somewhere for the caret to be. Claimed here
     // rather than in `render_input`, which stands down while an overlay is up.
     if let Stage::Prompt(prompt) = &session.stage {
-        if !prompt.masked() && area.height > 2 && area.width > 4 {
+        if !prompt.masked() && body_height > 0 {
             let column = session.input[..session.input_cursor].chars().count();
-            let x = area.x + 2 + (column.min(inner.saturating_sub(1))) as u16;
-            let y = area.bottom().saturating_sub(4).max(area.y + 1);
+            let x = content.x + (column.min(inner.saturating_sub(1))) as u16;
+            let y = content.y + body_height.saturating_sub(1);
             f.set_cursor(x, y);
         }
     }
@@ -4173,6 +4208,55 @@ mod tests {
             !joined.contains("line 30"),
             "the window stayed pinned to the end instead of following the cursor:\n{joined}"
         );
+    }
+
+    /// The viewport is a fixed strip (`VIEWPORT_ROWS` in `main.rs`), so the
+    /// panel cannot grow its way out of trouble: anything past the bottom is
+    /// simply not drawn. The status line and the keys are pinned for exactly
+    /// that reason -- they are the half you need while something is running.
+    #[test]
+    fn the_deployment_panel_keeps_its_status_line_inside_a_short_viewport() {
+        use crate::deploy::service::{tests_support, Step, StepLine};
+
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.workspace_root = "/tmp".to_string();
+        let mut session = tests_support::session("netlify");
+        session.stage = Stage::Working(Step::Deploying);
+        session.started = Some(std::time::Instant::now());
+        // Far more content than the strip can hold, in both halves.
+        for i in 0..20 {
+            session.steps.push(StepLine {
+                label: format!("finished step {i}"),
+                state: StepState::Done,
+            });
+            session.log.push_back(format!("building chunk {i}"));
+        }
+        app.deploy = Some(session);
+        app.overlay = Some(Overlay::Deploy);
+
+        // The height `main.rs` actually gives it.
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(76, 12),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(12),
+            },
+        )
+        .unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf.get(x, y).symbol().to_string()).collect())
+            .collect();
+        let joined = rows.concat();
+
+        assert!(joined.contains("Building and uploading"), "the status line must survive: {rows:?}");
+        assert!(joined.contains("esc to stop"), "so must the way out: {rows:?}");
+        // The tail of the log, not its beginning -- the newest lines are the
+        // ones being read.
+        assert!(joined.contains("building chunk 19"), "{rows:?}");
+        assert!(!joined.contains("building chunk 0 "), "it should have scrolled past: {rows:?}");
     }
 
     /// The cap on the menu's height has to stay above the number of commands.

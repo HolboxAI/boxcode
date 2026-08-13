@@ -403,18 +403,21 @@ on Windows, and the model is told which platform it is on so it reaches for
 
 ## Deploying
 
-Two ways in, sharing everything below the UI — the same detection, the same
-provider layer, the same runner:
+You deploy by **asking**, not by typing a command:
 
-- **Ask the assistant.** `deploy_project` is a tool like `run_command` or
-  `write_file`, so "deploy this to Vercel" works in the middle of a
-  conversation. One approval prompt, then the URL — or the build log — comes
-  back to the model, so it can read the error, fix it, and try again.
-- **`/deploy`.** The wizard you drive yourself: pick a provider, review or edit
-  the detected settings, add environment variables, choose production or
-  preview.
+```
+❯ deploy this project to vercel
+```
 
-### Asking the assistant
+There is deliberately no `/deploy`. A deployment needs a provider and a target
+to mean anything, and a sentence carries both — where a bare command would have
+to ask for them in screens of its own before anything could start.
+
+`deploy_project` is a tool like `run_command` or `write_file`, so this works in
+the middle of a conversation. One approval prompt, then the URL — or the build
+log — comes back to the model, so it can read the error, fix it, and try again.
+
+### What it looks like
 
 ```
 ❯ deploy this project to vercel
@@ -436,7 +439,7 @@ provider layer, the same runner:
 ╰──────────────────────────────────────────────────────────────────────╯
 
   (the deployment panel takes over here: install prompts, sign-in and the
-   streaming build all happen in it, exactly as they do for /deploy)
+   streaming build all happen in it)
 
   · 🚀 deploy → vercel (Preview) — https://my-app-x1.vercel.app
 
@@ -449,9 +452,9 @@ A deployment **always stops for an explicit decision**, even with
 the public internet. Previews are the default; the model has to be told
 "production" to get it.
 
-Once you press `y`, the deployment runs in **the same flow `/deploy` uses** --
-the model does not get a separate headless path. That matters, because it is
-what lets the two things a deployment may need mid-run actually happen:
+Once you press `y`, the deployment runs **interactively** rather than in a
+headless executor. That matters, because it is what lets the two things a
+deployment may need mid-run actually happen:
 
 - **Installing a missing CLI.** The install prompt appears with the exact
   command and the guardrails' verdict on it, and waits for you.
@@ -470,15 +473,20 @@ Two limits worth knowing:
   alongside others, it is declined with an explanation the model can act on.
 - **It cannot set environment variables.** The schema accepts only `provider`
   and `production`, so a model has no way to name a secret, let alone invent a
-  value for one. Those are typed by hand into `/deploy`'s masked field.
+  value for one. Those are typed by hand into the panel's masked field.
 
-### The wizard
+### The panel
 
-`/deploy` takes the project you are already working in and puts it on the
-internet, using the provider's own CLI. It inspects the directory, asks which
-provider, shows what it worked out, and then runs the deployment with its
-output streaming into the panel — the transcript stays visible above it the
-whole time, and the UI never blocks.
+Once approved, a panel takes over the bottom strip of the terminal and drives
+the rest: the checklist of what has happened, any question that comes up, and
+the build streaming live. The transcript stays visible above it the whole time,
+and the UI never blocks.
+
+The panel is a fixed height — the same strip the prompt normally occupies — so
+the log scrolls inside it while the **status line and the keys stay pinned to
+the bottom**. That is deliberate: the spinner and "esc to stop" are exactly
+what you need while a build runs, and they are the first thing a panel that
+simply grew would push off the screen.
 
 ```
 ╭ Continue with deployment? ───────────────────────────────────╮
@@ -540,9 +548,8 @@ manager your lockfile implies (`pnpm build`, `yarn build`, `bun run build`).
 Output is left unset for frameworks both providers infer themselves; passing a
 directory there would override a correct answer with a guess.
 
-Everything is a default, not a decision — **"Edit configuration"** on the
-settings screen changes the name, build command or output directory before
-anything runs.
+Everything is a default, not a decision — **"Edit configuration"** changes the
+name, build command or output directory before anything runs.
 
 ### Authentication
 
@@ -568,7 +575,7 @@ elsewhere.
 
 ### The CLI
 
-`/deploy` needs `vercel` or `netlify` on your `PATH`. If one is missing, it
+Deploying needs `vercel` or `netlify` on your `PATH`. If one is missing, it
 offers to install it and shows the exact command and the guardrails' verdict on
 it — `npm install -g` writes outside the project, so it is flagged as
 destructive by the same `danger.rs` classifier every shell command goes through:
@@ -639,15 +646,11 @@ rather than inventing a summary — that is what you would actually search for.
 
 ### Deployment history
 
-`/deployments` reads `~/.boxcode/deployments.jsonl`, appended to after
-every finished attempt:
+Every finished attempt is appended to `~/.boxcode/deployments.jsonl` — a plain
+file you can read yourself:
 
-```
-Recent deployments (this machine only)
-
-  my-app  (2026-08-10)
-    vercel · Production · Success → https://my-app.vercel.app
-    env: API_URL
+```bash
+cat ~/.boxcode/deployments.jsonl
 ```
 
 It stores the project, path, provider, target, status, URL, timestamp and the
@@ -660,7 +663,7 @@ fails to compile.
 
 ```toml
 [deploy]
-enabled = true            # false removes /deploy and /deployments entirely
+enabled = true            # false removes the deploy_project tool entirely
 allow_cli_install = true  # false = never offer to install a provider CLI
 history_limit = 10        # how many past deployments /deployments prints
 ```
@@ -739,10 +742,6 @@ variables override values in `config.toml`.
 
 - **`/plan`** — Toggles plan mode: the model researches and proposes a plan,
   and cannot change anything until you approve one. See "Plan mode" above.
-- **`/deploy`** — Ships the directory you launched in to Vercel or Netlify,
-  without leaving the terminal. See [Deploying](#deploying) below.
-- **`/deployments`** — Lists what this machine has deployed: project, provider,
-  status and URL. Local only, and never contains a token.
 - **`/provider`** — Opens a picker (↑/↓ to navigate, Enter to select, Esc to
   cancel) of built-in providers, plus a **"Custom endpoint..."** entry that
   preserves the "any OpenAI-compatible endpoint" support above — it's not
@@ -839,7 +838,7 @@ Clean, modular structure for easy feature additions:
 - `src/usage.rs` — Local per-install token usage log (`/usage`), never transmitted
 - `src/telemetry.rs` — Anonymous install/daily-active pings, disabled by default
 - `src/dateutil.rs` — Calendar-date helpers shared by the two above
-- `src/deploy/` — `/deploy`: shipping the project to a hosting provider
+- `src/deploy/` — shipping the project to a hosting provider
   - `mod.rs` — The `DeploymentProvider` trait, shared types, and `Secret`
   - `detect.rs` — Framework/build/output detection, from the filesystem alone
   - `cli.rs` — Is the provider's CLI installed, and may we install it

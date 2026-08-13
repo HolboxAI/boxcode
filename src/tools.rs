@@ -142,7 +142,11 @@ pub fn shell() -> (&'static str, &'static str) {
 /// never told about is one it cannot decide to call. `run_command` stays --
 /// research needs `git log`, `grep`, `cargo tree` -- and is narrowed to
 /// read-only commands by `plan_mode_block` instead.
-pub fn schemas(mode: Mode, active_plan: bool) -> Vec<Value> {
+///
+/// `deploy` is the same idea for `[deploy] enabled = false`: a schema the
+/// model can see is one it will eventually call, and answering "that is turned
+/// off" afterwards is a worse experience than never offering it.
+pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
     let (shell_name, shell_flag) = shell();
     let mut schemas = vec![
         json!({
@@ -327,11 +331,11 @@ pub fn schemas(mode: Mode, active_plan: bool) -> Vec<Value> {
                     "Deploy this project to a hosting provider and get back the live URL. Detects \
                      the framework, build command and output directory automatically, links or \
                      creates the provider-side project, runs the build and uploads it. The user \
-                     approves before anything is deployed. If the provider's CLI is missing or \
-                     nobody is signed in, this returns a clear error and the user has to run \
-                     /deploy once first -- installing and signing in both need the terminal, \
-                     which a tool call cannot take. On failure the build log comes back with the \
-                     error, so read it and fix the real problem before retrying.",
+                     approves before anything is deployed, and anything it needs along the way -- \
+                     installing the provider's CLI, signing in -- it asks the user for directly \
+                     as it goes. Request it on its own, never alongside other tool calls. On \
+                     failure the build log comes back with the error, so read it and fix the real \
+                     problem before retrying.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -351,6 +355,9 @@ pub fn schemas(mode: Mode, active_plan: bool) -> Vec<Value> {
         }),
     ];
 
+    if !deploy {
+        schemas.retain(|schema| schema["function"]["name"] != DEPLOY_PROJECT);
+    }
     if mode.is_plan() {
         schemas.retain(|schema| {
             let name = schema["function"]["name"].as_str().unwrap_or_default();
@@ -2754,9 +2761,41 @@ mod tests {
         );
     }
 
+    /// `enabled = false` has to mean the model never sees the tool. A schema
+    /// it can see is one it will eventually call, and answering "that is
+    /// turned off" is a worse experience than never offering it.
+    #[test]
+    fn disabling_deployment_withholds_the_schema_entirely() {
+        let names: Vec<String> = schemas(Mode::Normal, false, false)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == DEPLOY_PROJECT), "{names:?}");
+        // ...and the rest are untouched.
+        assert!(names.iter().any(|n| n == RUN_COMMAND), "{names:?}");
+        assert_eq!(names.len(), schemas(Mode::Normal, false, true).len() - 1);
+    }
+
+    /// The two gates are independent and must compose: plan mode withholds
+    /// deployment because it is the least reversible thing here, and
+    /// `enabled = false` withholds it because the user turned it off. Neither
+    /// may accidentally re-admit it when the other is inactive.
+    #[test]
+    fn the_deploy_gates_compose() {
+        let has_deploy = |mode, deploy| {
+            schemas(mode, false, deploy)
+                .iter()
+                .any(|s| s["function"]["name"] == DEPLOY_PROJECT)
+        };
+        assert!(has_deploy(Mode::Normal, true), "the ordinary case offers it");
+        assert!(!has_deploy(Mode::Normal, false), "turned off in config");
+        assert!(!has_deploy(Mode::Plan, true), "plan mode changes nothing");
+        assert!(!has_deploy(Mode::Plan, false), "both at once");
+    }
+
     #[test]
     fn the_schemas_name_exactly_the_tools_that_execute() {
-        let schemas = schemas(Mode::Normal, false);
+        let schemas = schemas(Mode::Normal, false, true);
         let names: Vec<_> = schemas.iter().map(|s| s["function"]["name"].clone()).collect();
         assert_eq!(
             names,
@@ -2882,7 +2921,7 @@ mod tests {
     /// `/deploy`, where the user types them into a masked field.
     #[test]
     fn the_deploy_schema_gives_the_model_no_way_to_pass_a_secret() {
-        let schema = schemas(Mode::Normal, false)
+        let schema = schemas(Mode::Normal, false, true)
             .into_iter()
             .find(|s| s["function"]["name"] == DEPLOY_PROJECT)
             .expect("the deploy schema");
@@ -2910,7 +2949,7 @@ mod tests {
     /// no prompt to mistakenly accept.
     #[test]
     fn plan_mode_withholds_the_writing_tools_and_offers_the_way_out() {
-        let names: Vec<String> = schemas(Mode::Plan, false)
+        let names: Vec<String> = schemas(Mode::Plan, false, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect();
@@ -2933,7 +2972,7 @@ mod tests {
     /// reversible thing this program does.
     #[test]
     fn plan_mode_withholds_and_refuses_deployment() {
-        let names: Vec<String> = schemas(Mode::Plan, false)
+        let names: Vec<String> = schemas(Mode::Plan, false, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect();
@@ -2954,7 +2993,7 @@ mod tests {
     /// nobody asked to approve.
     #[test]
     fn normal_mode_does_not_offer_exit_plan_mode() {
-        let names: Vec<String> = schemas(Mode::Normal, false)
+        let names: Vec<String> = schemas(Mode::Normal, false, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect();
@@ -3067,13 +3106,13 @@ mod tests {
     /// `plan_progress` is only offered when there is a plan to record against.
     #[test]
     fn plan_progress_is_offered_only_alongside_an_active_plan() {
-        let without: Vec<String> = schemas(Mode::Normal, false)
+        let without: Vec<String> = schemas(Mode::Normal, false, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect();
         assert!(!without.contains(&PLAN_PROGRESS.to_string()), "{without:?}");
 
-        let with: Vec<String> = schemas(Mode::Normal, true)
+        let with: Vec<String> = schemas(Mode::Normal, true, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect();
