@@ -1219,10 +1219,6 @@ mod tests {
         }
     }
 
-    /// A bare `/` is a target, never a switch. If the switch-skipping logic
-    /// ever swallows it, `Remove-Item -Recurse -Force /` silently downgrades
-    /// from blocked to a prompt.
-    #[test]
     /// The other half of auto-approving `gh` reads. These reach past this
     /// machine -- a deleted repo or a merged PR is something other people have
     /// already seen, and `git` undoes none of it -- so they belong in the tier
@@ -1271,6 +1267,9 @@ mod tests {
         }
     }
 
+    /// A bare `/` is a target, never a switch. If the switch-skipping logic
+    /// ever swallows it, `Remove-Item -Recurse -Force /` silently downgrades
+    /// from blocked to a prompt.
     #[test]
     fn a_bare_slash_is_never_treated_as_a_dos_switch() {
         assert_blocked("del /f /s /q /");

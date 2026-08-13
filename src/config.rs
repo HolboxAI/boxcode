@@ -20,6 +20,33 @@ pub struct Config {
     /// Same again for `[deploy]`.
     #[serde(default)]
     pub deploy: DeployConfig,
+    /// Same again for `[update]`.
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+/// Whether launching boxcode should notice that a newer release exists.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// Check for a newer release on startup, and offer to install it.
+    ///
+    /// Defaults to on, because the failure it prevents is silent: a user
+    /// stays on a build with a fixed bug still in it, and nothing ever tells
+    /// them. It is a single request, at most once a day, with a short
+    /// timeout, and every failure is ignored -- see `upgrade::check_on_start`.
+    ///
+    /// Worth turning off on a machine with no route to github.com, where the
+    /// check can only ever fail, and in CI, where nothing should be prompting.
+    #[serde(default = "yes")]
+    pub check_on_start: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check_on_start: yes(),
+        }
+    }
 }
 
 /// Settings for `/deploy`. See `src/deploy/`.
@@ -727,6 +754,7 @@ mod tests {
                 quota: QuotaConfig::default(),
                 ui: UiConfig::default(),
                 deploy: DeployConfig::default(),
+                update: UpdateConfig::default(),
                 llm: LlmConfig {
                     endpoint: "https://api.deepseek.com".to_string(),
                     model: "deepseek-v4-pro".to_string(),
