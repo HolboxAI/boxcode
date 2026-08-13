@@ -249,7 +249,15 @@ fn flush_to_scrollback<B: ratatui::backend::Backend>(
     // to whatever fits the strip at the bottom.
     if let Some(ready) = app.streamed_ready() {
         let text = ready.to_string();
-        let lines: Vec<_> = ui::wrapped_lines(text.trim_end_matches('\n'), text_width);
+        // One trailing newline, not all of them: that one is the last line's
+        // own terminator and would otherwise print an extra blank row. Any
+        // before it are deliberate blank lines in the reply, and a chunk now
+        // spans several lines (see `safe_flush_end`), so stripping the lot
+        // would swallow the paragraph break after a table or code block.
+        let lines: Vec<_> = ui::wrapped_lines(
+            text.strip_suffix('\n').unwrap_or(&text),
+            text_width,
+        );
         if !lines.is_empty() {
             let height = lines.len() as u16;
             terminal.insert_before(height, |buf| {
