@@ -583,6 +583,22 @@ pub fn system_prompt(
            call it and let it handle that. Request it on its own, never alongside other tool \
            calls. If the build fails, the log comes back with the error: read it, fix the real \
            problem, and only then deploy again.\n\
+         - For anything on GitHub -- repositories, pull requests, issues, releases, CI runs, \
+           contributor or commit counts -- use the `gh` CLI through {RUN_COMMAND}. It is \
+           already signed in, and its read commands run without asking the user, so there is \
+           no reason to guess or to say you cannot check.\n\
+         - `gh`'s list commands return only the FIRST 30 RESULTS unless you say otherwise. \
+           `gh repo list`, `gh pr list`, `gh issue list`, `gh run list` and the rest all \
+           default to 30, so a bare call quietly gives you a partial answer that looks \
+           complete. Always pass an explicit `--limit` (e.g. `--limit 1000`), and for \
+           anything that may exceed one API page use `gh api --paginate`. Never report a \
+           count, a total, or \"all of them\" from a command you did not bound yourself.\n\
+         - Ask for the fields you need rather than parsing the human-readable table: \
+           `gh repo list --limit 1000 --json name,visibility,updatedAt` and `--jq` to filter. \
+           It is exact, it is smaller, and it does not change shape between `gh` versions.\n\
+         - If output comes back truncated, narrow the query -- more `--jq`, fewer fields, a \
+           smaller `--limit` -- and run it again. Do not extrapolate from a partial result or \
+           present it as the whole.\n\
          - Answers appear in a terminal: keep narration to a sentence or two, not a report.\n\
          - That terminal renders markdown, so use it where it carries meaning and nowhere \
            else. `**bold**` for the few words that decide something; `backticks` around every \
@@ -1117,7 +1133,92 @@ pub fn is_read_only(command: &str) -> bool {
             return matches!(sub, "status" | "diff" | "log" | "show");
         }
     }
+    if program == "gh" {
+        return gh_is_read_only(&words.collect::<Vec<_>>());
+    }
     false
+}
+
+/// Whether a `gh` invocation only reads from GitHub.
+///
+/// Answering anything about a repository, its pull requests or its CI takes
+/// several `gh` calls -- list, then view, then check -- and prompting for each
+/// one is what turns an accurate answer into a half-answer: every prompt is a
+/// chance to lose the thread, and the model is told to prefer tools that cost
+/// the user nothing to approve. None of the commands below can change
+/// anything on GitHub or on disk, so there is nothing for a prompt to protect.
+///
+/// An allowlist of verb pairs rather than a blocklist, and deliberately so:
+/// `gh` has well over a hundred subcommands and gains more each release, so
+/// anything not named here -- `repo delete`, `pr merge`, `release upload`, a
+/// subcommand that does not exist yet -- keeps asking. Being wrong in that
+/// direction costs a keystroke; being wrong in the other costs a repository.
+fn gh_is_read_only(args: &[&str]) -> bool {
+    let mut positional = args.iter().filter(|a| !a.starts_with('-'));
+    let (Some(noun), verb) = (positional.next(), positional.next()) else {
+        return false;
+    };
+
+    // `gh api` is the exception: one subcommand that both reads and writes,
+    // told apart by its flags rather than by a verb. Anything carrying a
+    // method other than GET, a field, or a request body is a write.
+    if *noun == "api" {
+        return gh_api_is_read_only(args);
+    }
+
+    let Some(verb) = verb else {
+        // A bare `gh <noun>` is `gh status`-style or a help screen. Only the
+        // one that is genuinely a read is allowed through.
+        return *noun == "status";
+    };
+
+    matches!(
+        (*noun, *verb),
+        ("repo", "list" | "view")
+            | ("pr", "list" | "view" | "diff" | "checks" | "status")
+            | ("issue", "list" | "view" | "status")
+            | ("run", "list" | "view")
+            | ("release", "list" | "view")
+            | ("workflow", "list" | "view")
+            | ("gist", "list" | "view")
+            | ("label", "list")
+            | ("cache", "list")
+            | ("secret", "list") // names only; `gh` cannot print secret values
+            | ("variable", "list")
+            | ("ssh-key", "list")
+            | ("gpg-key", "list")
+            | ("auth", "status")
+            | ("org", "list")
+            | ("project", "list" | "view")
+            | ("search", "repos" | "issues" | "prs" | "code" | "commits")
+    )
+}
+
+/// `gh api` reads unless its flags say otherwise.
+///
+/// `--method`/`-X` anything but GET, and every flag that attaches a body
+/// (`-f`, `-F`, `--field`, `--raw-field`, `--input`) mean a write. `--paginate`
+/// and `--jq` are reads and are exactly what a complete answer needs, so they
+/// must not be caught here.
+fn gh_api_is_read_only(args: &[&str]) -> bool {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (*arg, None),
+        };
+        match flag {
+            "-X" | "--method" => {
+                let value = inline.or_else(|| iter.peek().map(|v| **v));
+                if !value.is_some_and(|v| v.eq_ignore_ascii_case("GET")) {
+                    return false;
+                }
+            }
+            "-f" | "-F" | "--field" | "--raw-field" | "--input" => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
@@ -1240,7 +1341,7 @@ async fn execute_run_command(call: &ToolCall, workspace: &Workspace, config: &To
     let budget = config.max_output_bytes;
     if !stdout.trim().is_empty() {
         content.push_str("--- stdout ---\n");
-        content.push_str(&clip(&stdout, budget));
+        content.push_str(&clip_output(&stdout, budget));
         content.push('\n');
     }
     if !stderr.trim().is_empty() {
@@ -2139,6 +2240,29 @@ fn clip(s: &str, max: usize) -> String {
     format!("{kept}\n[… truncated at {max} characters]")
 }
 
+/// `clip` for command output, where the model is the reader.
+///
+/// The bare marker said output was cut but not what to do about it, and the
+/// failure that follows is the expensive one: the model answers from the part
+/// it got and presents a partial result as the whole. Saying plainly that the
+/// rest exists, and how to go and get it, turns a silently wrong answer into
+/// one more tool call.
+///
+/// Separate from `clip` because that one also shortens 50-character labels for
+/// the transcript, where a paragraph of advice would be absurd.
+fn clip_output(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!(
+        "{kept}\n[… truncated: {max} of {total} characters shown. The rest was NOT read. \
+         Do not summarise or count from this partial output -- narrow the command (a filter, \
+         fewer fields, --jq, a smaller --limit, or head/tail) and run it again.]"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2545,7 +2669,10 @@ mod tests {
             "for i in $(seq 1 5000); do echo aaaaaaaaaaaaaaaaaaaa; done"
         };
         let out = execute(&call(command), &ws, &cfg).await;
-        assert!(out.content.contains("truncated at 200"), "{}", out.content);
+        assert!(out.content.contains("truncated: 200 of"), "{}", out.content);
+        // The marker alone let the model answer from the part it got and
+        // present a partial result as the whole; it has to say what to do.
+        assert!(out.content.contains("run it again"), "{}", out.content);
     }
 
     #[tokio::test]
@@ -2625,6 +2752,75 @@ mod tests {
     fn narrow_git_subcommands_are_recognised() {
         for cmd in ["git status", "git diff HEAD~1", "git log --oneline -5", "git show HEAD"] {
             assert!(is_read_only(cmd), "expected read-only: {cmd}");
+        }
+    }
+
+    /// Answering a question about a repo takes several `gh` calls in a row.
+    /// Prompting for each is what turned a complete answer into a partial one.
+    #[test]
+    fn read_only_gh_commands_are_recognised() {
+        for cmd in [
+            "gh repo list --limit 1000",
+            "gh repo view HolboxAI/boxcode --json name,visibility",
+            "gh pr list --state all --limit 500",
+            "gh pr view 42",
+            "gh pr diff 42",
+            "gh pr checks 42",
+            "gh issue list --limit 1000",
+            "gh run list --limit 100",
+            "gh release list",
+            "gh workflow list",
+            "gh search repos --owner HolboxAI",
+            "gh auth status",
+            "gh api repos/HolboxAI/boxcode",
+            "gh api --paginate repos/HolboxAI/boxcode/commits",
+            "gh api -X GET repos/HolboxAI/boxcode",
+            "gh api --method=GET repos/HolboxAI/boxcode",
+        ] {
+            assert!(is_read_only(cmd), "expected read-only: {cmd}");
+        }
+    }
+
+    /// The allowlist is verb pairs, so anything that writes -- named or not
+    /// yet invented -- keeps asking. Being wrong this way costs a keystroke;
+    /// being wrong the other way costs a repository.
+    #[test]
+    fn writing_gh_commands_still_need_approval() {
+        for cmd in [
+            "gh repo delete HolboxAI/boxcode",
+            "gh repo create thing --public",
+            "gh repo clone HolboxAI/boxcode",
+            "gh pr merge 42",
+            "gh pr close 42",
+            "gh pr create --fill",
+            "gh release create v9.9.9",
+            "gh release upload v1 file.zip",
+            "gh secret set TOKEN",
+            "gh auth logout",
+            "gh api -X DELETE repos/HolboxAI/boxcode",
+            "gh api --method POST repos/HolboxAI/boxcode/issues",
+            "gh api --method=DELETE repos/x/y",
+            "gh api repos/x/y/issues -f title=oops",
+            "gh api repos/x/y --input body.json",
+            // A subcommand this allowlist has never heard of.
+            "gh newthing whatever",
+            "gh",
+        ] {
+            assert!(!is_read_only(cmd), "expected NOT read-only: {cmd}");
+        }
+    }
+
+    /// Auto-approving reads must not smuggle a write in behind a pipe or a
+    /// subshell -- the existing chaining guard covers `gh` like anything else.
+    #[test]
+    fn a_chained_gh_command_is_never_read_only() {
+        for cmd in [
+            "gh repo list && gh repo delete x",
+            "gh repo list; rm -rf build",
+            "gh api repos/x/y | sh",
+            "gh repo list $(gh repo delete x)",
+        ] {
+            assert!(!is_read_only(cmd), "expected NOT read-only: {cmd}");
         }
     }
 

@@ -73,6 +73,61 @@ impl Risk {
     }
 }
 
+/// `gh` operations that cannot be undone from the machine that ran them.
+///
+/// The read side of `gh` now runs without an approval prompt, because
+/// answering a question about a repository takes several calls and prompting
+/// for each one is what produces half-answers. This is the other half of that
+/// change: widening the door on reads means naming the writes that must never
+/// go through it quietly.
+///
+/// These land in the always-ask tier -- the one `require_approval = false`
+/// does not reach -- because their blast radius is not on this machine. A
+/// deleted local file is a mistake; a deleted repository, a merged pull
+/// request or a published release is a mistake other people already saw, and
+/// `git` cannot undo any of them.
+fn gh_risk(args: &[&str]) -> Risk {
+    let mut positional = args.iter().filter(|a| !a.starts_with('-'));
+    let Some(noun) = positional.next() else {
+        return Risk::Normal;
+    };
+    let verb = positional.next().copied().unwrap_or("");
+
+    // `gh api -X DELETE ...` reaches everything the subcommands below do, and
+    // then some, without naming any of them.
+    if *noun == "api" {
+        let writes = args.windows(2).any(|pair| {
+            matches!(pair[0], "-X" | "--method")
+                && !pair[1].eq_ignore_ascii_case("GET")
+        }) || args.iter().any(|a| {
+            a.strip_prefix("--method=")
+                .is_some_and(|m| !m.eq_ignore_ascii_case("GET"))
+        });
+        if writes {
+            return dangerous("sends a writing GitHub API request");
+        }
+        return Risk::Normal;
+    }
+
+    match (*noun, verb) {
+        ("repo", "delete") => dangerous("deletes a GitHub repository, for everyone"),
+        ("repo", "archive") => dangerous("archives a GitHub repository"),
+        ("release", "delete") => dangerous("deletes a published release and its assets"),
+        ("issue", "delete") => dangerous("deletes an issue, which GitHub cannot restore"),
+        ("gist", "delete") => dangerous("deletes a gist"),
+        ("pr", "merge") => dangerous("merges a pull request into the base branch"),
+        ("pr", "close") => dangerous("closes someone's pull request"),
+        ("secret", "delete") | ("variable", "delete") => {
+            dangerous("removes a secret or variable that CI may depend on")
+        }
+        ("ssh-key", "delete") | ("gpg-key", "delete") => dangerous("removes a key from your account"),
+        ("cache", "delete") => dangerous("deletes CI caches"),
+        ("workflow", "disable") => dangerous("disables a CI workflow"),
+        ("auth", "logout") => dangerous("signs this machine out of GitHub"),
+        _ => Risk::Normal,
+    }
+}
+
 fn blocked(reason: impl Into<String>) -> Risk {
     Risk::Blocked(reason.into())
 }
@@ -316,6 +371,7 @@ fn program_risk(program: &str, args: &[&str], root: &Path) -> Risk {
             }
         }
         "history" if args.contains(&"-c") => dangerous("erases your shell history"),
+        "gh" => gh_risk(args),
         _ => Risk::Normal,
     }
 }
@@ -1166,6 +1222,55 @@ mod tests {
     /// A bare `/` is a target, never a switch. If the switch-skipping logic
     /// ever swallows it, `Remove-Item -Recurse -Force /` silently downgrades
     /// from blocked to a prompt.
+    #[test]
+    /// The other half of auto-approving `gh` reads. These reach past this
+    /// machine -- a deleted repo or a merged PR is something other people have
+    /// already seen, and `git` undoes none of it -- so they belong in the tier
+    /// `require_approval = false` cannot switch off.
+    #[test]
+    fn irreversible_gh_operations_always_stop_for_a_decision() {
+        for command in [
+            "gh repo delete HolboxAI/boxcode",
+            "gh repo delete HolboxAI/boxcode --yes",
+            "gh repo archive HolboxAI/boxcode",
+            "gh release delete v1.1.0",
+            "gh issue delete 42",
+            "gh gist delete abc123",
+            "gh pr merge 42 --squash",
+            "gh pr close 42",
+            "gh secret delete TOKEN",
+            "gh ssh-key delete 123",
+            "gh cache delete --all",
+            "gh workflow disable release.yml",
+            "gh auth logout",
+            "gh api -X DELETE repos/HolboxAI/boxcode",
+            "gh api --method DELETE repos/x/y",
+            "gh api --method=POST repos/x/y/issues",
+        ] {
+            assert_dangerous(command);
+        }
+    }
+
+    /// Reads must stay out of the way entirely, or the prompt fatigue this
+    /// change exists to remove comes straight back.
+    #[test]
+    fn reading_gh_operations_are_not_flagged() {
+        for command in [
+            "gh repo list --limit 1000",
+            "gh pr list --state all",
+            "gh pr view 42",
+            "gh issue list",
+            "gh run list --limit 100",
+            "gh release list",
+            "gh auth status",
+            "gh api repos/HolboxAI/boxcode",
+            "gh api --paginate repos/x/y/commits",
+            "gh api -X GET repos/x/y",
+        ] {
+            assert_normal(command);
+        }
+    }
+
     #[test]
     fn a_bare_slash_is_never_treated_as_a_dos_switch() {
         assert_blocked("del /f /s /q /");
