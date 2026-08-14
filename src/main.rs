@@ -1,3 +1,4 @@
+mod agent;
 mod app;
 mod approval;
 mod artifacts;
@@ -19,7 +20,7 @@ mod upgrade;
 mod usage;
 mod workspace;
 
-use app::{App, AppState};
+use app::App;
 use config::Config;
 use workspace::Workspace;
 use crossterm::event::{
@@ -384,19 +385,10 @@ async fn run_app<B: ratatui::backend::Backend>(
 
         // Drain every token that has arrived; doing only one per frame caps
         // throughput at ~60 tokens/sec and looks like the app is stalling.
+        // The dispatch itself (and the stale-request guard) lives in
+        // `agent::handle_event` -- the loop's job is only to pump the channel.
         while let Ok((id, event)) = rx.try_recv() {
-            if id != app.request_id {
-                continue; // stale: belongs to a cancelled request
-            }
-            match event {
-                StreamEvent::Token(token) => app.append_token(&token),
-                StreamEvent::ToolCalls(calls) => app.request_tools(calls),
-                StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
-                StreamEvent::Usage(u) => app.record_exact_usage(u),
-                StreamEvent::Done => app.finish_stream(),
-                StreamEvent::Notice(note) => app.note(note),
-                StreamEvent::Error(err) => app.fail_stream(err),
-            }
+            agent::handle_event(app, id, event);
         }
 
         // Deployment progress. Same shape as the token drain above, and drained
@@ -485,105 +477,12 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
-        // Fire a pending request.
-        if app.state == AppState::Sending {
-            app.request_id += 1;
-            let id = app.request_id;
-            let endpoint = app.config.llm.endpoint.clone();
-            let model = app.config.llm.model.clone();
-            let api_key = app.config.llm.api_key.clone();
-            let max_tokens = app.config.llm.max_tokens;
-
-            // Withholding the schemas once the budget is spent is what actually
-            // stops a runaway loop: the model has nothing left to call, so it
-            // answers. Saying "stop" in the prompt alone would only be a request.
-            let budget_left = app.tool_steps < app.config.tools.max_steps;
-            // Exact counts make the quota real; without them it falls back to the
-            // same character estimate `usage.rs` uses.
-            let include_usage = app.config.quota.enabled && app.config.quota.include_usage;
-            // A `/compact` request reads the conversation and writes a summary
-            // of it; it has nothing to run. Withholding the schemas is what
-            // makes that true rather than merely asked for -- and a tool call
-            // here would be worse than useless, since the history that replaces
-            // this one has nowhere to put the result it would be owed.
-            let (schemas, system) = match workspace {
-                _ if app.compacting => (Vec::new(), None),
-                Some(ws) => (
-                    if budget_left {
-                        tools::schemas(
-                            app.mode,
-                            app.active_plan.is_some(),
-                            app.config.deploy.enabled,
-                        )
-                    } else {
-                        Vec::new()
-                    },
-                    Some(tools::system_prompt(
-                        ws,
-                        &app.config.tools,
-                        app.tool_steps,
-                        app.mode,
-                        app.active_plan.as_ref(),
-                    )),
-                ),
-                None => (Vec::new(), None),
-            };
-            let history = if app.compacting {
-                app.compaction_history()
-            } else {
-                app.history(system.as_deref())
-            };
-            let tx_clone = tx.clone();
-
-            let handle = tokio::spawn(async move {
-                llm::stream_chat(
-                    llm::Target { endpoint: &endpoint, model: &model, api_key: &api_key, max_tokens, include_usage },
-                    history,
-                    schemas,
-                    id,
-                    tx_clone,
-                )
-                .await;
-            });
-
-            app.abort = Some(handle.abort_handle());
-            app.state = AppState::Streaming;
-        }
-
-        // Run the commands the user allowed.
-        //
-        // Spawned rather than run inline: a command may take a minute, and doing
-        // it on the event loop would freeze the whole UI -- no redraw, no Esc, no
-        // way to tell a slow build from a hang. Results come back on the same
-        // channel as tokens, so the stale-request-id guard covers them too.
-        if app.state == AppState::ExecutingTools && !app.approved_tools.is_empty() {
-            let calls = std::mem::take(&mut app.approved_tools);
-            let tools_config = app.config.tools.clone();
-            match workspace {
-                Some(ws) => {
-                    let ws = ws.clone();
-                    let id = app.request_id;
-                    let tx_clone = tx.clone();
-                    let handle = tokio::spawn(async move {
-                        let mut outcomes = Vec::with_capacity(calls.len());
-                        for call in &calls {
-                            outcomes.push(tools::execute(call, &ws, &tools_config).await);
-                        }
-                        let _ = tx_clone
-                            .send((id, StreamEvent::ToolsFinished(outcomes)))
-                            .await;
-                    });
-                    app.abort = Some(handle.abort_handle());
-                }
-                // Only reachable if a model invents tool calls for a schema it
-                // was never sent. Answer them anyway, or the history is left
-                // invalid and the next prompt fails instead of this one.
-                None => app.fail_stream(
-                    "The model asked to run a command, but the command tool is not enabled."
-                        .to_string(),
-                ),
-            }
-        }
+        // The agent loop's two active steps: fire the request `App` queued,
+        // and run what the user allowed. Both are no-ops unless `App` is in
+        // the matching state, and both live in `agent.rs` -- this loop only
+        // decides *when* they get a chance to run, not what they do.
+        agent::fire_request(app, workspace, &tx);
+        agent::execute_approved(app, workspace, &tx);
 
         if app.should_exit {
             break;
