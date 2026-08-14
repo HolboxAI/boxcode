@@ -1056,6 +1056,16 @@ fn tool_approval_parts(
             )));
             (" Search for these files? ", "search", "skip")
         }
+        Action::Grep { pattern, path } => {
+            let scope = path.as_deref().map(|p| format!(" in {p}")).unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                format!("🔎 {pattern}{scope}"),
+                Style::default()
+                    .fg(theme::p().text)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            (" Search file contents? ", "search", "skip")
+        }
         // An edit shows both spans, because approving a replacement you cannot
         // see is not approval. Unlike a write it does not need the whole file --
         // showing only what changes is the reason to prefer this tool.

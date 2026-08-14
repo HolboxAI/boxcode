@@ -1538,8 +1538,8 @@ impl App {
     /// session" and `require_approval = false` must not silently cover
     /// `rm -rf build` an hour later. Below that, the hatches short-circuit
     /// regardless of the call, and `auto_approve_read_only` waives the prompt
-    /// only for a narrow slice -- `read_file`, `list_dir` and `glob`
-    /// unconditionally (none of them can write anything), and shell commands
+    /// only for a narrow slice -- `read_file`, `list_dir`, `glob` and
+    /// `grep_search` unconditionally (none of them can write anything), and shell commands
     /// via `tools::is_read_only`. `write_file` and `edit_file` never qualify:
     /// unlike a shell command's read-only-ness, which has to be inferred,
     /// "this writes to a file" is certain, so they always ask -- and neither
@@ -1568,7 +1568,8 @@ impl App {
                 // it modifies a file and is approved like a write.
                 Some(tools::Action::Read { .. })
                 | Some(tools::Action::List { .. })
-                | Some(tools::Action::Glob { .. }) => return false,
+                | Some(tools::Action::Glob { .. })
+                | Some(tools::Action::Grep { .. }) => return false,
                 Some(tools::Action::Command { command, .. }) if tools::is_read_only(&command) => {
                     return false;
                 }
