@@ -23,7 +23,8 @@ pub enum AppState {
     ExecutingTools,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     User,
     Assistant,
@@ -43,17 +44,22 @@ pub enum Role {
     Summary,
 }
 
-#[derive(Clone)]
+// Serialized as one line of a session file (see `session.rs`); the
+// `default`s keep a file written by an older build loadable by a newer one.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
     /// What goes on the wire. For a tool result this is the entire file, which is
     /// why it is not what gets drawn.
     pub content: String,
     /// What the transcript shows, when that differs from `content`.
+    #[serde(default)]
     pub display: Option<String>,
     /// Tool calls the assistant asked for. Only ever set on `Role::Assistant`.
+    #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     /// Which call this message answers. Only ever set on `Role::Tool`.
+    #[serde(default)]
     pub tool_call_id: Option<String>,
 }
 
@@ -138,6 +144,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/provider", "switch provider or endpoint"),
     ("/model", "switch model"),
     ("/init", "write a BOXCODE.md the model reads every session"),
+    ("/resume", "pick up this directory's last session"),
     ("/new", "forget the current conversation"),
     ("/compact", "summarise the conversation to free up context"),
     ("/usage", "what today cost, and the history"),
@@ -264,6 +271,11 @@ pub struct App {
     /// hidden filesystem write inside one of them would have every test
     /// touching the real developer machine. Only `main.rs`'s loop persists.
     pub plan_dirty: bool,
+    /// The conversation was replaced wholesale (`/new`, a finished
+    /// compaction, a resume) and the session log must rotate to a fresh file
+    /// -- length alone cannot tell replacement from growth. Same
+    /// mark-and-let-main-write pattern as `plan_dirty`/`quota_dirty`.
+    pub session_reset: bool,
     pub messages: Vec<Message>,
     /// Raw text of the prompt box. May contain '\n' (Alt/Shift-Enter inserts one).
     pub input_buffer: String,
@@ -437,6 +449,7 @@ impl App {
             mode: Mode::Normal,
             active_plan: None,
             plan_dirty: false,
+            session_reset: false,
             messages: Vec::new(),
             input_buffer: String::new(),
             cursor: 0,
@@ -575,6 +588,7 @@ impl App {
                         "/provider" => self.open_provider_picker(),
                         "/model" => self.open_model_picker_from_config(),
                         "/init" => self.start_init(),
+                        "/resume" => self.resume_latest(),
                         "/new" => self.start_new_conversation(),
                         "/compact" => self.start_compaction(),
                         "/usage" => self.show_usage(),
@@ -1096,6 +1110,7 @@ impl App {
     /// mean the next unrelated request silently refusing to do anything, with
     /// the message explaining why now scrolled away above the line.
     fn start_new_conversation(&mut self) {
+        self.session_reset = true;
         self.messages.clear();
         self.streaming_response.clear();
         self.pending_tools.clear();
@@ -1148,17 +1163,63 @@ impl App {
         }
     }
 
-    /// `/compact` -- have the model write the conversation down to a summary,
-    /// and continue from that instead.
-    ///
-    /// The same problem `/new` solves, without the amnesia: the whole
-    /// transcript is resent every turn, so a long session costs more with each
-    /// prompt whether or not the early messages still matter. `/new` fixes the
-    /// cost by discarding everything; this pays for one summarising request in
-    /// order to keep what was actually established.
-    ///
-    /// It is a real request against a real endpoint, so it is metered, refused
-    /// by an exhausted quota, and interruptible, like any other.
+    /// `/resume` (and `--resume` at launch) -- reload this directory's most
+    /// recent recorded session and carry on from it. The loaded messages go
+    /// on the wire with the next request exactly as if they had never left,
+    /// and the resumed-from file is not written to: the continuation records
+    /// into a fresh session file (see `session::SessionLog::append`).
+    pub fn resume_latest(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        self.greeted = true;
+        self.follow_tail = true;
+        // Only into a fresh conversation. Splicing a past session under one
+        // already in flight would hand the model two interleaved histories,
+        // and silently discarding the current one is /new's decision to make,
+        // not this command's.
+        if self.context_size().messages > 0 {
+            self.messages.push(Message::new(
+                Role::Error,
+                "There is already a conversation here. /resume picks a past session up only \
+                 from a fresh start -- /new first if you mean to switch.",
+            ));
+            return;
+        }
+        let Some(path) = crate::session::latest_for(&self.workspace_root) else {
+            self.messages.push(Message::new(
+                Role::System,
+                "No recorded session for this directory yet. Sessions are saved as you work, \
+                 under ~/.boxcode/sessions/.",
+            ));
+            return;
+        };
+        let loaded = crate::session::load(&path);
+        if loaded.is_empty() {
+            self.messages.push(Message::new(
+                Role::System,
+                "The last recorded session is empty or unreadable, so there is nothing to resume.",
+            ));
+            return;
+        }
+        let count = loaded.len();
+        self.session_reset = true;
+        self.messages = loaded;
+        // The restored transcript should be on screen, not just in context --
+        // same cursor reset a compaction does when the list changes under it.
+        self.flushed = 0;
+        self.scroll = 0;
+        self.last_prompt_tokens = None;
+        self.messages.push(Message::new(
+            Role::System,
+            format!(
+                "Resumed the last session in this directory — {count} message{} restored. \
+                 Carry on where it left off.",
+                if count == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+
     /// `/init` -- has the model explore the project and write the `BOXCODE.md`
     /// that every later session reads (see `tools::project_memory`). Nothing
     /// special mechanically: it is an ordinary turn with a canned prompt, and
@@ -1202,6 +1263,17 @@ impl App {
         self.state = AppState::Sending;
     }
 
+    /// `/compact` -- have the model write the conversation down to a summary,
+    /// and continue from that instead.
+    ///
+    /// The same problem `/new` solves, without the amnesia: the whole
+    /// transcript is resent every turn, so a long session costs more with each
+    /// prompt whether or not the early messages still matter. `/new` fixes the
+    /// cost by discarding everything; this pays for one summarising request in
+    /// order to keep what was actually established.
+    ///
+    /// It is a real request against a real endpoint, so it is metered, refused
+    /// by an exhausted quota, and interruptible, like any other.
     fn start_compaction(&mut self) {
         if self.is_busy() {
             return;
@@ -1290,6 +1362,7 @@ impl App {
             return;
         }
 
+        self.session_reset = true;
         self.messages.clear();
         self.messages.push(Message {
             role: Role::Summary,
@@ -2047,6 +2120,50 @@ impl App {
             self.follow_tail = true;
         }
         self.settle_turn();
+        // Only here, at the end of an ordinary completed turn -- not after a
+        // finished compaction (its whole point was to shrink the context, and
+        // re-checking would be circular) and not on a failed request (where
+        // retrying a full-context summarisation against a failing endpoint
+        // would loop).
+        self.maybe_auto_compact();
+    }
+
+    /// Compact without being asked, once the context passes the configured
+    /// size -- the moment is chosen for being cheap: the turn is over, nothing
+    /// is queued, and the alternative is every later turn paying for a
+    /// transcript nobody chose to keep whole. Announced before it happens, and
+    /// `/compact`'s own guarantees hold: nothing is discarded until a usable
+    /// summary comes back.
+    fn maybe_auto_compact(&mut self) {
+        if !self.config.compact.auto || self.compacting || self.is_busy() {
+            return;
+        }
+        // Exact prompt size from the endpoint where it was reported --
+        // that figure is what the context actually costs -- and the character
+        // estimate where it was not.
+        let context = self
+            .last_prompt_tokens
+            .unwrap_or_else(|| self.context_size().approx_tokens);
+        let threshold = self.config.compact.auto_at_tokens as usize;
+        if context < threshold {
+            return;
+        }
+        // Below two messages `start_compaction` would refuse with its own
+        // notice; reaching that state with a giant context means one enormous
+        // message, which a summary cannot shrink anyway.
+        if self.context_size().messages < 2 {
+            return;
+        }
+        self.messages.push(Message::new(
+            Role::System,
+            format!(
+                "The conversation has reached ~{context} tokens, past the auto-compact \
+                 threshold ({threshold}), so it is being summarised to free up context. \
+                 `[compact] auto = false` in ~/.boxcode/config.toml turns this off; \
+                 `auto_at_tokens` moves it."
+            ),
+        ));
+        self.start_compaction();
     }
 
     /// The bookkeeping every finished request shares, whatever it was for:
@@ -3001,6 +3118,71 @@ mod tests {
         assert_eq!(a.state, AppState::AwaitingInput);
     }
 
+    /// Past the configured context size, a finished turn rolls straight into
+    /// a compaction, announced first -- the user watches it happen rather
+    /// than wondering why the app went quiet.
+    #[test]
+    fn a_turn_past_the_threshold_compacts_itself_with_a_notice() {
+        let mut a = a_conversation();
+        a.config.compact.auto_at_tokens = 4_000;
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 5_000, completion_tokens: 20 });
+        a.state = AppState::Streaming;
+        a.streaming_response = "Done.".to_string();
+
+        a.finish_stream();
+
+        assert!(a.compacting, "the turn should have rolled into a compaction");
+        assert_eq!(a.state, AppState::Sending);
+        let shown: String = a.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(shown.contains("auto-compact threshold"), "{shown}");
+        assert!(shown.contains("[compact] auto = false"), "the off switch is named: {shown}");
+    }
+
+    #[test]
+    fn a_turn_below_the_threshold_does_not_compact() {
+        let mut a = a_conversation();
+        a.config.compact.auto_at_tokens = 4_000;
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 3_000, completion_tokens: 20 });
+        a.state = AppState::Streaming;
+        a.streaming_response = "Done.".to_string();
+
+        a.finish_stream();
+
+        assert!(!a.compacting);
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    #[test]
+    fn auto_compaction_can_be_turned_off() {
+        let mut a = a_conversation();
+        a.config.compact.auto = false;
+        a.config.compact.auto_at_tokens = 4_000;
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 50_000, completion_tokens: 20 });
+        a.state = AppState::Streaming;
+        a.streaming_response = "Done.".to_string();
+
+        a.finish_stream();
+
+        assert!(!a.compacting);
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    /// A failed request must not roll into an automatic compaction: that
+    /// would fire a full-context summarisation at an endpoint that just
+    /// failed, and keep firing it after every failure.
+    #[test]
+    fn a_failed_request_does_not_trigger_auto_compaction() {
+        let mut a = a_conversation();
+        a.config.compact.auto_at_tokens = 4_000;
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 50_000, completion_tokens: 0 });
+        a.state = AppState::Streaming;
+
+        a.fail_stream("connection reset".to_string());
+
+        assert!(!a.compacting);
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
     /// The same leak without the budget being spent is a plain formatting
     /// misfire, and says so instead of blaming a limit that was not hit.
     #[test]
@@ -3796,6 +3978,31 @@ mod tests {
         assert!(last.role == Role::User);
         assert!(last.content.contains("BOXCODE.md"), "{}", last.content);
         assert!(last.content.contains("verified by reading files"), "{}", last.content);
+    }
+
+    #[test]
+    fn slash_resume_with_no_recorded_session_says_so() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            type_str(&mut a, "/resume");
+            a.handle_key(key(KeyCode::Enter));
+            let out: String = a.messages.iter().map(|m| m.content.as_str()).collect();
+            assert!(out.contains("No recorded session"), "{out}");
+            assert_eq!(a.state, AppState::AwaitingInput, "nothing was sent anywhere");
+        });
+    }
+
+    /// Splicing a past session under a conversation already in flight would
+    /// hand the model two interleaved histories; discarding the current one
+    /// is /new's decision, not /resume's.
+    #[test]
+    fn slash_resume_refuses_over_an_existing_conversation() {
+        let mut a = a_conversation();
+        type_str(&mut a, "/resume");
+        a.handle_key(key(KeyCode::Enter));
+        let last = a.messages.last().expect("a refusal");
+        assert!(last.role == Role::Error);
+        assert!(last.content.contains("/new first"), "{}", last.content);
     }
 
     #[test]

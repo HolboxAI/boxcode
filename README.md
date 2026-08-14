@@ -446,6 +446,26 @@ sessions start briefed, delete it to turn the feature off.
 Keep it short. It is resent with every request, so every line has a running
 cost; a file over ~16k characters is clipped rather than sent whole.
 
+## Sessions survive the terminal
+
+Everything said in a conversation is appended, as it happens, to a plain
+JSONL file under `~/.boxcode/sessions/` — one file per conversation, local
+only, never transmitted. Close the terminal mid-task (or lose it to a crash)
+and nothing said before that moment is gone:
+
+```bash
+boxcode --resume     # pick up this directory's last session where it left off
+```
+
+`/resume` does the same mid-session, into a fresh conversation (`/new` first
+if one is already going — silently discarding it is not this command's call).
+Sessions are per-directory: a session recorded in one project is never
+offered in another.
+
+`/new` and `/compact` start a fresh session file rather than rewriting the
+old one, so the conversation you abandoned or summarised is still there to go
+back to. A launch that never says anything leaves no file behind.
+
 ## Deploying
 
 You deploy by **asking**, not by typing a command:
@@ -799,8 +819,12 @@ variables override values in `config.toml`.
 - **`/init`** — Has the model explore the project and write (or update) the
   `BOXCODE.md` that every later session reads -- see "Project memory" above.
   The write waits for your approval like any other.
+- **`/resume`** — Reloads this directory's most recent recorded session and
+  carries on from it — see "Sessions survive the terminal" above. Only into a
+  fresh conversation; `boxcode --resume` does it from launch.
 - **`/new`** — Forgets the current conversation. The configured provider and
   model are untouched; only the message history and tool-step count reset.
+  The forgotten session's file stays on disk, so `/resume` can bring it back.
 - **`/compact`** — Has the model summarise the conversation so far, then
   continues from that summary instead of the full transcript. Same problem
   `/new` solves — the whole history is resent every turn, so a long session
@@ -822,6 +846,19 @@ variables override values in `config.toml`.
   The summary is shown in full, since it is what the model will be working
   from next. Nothing is discarded until a usable summary comes back: an empty
   reply, a failed request, or Esc all leave the conversation exactly as it was.
+
+  **It also happens by itself.** When the context passes a threshold — exact
+  prompt tokens where the endpoint reports them, the 4-chars/token estimate
+  otherwise — the next finished turn rolls straight into a compaction, with a
+  notice first so you watch it happen. The same guarantees hold: nothing is
+  discarded until a usable summary comes back, and a failed request never
+  triggers one. Tune or disable it:
+
+  ```toml
+  [compact]
+  auto = true             # false turns automatic compaction off
+  auto_at_tokens = 80000  # context size that triggers it
+  ```
   The request is metered like any other, and an exhausted `/quota` refuses it —
   otherwise the cheapest way past a spent allowance would be to know this
   command.
@@ -883,6 +920,7 @@ Clean, modular structure for easy feature additions:
 - `src/providers.rs` — Built-in provider/model registry for `/provider` and `/model`
 - `src/tools.rs` — The model's tools (`run_command`, `read_file`, `write_file`): schemas, execution, timeouts
 - `src/workspace.rs` — The working directory commands run in
+- `src/session.rs` — Conversation persistence (`~/.boxcode/sessions/`, `/resume`), local only
 - `src/usage.rs` — Local per-install token usage log (`/usage`), never transmitted
 - `src/telemetry.rs` — Anonymous install/daily-active pings, disabled by default
 - `src/dateutil.rs` — Calendar-date helpers shared by the two above
