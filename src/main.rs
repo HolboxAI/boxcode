@@ -1,4 +1,5 @@
 mod app;
+mod artifacts;
 mod config;
 mod danger;
 mod dateutil;

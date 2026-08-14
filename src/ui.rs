@@ -981,6 +981,24 @@ fn tool_approval_parts(
     // model goes on without that one thing. Declining a plan skips nothing;
     // it sends the whole proposal back, so it says so.
     let (title, verb, deny) = match action {
+        Action::Publish { path } => {
+            for wrapped in wrap(path, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            // Said at the point of decision, not afterwards: "public" and
+            // "expires" are the two things the answer actually turns on.
+            for wrapped in wrap(
+                "Uploads these files to a public link anyone can open. It expires after 48 hours.",
+                inner,
+            ) {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            (" Publish a preview? ", "publish", "skip")
+        }
         Action::Command { command, purpose } => {
             if let Some(purpose) = purpose {
                 for wrapped in wrap(purpose, inner) {

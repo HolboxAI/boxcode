@@ -58,6 +58,7 @@ pub const GREP_SEARCH: &str = "grep_search";
 pub const EDIT_FILE: &str = "edit_file";
 pub const WEB_SEARCH: &str = "web_search";
 pub const DEPLOY_PROJECT: &str = "deploy_project";
+pub const PUBLISH_ARTIFACT: &str = "publish_artifact";
 pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
 pub const PLAN_PROGRESS: &str = "plan_progress";
 
@@ -383,6 +384,32 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": PUBLISH_ARTIFACT,
+                "description": "Upload static files to a temporary public URL so the user can \
+                                LOOK at them in a browser. Use this ONLY when the user asks to \
+                                see, preview, open, share or check how something looks. Never \
+                                call it on your own initiative, never to 'check your work', and \
+                                never after merely creating or editing a file -- say the file is \
+                                written and stop. Works for a built site or SPA (point at the \
+                                output directory, e.g. dist/), a single HTML page, a chart or \
+                                diagram, a CSV or a text file. The link is public to anyone who \
+                                has it and stops working after 48 hours, which you must tell the \
+                                user when you give it to them.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File or directory to publish, relative to the project. For a site, the BUILT output directory (dist/, build/, out/, public/) -- not the project root, which has no index.html."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": WEB_SEARCH,
                 "description": "Search the web and get back a short list of results (title, URL, \
                                  snippet). Use this when you need current information, something \
@@ -690,6 +717,11 @@ pub fn system_prompt(
          - If output comes back truncated, narrow the query -- more `--jq`, fewer fields, a \
            smaller `--limit` -- and run it again. Do not extrapolate from a partial result or \
            present it as the whole.\n\
+         - {PUBLISH_ARTIFACT} is for when the user wants to LOOK at something: \"show me\", \
+           \"let me see it\", \"how does it look\", \"preview\", \"open it\", \"share this\". \
+           Only then. Writing or changing a file is not a reason to publish it, and neither is \
+           checking your own work -- say what you did and stop. The link is public to whoever \
+           has it and dies after 48 hours, so always say both when you hand it over.\n\
          - Answers appear in a terminal: keep narration to a sentence or two, not a report.\n\
          - That terminal renders markdown, so use it where it carries meaning and nowhere \
            else. `**bold**` for the few words that decide something; `backticks` around every \
@@ -969,6 +1001,9 @@ pub enum Action {
     /// one file into one approval.
     Edit { path: String, edits: Vec<EditSpan> },
     Search { query: String, max_results: u32 },
+    /// Uploads static files to a temporary public URL so the user can look at
+    /// them. Always approved, for the same reason `Deploy` is: it publishes.
+    Publish { path: String },
     /// Puts this project on the internet. Always approved -- see `action_risk`.
     Deploy {
         provider: String,
@@ -1034,6 +1069,7 @@ impl Action {
                 "🚀 deploy → {provider} ({})",
                 if *production { "Production" } else { "Preview" }
             ),
+            Action::Publish { path } => format!("🌐 preview {path} — public link, 48h"),
             Action::Plan(p) => format!("📋 plan: {}", p.title),
             Action::Progress { step, done, .. } => {
                 format!("{} step {step}", if *done { "☑" } else { "☐" })
@@ -1054,6 +1090,9 @@ pub fn action_risk(action: &Action, workspace_root: &Path) -> danger::Risk {
         // approval switched off entirely: it sends this project to a third
         // party and puts it on the public internet, which is not something an
         // unattended-mode setting made an hour ago should silently cover.
+        Action::Publish { .. } => danger::Risk::Dangerous(
+            "uploads these files to a public URL anyone with the link can open".to_string(),
+        ),
         Action::Deploy { production: true, .. } => danger::Risk::Dangerous(
             "publishes to the live production URL, replacing whatever is served there now"
                 .to_string(),
@@ -1108,10 +1147,13 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
              your plan and call {EXIT_PLAN_MODE}.",
             clip(command, 60)
         )),
-        // Nothing in the working directory changes, which is exactly why this
-        // one needs saying explicitly -- a check that only thinks about files
-        // would wave it through, and it puts the project on the public
-        // internet.
+        // Publishing changes nothing on disk, which is exactly why it has to
+        // be named here: a check that only thinks about files would wave it
+        // through, and it puts the project on the public internet.
+        Action::Publish { .. } => Some(
+            "Plan mode does not publish anything, so nothing was uploaded. Say in your plan \
+             what you would show the user and call ".to_string() + EXIT_PLAN_MODE + ".",
+        ),
         Action::Deploy { provider, .. } => Some(format!(
             "Plan mode changes nothing, and deploying to {provider} would put this project on \
              the internet, so it was not run. Make the deployment a step in your plan and call \
@@ -1184,6 +1226,16 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
                 .iter()
                 .all(|e| !e.old.is_empty())
                 .then_some(Action::Edit { path, edits })
+        }
+        PUBLISH_ARTIFACT => {
+            #[derive(serde::Deserialize)]
+            struct Args { path: String }
+            let args: Args = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            Some(Action::Publish { path })
         }
         WEB_SEARCH => {
             let args: WebSearchArgs = serde_json::from_str(&call.function.arguments).ok()?;
@@ -1463,6 +1515,7 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         EDIT_FILE => execute_edit_file(call, workspace),
         WEB_SEARCH => execute_web_search(call, config).await,
         DEPLOY_PROJECT => execute_deploy_project(call, workspace).await,
+        PUBLISH_ARTIFACT => execute_publish_artifact(call, workspace, config).await,
         // Never reached: `app::advance_approvals` resolves this one itself,
         // because accepting it changes `App`'s mode and the runner has no
         // access to `App`. Handled anyway so a routing mistake produces a
@@ -2085,6 +2138,61 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
 /// So this is the explanation for the cases that flow past that: arguments
 /// that describe nothing, a workspace with nothing deployable in it, or a
 /// deployment requested alongside other tool calls in one batch.
+/// Publish a preview and hand back the link.
+///
+/// The path is resolved inside the workspace like every other file-taking
+/// tool, so `publish_artifact` cannot be pointed at `~/.ssh` by a model that
+/// has misunderstood the question.
+async fn execute_publish_artifact(
+    call: &ToolCall,
+    workspace: &Workspace,
+    config: &ToolsConfig,
+) -> ToolOutcome {
+    let Some(Action::Publish { path }) = describe_action(call) else {
+        return outcome(
+            &call.id,
+            "\u{1F310} preview \u{2014} unusable arguments".to_string(),
+            format!("Error: {PUBLISH_ARTIFACT} needs a `path`."),
+        );
+    };
+    let resolved = match resolve_in_workspace(workspace, &path) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("\u{1F310} preview {} \u{2014} refused", clip(&path, 40)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    match crate::artifacts::publish(&resolved, &config.artifact_endpoint).await {
+        Ok(published) => outcome(
+            &call.id,
+            format!(
+                "\u{1F310} preview \u{2014} {} file{}, expires in {}h",
+                published.files,
+                if published.files == 1 { "" } else { "s" },
+                published.expires_in_hours
+            ),
+            format!(
+                "Published {} file{} ({:.0} KB).\n\nURL: {}\n\nTell the user this link is \
+                 public to anyone who has it and stops working in {} hours.",
+                published.files,
+                if published.files == 1 { "" } else { "s" },
+                published.bytes as f64 / 1024.0,
+                published.url,
+                published.expires_in_hours
+            ),
+        ),
+        Err(e) => outcome(
+            &call.id,
+            format!("\u{1F310} preview {} \u{2014} failed", clip(&path, 40)),
+            format!("Error: {e}"),
+        ),
+    }
+}
+
 async fn execute_deploy_project(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let Some(Action::Deploy { provider, .. }) = describe_action(call) else {
         return outcome(
@@ -3767,6 +3875,7 @@ mod tests {
                 GLOB,
                 GREP_SEARCH,
                 EDIT_FILE,
+                PUBLISH_ARTIFACT,
                 WEB_SEARCH,
                 DEPLOY_PROJECT
             ]
