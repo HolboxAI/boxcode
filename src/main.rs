@@ -8,6 +8,7 @@ mod notice;
 mod plan;
 mod providers;
 mod quota;
+mod session;
 mod telemetry;
 mod tools;
 mod theme;
@@ -46,6 +47,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut upgrade = false;
     let mut force = false;
     let mut plan = false;
+    let mut resume = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-V" | "--version" => {
@@ -59,6 +61,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "-u" | "--upgrade" => upgrade = true,
             "-f" | "--force" => force = true,
             "-p" | "--plan" => plan = true,
+            "-r" | "--resume" => resume = true,
             other => {
                 eprintln!("Unknown argument: {other}\n");
                 print_help();
@@ -194,6 +197,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             None => {}
         }
     }
+    // Everything said in this conversation lands in a session file as it
+    // happens; `--resume` reloads the last one before the first keystroke.
+    // The log itself creates no file until there is a message to put in it.
+    let mut session_log = session::SessionLog::new(&app.workspace_root);
+    if resume {
+        app.resume_latest();
+    }
     let (tx, mut rx) = mpsc::channel::<(u64, StreamEvent)>(256);
     // A second channel rather than more variants on `StreamEvent`: a
     // deployment is not the model talking, and folding it into the LLM
@@ -205,6 +215,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &mut terminal,
         &mut app,
         workspace.as_ref(),
+        &mut session_log,
         tx,
         &mut rx,
         deploy_tx,
@@ -339,6 +350,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     workspace: Option<&Workspace>,
+    session_log: &mut session::SessionLog,
     tx: mpsc::Sender<(u64, StreamEvent)>,
     rx: &mut mpsc::Receiver<(u64, StreamEvent)>,
     deploy_tx: mpsc::Sender<deploy::DeployEvent>,
@@ -450,6 +462,14 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.quota.save();
             app.quota_dirty = false;
         }
+        // The session record, same place as the other files this loop owns.
+        // A length comparison almost every tick; messages hit the disk the
+        // tick they appear, so a Ctrl-C loses nothing said before it.
+        if app.session_reset {
+            app.session_reset = false;
+            session_log.reset();
+        }
+        session_log.append(&app.messages);
         // Same reasoning again: `App` marks the plan dirty, this loop writes
         // it. A failed write is reported rather than swallowed -- the whole
         // value of an approved plan is that it is on disk, so silently not
@@ -686,6 +706,10 @@ FLAGS:
                        plan, and cannot write, edit, or run anything that
                        changes the project until you approve one. Toggle it
                        any time with /plan.
+    -r, --resume     Pick up this directory's most recent session where it
+                       left off. Sessions are recorded as you work, under
+                       ~/.boxcode/sessions/. Also available mid-session
+                       as /resume.
 
 CONFIG (environment overrides ~/.boxcode/config.toml):
     BOXCODE_ENDPOINT    Base URL, e.g. https://llm.internal:8443
