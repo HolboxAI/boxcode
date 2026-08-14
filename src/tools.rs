@@ -109,6 +109,17 @@ const MAX_GREP_CONTEXT: u32 = 5;
 /// minified line cannot swallow the whole result budget.
 const MAX_GREP_LINE_CHARS: usize = 250;
 
+/// Files read from the project root into every request's system prompt --
+/// standing instructions the user (or `/init`) maintains. `BOXCODE.md` is
+/// this app's own; `AGENTS.md` is the convention other coding tools read and
+/// write, honoured so a project already carrying one works here unchanged.
+pub const MEMORY_FILES: &[&str] = &["BOXCODE.md", "AGENTS.md"];
+
+/// Ceiling on how much of one memory file reaches the prompt. These notes are
+/// resent with every request for the rest of every session, so an unbounded
+/// file taxes each turn from then on.
+const MAX_MEMORY_CHARS: usize = 16_000;
+
 fn is_skipped(path: &Path, workspace: &Path) -> bool {
     path.strip_prefix(workspace)
         .unwrap_or(path)
@@ -697,6 +708,21 @@ pub fn system_prompt(
         config.command_timeout_secs,
     );
 
+    // Standing project notes ride along on every request, so a session picks
+    // up where the project's own documentation of itself left off -- build
+    // commands, layout, conventions -- without the model re-deriving them.
+    // Read fresh each time rather than cached at startup: the user edits
+    // these files mid-session, and stale instructions silently followed are
+    // worse than a file read per request.
+    for (name, content) in project_memory(workspace) {
+        prompt.push_str(&format!(
+            "\n\nPROJECT NOTES from {name}, kept in the project root by the user (and by \
+             /init). Standing instructions for working in this project -- follow them over \
+             your own defaults, and trust them over guesses, but verify anything that looks \
+             out of date against the actual code:\n{content}"
+        ));
+    }
+
     if mode.is_plan() {
         prompt.push_str(&format!(
             "\n\nPLAN MODE — you cannot change anything yet.\n\
@@ -1230,6 +1256,21 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
         }
         _ => None,
     }
+}
+
+/// The project-memory files that exist and say something, as (name, capped
+/// content) in `MEMORY_FILES` order. Unreadable files are treated as absent:
+/// the memory is an amenity, and a permissions problem must not take the
+/// whole session down with it.
+pub fn project_memory(workspace: &Workspace) -> Vec<(String, String)> {
+    MEMORY_FILES
+        .iter()
+        .filter_map(|name| {
+            let content = std::fs::read_to_string(workspace.root().join(name)).ok()?;
+            let trimmed = content.trim();
+            (!trimmed.is_empty()).then(|| (name.to_string(), clip(trimmed, MAX_MEMORY_CHARS)))
+        })
+        .collect()
 }
 
 /// Joins `path` onto the workspace root and rejects anything that resolves
@@ -3564,6 +3605,46 @@ mod tests {
         );
         // Warned, but still working: the full tool list is still described.
         assert!(late.contains(GREP_SEARCH), "{late}");
+    }
+
+    /// BOXCODE.md and AGENTS.md ride along on every request when present, and
+    /// leave no trace at all when absent.
+    #[test]
+    fn the_system_prompt_carries_the_project_memory_files() {
+        let (_dir, ws, cfg) = fixture();
+
+        let without = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        assert!(!without.contains("PROJECT NOTES"), "{without}");
+
+        std::fs::write(ws.root().join("BOXCODE.md"), "Run `cargo test` before committing.\n")
+            .unwrap();
+        std::fs::write(ws.root().join("AGENTS.md"), "The API layer lives in src/api.\n").unwrap();
+        let with = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        assert!(with.contains("PROJECT NOTES from BOXCODE.md"), "{with}");
+        assert!(with.contains("Run `cargo test` before committing."), "{with}");
+        assert!(with.contains("PROJECT NOTES from AGENTS.md"), "{with}");
+        assert!(with.contains("The API layer lives in src/api."), "{with}");
+    }
+
+    /// The memory is resent with every request, so a runaway file is capped
+    /// rather than allowed to tax every turn of every later session.
+    #[test]
+    fn an_oversized_memory_file_is_clipped_not_sent_whole() {
+        let (_dir, ws, cfg) = fixture();
+        std::fs::write(ws.root().join("BOXCODE.md"), "x".repeat(100_000)).unwrap();
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        assert!(prompt.contains("truncated"), "{prompt}");
+        assert!(prompt.len() < 60_000, "the whole file went through: {}", prompt.len());
+    }
+
+    /// An empty or unreadable memory file is treated as absent -- an amenity
+    /// must not inject blank sections or take the session down.
+    #[test]
+    fn an_empty_memory_file_is_ignored() {
+        let (_dir, ws, cfg) = fixture();
+        std::fs::write(ws.root().join("BOXCODE.md"), "   \n\n").unwrap();
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        assert!(!prompt.contains("PROJECT NOTES"), "{prompt}");
     }
 
     /// Regression: without this, a model that only emits tool calls leaves the
