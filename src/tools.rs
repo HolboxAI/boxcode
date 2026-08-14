@@ -195,13 +195,24 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                 "name": READ_FILE,
                 "description": "Read a file's contents from the user's project directory. Prefer this \
                                  over running `cat`/`type` through run_command -- it is not subject to \
-                                 shell quoting.",
+                                 shell quoting. For a big file, pass offset/limit to read just a \
+                                 slice: sliced output comes back with a line number in front of each \
+                                 line. The numbers are annotations, not file content -- never copy \
+                                 them into edit_file's old_string.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "Path to the file, relative to the project directory."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Line to start reading from, counted from 1. Omit to read from the top."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "How many lines to return. Omit to read to the end."
                         }
                     },
                     "required": ["path"]
@@ -569,7 +580,9 @@ pub fn system_prompt(
          Working directory: {}\n\
          Operating system: {os} — shell commands run through `{shell_name} {shell_flag}`\n\n\
          Tools:\n\
-         - {READ_FILE}(path): read a file's contents.\n\
+         - {READ_FILE}(path, offset, limit): read a file's contents, or just a slice of a big \
+           one -- offset is the 1-based line to start from, limit is how many lines. Sliced \
+           output is line-numbered; the numbers are annotations, never file content.\n\
          {write_tools}\
          - {LIST_DIR}(path): list one directory. Read-only, runs without asking.\n\
          - {GLOB}(pattern): find files by path pattern, e.g. 'src/**/*.rs'. Read-only, runs \
@@ -753,6 +766,10 @@ struct RunArgs {
 #[derive(Deserialize)]
 struct ReadFileArgs {
     path: String,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1480,11 +1497,61 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
             // a source file is not guaranteed valid UTF-8, and replacement
             // characters beat refusing to report anything.
             let text = String::from_utf8_lossy(&bytes);
-            let lines = text.lines().count();
+            let total = text.lines().count();
+
+            if args.offset.is_none() && args.limit.is_none() {
+                let body = if text.chars().count() > config.max_output_bytes {
+                    // The generic clip marker says output was cut but not what
+                    // to do about it. A file has a better answer: come back
+                    // with an offset. The resume point is the clipped line
+                    // itself, since it likely came through partial.
+                    let kept: String = text.chars().take(config.max_output_bytes).collect();
+                    let lines_kept = kept.lines().count();
+                    format!(
+                        "{kept}\n[… truncated at {} characters, {lines_kept} of {total} lines. \
+                         Call {READ_FILE} again with offset={lines_kept} to continue.]",
+                        config.max_output_bytes
+                    )
+                } else {
+                    text.to_string()
+                };
+                return outcome(
+                    &call.id,
+                    format!(
+                        "📄 read {} — {total} line{}",
+                        clip(path, 50),
+                        if total == 1 { "" } else { "s" }
+                    ),
+                    body,
+                );
+            }
+
+            // A ranged read. Line numbers are annotations for navigating and
+            // for aiming later reads/edits; the schema warns the model off
+            // copying them into edit_file.
+            let offset = args.offset.unwrap_or(1).max(1) as usize;
+            let limit = args.limit.map(|l| (l.max(1)) as usize).unwrap_or(usize::MAX);
+            if offset > total {
+                // An answer, not a failure -- same contract as an empty glob.
+                return outcome(
+                    &call.id,
+                    format!("📄 read {} — past the end", clip(path, 50)),
+                    format!("'{path}' has only {total} line{}; nothing at offset {offset}.",
+                        if total == 1 { "" } else { "s" }),
+                );
+            }
+            let numbered: Vec<String> = text
+                .lines()
+                .enumerate()
+                .skip(offset - 1)
+                .take(limit)
+                .map(|(i, line)| format!("{:>6}\t{}", i + 1, line))
+                .collect();
+            let end = offset + numbered.len() - 1;
             outcome(
                 &call.id,
-                format!("📄 read {} — {lines} line{}", clip(path, 50), if lines == 1 { "" } else { "s" }),
-                clip(&text, config.max_output_bytes),
+                format!("📄 read {} — lines {offset}-{end} of {total}", clip(path, 50)),
+                clip(&numbered.join("\n"), config.max_output_bytes),
             )
         }
         Err(e) => outcome(
@@ -3787,6 +3854,68 @@ mod tests {
 
         assert_eq!(out.content, "one\ntwo\nthree\n");
         assert!(out.display.contains("3 lines"), "{}", out.display);
+    }
+
+    #[tokio::test]
+    async fn a_ranged_read_returns_a_numbered_slice() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(
+            &tool_call(READ_FILE, json!({"path": "hello.txt", "offset": 2, "limit": 1})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert_eq!(out.content, "     2\ttwo");
+        assert!(out.display.contains("lines 2-2 of 3"), "{}", out.display);
+    }
+
+    #[tokio::test]
+    async fn offset_alone_reads_to_the_end_and_limit_alone_from_the_top() {
+        let (_dir, ws, cfg) = fixture();
+        let from_two = execute(
+            &tool_call(READ_FILE, json!({"path": "hello.txt", "offset": 2})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert_eq!(from_two.content, "     2\ttwo\n     3\tthree");
+
+        let first_two = execute(
+            &tool_call(READ_FILE, json!({"path": "hello.txt", "limit": 2})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert_eq!(first_two.content, "     1\tone\n     2\ttwo");
+    }
+
+    /// Asking past the end is an answer, not a failure -- an error would push
+    /// the model toward retrying instead of concluding the file is shorter.
+    #[tokio::test]
+    async fn an_offset_past_the_end_reports_the_real_length() {
+        let (_dir, ws, cfg) = fixture();
+        let out = execute(
+            &tool_call(READ_FILE, json!({"path": "hello.txt", "offset": 99})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.content.contains("has only 3 lines"), "{}", out.content);
+        assert!(!out.content.starts_with("Error:"), "{}", out.content);
+    }
+
+    /// A truncated full read tells the model how to get the rest -- the whole
+    /// reason ranged reads exist -- instead of a bare "output was cut" marker.
+    #[tokio::test]
+    async fn a_truncated_full_read_says_which_offset_to_resume_from() {
+        let (_dir, ws, mut cfg) = fixture();
+        cfg.max_output_bytes = 8;
+        let out = execute(&read_call("hello.txt"), &ws, &cfg).await;
+        assert!(
+            out.content.contains(&format!("Call {READ_FILE} again with offset=")),
+            "{}",
+            out.content
+        );
     }
 
     #[tokio::test]
