@@ -822,6 +822,19 @@ variables override values in `config.toml`.
   The summary is shown in full, since it is what the model will be working
   from next. Nothing is discarded until a usable summary comes back: an empty
   reply, a failed request, or Esc all leave the conversation exactly as it was.
+
+  **It also happens by itself.** When the context passes a threshold — exact
+  prompt tokens where the endpoint reports them, the 4-chars/token estimate
+  otherwise — the next finished turn rolls straight into a compaction, with a
+  notice first so you watch it happen. The same guarantees hold: nothing is
+  discarded until a usable summary comes back, and a failed request never
+  triggers one. Tune or disable it:
+
+  ```toml
+  [compact]
+  auto = true             # false turns automatic compaction off
+  auto_at_tokens = 80000  # context size that triggers it
+  ```
   The request is metered like any other, and an exhausted `/quota` refuses it —
   otherwise the cheapest way past a spent allowance would be to know this
   command.

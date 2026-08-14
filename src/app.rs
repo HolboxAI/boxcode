@@ -1148,17 +1148,6 @@ impl App {
         }
     }
 
-    /// `/compact` -- have the model write the conversation down to a summary,
-    /// and continue from that instead.
-    ///
-    /// The same problem `/new` solves, without the amnesia: the whole
-    /// transcript is resent every turn, so a long session costs more with each
-    /// prompt whether or not the early messages still matter. `/new` fixes the
-    /// cost by discarding everything; this pays for one summarising request in
-    /// order to keep what was actually established.
-    ///
-    /// It is a real request against a real endpoint, so it is metered, refused
-    /// by an exhausted quota, and interruptible, like any other.
     /// `/init` -- has the model explore the project and write the `BOXCODE.md`
     /// that every later session reads (see `tools::project_memory`). Nothing
     /// special mechanically: it is an ordinary turn with a canned prompt, and
@@ -1202,6 +1191,17 @@ impl App {
         self.state = AppState::Sending;
     }
 
+    /// `/compact` -- have the model write the conversation down to a summary,
+    /// and continue from that instead.
+    ///
+    /// The same problem `/new` solves, without the amnesia: the whole
+    /// transcript is resent every turn, so a long session costs more with each
+    /// prompt whether or not the early messages still matter. `/new` fixes the
+    /// cost by discarding everything; this pays for one summarising request in
+    /// order to keep what was actually established.
+    ///
+    /// It is a real request against a real endpoint, so it is metered, refused
+    /// by an exhausted quota, and interruptible, like any other.
     fn start_compaction(&mut self) {
         if self.is_busy() {
             return;
@@ -2047,6 +2047,50 @@ impl App {
             self.follow_tail = true;
         }
         self.settle_turn();
+        // Only here, at the end of an ordinary completed turn -- not after a
+        // finished compaction (its whole point was to shrink the context, and
+        // re-checking would be circular) and not on a failed request (where
+        // retrying a full-context summarisation against a failing endpoint
+        // would loop).
+        self.maybe_auto_compact();
+    }
+
+    /// Compact without being asked, once the context passes the configured
+    /// size -- the moment is chosen for being cheap: the turn is over, nothing
+    /// is queued, and the alternative is every later turn paying for a
+    /// transcript nobody chose to keep whole. Announced before it happens, and
+    /// `/compact`'s own guarantees hold: nothing is discarded until a usable
+    /// summary comes back.
+    fn maybe_auto_compact(&mut self) {
+        if !self.config.compact.auto || self.compacting || self.is_busy() {
+            return;
+        }
+        // Exact prompt size from the endpoint where it was reported --
+        // that figure is what the context actually costs -- and the character
+        // estimate where it was not.
+        let context = self
+            .last_prompt_tokens
+            .unwrap_or_else(|| self.context_size().approx_tokens);
+        let threshold = self.config.compact.auto_at_tokens as usize;
+        if context < threshold {
+            return;
+        }
+        // Below two messages `start_compaction` would refuse with its own
+        // notice; reaching that state with a giant context means one enormous
+        // message, which a summary cannot shrink anyway.
+        if self.context_size().messages < 2 {
+            return;
+        }
+        self.messages.push(Message::new(
+            Role::System,
+            format!(
+                "The conversation has reached ~{context} tokens, past the auto-compact \
+                 threshold ({threshold}), so it is being summarised to free up context. \
+                 `[compact] auto = false` in ~/.boxcode/config.toml turns this off; \
+                 `auto_at_tokens` moves it."
+            ),
+        ));
+        self.start_compaction();
     }
 
     /// The bookkeeping every finished request shares, whatever it was for:
@@ -2998,6 +3042,71 @@ mod tests {
         // And the cause is named, with both ways out.
         assert!(shown.contains("3 tool rounds"), "{shown}");
         assert!(shown.contains("max_steps"), "{shown}");
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    /// Past the configured context size, a finished turn rolls straight into
+    /// a compaction, announced first -- the user watches it happen rather
+    /// than wondering why the app went quiet.
+    #[test]
+    fn a_turn_past_the_threshold_compacts_itself_with_a_notice() {
+        let mut a = a_conversation();
+        a.config.compact.auto_at_tokens = 4_000;
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 5_000, completion_tokens: 20 });
+        a.state = AppState::Streaming;
+        a.streaming_response = "Done.".to_string();
+
+        a.finish_stream();
+
+        assert!(a.compacting, "the turn should have rolled into a compaction");
+        assert_eq!(a.state, AppState::Sending);
+        let shown: String = a.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(shown.contains("auto-compact threshold"), "{shown}");
+        assert!(shown.contains("[compact] auto = false"), "the off switch is named: {shown}");
+    }
+
+    #[test]
+    fn a_turn_below_the_threshold_does_not_compact() {
+        let mut a = a_conversation();
+        a.config.compact.auto_at_tokens = 4_000;
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 3_000, completion_tokens: 20 });
+        a.state = AppState::Streaming;
+        a.streaming_response = "Done.".to_string();
+
+        a.finish_stream();
+
+        assert!(!a.compacting);
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    #[test]
+    fn auto_compaction_can_be_turned_off() {
+        let mut a = a_conversation();
+        a.config.compact.auto = false;
+        a.config.compact.auto_at_tokens = 4_000;
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 50_000, completion_tokens: 20 });
+        a.state = AppState::Streaming;
+        a.streaming_response = "Done.".to_string();
+
+        a.finish_stream();
+
+        assert!(!a.compacting);
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
+    /// A failed request must not roll into an automatic compaction: that
+    /// would fire a full-context summarisation at an endpoint that just
+    /// failed, and keep firing it after every failure.
+    #[test]
+    fn a_failed_request_does_not_trigger_auto_compaction() {
+        let mut a = a_conversation();
+        a.config.compact.auto_at_tokens = 4_000;
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 50_000, completion_tokens: 0 });
+        a.state = AppState::Streaming;
+
+        a.fail_stream("connection reset".to_string());
+
+        assert!(!a.compacting);
         assert_eq!(a.state, AppState::AwaitingInput);
     }
 

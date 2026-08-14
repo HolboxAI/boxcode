@@ -23,6 +23,45 @@ pub struct Config {
     /// Same again for `[update]`.
     #[serde(default)]
     pub update: UpdateConfig,
+    /// Same again for `[compact]`.
+    #[serde(default)]
+    pub compact: CompactConfig,
+}
+
+/// When the conversation compacts itself. `/compact` by hand is always
+/// available regardless of these settings.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompactConfig {
+    /// Compact automatically when the context passes `auto_at_tokens`.
+    ///
+    /// On by default because the failure it prevents is a slow one nobody
+    /// chose: every turn of a long session resends the whole transcript, so
+    /// the session gets more expensive and eventually stops fitting the
+    /// model's window at all -- and by the time that error appears, the cheap
+    /// moment to summarise is long gone.
+    #[serde(default = "yes")]
+    pub auto: bool,
+    /// The context size, in tokens, that triggers it. Exact when the endpoint
+    /// reports prompt tokens, estimated at 4 chars/token otherwise.
+    ///
+    /// The default suits models with a 128k window or more: late enough that
+    /// short sessions never see it, early enough to leave room for the turns
+    /// after the summary.
+    #[serde(default = "default_auto_at_tokens")]
+    pub auto_at_tokens: u64,
+}
+
+fn default_auto_at_tokens() -> u64 {
+    80_000
+}
+
+impl Default for CompactConfig {
+    fn default() -> Self {
+        Self {
+            auto: yes(),
+            auto_at_tokens: default_auto_at_tokens(),
+        }
+    }
 }
 
 /// Whether launching boxcode should notice that a newer release exists.
@@ -423,6 +462,10 @@ impl Config {
         // A history limit of 0 would make `/deployments` print a heading and
         // nothing else, which reads as a broken command rather than a setting.
         self.deploy.history_limit = self.deploy.history_limit.clamp(1, 200);
+
+        // A tiny threshold would compact after every turn -- each one a real,
+        // metered request -- and a threshold of 0 would try before the first.
+        self.compact.auto_at_tokens = self.compact.auto_at_tokens.max(4_000);
     }
 
     /// Nonsense quota settings are clamped rather than obeyed. A warn threshold
@@ -755,6 +798,7 @@ mod tests {
                 ui: UiConfig::default(),
                 deploy: DeployConfig::default(),
                 update: UpdateConfig::default(),
+                compact: CompactConfig::default(),
                 llm: LlmConfig {
                     endpoint: "https://api.deepseek.com".to_string(),
                     model: "deepseek-v4-pro".to_string(),
