@@ -137,6 +137,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/plan", "research first, change nothing until you approve"),
     ("/provider", "switch provider or endpoint"),
     ("/model", "switch model"),
+    ("/init", "write a BOXCODE.md the model reads every session"),
     ("/new", "forget the current conversation"),
     ("/compact", "summarise the conversation to free up context"),
     ("/usage", "what today cost, and the history"),
@@ -573,6 +574,7 @@ impl App {
                         "/plan" => self.toggle_plan_mode(),
                         "/provider" => self.open_provider_picker(),
                         "/model" => self.open_model_picker_from_config(),
+                        "/init" => self.start_init(),
                         "/new" => self.start_new_conversation(),
                         "/compact" => self.start_compaction(),
                         "/usage" => self.show_usage(),
@@ -1157,6 +1159,49 @@ impl App {
     ///
     /// It is a real request against a real endpoint, so it is metered, refused
     /// by an exhausted quota, and interruptible, like any other.
+    /// `/init` -- has the model explore the project and write the `BOXCODE.md`
+    /// that every later session reads (see `tools::project_memory`). Nothing
+    /// special mechanically: it is an ordinary turn with a canned prompt, and
+    /// the write lands through the ordinary `write_file` approval.
+    fn start_init(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        // Checked exactly as `submit` checks it: this is a full model turn.
+        self.roll_quota_day();
+        if let Some(message) = self.quota_block() {
+            self.greeted = true;
+            self.follow_tail = true;
+            self.messages.push(Message::new(Role::Error, message));
+            return;
+        }
+
+        let existing = Path::new(&self.workspace_root).join("BOXCODE.md").exists();
+        let prompt = if existing {
+            "BOXCODE.md already exists in this project. Read it, then bring it up to date \
+             against the actual code: fix anything stale, fill real gaps, keep it about a page. \
+             Verify claims by reading files before keeping or writing them."
+        } else {
+            "Explore this project and write a BOXCODE.md at the project root. It will be \
+             injected into your system prompt in every future session here, so write standing \
+             notes, not a tour: what the project is in a sentence or two, the layout \
+             (directories that matter and what lives in them), how to build, run and test it \
+             (real commands, verified by reading the config files that define them), and any \
+             conventions someone changing the code must follow. Keep it to about a page -- it \
+             is resent with every request, so every word has a running cost. Only write what \
+             you verified by reading files, never a guess."
+        };
+
+        self.greeted = true;
+        self.follow_tail = true;
+        self.streaming_response.clear();
+        self.tool_steps = 0;
+        self.busy_started = Some(std::time::Instant::now());
+        self.streamed_chars = 0;
+        self.messages.push(Message::new(Role::User, prompt));
+        self.state = AppState::Sending;
+    }
+
     fn start_compaction(&mut self) {
         if self.is_busy() {
             return;
@@ -3737,6 +3782,20 @@ mod tests {
     fn compact(app: &mut App) {
         type_str(app, "/compact");
         app.handle_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    fn slash_init_sends_a_canned_prompt_and_an_ordinary_turn() {
+        let mut a = app();
+        type_str(&mut a, "/init");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.state, AppState::Sending);
+        assert!(!a.compacting, "/init is an ordinary turn, not a compaction");
+        let last = a.messages.last().expect("a prompt was queued");
+        assert!(last.role == Role::User);
+        assert!(last.content.contains("BOXCODE.md"), "{}", last.content);
+        assert!(last.content.contains("verified by reading files"), "{}", last.content);
     }
 
     #[test]

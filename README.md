@@ -429,6 +429,23 @@ on Windows, and the model is told which platform it is on so it reaches for
 > request comes back as `HTTP 400` — set `enabled = false` under `[tools]` and
 > everything else keeps working as before.
 
+## Project memory
+
+If a `BOXCODE.md` exists at the project root, its contents ride along in the
+system prompt of **every request** -- standing notes about the project (build
+commands, layout, conventions) that the model follows without re-deriving
+them each session. `AGENTS.md` is honoured the same way, so a project already
+carrying one for other tools works here unchanged.
+
+Type `/init` and the model explores the project and writes a starter
+`BOXCODE.md` -- through the ordinary write approval, so you read it before it
+exists. It is a plain file you own: edit it by hand any time (changes are
+picked up on the very next request, no restart), commit it so the whole team's
+sessions start briefed, delete it to turn the feature off.
+
+Keep it short. It is resent with every request, so every line has a running
+cost; a file over ~16k characters is clipped rather than sent whole.
+
 ## Deploying
 
 You deploy by **asking**, not by typing a command:
@@ -779,6 +796,9 @@ variables override values in `config.toml`.
   configured, without going through `/provider` again. If no provider has been
   set yet (e.g. you're only using `BOXCODE_*` env vars or a custom endpoint),
   this shows an inline error telling you to run `/provider` first.
+- **`/init`** — Has the model explore the project and write (or update) the
+  `BOXCODE.md` that every later session reads -- see "Project memory" above.
+  The write waits for your approval like any other.
 - **`/new`** — Forgets the current conversation. The configured provider and
   model are untouched; only the message history and tool-step count reset.
 - **`/compact`** — Has the model summarise the conversation so far, then
