@@ -1,4 +1,5 @@
 mod app;
+mod approval;
 mod artifacts;
 mod config;
 mod danger;

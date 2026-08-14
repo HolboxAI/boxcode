@@ -34,7 +34,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // that spot is for. The transcript stays fully visible and in place, the
     // way it does for every other kind of turn.
     let approval = match &app.overlay {
-        Some(Overlay::ToolApproval { action, remaining }) => Some((action.clone(), *remaining)),
+        Some(Overlay::ToolApproval(request)) => Some((request.action.clone(), request.remaining)),
         _ => None,
     };
 
@@ -3147,13 +3147,13 @@ mod tests {
         app.greeted = true;
         app.state = AppState::AwaitingApproval;
         app.workspace_root = "/tmp/project".to_string();
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Command {
                 command: "ls -la".to_string(),
                 purpose: None,
             },
             remaining: 0,
-        });
+        }));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
@@ -3240,10 +3240,10 @@ mod tests {
         app.greeted = true;
         app.state = AppState::AwaitingApproval;
         app.workspace_root = "/tmp/project".to_string();
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Command { command: "ls -la".to_string(), purpose: None },
             remaining: 0,
-        });
+        }));
 
         app.approval_selected = true;
         let on_yes = rendered_rows(&mut app, 80, 24);
@@ -3288,13 +3288,13 @@ mod tests {
     #[test]
     fn rendering_an_overlay_into_a_zero_size_frame_does_not_panic() {
         let mut app = App::new(crate::config::Config::default());
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Command {
                 command: "rm -rf /".to_string(),
                 purpose: Some("something alarming".to_string()),
             },
             remaining: 2,
-        });
+        }));
 
         for (w, h) in [(1, 1), (2, 2), (10, 4), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -3315,13 +3315,13 @@ mod tests {
         app.greeted = true;
         app.messages
             .push(Message::new(Role::User, "delete the build directory"));
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Command {
                 command: "rm -rf build".to_string(),
                 purpose: Some("clear stale output".to_string()),
             },
             remaining: 0,
-        });
+        }));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
@@ -3471,7 +3471,7 @@ mod tests {
             let mut app = App::new(crate::config::Config::default());
             app.greeted = true;
             app.workspace_root = "/tmp/project".into();
-            app.overlay = Some(Overlay::ToolApproval { action, remaining: 0 });
+            app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(), action, remaining: 0 }));
 
             for (w, h) in [(80, 24), (120, 40), (60, 12)] {
                 let rendered = rendered_text(&mut app, w, h);
@@ -3494,13 +3494,13 @@ mod tests {
         let mut app = App::new(crate::config::Config::default());
         app.greeted = true;
         app.workspace_root = "/tmp/project".into();
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Write {
                 path: "big.txt".into(),
                 content: (1..=200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
             },
             remaining: 0,
-        });
+        }));
 
         let rendered = rendered_text(&mut app, 80, 24);
         assert!(rendered.contains("more"), "expected a 'N more' marker: {rendered}");
@@ -3513,13 +3513,13 @@ mod tests {
         let mut app = App::new(crate::config::Config::default());
         app.greeted = true;
         app.workspace_root = "/tmp/project".into();
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Write {
                 path: "big.txt".into(),
                 content: (1..=40).map(|i| format!("marker{i}")).collect::<Vec<_>>().join("\n"),
             },
             remaining: 0,
-        });
+        }));
 
         let top = rendered_text(&mut app, 80, 24);
         assert!(top.contains("marker1"), "{top}");
@@ -3546,13 +3546,13 @@ mod tests {
     fn the_approval_prompt_shows_the_command_and_the_keys() {
         let mut app = App::new(crate::config::Config::default());
         app.workspace_root = "/tmp/project".to_string();
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Command {
                 command: "rm -rf build".to_string(),
                 purpose: None,
             },
             remaining: 0,
-        });
+        }));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
@@ -3583,13 +3583,13 @@ mod tests {
     fn the_write_approval_prompt_shows_the_path_and_content() {
         let mut app = App::new(crate::config::Config::default());
         app.workspace_root = "/tmp/project".to_string();
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Write {
                 path: "hello.py".to_string(),
                 content: "print('hi')\n".to_string(),
             },
             remaining: 0,
-        });
+        }));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
@@ -3618,13 +3618,13 @@ mod tests {
     fn the_search_approval_prompt_shows_the_query_and_the_keys() {
         let mut app = App::new(crate::config::Config::default());
         app.workspace_root = "/tmp/project".to_string();
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Search {
                 query: "rust async runtime comparison".to_string(),
                 max_results: 5,
             },
             remaining: 0,
-        });
+        }));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
@@ -4342,7 +4342,7 @@ mod tests {
         let steps: Vec<String> = (1..=30)
             .map(|i| format!("step {i}: change file_{i}.rs"))
             .collect();
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Plan(crate::tools::Proposal {
                 title: "Rate limiting for the items API".to_string(),
                 summary: "Fixed window, keyed by API key.".to_string(),
@@ -4350,7 +4350,7 @@ mod tests {
                 not_doing: vec!["Distributed limiting".to_string()],
             }),
             remaining: 0,
-        });
+        }));
 
         let rows = rendered_rows(&mut app, 80, 40);
         let joined = rows.concat();
@@ -4421,10 +4421,10 @@ mod tests {
             steps: vec!["Move to refresh tokens".to_string()],
             not_doing: Vec::new(),
         };
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Plan(proposal.clone()),
             remaining: 0,
-        });
+        }));
 
         let joined = rendered_rows(&mut app, 80, 30).concat();
         assert!(joined.contains("saves to plan.md"), "{joined}");
@@ -4443,7 +4443,7 @@ mod tests {
         app.workspace_root = "/tmp/project".to_string();
         app.active_plan = Some(a_plan("Rate limiting", &["one", "two"], &[]));
 
-        app.overlay = Some(Overlay::ToolApproval {
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Plan(crate::tools::Proposal {
                 title: "Rate limiting".to_string(),
                 summary: "Reworked.".to_string(),
@@ -4451,7 +4451,7 @@ mod tests {
                 not_doing: Vec::new(),
             }),
             remaining: 0,
-        });
+        }));
 
         let joined = rendered_rows(&mut app, 80, 30).concat();
         assert!(!joined.contains("replaces"), "{joined}");
