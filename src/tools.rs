@@ -547,11 +547,11 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
 pub fn system_prompt(
     workspace: &Workspace,
     config: &ToolsConfig,
-    tools_available: bool,
+    steps_used: usize,
     mode: Mode,
     active_plan: Option<&crate::plan::Plan>,
 ) -> String {
-    if !tools_available {
+    if steps_used >= config.max_steps {
         return format!(
             "You are boxcode, a terminal coding assistant working in {}.\n\
              You have used up this turn's command budget. Answer the user now, in text, \
@@ -768,6 +768,22 @@ pub fn system_prompt(
              - When every step is ticked, say so plainly and stop.",
             plan.path.display(),
             plan.title,
+        ));
+    }
+
+    // Past three quarters of the budget, say so plainly rather than letting
+    // the model run into the cliff: once the budget is spent the schemas are
+    // withheld, and a call it was halfway through composing dies as leaked
+    // text (see `App::finish_stream`). A model that knows the budget can
+    // land the turn; one that discovers it cannot.
+    if steps_used * 4 >= config.max_steps * 3 {
+        let steps_left = config.max_steps - steps_used;
+        prompt.push_str(&format!(
+            "\n\nBUDGET: {steps_used} of {} tool rounds used this turn -- {steps_left} left. \
+             Wrap up rather than starting anything new: finish the immediate work, verify \
+             cheaply, and answer. If the task genuinely needs more rounds, say where you got \
+             to and ask the user to say \"continue\".",
+            config.max_steps
         ));
     }
 
@@ -3514,7 +3530,7 @@ mod tests {
     #[test]
     fn the_system_prompt_names_the_platform_and_the_shell() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
 
         assert!(prompt.contains(std::env::consts::OS), "{prompt}");
         assert!(prompt.contains(shell().0), "{prompt}");
@@ -3525,8 +3541,29 @@ mod tests {
             assert!(prompt.contains("Unix-like"), "{prompt}");
         }
 
-        let exhausted = system_prompt(&ws, &cfg, false, Mode::Normal, None);
+        let exhausted = system_prompt(&ws, &cfg, cfg.max_steps, Mode::Normal, None);
         assert!(exhausted.contains("Answer the user now"), "{exhausted}");
+    }
+
+    /// The budget must not be a cliff the model discovers by falling off it:
+    /// past three quarters, the prompt says how many rounds are left and to
+    /// wrap up; before that, no budget talk at all.
+    #[test]
+    fn the_system_prompt_warns_at_three_quarters_of_the_step_budget() {
+        let (_dir, ws, cfg) = fixture();
+        let three_quarters = cfg.max_steps * 3 / 4;
+
+        let early = system_prompt(&ws, &cfg, three_quarters.saturating_sub(1), Mode::Normal, None);
+        assert!(!early.contains("BUDGET:"), "{early}");
+
+        let late = system_prompt(&ws, &cfg, three_quarters, Mode::Normal, None);
+        assert!(late.contains("BUDGET:"), "{late}");
+        assert!(
+            late.contains(&format!("{} left", cfg.max_steps - three_quarters)),
+            "{late}"
+        );
+        // Warned, but still working: the full tool list is still described.
+        assert!(late.contains(GREP_SEARCH), "{late}");
     }
 
     /// Regression: without this, a model that only emits tool calls leaves the
@@ -3536,7 +3573,7 @@ mod tests {
     #[test]
     fn the_system_prompt_requires_narration_before_and_after_tool_use() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
 
         assert!(prompt.contains("Before acting"), "{prompt}");
         assert!(prompt.contains("After tool results come back"), "{prompt}");
@@ -3555,7 +3592,7 @@ mod tests {
     #[test]
     fn the_system_prompt_asks_for_multiple_calls_in_one_turn_rather_than_one_narrated_turn_each() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
 
         assert!(prompt.contains("request all of them in the same turn"), "{prompt}");
         assert!(
@@ -3570,7 +3607,7 @@ mod tests {
     #[test]
     fn the_system_prompt_requires_verifying_work_before_declaring_success() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
 
         assert!(prompt.contains("Verify before declaring success"), "{prompt}");
         assert!(
@@ -3591,7 +3628,7 @@ mod tests {
     #[test]
     fn the_system_prompt_offers_to_open_viewable_output_without_skipping_approval() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
 
         assert!(
             prompt.contains("offer to open it with"),
@@ -3776,7 +3813,7 @@ mod tests {
     #[test]
     fn the_system_prompt_tells_the_model_when_and_when_not_to_deploy() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
         assert!(prompt.contains(DEPLOY_PROJECT), "{prompt}");
         assert!(prompt.contains("public internet"), "{prompt}");
         assert!(prompt.contains("Default to a preview"), "{prompt}");
@@ -3892,7 +3929,7 @@ mod tests {
     #[test]
     fn the_plan_mode_prompt_says_what_is_unavailable_and_how_to_get_out() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Plan, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Plan, None);
 
         assert!(prompt.contains("PLAN MODE"), "{prompt}");
         assert!(prompt.contains(EXIT_PLAN_MODE), "{prompt}");
@@ -3997,7 +4034,7 @@ mod tests {
         };
         plan.mark(1, true, None).unwrap();
 
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, Some(&plan));
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, Some(&plan));
         assert!(prompt.contains("1/2 steps done"), "{prompt}");
         assert!(prompt.contains("[x] 1. Add the limiter"), "{prompt}");
         assert!(prompt.contains("[ ] 2. Wrap the router"), "{prompt}");
@@ -4007,7 +4044,7 @@ mod tests {
         // A finished plan is not restated: there is nothing left to follow,
         // and repeating it invites the model to redo work.
         plan.mark(2, true, None).unwrap();
-        let done = system_prompt(&ws, &cfg, true, Mode::Normal, Some(&plan));
+        let done = system_prompt(&ws, &cfg, 0, Mode::Normal, Some(&plan));
         assert!(!done.contains("IMPLEMENTING AN APPROVED PLAN"), "{done}");
     }
 

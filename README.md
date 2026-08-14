@@ -403,7 +403,7 @@ require_approval = true        # false = the model runs commands unattended
 auto_approve_read_only = true  # skip the prompt for a narrow read-only allowlist
 command_timeout_secs = 60
 max_output_bytes = 65536  # ceiling on one command's output
-max_steps = 10            # command rounds per prompt before the model must answer
+max_steps = 40            # command rounds per prompt before the model must answer
 ```
 
 Per-run: `BOXCODE_WORKSPACE=/path/to/project`, `BOXCODE_TOOLS_ENABLED=0`.
