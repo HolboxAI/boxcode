@@ -290,6 +290,14 @@ pub struct ToolsConfig {
     /// that budget was sized for.
     #[serde(default = "default_search_timeout")]
     pub search_timeout_secs: u64,
+    /// Where `publish_artifact` sends its manifest to be signed.
+    ///
+    /// A URL rather than a compiled-in constant so a fork, an internal
+    /// mirror, or a self-hosted bucket can be pointed at without rebuilding --
+    /// and so setting it to "" switches the feature off entirely for anyone
+    /// who would rather boxcode could not publish anything.
+    #[serde(default = "default_artifact_endpoint")]
+    pub artifact_endpoint: String,
 }
 
 fn yes() -> bool {
@@ -330,6 +338,10 @@ fn default_python_bin() -> String {
     "python3".to_string()
 }
 
+fn default_artifact_endpoint() -> String {
+    "https://boxcode.sh/api/artifact".to_string()
+}
+
 fn default_search_timeout() -> u64 {
     20
 }
@@ -346,6 +358,7 @@ impl Default for ToolsConfig {
             max_steps: default_max_steps(),
             python_bin: default_python_bin(),
             search_timeout_secs: default_search_timeout(),
+            artifact_endpoint: default_artifact_endpoint(),
         }
     }
 }
