@@ -499,7 +499,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     Some(tools::system_prompt(
                         ws,
                         &app.config.tools,
-                        budget_left,
+                        app.tool_steps,
                         app.mode,
                         app.active_plan.as_ref(),
                     )),

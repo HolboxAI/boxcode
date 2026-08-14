@@ -328,7 +328,10 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                     "Replace an exact span of text in an existing file, leaving the rest untouched. \
                      Prefer this over write_file for changing part of a file: write_file replaces \
                      the whole thing, so it loses anything you did not reproduce. Read the file \
-                     first -- old_string must match byte for byte, including indentation.",
+                     first -- old_string must match byte for byte, including indentation. To make \
+                     several replacements in the same file, pass them together under `edits` \
+                     instead of calling this repeatedly: the user approves the whole batch once, \
+                     and it applies in order, all of it or none of it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -347,9 +350,22 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                         "replace_all": {
                             "type": "boolean",
                             "description": "Replace every occurrence instead of requiring a unique match."
+                        },
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old_string": { "type": "string" },
+                                    "new_string": { "type": "string" },
+                                    "replace_all": { "type": "boolean" }
+                                },
+                                "required": ["old_string", "new_string"]
+                            },
+                            "description": "Several replacements to apply to this file in order, each seeing the previous ones' result. Use INSTEAD of old_string/new_string, never alongside them."
                         }
                     },
-                    "required": ["path", "old_string", "new_string"]
+                    "required": ["path"]
                 }
             }
         }),
@@ -531,11 +547,11 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
 pub fn system_prompt(
     workspace: &Workspace,
     config: &ToolsConfig,
-    tools_available: bool,
+    steps_used: usize,
     mode: Mode,
     active_plan: Option<&crate::plan::Plan>,
 ) -> String {
-    if !tools_available {
+    if steps_used >= config.max_steps {
         return format!(
             "You are boxcode, a terminal coding assistant working in {}.\n\
              You have used up this turn's command budget. Answer the user now, in text, \
@@ -571,7 +587,9 @@ pub fn system_prompt(
         format!(
             "- {WRITE_FILE}(path, content): create a file, or overwrite one, with new content.\n\
              - {EDIT_FILE}(path, old_string, new_string, replace_all): replace an exact span of \
-             text in an existing file, leaving the rest untouched.\n"
+             text in an existing file, leaving the rest untouched. Several changes to the SAME \
+             file belong in one call as edits: [{{old_string, new_string}}, ...] -- the user \
+             approves the batch once, and it applies all-or-nothing.\n"
         )
     };
 
@@ -753,6 +771,22 @@ pub fn system_prompt(
         ));
     }
 
+    // Past three quarters of the budget, say so plainly rather than letting
+    // the model run into the cliff: once the budget is spent the schemas are
+    // withheld, and a call it was halfway through composing dies as leaked
+    // text (see `App::finish_stream`). A model that knows the budget can
+    // land the turn; one that discovers it cannot.
+    if steps_used * 4 >= config.max_steps * 3 {
+        let steps_left = config.max_steps - steps_used;
+        prompt.push_str(&format!(
+            "\n\nBUDGET: {steps_used} of {} tool rounds used this turn -- {steps_left} left. \
+             Wrap up rather than starting anything new: finish the immediate work, verify \
+             cheaply, and answer. If the task genuinely needs more rounds, say where you got \
+             to and ask the user to say \"continue\".",
+            config.max_steps
+        ));
+    }
+
     prompt
 }
 
@@ -799,12 +833,52 @@ struct GrepSearchArgs {
 }
 
 #[derive(Deserialize)]
-struct EditFileArgs {
-    path: String,
+struct EditSpanArgs {
     old_string: String,
     new_string: String,
     #[serde(default)]
     replace_all: bool,
+}
+
+#[derive(Deserialize)]
+struct EditFileArgs {
+    path: String,
+    #[serde(default)]
+    old_string: Option<String>,
+    #[serde(default)]
+    new_string: Option<String>,
+    #[serde(default)]
+    replace_all: bool,
+    #[serde(default)]
+    edits: Vec<EditSpanArgs>,
+}
+
+/// Normalizes `edit_file`'s two argument forms -- one old/new pair, or a
+/// batch under `edits` -- into the list of spans to apply, in order. Both
+/// forms at once is ambiguous about intent, so it is refused rather than
+/// guessed at.
+fn edit_spans(args: EditFileArgs) -> Result<Vec<EditSpan>, String> {
+    let single = args.old_string.is_some() || args.new_string.is_some();
+    if single && !args.edits.is_empty() {
+        return Err("pass either old_string/new_string or edits, not both.".to_string());
+    }
+    if !args.edits.is_empty() {
+        return Ok(args
+            .edits
+            .into_iter()
+            .map(|e| EditSpan { old: e.old_string, new: e.new_string, replace_all: e.replace_all })
+            .collect());
+    }
+    match (args.old_string, args.new_string) {
+        (Some(old), Some(new)) => {
+            Ok(vec![EditSpan { old, new, replace_all: args.replace_all }])
+        }
+        _ => Err(
+            "old_string and new_string are both required, unless the replacements are given \
+             under edits."
+                .to_string(),
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -864,8 +938,10 @@ pub enum Action {
     /// file names.
     Grep { pattern: String, path: Option<String> },
     /// Changes a file, so it is approved like `Write` -- but shows only the
-    /// span being replaced, which is the whole reason to prefer it.
-    Edit { path: String, old: String, new: String, replace_all: bool },
+    /// spans being replaced, which is the whole reason to prefer it. Always
+    /// holds at least one span; several when the model batched its edits to
+    /// one file into one approval.
+    Edit { path: String, edits: Vec<EditSpan> },
     Search { query: String, max_results: u32 },
     /// Puts this project on the internet. Always approved -- see `action_risk`.
     Deploy {
@@ -886,6 +962,15 @@ pub enum Action {
     /// `plan_progress`: bookkeeping against a plan the user already approved.
     /// Also resolved in `app.rs`, since it edits the live plan.
     Progress { step: usize, done: bool, note: Option<String> },
+}
+
+/// One replacement within an `Action::Edit` -- what `edit_file` shows the
+/// user and applies to the file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditSpan {
+    pub old: String,
+    pub new: String,
+    pub replace_all: bool,
 }
 
 /// A plan as the model proposes it, before the user has agreed to anything.
@@ -1063,12 +1148,16 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
         EDIT_FILE => {
             let args: EditFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
             let path = args.path.trim().to_string();
-            (!path.is_empty() && !args.old_string.is_empty()).then_some(Action::Edit {
-                path,
-                old: args.old_string,
-                new: args.new_string,
-                replace_all: args.replace_all,
-            })
+            if path.is_empty() {
+                return None;
+            }
+            let edits = edit_spans(args).ok()?;
+            // A span with nothing to find matches nothing meaningful; there is
+            // nothing coherent to put in front of the user.
+            edits
+                .iter()
+                .all(|e| !e.old.is_empty())
+                .then_some(Action::Edit { path, edits })
         }
         WEB_SEARCH => {
             let args: WebSearchArgs = serde_json::from_str(&call.function.arguments).ok()?;
@@ -2334,13 +2423,32 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     if requested.is_empty() {
         return fail("Error: path must not be empty.".to_string());
     }
-    if args.old_string.is_empty() {
-        return fail(
-            "Error: old_string must not be empty. Use write_file to create a file.".to_string(),
-        );
-    }
-    if args.old_string == args.new_string {
-        return fail("Error: old_string and new_string are identical.".to_string());
+    let spans = match edit_spans(args) {
+        Ok(s) => s,
+        Err(e) => return fail(format!("Error: {e}")),
+    };
+    let batch = spans.len() > 1;
+    // "which edit" for a batch's error messages; a lone edit needs no label.
+    let nth = |i: usize| {
+        if batch {
+            format!("edit {} of {}: ", i + 1, spans.len())
+        } else {
+            String::new()
+        }
+    };
+    for (i, span) in spans.iter().enumerate() {
+        if span.old.is_empty() {
+            return fail(format!(
+                "Error: {}old_string must not be empty. Use write_file to create a file.",
+                nth(i)
+            ));
+        }
+        if span.old == span.new {
+            return fail(format!(
+                "Error: {}old_string and new_string are identical.",
+                nth(i)
+            ));
+        }
     }
 
     let path = match resolve_in_workspace(workspace, &requested) {
@@ -2352,44 +2460,64 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         Err(e) => return fail(format!("Error: could not read '{requested}': {e}")),
     };
 
-    let matches = contents.matches(&args.old_string).count();
-    match matches {
-        0 => {
-            return fail(format!(
-                "Error: old_string was not found in '{requested}'. It must match byte for byte, \
-                 including indentation. Read the file and copy the text exactly."
-            ))
+    // Applied in order, each span matched against the previous spans' result,
+    // and nothing touches the disk until every one has succeeded -- a batch
+    // that half-applied would leave the file in a state neither the model nor
+    // the user approved.
+    let untouched = if batch { " None of the edits were applied." } else { "" };
+    let mut working = contents;
+    let mut replaced_total = 0usize;
+    for (i, span) in spans.iter().enumerate() {
+        let matches = working.matches(&span.old).count();
+        match matches {
+            0 => {
+                return fail(format!(
+                    "Error: {}old_string was not found in '{requested}'. It must match byte for \
+                     byte, including indentation. Read the file and copy the text exactly.{untouched}",
+                    nth(i)
+                ))
+            }
+            // Silently editing the wrong one of several identical spans is the
+            // most damaging thing this tool could do, so an ambiguous edit is
+            // refused rather than guessed at.
+            n if n > 1 && !span.replace_all => {
+                return fail(format!(
+                    "Error: {}old_string appears {n} times in '{requested}'. Add surrounding \
+                     context to make it unique, or pass replace_all: true.{untouched}",
+                    nth(i)
+                ))
+            }
+            _ => {}
         }
-        // Silently editing the wrong one of several identical spans is the most
-        // damaging thing this tool could do, so an ambiguous edit is refused
-        // rather than guessed at.
-        n if n > 1 && !args.replace_all => {
-            return fail(format!(
-                "Error: old_string appears {n} times in '{requested}'. Add surrounding context to \
-                 make it unique, or pass replace_all: true."
-            ))
+        if span.replace_all {
+            working = working.replace(&span.old, &span.new);
+            replaced_total += matches;
+        } else {
+            working = working.replacen(&span.old, &span.new, 1);
+            replaced_total += 1;
         }
-        _ => {}
     }
 
-    let updated = if args.replace_all {
-        contents.replace(&args.old_string, &args.new_string)
-    } else {
-        contents.replacen(&args.old_string, &args.new_string, 1)
-    };
-
-    if let Err(e) = std::fs::write(&path, &updated) {
+    if let Err(e) = std::fs::write(&path, &working) {
         return fail(format!("Error: could not write '{requested}': {e}"));
     }
 
-    let replaced = if args.replace_all { matches } else { 1 };
+    let summary = if batch {
+        format!(
+            "Applied {} edits ({replaced_total} replacements) in '{requested}'. The file is now {} bytes.",
+            spans.len(),
+            working.len()
+        )
+    } else {
+        format!(
+            "Replaced {replaced_total} occurrence(s) in '{requested}'. The file is now {} bytes.",
+            working.len()
+        )
+    };
     outcome(
         &call.id,
-        format!("✏️ edit {requested} — {replaced} replacement(s)"),
-        format!(
-            "Replaced {replaced} occurrence(s) in '{requested}'. The file is now {} bytes.",
-            updated.len()
-        ),
+        format!("✏️ edit {requested} — {replaced_total} replacement(s)"),
+        summary,
     )
 }
 
@@ -2957,6 +3085,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_batch_of_edits_applies_in_order_under_one_call() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "alpha\nbeta\ngamma\n").unwrap();
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "edits": [
+                {"old_string": "alpha", "new_string": "ALPHA"},
+                {"old_string": "gamma", "new_string": "GAMMA"},
+            ]})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.content.contains("Applied 2 edits"), "{}", out.content);
+        let after = std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap();
+        assert_eq!(after, "ALPHA\nbeta\nGAMMA\n");
+    }
+
+    /// Each span is matched against the previous spans' result -- the batch is
+    /// one edit session, not several independent views of the original file.
+    #[tokio::test]
+    async fn a_later_edit_sees_what_an_earlier_one_produced() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "one\n").unwrap();
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "edits": [
+                {"old_string": "one", "new_string": "two"},
+                {"old_string": "two", "new_string": "three"},
+            ]})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.content.contains("Applied 2 edits"), "{}", out.content);
+        let after = std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap();
+        assert_eq!(after, "three\n");
+    }
+
+    /// A batch that half-applied would leave the file in a state neither the
+    /// model nor the user approved, so a failure anywhere writes nothing.
+    #[tokio::test]
+    async fn a_failing_batch_names_the_edit_and_touches_nothing() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "alpha\nbeta\n").unwrap();
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "edits": [
+                {"old_string": "alpha", "new_string": "ALPHA"},
+                {"old_string": "no such text", "new_string": "x"},
+            ]})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.content.contains("edit 2 of 2"), "{}", out.content);
+        assert!(out.content.contains("None of the edits were applied"), "{}", out.content);
+        let after = std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap();
+        assert_eq!(after, "alpha\nbeta\n", "the first edit must not have landed");
+    }
+
+    /// Both argument forms at once is ambiguous about intent, so it is refused
+    /// rather than guessed at -- and the single form still needs both halves.
+    #[tokio::test]
+    async fn edit_file_refuses_mixed_or_incomplete_argument_forms() {
+        let (_d, ws, cfg) = tree();
+        let mixed = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs",
+                "old_string": "a", "new_string": "b",
+                "edits": [{"old_string": "c", "new_string": "d"}]})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(mixed.content.contains("not both"), "{}", mixed.content);
+
+        let incomplete = execute(
+            &tool_call(EDIT_FILE, json!({"path": "src/app.rs", "old_string": "a"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(incomplete.content.contains("both required"), "{}", incomplete.content);
+    }
+
+    #[tokio::test]
     async fn edit_file_cannot_escape_the_workspace() {
         let (_d, ws, cfg) = tree();
         let out = execute(
@@ -3319,7 +3530,7 @@ mod tests {
     #[test]
     fn the_system_prompt_names_the_platform_and_the_shell() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
 
         assert!(prompt.contains(std::env::consts::OS), "{prompt}");
         assert!(prompt.contains(shell().0), "{prompt}");
@@ -3330,8 +3541,29 @@ mod tests {
             assert!(prompt.contains("Unix-like"), "{prompt}");
         }
 
-        let exhausted = system_prompt(&ws, &cfg, false, Mode::Normal, None);
+        let exhausted = system_prompt(&ws, &cfg, cfg.max_steps, Mode::Normal, None);
         assert!(exhausted.contains("Answer the user now"), "{exhausted}");
+    }
+
+    /// The budget must not be a cliff the model discovers by falling off it:
+    /// past three quarters, the prompt says how many rounds are left and to
+    /// wrap up; before that, no budget talk at all.
+    #[test]
+    fn the_system_prompt_warns_at_three_quarters_of_the_step_budget() {
+        let (_dir, ws, cfg) = fixture();
+        let three_quarters = cfg.max_steps * 3 / 4;
+
+        let early = system_prompt(&ws, &cfg, three_quarters.saturating_sub(1), Mode::Normal, None);
+        assert!(!early.contains("BUDGET:"), "{early}");
+
+        let late = system_prompt(&ws, &cfg, three_quarters, Mode::Normal, None);
+        assert!(late.contains("BUDGET:"), "{late}");
+        assert!(
+            late.contains(&format!("{} left", cfg.max_steps - three_quarters)),
+            "{late}"
+        );
+        // Warned, but still working: the full tool list is still described.
+        assert!(late.contains(GREP_SEARCH), "{late}");
     }
 
     /// Regression: without this, a model that only emits tool calls leaves the
@@ -3341,7 +3573,7 @@ mod tests {
     #[test]
     fn the_system_prompt_requires_narration_before_and_after_tool_use() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
 
         assert!(prompt.contains("Before acting"), "{prompt}");
         assert!(prompt.contains("After tool results come back"), "{prompt}");
@@ -3360,7 +3592,7 @@ mod tests {
     #[test]
     fn the_system_prompt_asks_for_multiple_calls_in_one_turn_rather_than_one_narrated_turn_each() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
 
         assert!(prompt.contains("request all of them in the same turn"), "{prompt}");
         assert!(
@@ -3375,7 +3607,7 @@ mod tests {
     #[test]
     fn the_system_prompt_requires_verifying_work_before_declaring_success() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
 
         assert!(prompt.contains("Verify before declaring success"), "{prompt}");
         assert!(
@@ -3396,7 +3628,7 @@ mod tests {
     #[test]
     fn the_system_prompt_offers_to_open_viewable_output_without_skipping_approval() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
 
         assert!(
             prompt.contains("offer to open it with"),
@@ -3581,7 +3813,7 @@ mod tests {
     #[test]
     fn the_system_prompt_tells_the_model_when_and_when_not_to_deploy() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
         assert!(prompt.contains(DEPLOY_PROJECT), "{prompt}");
         assert!(prompt.contains("public internet"), "{prompt}");
         assert!(prompt.contains("Default to a preview"), "{prompt}");
@@ -3675,9 +3907,7 @@ mod tests {
             Action::Write { path: "a.py".into(), content: String::new() },
             Action::Edit {
                 path: "a.py".into(),
-                old: "a".into(),
-                new: "b".into(),
-                replace_all: false,
+                edits: vec![EditSpan { old: "a".into(), new: "b".into(), replace_all: false }],
             },
             Action::Command { command: "cargo build".into(), purpose: None },
             Action::Command { command: "rm -rf build".into(), purpose: None },
@@ -3699,7 +3929,7 @@ mod tests {
     #[test]
     fn the_plan_mode_prompt_says_what_is_unavailable_and_how_to_get_out() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Plan, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Plan, None);
 
         assert!(prompt.contains("PLAN MODE"), "{prompt}");
         assert!(prompt.contains(EXIT_PLAN_MODE), "{prompt}");
@@ -3804,7 +4034,7 @@ mod tests {
         };
         plan.mark(1, true, None).unwrap();
 
-        let prompt = system_prompt(&ws, &cfg, true, Mode::Normal, Some(&plan));
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, Some(&plan));
         assert!(prompt.contains("1/2 steps done"), "{prompt}");
         assert!(prompt.contains("[x] 1. Add the limiter"), "{prompt}");
         assert!(prompt.contains("[ ] 2. Wrap the router"), "{prompt}");
@@ -3814,7 +4044,7 @@ mod tests {
         // A finished plan is not restated: there is nothing left to follow,
         // and repeating it invites the model to redo work.
         plan.mark(2, true, None).unwrap();
-        let done = system_prompt(&ws, &cfg, true, Mode::Normal, Some(&plan));
+        let done = system_prompt(&ws, &cfg, 0, Mode::Normal, Some(&plan));
         assert!(!done.contains("IMPLEMENTING AN APPROVED PLAN"), "{done}");
     }
 

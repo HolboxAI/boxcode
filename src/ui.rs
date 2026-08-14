@@ -1066,12 +1066,22 @@ fn tool_approval_parts(
             )));
             (" Search file contents? ", "search", "skip")
         }
-        // An edit shows both spans, because approving a replacement you cannot
+        // An edit shows every span, because approving a replacement you cannot
         // see is not approval. Unlike a write it does not need the whole file --
-        // showing only what changes is the reason to prefer this tool.
-        Action::Edit { path, old, new, replace_all } => {
+        // showing only what changes is the reason to prefer this tool. A batch
+        // is one approval covering all of its spans, so all of them are here.
+        Action::Edit { path, edits } => {
+            let batch = edits.len() > 1;
+            let solo_all = !batch && edits.first().is_some_and(|e| e.replace_all);
+            let suffix = if batch {
+                format!("  ({} edits, all or none)", edits.len())
+            } else if solo_all {
+                "  (all occurrences)".to_string()
+            } else {
+                String::new()
+            };
             lines.push(Line::from(Span::styled(
-                format!("✏️ {path}{}", if *replace_all { "  (all occurrences)" } else { "" }),
+                format!("✏️ {path}{suffix}"),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1094,9 +1104,24 @@ fn tool_approval_parts(
                 }
                 lines.push(Line::from(""));
             };
-            span("replace:", old, theme::p().danger);
-            span("with:", new, theme::p().success);
-            (" Apply this edit? ", "edit", "skip")
+            for (i, edit) in edits.iter().enumerate() {
+                let (replace_label, with_label);
+                if batch {
+                    let all = if edit.replace_all { ", all occurrences" } else { "" };
+                    replace_label = format!("edit {} of {} — replace:{all}", i + 1, edits.len());
+                    with_label = "with:".to_string();
+                } else {
+                    replace_label = "replace:".to_string();
+                    with_label = "with:".to_string();
+                }
+                span(&replace_label, &edit.old, theme::p().danger);
+                span(&with_label, &edit.new, theme::p().success);
+            }
+            if batch {
+                (" Apply these edits? ", "edit", "skip")
+            } else {
+                (" Apply this edit? ", "edit", "skip")
+            }
         }
         Action::Deploy { provider, production, summary } => {
             lines.push(Line::from(Span::styled(
