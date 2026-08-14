@@ -221,8 +221,10 @@ $ python3 hello.py — 1 line
 ```
 
 `read_file`/`write_file` handle reading and creating/overwriting a single
-file. `deploy_project` ships the project to Vercel or Netlify (see
-[Deploying](#deploying)). `run_command` is for everything else — search (`grep`), builds, tests,
+file. `grep_search` finds lines by content (a regular expression, searched
+recursively) the way `glob` finds files by name — both read-only, so neither
+stops to ask. `deploy_project` ships the project to Vercel or Netlify (see
+[Deploying](#deploying)). `run_command` is for everything else — builds, tests,
 running a program, listing an archive (`unzip -l`), extracting a PDF
 (`pdftotext`) — anything installed on your machine.
 

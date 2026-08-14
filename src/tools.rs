@@ -54,6 +54,7 @@ pub const READ_FILE: &str = "read_file";
 pub const WRITE_FILE: &str = "write_file";
 pub const LIST_DIR: &str = "list_dir";
 pub const GLOB: &str = "glob";
+pub const GREP_SEARCH: &str = "grep_search";
 pub const EDIT_FILE: &str = "edit_file";
 pub const WEB_SEARCH: &str = "web_search";
 pub const DEPLOY_PROJECT: &str = "deploy_project";
@@ -95,6 +96,18 @@ pub const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "dis
 const MAX_GLOB_RESULTS: usize = 500;
 /// Ceiling on `list_dir` entries, for the same reason.
 const MAX_DIR_ENTRIES: usize = 300;
+/// Ceiling on `grep_search` matched lines, for the same reason again -- a
+/// pattern like `e` would otherwise return most of the project.
+const MAX_GREP_MATCHES: usize = 200;
+/// Files bigger than this are skipped by `grep_search` rather than read: at
+/// this size they are lockfiles, bundles or data, and reading them costs more
+/// than any match in them is worth.
+const MAX_GREP_FILE_BYTES: u64 = 1_000_000;
+/// How much surrounding context `grep_search` may be asked for per match.
+const MAX_GREP_CONTEXT: u32 = 5;
+/// A matched or context line is clipped to this many characters so one
+/// minified line cannot swallow the whole result budget.
+const MAX_GREP_LINE_CHARS: usize = 250;
 
 fn is_skipped(path: &Path, workspace: &Path) -> bool {
     path.strip_prefix(workspace)
@@ -258,6 +271,38 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                         "pattern": {
                             "type": "string",
                             "description": "Glob relative to the project root, e.g. 'src/**/*.rs' or '**/Cargo.toml'."
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": GREP_SEARCH,
+                "description": format!(
+                    "Search file CONTENTS for a regular expression, recursively, and get back \
+                     matching lines as path:line: text. Use this to find code by what it says -- \
+                     where a function is called, where a string appears -- where `glob` finds \
+                     files by what they are called. Case-sensitive; prefix the pattern with \
+                     `(?i)` for case-insensitive. Skips {} and binary files. Read-only.",
+                    SKIP_DIRS.join(", ")
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regular expression to search for, e.g. 'fn resolve_\\w+' or '(?i)todo'. Matched against each line."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "File or directory to search, relative to the project root. Defaults to the whole project."
+                        },
+                        "context": {
+                            "type": "integer",
+                            "description": format!("Lines of surrounding context to include per match, 0-{MAX_GREP_CONTEXT}. Defaults to 0.")
                         }
                     },
                     "required": ["pattern"]
@@ -529,6 +574,9 @@ pub fn system_prompt(
          - {LIST_DIR}(path): list one directory. Read-only, runs without asking.\n\
          - {GLOB}(pattern): find files by path pattern, e.g. 'src/**/*.rs'. Read-only, runs \
            without asking.\n\
+         - {GREP_SEARCH}(pattern, path, context): search file contents for a regular \
+           expression, recursively; returns matching lines as path:line: text. Read-only, runs \
+           without asking.\n\
          - {RUN_COMMAND}(command, purpose): run a shell command and get back its exit code, \
            stdout and stderr.\n\
          - {WEB_SEARCH}(query, max_results): search the web, get back titles/URLs/snippets. \
@@ -557,9 +605,10 @@ pub fn system_prompt(
            {RUN_COMMAND} instead of only telling the user how. This is still just another \
            command: it waits for the same approval as everything else, it does not skip the \
            prompt.\n\
-         - Explore with {LIST_DIR} and {GLOB} before guessing at paths, and prefer them over \
-           `ls`/`find` through {RUN_COMMAND}: they need no approval, so they cost the user \
-           nothing to answer.\n\
+         - Explore with {LIST_DIR} and {GLOB} before guessing at paths, and search contents \
+           with {GREP_SEARCH} before guessing at what a file says. Prefer all three over \
+           `ls`/`find`/`grep` through {RUN_COMMAND}: they need no approval, so they cost the \
+           user nothing to answer.\n\
          - To change part of an existing file use {EDIT_FILE}, not {WRITE_FILE}. {WRITE_FILE} \
            replaces the entire file, so it silently destroys anything you did not reproduce; \
            reserve it for creating a file or rewriting one wholesale. Read the file first so \
@@ -724,6 +773,15 @@ struct GlobArgs {
 }
 
 #[derive(Deserialize)]
+struct GrepSearchArgs {
+    pattern: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    context: Option<u32>,
+}
+
+#[derive(Deserialize)]
 struct EditFileArgs {
     path: String,
     old_string: String,
@@ -785,6 +843,9 @@ pub enum Action {
     List { path: String },
     /// Read-only, like `Read`.
     Glob { pattern: String },
+    /// Read-only, like `Glob` -- searches file contents where `Glob` searches
+    /// file names.
+    Grep { pattern: String, path: Option<String> },
     /// Changes a file, so it is approved like `Write` -- but shows only the
     /// span being replaced, which is the whole reason to prefer it.
     Edit { path: String, old: String, new: String, replace_all: bool },
@@ -835,6 +896,10 @@ impl Action {
             Action::Write { path, .. } => format!("📝 write {path}"),
             Action::List { path } => format!("📁 list {path}"),
             Action::Glob { pattern } => format!("🔎 find {pattern}"),
+            Action::Grep { pattern, path } => match path {
+                Some(path) => format!("🔎 grep {pattern} in {path}"),
+                None => format!("🔎 grep {pattern}"),
+            },
             Action::Edit { path, .. } => format!("✏️ edit {path}"),
             Action::Search { query, .. } => format!("🔎 search \"{query}\""),
             Action::Deploy { provider, production, .. } => format!(
@@ -891,6 +956,7 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
         Action::Read { .. }
         | Action::List { .. }
         | Action::Glob { .. }
+        | Action::Grep { .. }
         | Action::Search { .. }
         | Action::Plan(_)
         // Cannot arise in plan mode -- there is no approved plan to record
@@ -968,6 +1034,14 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
             let args: GlobArgs = serde_json::from_str(&call.function.arguments).ok()?;
             let pattern = args.pattern.trim().to_string();
             (!pattern.is_empty()).then_some(Action::Glob { pattern })
+        }
+        GREP_SEARCH => {
+            let args: GrepSearchArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let pattern = args.pattern.trim().to_string();
+            (!pattern.is_empty()).then_some(Action::Grep {
+                pattern,
+                path: args.path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()),
+            })
         }
         EDIT_FILE => {
             let args: EditFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
@@ -1238,6 +1312,7 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         WRITE_FILE => execute_write_file(call, workspace).await,
         LIST_DIR => execute_list_dir(call, workspace),
         GLOB => execute_glob(call, workspace),
+        GREP_SEARCH => execute_grep_search(call, workspace),
         EDIT_FILE => execute_edit_file(call, workspace),
         WEB_SEARCH => execute_web_search(call, config).await,
         DEPLOY_PROJECT => execute_deploy_project(call, workspace).await,
@@ -1265,7 +1340,8 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
             format!("⚙ {other} — unknown tool"),
             format!(
                 "Error: there is no tool named '{other}'. The tools are {RUN_COMMAND}, \
-                 {READ_FILE}, {WRITE_FILE}, {LIST_DIR}, {GLOB}, {EDIT_FILE}, {WEB_SEARCH}."
+                 {READ_FILE}, {WRITE_FILE}, {LIST_DIR}, {GLOB}, {GREP_SEARCH}, {EDIT_FILE}, \
+                 {WEB_SEARCH}."
             ),
         ),
     }
@@ -1988,6 +2064,190 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     )
 }
 
+/// Walks `dir` depth-first, gathering the files `grep_search` will read, in a
+/// stable (sorted) order so the same search always returns the same result.
+/// Skips `SKIP_DIRS` and never follows symlinks -- a link pointing outside the
+/// workspace must not pull the search out with it.
+fn collect_grep_files(dir: &Path, workspace_root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if is_skipped(&path, workspace_root) {
+            continue;
+        }
+        // `entry.file_type()` does not follow symlinks, so a symlinked
+        // directory or file falls through both arms and is ignored.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_grep_files(&path, workspace_root, out);
+        } else if file_type.is_file() {
+            out.push(path);
+        }
+    }
+}
+
+/// `grep_search` -- find lines by what they say, the way `glob` finds files by
+/// what they are called.
+fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+    let Ok(args) = serde_json::from_str::<GrepSearchArgs>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "🔎 grep — unusable arguments".to_string(),
+            format!(
+                r#"Error: could not read the arguments. Expected {{"pattern": "fn main"}}, got: {}"#,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+    let pattern = args.pattern.trim();
+    if pattern.is_empty() {
+        return outcome(
+            &call.id,
+            "🔎 grep — empty pattern".to_string(),
+            "Error: pattern must not be empty.".to_string(),
+        );
+    }
+    let regex = match regex::Regex::new(pattern) {
+        Ok(r) => r,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("🔎 grep {pattern} — invalid"),
+                format!("Error: '{pattern}' is not a valid regular expression: {e}"),
+            )
+        }
+    };
+    let context = args.context.unwrap_or(0).min(MAX_GREP_CONTEXT) as usize;
+
+    let requested = args
+        .path
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+    let root = match resolve_in_workspace(workspace, &requested) {
+        Ok(p) => p,
+        Err(e) => {
+            return outcome(&call.id, format!("🔎 grep {pattern} — {e}"), format!("Error: {e}"))
+        }
+    };
+    if !root.exists() {
+        return outcome(
+            &call.id,
+            format!("🔎 grep {pattern} — no such path"),
+            format!("Error: '{requested}' does not exist."),
+        );
+    }
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    if root.is_file() {
+        files.push(root.clone());
+    } else {
+        collect_grep_files(&root, workspace.root(), &mut files);
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+    let mut matched_lines = 0usize;
+    let mut truncated = false;
+    for file in &files {
+        let Ok(meta) = std::fs::metadata(file) else {
+            continue;
+        };
+        if meta.len() > MAX_GREP_FILE_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(file) else {
+            continue;
+        };
+        // A NUL early in the file marks it binary: matched fragments of an
+        // image or an object file are noise the model cannot use.
+        if bytes.iter().take(8192).any(|&b| b == 0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+
+        let remaining = MAX_GREP_MATCHES - matched_lines;
+        let mut match_idx: Vec<usize> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if regex.is_match(line) {
+                if match_idx.len() == remaining {
+                    truncated = true;
+                    break;
+                }
+                match_idx.push(i);
+            }
+        }
+        if match_idx.is_empty() {
+            continue;
+        }
+        matched_lines += match_idx.len();
+
+        // grep's own format: `path:line: text` for a match, `path-line- text`
+        // for context, `--` between non-adjacent runs. Familiar to both the
+        // model and anyone reading the transcript.
+        let rel = relative_to(workspace, file);
+        let mut section: Vec<String> = Vec::new();
+        let mut last_printed: Option<usize> = None;
+        for &m in &match_idx {
+            let start = m.saturating_sub(context);
+            let end = (m + context).min(lines.len().saturating_sub(1));
+            for (i, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+                if last_printed.is_some_and(|lp| i <= lp) {
+                    continue;
+                }
+                if context > 0 && last_printed.is_some_and(|lp| i > lp + 1) {
+                    section.push("--".to_string());
+                }
+                if match_idx.contains(&i) {
+                    section.push(format!("{rel}:{}: {}", i + 1, clip(line, MAX_GREP_LINE_CHARS)));
+                } else {
+                    section.push(format!("{rel}-{}- {}", i + 1, clip(line, MAX_GREP_LINE_CHARS)));
+                }
+                last_printed = Some(i);
+            }
+        }
+        sections.push(section.join("\n"));
+
+        if truncated {
+            break;
+        }
+    }
+
+    if sections.is_empty() {
+        // Finding nothing is an answer, not a failure -- same as `glob`.
+        let scope = if requested == "." {
+            String::new()
+        } else {
+            format!(" in '{requested}'")
+        };
+        return outcome(
+            &call.id,
+            format!("🔎 grep {pattern} — no matches"),
+            format!("No lines match '{pattern}'{scope}."),
+        );
+    }
+
+    let files_with_matches = sections.len();
+    let mut body = sections.join("\n\n");
+    if truncated {
+        body.push_str(&format!(
+            "\n[capped at {MAX_GREP_MATCHES} matching lines; narrow the pattern or path]"
+        ));
+    }
+
+    outcome(
+        &call.id,
+        format!("🔎 grep {pattern} — {matched_lines} match(es) in {files_with_matches} file(s)"),
+        clip(&body, 32_000),
+    )
+}
+
 /// `edit_file` -- replace an exact span, leaving the rest of the file alone.
 fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<EditFileArgs>(&call.function.arguments) else {
@@ -2415,6 +2675,130 @@ mod tests {
         let (_d, ws, cfg) = tree();
         let out = execute(&tool_call(GLOB, json!({"pattern": "src/[unclosed"})), &ws, &cfg).await;
         assert!(out.content.contains("not a valid glob"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn grep_finds_matches_as_path_line_text() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(GREP_SEARCH, json!({"pattern": "needle"})), &ws, &cfg).await;
+        assert!(out.content.contains("src/app.rs:1: let needle = 1;"), "{}", out.content);
+        assert!(out.display.contains("1 match(es) in 1 file(s)"), "{}", out.display);
+    }
+
+    #[tokio::test]
+    async fn grep_skips_build_output_and_dependencies() {
+        let (_d, ws, cfg) = tree();
+        // `//` appears in src/ui/render.rs, target/ and node_modules/ alike;
+        // only the real source file may come back.
+        let out = execute(&tool_call(GREP_SEARCH, json!({"pattern": "//"})), &ws, &cfg).await;
+        assert!(out.content.contains("src/ui/render.rs"), "{}", out.content);
+        assert!(!out.content.contains("target/"), "{}", out.content);
+        assert!(!out.content.contains("node_modules/"), "{}", out.content);
+    }
+
+    /// Finding nothing is an answer, not a failure -- same contract as `glob`.
+    #[tokio::test]
+    async fn grep_reports_no_matches_as_a_normal_result() {
+        let (_d, ws, cfg) = tree();
+        let out =
+            execute(&tool_call(GREP_SEARCH, json!({"pattern": "nowhere_to_be_found"})), &ws, &cfg)
+                .await;
+        assert!(out.content.contains("No lines match"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_an_invalid_regex_with_an_actionable_message() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(&tool_call(GREP_SEARCH, json!({"pattern": "[unclosed"})), &ws, &cfg).await;
+        assert!(out.content.contains("not a valid regular expression"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn grep_cannot_escape_the_workspace() {
+        let (_d, ws, cfg) = tree();
+        for escape in ["..", "../..", "/etc"] {
+            let out = execute(
+                &tool_call(GREP_SEARCH, json!({"pattern": "x", "path": escape})),
+                &ws,
+                &cfg,
+            )
+            .await;
+            assert!(
+                out.content.contains("outside the workspace"),
+                "{escape} must be refused: {}",
+                out.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_scopes_to_a_subdirectory_or_single_file() {
+        let (_d, ws, cfg) = tree();
+        let dir_scoped =
+            execute(&tool_call(GREP_SEARCH, json!({"pattern": "//", "path": "src/ui"})), &ws, &cfg)
+                .await;
+        assert!(dir_scoped.content.contains("src/ui/render.rs"), "{}", dir_scoped.content);
+        assert!(!dir_scoped.content.contains("src/app.rs"), "{}", dir_scoped.content);
+
+        let file_scoped = execute(
+            &tool_call(GREP_SEARCH, json!({"pattern": "needle", "path": "src/app.rs"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(file_scoped.content.contains("src/app.rs:1:"), "{}", file_scoped.content);
+    }
+
+    #[tokio::test]
+    async fn grep_includes_context_lines_grep_style() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "one\ntwo\nthree\n").unwrap();
+        let out = execute(
+            &tool_call(GREP_SEARCH, json!({"pattern": "two", "path": "src/app.rs", "context": 1})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.content.contains("src/app.rs-1- one"), "{}", out.content);
+        assert!(out.content.contains("src/app.rs:2: two"), "{}", out.content);
+        assert!(out.content.contains("src/app.rs-3- three"), "{}", out.content);
+    }
+
+    /// Matched fragments of an image or an object file are noise the model
+    /// cannot use, so binary files are skipped outright.
+    #[tokio::test]
+    async fn grep_skips_binary_files() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("blob.bin"), b"needle\x00needle\n").unwrap();
+        let out = execute(&tool_call(GREP_SEARCH, json!({"pattern": "needle"})), &ws, &cfg).await;
+        assert!(!out.content.contains("blob.bin"), "{}", out.content);
+    }
+
+    /// A pattern like `e` would otherwise return most of the project, so the
+    /// result is capped and says so rather than silently stopping.
+    #[tokio::test]
+    async fn grep_caps_runaway_matches_and_says_so() {
+        let (_d, ws, cfg) = tree();
+        let many = "needle\n".repeat(MAX_GREP_MATCHES + 50);
+        std::fs::write(ws.root().join("src/app.rs"), many).unwrap();
+        let out = execute(&tool_call(GREP_SEARCH, json!({"pattern": "needle"})), &ws, &cfg).await;
+        assert!(
+            out.content.contains(&format!("[capped at {MAX_GREP_MATCHES} matching lines")),
+            "{}",
+            out.content
+        );
+    }
+
+    /// Searching contents changes nothing, so plan mode has no reason to
+    /// refuse it -- the point of the mode is to make research cheap.
+    #[test]
+    fn grep_is_allowed_in_plan_mode_and_offered_to_the_model() {
+        assert!(plan_mode_block(&Action::Grep { pattern: "x".into(), path: None }).is_none());
+        let names: Vec<String> = schemas(Mode::Plan, false, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(names.contains(&GREP_SEARCH.to_string()), "{names:?}");
     }
 
     #[tokio::test]
@@ -3001,6 +3385,7 @@ mod tests {
                 WRITE_FILE,
                 LIST_DIR,
                 GLOB,
+                GREP_SEARCH,
                 EDIT_FILE,
                 WEB_SEARCH,
                 DEPLOY_PROJECT
