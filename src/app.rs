@@ -113,11 +113,12 @@ pub enum Overlay {
     CustomEndpoint(CustomStep),
     /// Asks about `pending_tools.front()`. Unlike the other overlays this one
     /// appears while the app is busy, mid-turn.
-    ToolApproval {
-        action: tools::Action,
-        /// How many more calls are queued behind this one.
-        remaining: usize,
-    },
+    /// One `ApprovalRequest`, on screen. The popup renders the request's
+    /// `action`, and the keypress that answers it becomes a
+    /// `approval::Decision` consumed by `App::decide` -- the whole exchange
+    /// speaks `approval.rs`'s types, so when the agent loop moves behind a
+    /// channel the popup does not change.
+    ToolApproval(crate::approval::ApprovalRequest),
     /// `/deploy`. A marker only: the flow is long-lived and streams output, so
     /// its state lives in `App::deploy` rather than in this variant. Every
     /// other overlay is one question with one answer and carries its own data.
@@ -960,13 +961,11 @@ impl App {
                                 )
                             });
                     }
-                    self.overlay = Some(Overlay::ToolApproval {
+                    self.show_approval(crate::approval::ApprovalRequest {
+                        call: call.clone(),
                         action,
                         remaining: self.pending_tools.len().saturating_sub(1),
                     });
-                    self.approval_scroll = 0;
-                    self.approval_selected = true;
-                    self.state = AppState::AwaitingApproval;
                     return;
                 }
                 // Nothing coherent to show, so nothing to approve. Let it through
@@ -1712,6 +1711,16 @@ impl App {
     /// of yet. `[tools] require_approval = false` still exists for scripted
     /// runs, where turning it off is an explicit, visible act rather than a
     /// keystroke.
+    /// Put one `ApprovalRequest` in front of the user. The single place a
+    /// request becomes visible, so what the popup shows and what `decide`
+    /// answers are always the same object.
+    fn show_approval(&mut self, request: crate::approval::ApprovalRequest) {
+        self.overlay = Some(Overlay::ToolApproval(request));
+        self.approval_scroll = 0;
+        self.approval_selected = true;
+        self.state = AppState::AwaitingApproval;
+    }
+
     fn handle_command_approval_key(&mut self, key: KeyEvent) {
         if matches!(key.code, KeyCode::Up | KeyCode::Down) {
             self.approval_selected = !self.approval_selected;
@@ -1733,16 +1742,28 @@ impl App {
             _ => {}
         }
 
+        use crate::approval::Decision;
         let decision = match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
-            KeyCode::Enter => Some(self.approval_selected),
-            _ => None,
+            KeyCode::Char('y') | KeyCode::Char('Y') => Decision::Allowed,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Decision::Refused,
+            KeyCode::Enter => {
+                if self.approval_selected {
+                    Decision::Allowed
+                } else {
+                    Decision::Refused
+                }
+            }
+            _ => return, // unrecognised key: leave the prompt exactly as it was
         };
+        self.decide(decision);
+    }
 
-        let Some(allowed) = decision else {
-            return; // unrecognised key: leave the prompt exactly as it was
-        };
+    /// Apply the user's answer to the request currently on screen -- the one
+    /// function every approval decision flows through, however it was asked.
+    /// Keys arrive here today; a channel's responses will arrive here when
+    /// the agent loop runs behind one.
+    pub fn decide(&mut self, decision: crate::approval::Decision) {
+        let allowed = decision.is_allowed();
         let Some(call) = self.pending_tools.pop_front() else {
             return;
         };
@@ -2707,7 +2728,7 @@ impl App {
             // Put back first: an unrecognised key must leave the prompt standing
             // rather than silently dismissing it, and `handle_overlay_key` took
             // the overlay before dispatching here.
-            approval @ Overlay::ToolApproval { .. } => {
+            approval @ Overlay::ToolApproval(_) => {
                 self.overlay = Some(approval);
                 self.handle_command_approval_key(key);
             }
@@ -4836,7 +4857,7 @@ mod tests {
         assert_eq!(a.tool_steps, 1);
 
         match &a.overlay {
-            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, .. }) => {
+            Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { action: tools::Action::Command { command, .. }, .. })) => {
                 assert_eq!(command, "cat src/main.rs")
             }
             other => panic!("expected an approval prompt, got {other:?}"),
@@ -4977,7 +4998,7 @@ mod tests {
         ]);
 
         match &a.overlay {
-            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, remaining }) => {
+            Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { action: tools::Action::Command { command, .. }, remaining, .. })) => {
                 assert_eq!(command, "ls");
                 assert_eq!(*remaining, 1);
             }
@@ -4986,7 +5007,7 @@ mod tests {
 
         a.handle_key(key(KeyCode::Char('y')));
         match &a.overlay {
-            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, remaining }) => {
+            Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { action: tools::Action::Command { command, .. }, remaining, .. })) => {
                 assert_eq!(command, "cat Cargo.toml");
                 assert_eq!(*remaining, 0);
             }
@@ -5203,7 +5224,7 @@ mod tests {
 
         assert_eq!(a.approved_tools.len(), 1, "the read-only call ran with no prompt");
         match &a.overlay {
-            Some(Overlay::ToolApproval { action: tools::Action::Command { command, .. }, remaining }) => {
+            Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { action: tools::Action::Command { command, .. }, remaining, .. })) => {
                 assert_eq!(command, "rm -rf build");
                 assert_eq!(*remaining, 0);
             }
@@ -5234,7 +5255,7 @@ mod tests {
         assert_eq!(a.state, AppState::AwaitingApproval);
         assert!(a.approved_tools.is_empty());
         match &a.overlay {
-            Some(Overlay::ToolApproval { action: tools::Action::Write { path, content }, .. }) => {
+            Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { action: tools::Action::Write { path, content }, .. })) => {
                 assert_eq!(path, "hello.py");
                 assert_eq!(content, "print('hi')\n");
             }
@@ -5254,7 +5275,7 @@ mod tests {
         assert_eq!(a.state, AppState::AwaitingApproval);
         assert!(a.approved_tools.is_empty());
         match &a.overlay {
-            Some(Overlay::ToolApproval { action: tools::Action::Search { query, .. }, .. }) => {
+            Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { action: tools::Action::Search { query, .. }, .. })) => {
                 assert_eq!(query, "rust async runtimes");
             }
             other => panic!("expected a search approval prompt, got {other:?}"),
@@ -5286,7 +5307,7 @@ mod tests {
 
         assert_eq!(a.state, AppState::AwaitingApproval);
         match &a.overlay {
-            Some(Overlay::ToolApproval { action: tools::Action::Search { query, .. }, .. }) => {
+            Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { action: tools::Action::Search { query, .. }, .. })) => {
                 assert_eq!(query, "rust language latest release notes");
             }
             other => panic!("expected a search approval prompt, got {other:?}"),
@@ -6130,7 +6151,7 @@ mod tests {
 
         assert_eq!(a.state, AppState::AwaitingApproval);
         match &a.overlay {
-            Some(Overlay::ToolApproval { action: tools::Action::Plan(p), .. }) => {
+            Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { action: tools::Action::Plan(p), .. })) => {
                 assert_eq!(p.title, "Rate limiting");
                 assert_eq!(p.steps.len(), 2);
             }
