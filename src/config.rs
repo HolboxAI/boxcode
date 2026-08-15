@@ -304,6 +304,10 @@ pub struct ToolsConfig {
     /// without rebuilding, and "" switches the feature off.
     #[serde(default = "default_auth_endpoint")]
     pub auth_endpoint: String,
+    /// Where `db_query` sends one SQL statement to run against a project's
+    /// database. Same reasoning as `artifact_endpoint`/`auth_endpoint`.
+    #[serde(default = "default_db_endpoint")]
+    pub db_endpoint: String,
 }
 
 fn yes() -> bool {
@@ -352,6 +356,12 @@ fn default_auth_endpoint() -> String {
     "https://auth.boxcode.sh/provision".to_string()
 }
 
+fn default_db_endpoint() -> String {
+    // Same box, same vhost and cert as auth -- see infra/db/README.md for
+    // why this never needed a second domain.
+    "https://auth.boxcode.sh/db/query".to_string()
+}
+
 fn default_search_timeout() -> u64 {
     20
 }
@@ -370,6 +380,7 @@ impl Default for ToolsConfig {
             search_timeout_secs: default_search_timeout(),
             artifact_endpoint: default_artifact_endpoint(),
             auth_endpoint: default_auth_endpoint(),
+            db_endpoint: default_db_endpoint(),
         }
     }
 }

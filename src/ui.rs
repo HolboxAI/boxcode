@@ -1015,6 +1015,19 @@ fn tool_approval_parts(
             }
             (" Add sign-up/sign-in? ", "provision", "skip")
         }
+        Action::DbQuery { path, sql } => {
+            for wrapped in wrap(path, inner) {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            lines.push(Line::from(""));
+            for wrapped in wrap(sql, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            (" Run this against the project's database? ", "run", "skip")
+        }
         Action::Command { command, purpose } => {
             if let Some(purpose) = purpose {
                 for wrapped in wrap(purpose, inner) {

@@ -60,6 +60,7 @@ pub const WEB_SEARCH: &str = "web_search";
 pub const DEPLOY_PROJECT: &str = "deploy_project";
 pub const PUBLISH_ARTIFACT: &str = "publish_artifact";
 pub const ENABLE_AUTH: &str = "enable_auth";
+pub const DB_QUERY: &str = "db_query";
 pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
 pub const PLAN_PROGRESS: &str = "plan_progress";
 
@@ -412,6 +413,46 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                         }
                     },
                     "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": DB_QUERY,
+                "description": "Run one SQL statement against an already-published project's own \
+                                database (SQLite -- one file per project, created automatically on \
+                                first use). Requires the path to have been published with \
+                                publish_artifact first, same as enable_auth. One statement per \
+                                call -- call this again for a second one, never separate several \
+                                with semicolons. Prefer `?` placeholders with `params` over \
+                                building the SQL string yourself, especially for any value that \
+                                came from outside your own code. A statement starting with SELECT, \
+                                PRAGMA or EXPLAIN returns {\"rows\": [...], \"truncated\": bool} \
+                                (capped at 500 rows); anything else (CREATE TABLE, INSERT, UPDATE, \
+                                DELETE, ...) returns {\"changes\": n, \"last_insert_rowid\": n}. \
+                                This tool never publishes anything and holds no secret the \
+                                published page's own JS needs -- data access from the live page \
+                                still has to go through code you write and ship with \
+                                write_file/edit_file, the same as any other backend logic.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The same path already given to publish_artifact for this project."
+                        },
+                        "sql": {
+                            "type": "string",
+                            "description": "Exactly one SQL statement."
+                        },
+                        "params": {
+                            "type": "array",
+                            "items": { "type": ["string", "number", "boolean", "null"] },
+                            "description": "Values for `?` placeholders in sql, in order. Omit if sql has none."
+                        }
+                    },
+                    "required": ["path", "sql"]
                 }
             }
         }),
@@ -1050,6 +1091,11 @@ pub enum Action {
     /// stands up a real backend on the public internet, not something a
     /// blanket "skip approval" setting should silently cover.
     EnableAuth { path: String },
+    /// Runs one statement against an already-published project's own
+    /// database. Ordinary approval, not always-on like `Publish`/`Deploy`/
+    /// `EnableAuth` -- it does not put anything on the public internet by
+    /// itself, so it is judged the same way `Write`/`Edit` are.
+    DbQuery { path: String, sql: String },
     /// Puts this project on the internet. Always approved -- see `action_risk`.
     Deploy {
         provider: String,
@@ -1117,6 +1163,7 @@ impl Action {
             ),
             Action::Publish { path } => format!("🌐 preview {path} — public link, 48h"),
             Action::EnableAuth { path } => format!("🔐 auth {path} — sign-up/sign-in"),
+            Action::DbQuery { path, sql } => format!("🗄️ db {path} — {}", clip(sql, 50)),
             Action::Plan(p) => format!("📋 plan: {}", p.title),
             Action::Progress { step, done, .. } => {
                 format!("{} step {step}", if *done { "☑" } else { "☐" })
@@ -1190,6 +1237,10 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
         Action::Edit { path, .. } => Some(format!(
             "Plan mode is read-only, so {path} was not changed. Describe the change in your \
              plan, then call {EXIT_PLAN_MODE}."
+        )),
+        Action::DbQuery { path, .. } => Some(format!(
+            "Plan mode is read-only, so nothing was run against {path}'s database. Describe the \
+             statement in your plan, then call {EXIT_PLAN_MODE}."
         )),
         Action::Command { command, .. } => Some(format!(
             "Plan mode only runs commands that cannot change anything, and `{}` is not one of \
@@ -1294,6 +1345,17 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
                 return None;
             }
             Some(Action::Publish { path })
+        }
+        DB_QUERY => {
+            #[derive(serde::Deserialize)]
+            struct Args { path: String, sql: String }
+            let args: Args = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            let sql = args.sql.trim().to_string();
+            if path.is_empty() || sql.is_empty() {
+                return None;
+            }
+            Some(Action::DbQuery { path, sql })
         }
         ENABLE_AUTH => {
             #[derive(serde::Deserialize)]
@@ -1585,6 +1647,7 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         DEPLOY_PROJECT => execute_deploy_project(call, workspace).await,
         PUBLISH_ARTIFACT => execute_publish_artifact(call, workspace, config).await,
         ENABLE_AUTH => execute_enable_auth(call, workspace, config).await,
+        DB_QUERY => execute_db_query(call, workspace, config).await,
         // Never reached: `app::advance_approvals` resolves this one itself,
         // because accepting it changes `App`'s mode and the runner has no
         // access to `App`. Handled anyway so a routing mistake produces a
@@ -2306,6 +2369,66 @@ async fn execute_enable_auth(call: &ToolCall, workspace: &Workspace, config: &To
         Err(e) => outcome(
             &call.id,
             format!("\u{1F510} auth {} \u{2014} failed", clip(&path, 40)),
+            format!("Error: {e}"),
+        ),
+    }
+}
+
+/// Run one statement against an already-published project's database.
+///
+/// `Action::DbQuery` (used for the approval prompt and risk classification)
+/// only carries `path` and `sql` -- `params` is re-read from the raw call
+/// arguments here rather than added to the enum, since nothing outside
+/// this one function needs it.
+async fn execute_db_query(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
+    let Some(Action::DbQuery { path, sql }) = describe_action(call) else {
+        return outcome(
+            &call.id,
+            "\u{1F5C4}\u{FE0F} db \u{2014} unusable arguments".to_string(),
+            format!("Error: {DB_QUERY} needs a `path` and a `sql` statement."),
+        );
+    };
+    #[derive(serde::Deserialize, Default)]
+    struct ParamsArgs {
+        #[serde(default)]
+        params: Vec<serde_json::Value>,
+    }
+    let params = serde_json::from_str::<ParamsArgs>(&call.function.arguments)
+        .map(|a| a.params)
+        .unwrap_or_default();
+
+    let resolved = match resolve_in_workspace(workspace, &path) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("\u{1F5C4}\u{FE0F} db {} \u{2014} refused", clip(&path, 40)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    match crate::db::query(&resolved, &config.db_endpoint, &sql, &params).await {
+        Ok(crate::db::QueryResult::Rows { rows, truncated }) => {
+            let count = rows.len();
+            let json = serde_json::to_string_pretty(&rows).unwrap_or_default();
+            outcome(
+                &call.id,
+                format!("\u{1F5C4}\u{FE0F} db \u{2014} {count} row{}", if count == 1 { "" } else { "s" }),
+                format!(
+                    "{json}{}",
+                    if truncated { "\n\n(truncated at 500 rows)" } else { "" }
+                ),
+            )
+        }
+        Ok(crate::db::QueryResult::Write { changes, last_insert_rowid }) => outcome(
+            &call.id,
+            format!("\u{1F5C4}\u{FE0F} db \u{2014} {changes} change{}", if changes == 1 { "" } else { "s" }),
+            format!("changes: {changes}\nlast_insert_rowid: {last_insert_rowid}"),
+        ),
+        Err(e) => outcome(
+            &call.id,
+            format!("\u{1F5C4}\u{FE0F} db {} \u{2014} failed", clip(&path, 40)),
             format!("Error: {e}"),
         ),
     }
@@ -3994,11 +4117,35 @@ mod tests {
                 GREP_SEARCH,
                 EDIT_FILE,
                 PUBLISH_ARTIFACT,
+                DB_QUERY,
                 ENABLE_AUTH,
                 WEB_SEARCH,
                 DEPLOY_PROJECT
             ]
         );
+    }
+
+    // ---- db_query --------------------------------------------------------
+
+    #[test]
+    fn db_query_parses_into_an_action_and_is_normal_risk() {
+        let call = tool_call(DB_QUERY, json!({ "path": "dist", "sql": "SELECT 1" }));
+        let action = describe_action(&call).expect("should parse");
+        assert_eq!(action, Action::DbQuery { path: "dist".to_string(), sql: "SELECT 1".to_string() });
+
+        // Unlike enable_auth/publish_artifact/deploy_project, this never
+        // touches the public internet by itself -- ordinary approval, same
+        // as Write/Edit, not always-on.
+        let risk = action_risk(&action, Path::new("/tmp"));
+        assert!(matches!(risk, danger::Risk::Normal), "{risk:?}");
+
+        assert!(plan_mode_block(&action).is_some(), "plan mode must not run real queries");
+    }
+
+    #[test]
+    fn db_query_with_no_sql_does_not_parse() {
+        let call = tool_call(DB_QUERY, json!({ "path": "dist", "sql": "" }));
+        assert!(describe_action(&call).is_none());
     }
 
     // ---- enable_auth ---------------------------------------------------------

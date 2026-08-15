@@ -6,6 +6,7 @@ mod auth;
 mod config;
 mod danger;
 mod dateutil;
+mod db;
 mod deploy;
 mod llm;
 mod notice;
