@@ -3,7 +3,12 @@ Description=boxcode db control-plane
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/node /opt/boxcode-db/control-plane/index.mjs
+# /opt/node24, not /usr/bin/node: this service needs node:sqlite, which
+# needs Node 22.5+; the system node the auth control-plane already runs on
+# is v18 on this box, and there's no reason to touch that for a need only
+# this service has. See setup.sh for why it's a dedicated download rather
+# than a system upgrade.
+ExecStart=/opt/node24/bin/node /opt/boxcode-db/control-plane/index.mjs
 Restart=on-failure
 RestartSec=2
 Environment=REGISTRY_PATH=/opt/boxcode-db/registry.json

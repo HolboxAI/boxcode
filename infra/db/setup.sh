@@ -18,11 +18,33 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR=/opt/boxcode-db
+NODE_VERSION=v24.19.0
+NODE_DIR=/opt/node24
 
 if [ ! -f /etc/nginx/conf.d/auth.conf ]; then
     echo "no /etc/nginx/conf.d/auth.conf found -- run infra/auth/setup.sh on this box first." >&2
     exit 1
 fi
+
+echo "== node $NODE_VERSION (dedicated, not the system node) =="
+# infra/auth/setup.sh's `dnf install nodejs` gets whatever AL2023's default
+# repo carries -- confirmed live to be v18.20.8, which has no node:sqlite
+# at all ("No such built-in module: node:sqlite"; the module wasn't added
+# until v22.5), and `dnf module list nodejs` has no stream to switch to on
+# this box either. Rather than upgrading the system node (which the auth
+# control-plane already depends on and works fine with, on v18 -- no
+# reason to put that at risk for a need only this service has), this pulls
+# a real prebuilt tarball from nodejs.org into its own directory and
+# points only this service's systemd unit at it.
+if [ ! -x "$NODE_DIR/bin/node" ] || [ "$("$NODE_DIR/bin/node" --version)" != "$NODE_VERSION" ]; then
+    TARBALL="node-$NODE_VERSION-linux-x64.tar.xz"
+    curl -fsSLO "https://nodejs.org/dist/$NODE_VERSION/$TARBALL"
+    sudo rm -rf "$NODE_DIR"
+    sudo mkdir -p "$NODE_DIR"
+    sudo tar -xJf "$TARBALL" -C "$NODE_DIR" --strip-components=1
+    rm -f "$TARBALL"
+fi
+"$NODE_DIR/bin/node" --version
 
 echo "== nginx route for /db/query =="
 sudo mkdir -p /etc/nginx/conf.d/auth-projects

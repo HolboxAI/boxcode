@@ -11,8 +11,17 @@ no migration system, no schema-namespace conventions to get right — all
 real, live-debugged costs paid on the auth side (see `infra/auth/`'s own
 history) for a third-party server (GoTrue) with its own opinions about all
 three. Nothing here is a third-party binary; it's ~150 lines this repo
-owns outright, using `node:sqlite` (built into the Node runtime already on
-this box — no new dependency).
+owns outright, using `node:sqlite`.
+
+`node:sqlite` needs Node 22.5+. The system `node` this box already has
+(from `infra/auth/setup.sh`'s `dnf install nodejs`) turned out to be
+v18.20.8 — confirmed live, `dnf module list nodejs` has no newer stream
+to switch to on this box either — so `setup.sh` downloads a real Node
+tarball from nodejs.org into `/opt/node24` and points only this
+service's systemd unit at it, rather than upgrading the system node the
+auth control-plane already depends on and works fine with. So: one real
+new thing on the box (a second Node install), but still zero new npm
+dependencies for this service's own code.
 
 ## Layout
 
