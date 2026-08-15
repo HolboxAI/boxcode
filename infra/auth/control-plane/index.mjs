@@ -139,7 +139,16 @@ async function startGoTrue({ containerName, port, dbName, jwtSecret, siteUrl, ap
     "-e", `GOTRUE_API_HOST=127.0.0.1`,
     "-e", `GOTRUE_API_PORT=${port}`,
     "-e", `GOTRUE_DB_DRIVER=postgres`,
-    "-e", `GOTRUE_DB_DATABASE_URL=postgres://postgres@127.0.0.1:5432/${dbName}`,
+    // ?search_path=auth is load-bearing, not cosmetic: migrations qualify
+    // every table explicitly (auth.users, auth.identities, ...), visible
+    // in their own DDL, but GoTrue's runtime queries use unqualified names
+    // and rely entirely on the connection's search_path to find them --
+    // confirmed live, without this every query past migration time fails
+    // with `relation "identities" does not exist`. Supabase's own
+    // reference setup never needs this because their Postgres image sets
+    // search_path at the role level (`ALTER ROLE ... SET search_path`);
+    // plain postgres:15 has no such role, so it goes on the DSN instead.
+    "-e", `GOTRUE_DB_DATABASE_URL=postgres://postgres@127.0.0.1:5432/${dbName}?search_path=auth`,
     "-e", `GOTRUE_JWT_SECRET=${jwtSecret}`,
     // Required for a login to actually issue a usable token -- confirmed
     // against Supabase's own reference docker-compose.yml, which sets this
