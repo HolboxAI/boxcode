@@ -392,9 +392,12 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                                 never after merely creating or editing a file -- say the file is \
                                 written and stop. Works for a built site or SPA (point at the \
                                 output directory, e.g. dist/), a single HTML page, a chart or \
-                                diagram, a CSV or a text file. The link is public to anyone who \
-                                has it and stops working after 48 hours, which you must tell the \
-                                user when you give it to them.",
+                                diagram, a CSV or a text file. Publishing the same path again \
+                                (e.g. after editing it) updates that link in place rather than \
+                                creating a new one, so there is no need to reopen it -- tell the \
+                                user it is already live at the same URL. The link is public to \
+                                anyone who has it and stops working after 48 hours, which you \
+                                must tell the user when you give it to them.",
                 "parameters": {
                     "type": "object",
                     "properties": {

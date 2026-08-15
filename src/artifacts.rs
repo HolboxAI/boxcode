@@ -14,6 +14,7 @@
 //! client that lies about a file's type simply fails the upload. That is why
 //! there is no content-type guessing here.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -63,6 +64,7 @@ struct Upload {
 
 #[derive(serde::Deserialize)]
 struct SignResponse {
+    id: String,
     url: String,
     #[serde(default = "default_expiry")]
     expires_in_hours: u32,
@@ -191,6 +193,49 @@ fn wrap_single(name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Where `publish` last put a given path, so publishing it again updates the
+/// same link instead of minting a new one -- the same file, the same slot,
+/// same shape as `session.rs`'s `~/.boxcode/sessions/`: a plain file the
+/// user can delete to forget, not a database.
+fn registry_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(crate::config::Config::config_dir().join("artifacts.json"))
+}
+
+fn load_registry() -> HashMap<String, String> {
+    registry_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// The id `path` was last published under, keyed by its canonicalized form
+/// so `./foo.html` and `foo.html` from different cwds still match.
+fn remembered_id(path: &Path) -> Option<String> {
+    let key = path.canonicalize().ok()?.to_string_lossy().into_owned();
+    load_registry().get(&key).cloned()
+}
+
+/// A registry write is an amenity, not a correctness requirement: losing it
+/// just means the next publish of this path starts a new artifact instead of
+/// updating the old one, so every failure here is swallowed rather than
+/// surfaced.
+fn remember(path: &Path, id: &str) {
+    let Some(key) = path.canonicalize().ok().map(|p| p.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let Some(reg_path) = registry_path() else { return };
+    let Some(parent) = reg_path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let mut map = load_registry();
+    map.insert(key, id.to_string());
+    if let Ok(s) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(reg_path, s);
+    }
+}
+
 fn file_size(path: &Path) -> Result<u64, String> {
     std::fs::metadata(path)
         .map(|m| m.len())
@@ -263,7 +308,15 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
         .iter()
         .map(|f| ManifestEntry { path: f.key.clone(), size: f.size })
         .collect();
-    let body = serde_json::json!({ "files": manifest }).to_string();
+    // Republishing the same path sends back the id it got last time, so the
+    // signer reuses that S3 prefix instead of minting a new one -- an unknown
+    // or missing id is treated by the signer as a fresh publish, so there is
+    // nothing here to validate before sending it.
+    let mut request = serde_json::json!({ "files": manifest });
+    if let Some(id) = remembered_id(path) {
+        request["id"] = serde_json::Value::String(id);
+    }
+    let body = request.to_string();
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -302,6 +355,14 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
         let put = client
             .put(&upload.url)
             .header("content-type", &upload.content_type)
+            // Not part of the presigned signature (the signer never required
+            // it, so old and new clients both still upload fine either way),
+            // but S3 stores it as the object's metadata regardless, and
+            // CloudFront honors it from there. Without it, a same-URL update
+            // publishes correctly to S3 but can sit behind a day-old cached
+            // copy at the edge -- confirmed live: CloudFront serves the new
+            // bytes on the very next request once this header is set.
+            .header("cache-control", "no-cache")
             .body(bytes)
             .send()
             .await
@@ -311,6 +372,7 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
         }
     }
 
+    remember(path, &signed.id);
     Ok(Published {
         url: signed.url,
         files: files.len(),
@@ -343,6 +405,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
+    }
+
+    /// Republishing a path recovers the id it got last time, so `publish`
+    /// can send it back and update the same link. A path seen for the first
+    /// time has nothing to recover.
+    #[test]
+    fn a_republished_path_remembers_its_last_id() {
+        crate::config::test_support::with_isolated_home(|| {
+            let dir = temp("remember");
+            let target = dir.join("index.html");
+            write(&dir, "index.html", "hi");
+
+            assert!(remembered_id(&target).is_none(), "never published before");
+
+            remember(&target, "abc12345");
+            assert_eq!(remembered_id(&target).as_deref(), Some("abc12345"));
+
+            // A later publish's id replaces the old one for this same path.
+            remember(&target, "zzz98765");
+            assert_eq!(remembered_id(&target).as_deref(), Some("zzz98765"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     /// A whole build directory, which is what an SPA actually is.
