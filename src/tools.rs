@@ -389,15 +389,19 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                                 LOOK at them in a browser. Use this ONLY when the user asks to \
                                 see, preview, open, share or check how something looks. Never \
                                 call it on your own initiative, never to 'check your work', and \
-                                never after merely creating or editing a file -- say the file is \
-                                written and stop. Works for a built site or SPA (point at the \
-                                output directory, e.g. dist/), a single HTML page, a chart or \
-                                diagram, a CSV or a text file. Publishing the same path again \
-                                (e.g. after editing it) updates that link in place rather than \
-                                creating a new one, so there is no need to reopen it -- tell the \
-                                user it is already live at the same URL. The link is public to \
-                                anyone who has it and stops working after 48 hours, which you \
-                                must tell the user when you give it to them.",
+                                never after merely creating or editing a file that has not been \
+                                published before -- say the file is written and stop. Works for \
+                                a built site or SPA (point at the output directory, e.g. dist/), \
+                                a single HTML page, a chart or diagram, a CSV or a text file. \
+                                Publishing the same path again (e.g. after editing it) updates \
+                                that link in place rather than creating a new one, so there is no \
+                                new link to hand over -- but that update only happens when you \
+                                call this tool again. If a path has already been published and \
+                                you edit it afterward, you must call this tool again on that path \
+                                before telling the user it is live -- editing the file does not \
+                                refresh the hosted copy by itself. The link is public to anyone \
+                                who has it and stops working after 48 hours, which you must tell \
+                                the user when you give it to them.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -722,8 +726,12 @@ pub fn system_prompt(
            present it as the whole.\n\
          - {PUBLISH_ARTIFACT} is for when the user wants to LOOK at something: \"show me\", \
            \"let me see it\", \"how does it look\", \"preview\", \"open it\", \"share this\". \
-           Only then. Writing or changing a file is not a reason to publish it, and neither is \
-           checking your own work -- say what you did and stop. The link is public to whoever \
+           Only then, for a path never published before. Once a path HAS been published, an \
+           edit to it does not update the live link by itself -- call {PUBLISH_ARTIFACT} again \
+           on that path before saying it is live; never claim \"already live at the same URL\" \
+           without actually calling it. Writing or changing a file you have not published yet \
+           is not a reason to publish it, and neither is checking your own work -- say what you \
+           did and stop. The link is public to whoever \
            has it and dies after 48 hours, so always say both when you hand it over.\n\
          - Answers appear in a terminal: keep narration to a sentence or two, not a report.\n\
          - That terminal renders markdown, so use it where it carries meaning and nowhere \
