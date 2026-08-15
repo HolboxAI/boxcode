@@ -87,8 +87,17 @@ async function databaseExists(name) {
 }
 
 async function createDatabase(name) {
-  if (await databaseExists(name)) return;
-  await run("sudo", ["-u", "postgres", "psql", "-c", `CREATE DATABASE ${name}`]);
+  if (!(await databaseExists(name))) {
+    await run("sudo", ["-u", "postgres", "psql", "-c", `CREATE DATABASE ${name}`]);
+  }
+  // Not gated behind the exists-check above: GoTrue's own migrations only
+  // create its *tables*, never the `auth` schema they live in -- Supabase's
+  // reference setup gets away with skipping this because their Postgres
+  // image pre-creates it, but plain postgres:15 does not. Confirmed live:
+  // without this, every migration fails with `schema "auth" does not
+  // exist`. Idempotent (IF NOT EXISTS), so safe to run on a database this
+  // was already done for, including one from before this line existed.
+  await run("sudo", ["-u", "postgres", "psql", "-d", name, "-c", "CREATE SCHEMA IF NOT EXISTS auth"]);
 }
 
 async function containerIsRunning(name) {
