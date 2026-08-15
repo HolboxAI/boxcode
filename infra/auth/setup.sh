@@ -22,7 +22,16 @@
 # Idempotent -- every step here is safe to run again on a box that already
 # has some or all of this, which is the point: this is meant to be re-run
 # after `infra/auth/` changes, not just once at instance creation.
+#
+# SKIP_TLS=1 bash infra/auth/setup.sh sets up everything except the DNS
+# check and certbot, so the whole rest of the stack (Postgres, Docker,
+# nginx, the control-plane service) can be proven working over plain HTTP
+# before the domain's A record exists -- e.g. to test against
+# http://<this box's IP>/provision with a manual `Host: auth.boxcode.sh`
+# header. Re-run without SKIP_TLS once DNS is live to add the real cert;
+# nothing else needs to change.
 set -euo pipefail
+SKIP_TLS="${SKIP_TLS:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR=/opt/boxcode-auth
@@ -57,25 +66,30 @@ sudo nginx -t
 sudo systemctl enable --now nginx
 sudo systemctl reload nginx
 
-echo "== DNS check =="
-# certbot's HTTP-01 challenge fails opaquely if this is not already true, so
-# check it here with a clear message rather than letting certbot's own error
-# be the first anyone hears about it.
-RESOLVED=$(dig +short "$DOMAIN" | tail -1)
-THIS_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 \
-    -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')")
-if [ "$RESOLVED" != "$THIS_IP" ]; then
-    echo "$DOMAIN resolves to '$RESOLVED', not this box's IP ($THIS_IP)." >&2
-    echo "Add/update the A record at whoever manages boxcode.sh's DNS before re-running this." >&2
-    exit 1
-fi
+if [ "$SKIP_TLS" = "1" ]; then
+    echo "== SKIP_TLS=1: leaving this on plain HTTP, no DNS check, no certbot =="
+else
+    echo "== DNS check =="
+    # certbot's HTTP-01 challenge fails opaquely if this is not already true,
+    # so check it here with a clear message rather than letting certbot's own
+    # error be the first anyone hears about it.
+    RESOLVED=$(dig +short "$DOMAIN" | tail -1)
+    THIS_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 \
+        -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')")
+    if [ "$RESOLVED" != "$THIS_IP" ]; then
+        echo "$DOMAIN resolves to '$RESOLVED', not this box's IP ($THIS_IP)." >&2
+        echo "Add/update the A record at whoever manages boxcode.sh's DNS before re-running this," >&2
+        echo "or re-run with SKIP_TLS=1 to test everything except TLS in the meantime." >&2
+        exit 1
+    fi
 
-echo "== TLS (Let's Encrypt, for $DOMAIN) =="
-# --redirect adds the plain-80-to-443 redirect and the whole HTTPS server
-# block to /etc/nginx/conf.d/auth.conf itself -- run once per box, safe to
-# re-run (certbot renews in place rather than erroring on an existing cert).
-sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos \
-    --register-unsafely-without-email --redirect
+    echo "== TLS (Let's Encrypt, for $DOMAIN) =="
+    # --redirect adds the plain-80-to-443 redirect and the whole HTTPS server
+    # block to /etc/nginx/conf.d/auth.conf itself -- run once per box, safe to
+    # re-run (certbot renews in place rather than erroring on an existing cert).
+    sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos \
+        --register-unsafely-without-email --redirect
+fi
 
 echo "== control-plane service =="
 sudo mkdir -p "$INSTALL_DIR/control-plane"
