@@ -1,0 +1,36 @@
+# Base vhost for this box's own AWS-assigned public hostname (see
+# setup.sh -- `__HOSTNAME__` below is substituted with it, e.g.
+# ec2-54-123-45-67.compute-1.amazonaws.com). No custom domain: the
+# published page needs an HTTPS origin to call (mixed content is blocked
+# outright, not a config option), and Let's Encrypt only needs *some* real
+# public hostname to validate against -- the one EC2 already hands out for
+# free is enough, so there is nothing to wait on a registrar for. If this
+# box ever gets a real subdomain later, point it here and re-run certbot;
+# nothing else about this file changes.
+#
+# Listens on 80 only; setup.sh runs `certbot --nginx` after this file is in
+# place, which adds the 443/TLS server block and the redirect itself --
+# hand-writing that block here would just be something for certbot's own
+# edit to immediately diverge from.
+server {
+    listen 80;
+    server_name __HOSTNAME__;
+
+    # The one control-plane route the boxcode client itself calls (see
+    # src/auth.rs). Everything else nginx routes is a per-project GoTrue
+    # container, added below by the control-plane service, never this file.
+    location = /provision {
+        proxy_pass http://127.0.0.1:8080/provision;
+        proxy_set_header Host $host;
+    }
+
+    # A request to a project id nobody has provisioned falls through to
+    # here rather than nginx's default "welcome" page -- a clearer signal
+    # than a generic 404 that the id itself is the problem.
+    location / {
+        return 404 "no project provisioned at this path\n";
+        add_header Content-Type text/plain;
+    }
+
+    include /etc/nginx/conf.d/auth-projects/*.conf;
+}

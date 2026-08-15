@@ -999,6 +999,22 @@ fn tool_approval_parts(
             }
             (" Publish a preview? ", "publish", "skip")
         }
+        Action::EnableAuth { path } => {
+            for wrapped in wrap(path, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            for wrapped in wrap(
+                "Stands up a real sign-up/sign-in service for this project on the public internet.",
+                inner,
+            ) {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            (" Add sign-up/sign-in? ", "provision", "skip")
+        }
         Action::Command { command, purpose } => {
             if let Some(purpose) = purpose {
                 for wrapped in wrap(purpose, inner) {

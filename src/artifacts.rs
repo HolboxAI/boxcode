@@ -211,7 +211,12 @@ fn load_registry() -> HashMap<String, String> {
 
 /// The id `path` was last published under, keyed by its canonicalized form
 /// so `./foo.html` and `foo.html` from different cwds still match.
-fn remembered_id(path: &Path) -> Option<String> {
+///
+/// `pub(crate)`, not private: `enable_auth` (see `tools.rs`) needs the same
+/// id to provision a project's auth against -- a project's identity to the
+/// rest of boxcode *is* the artifact id it already published under, not a
+/// second id invented for this.
+pub(crate) fn remembered_id(path: &Path) -> Option<String> {
     let key = path.canonicalize().ok()?.to_string_lossy().into_owned();
     load_registry().get(&key).cloned()
 }

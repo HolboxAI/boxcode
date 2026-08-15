@@ -1,0 +1,217 @@
+// boxcode auth control-plane -- turns a project id into a running,
+// isolated GoTrue instance.
+//
+// Zero npm dependencies, on purpose, matching boxcode-artifact-signer's own
+// stance: this shells out to `psql`, `docker` and `nginx`, the same tools a
+// human would reach for by hand, rather than owning client libraries for
+// three different systems. It runs as a plain systemd-managed process on the
+// box it provisions onto (not Lambda -- Postgres and Docker need a real,
+// persistent filesystem and a long-lived daemon, which Lambda does not
+// offer), listening on localhost only; nginx is what the internet reaches.
+//
+// One GoTrue container per project, each with its own Postgres database and
+// its own JWT secret, so unrelated projects never share a user pool -- see
+// infra/auth/README.md for why that split exists. Idempotent: calling
+// /provision twice for the same project returns the same answer instead of
+// doubling up.
+import { createServer } from "node:http";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { randomBytes } from "node:crypto";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import path from "node:path";
+
+const run = promisify(execFile);
+
+const REGISTRY_PATH = process.env.REGISTRY_PATH || "/opt/boxcode-auth/registry.json";
+const NGINX_CONF_DIR = process.env.NGINX_CONF_DIR || "/etc/nginx/conf.d/auth-projects";
+const SITE_BASE = process.env.SITE_BASE || "https://boxcode.sh";
+const PORT = Number(process.env.PORT || 8080);
+const GOTRUE_PORT_BASE = 9000;
+const GOTRUE_IMAGE = process.env.GOTRUE_IMAGE || "supabase/gotrue:latest";
+
+// No custom domain (see infra/auth/README.md for why): AUTH_BASE is this
+// box's own AWS-assigned public hostname unless something more permanent
+// overrides it. Resolved once at startup via IMDSv2, the same way
+// setup.sh finds it for nginx/certbot -- asking on every request would be
+// needless latency for a value that cannot change without the process
+// restarting anyway (a new public hostname means a new instance).
+async function resolveAuthBase() {
+  if (process.env.AUTH_BASE) return process.env.AUTH_BASE;
+  const tokenRes = await fetch("http://169.254.169.254/latest/api/token", {
+    method: "PUT",
+    headers: { "X-aws-ec2-metadata-token-ttl-seconds": "60" },
+  });
+  const token = await tokenRes.text();
+  const hostRes = await fetch("http://169.254.169.254/latest/meta-data/public-hostname", {
+    headers: { "X-aws-ec2-metadata-token": token },
+  });
+  const hostname = (await hostRes.text()).trim();
+  if (!hostname) throw new Error("could not resolve this instance's public hostname from IMDS");
+  return `https://${hostname}`;
+}
+
+// Same shape as an artifact id (see boxcode-artifact-signer's `ID_RE`):
+// lowercase letters minus i/l/o (visually ambiguous) plus 2-9, 8 chars. A
+// project id that does not look like one boxcode would have generated is
+// refused outright -- it is about to become a Postgres database name, a
+// Docker container name and an nginx filename, so "looks safe" has to be
+// verified, not assumed.
+const PROJECT_ID_RE = /^[a-z2-9]{4,16}$/;
+
+function fail(res, code, message) {
+  res.writeHead(code, { "content-type": "application/json" });
+  res.end(JSON.stringify({ error: message }));
+}
+
+async function loadRegistry() {
+  try {
+    return JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+async function saveRegistry(registry) {
+  await mkdir(path.dirname(REGISTRY_PATH), { recursive: true });
+  await writeFile(REGISTRY_PATH, JSON.stringify(registry, null, 2));
+}
+
+function nextPort(registry) {
+  const used = new Set(Object.values(registry).map((entry) => entry.port));
+  let port = GOTRUE_PORT_BASE;
+  while (used.has(port)) port += 1;
+  return port;
+}
+
+async function databaseExists(name) {
+  const { stdout } = await run("sudo", [
+    "-u", "postgres", "psql", "-tAc",
+    `SELECT 1 FROM pg_database WHERE datname = '${name}'`,
+  ]);
+  return stdout.trim() === "1";
+}
+
+async function createDatabase(name) {
+  if (await databaseExists(name)) return;
+  await run("sudo", ["-u", "postgres", "psql", "-c", `CREATE DATABASE ${name}`]);
+}
+
+async function containerExists(name) {
+  const { stdout } = await run("docker", ["ps", "-aq", "-f", `name=^${name}$`]);
+  return stdout.trim().length > 0;
+}
+
+async function startGoTrue({ containerName, port, dbName, jwtSecret, siteUrl }) {
+  if (await containerExists(containerName)) return;
+  // --network host: simplest way for the container to reach Postgres on
+  // 127.0.0.1 and for nginx on the same box to reach the container by port,
+  // with no Docker network/DNS layer in between to debug. Acceptable on a
+  // single trusted box; the first thing to revisit if this box ever stops
+  // being single-tenant-per-project-trusted.
+  await run("docker", [
+    "run", "-d", "--network", "host", "--restart", "unless-stopped",
+    "--name", containerName,
+    "-e", `GOTRUE_API_HOST=127.0.0.1`,
+    "-e", `GOTRUE_API_PORT=${port}`,
+    "-e", `GOTRUE_DB_DRIVER=postgres`,
+    "-e", `GOTRUE_DB_DATABASE_URL=postgres://postgres@127.0.0.1:5432/${dbName}`,
+    "-e", `GOTRUE_JWT_SECRET=${jwtSecret}`,
+    "-e", `GOTRUE_JWT_EXP=3600`,
+    "-e", `GOTRUE_SITE_URL=${siteUrl}`,
+    "-e", `GOTRUE_URI_ALLOW_LIST=${SITE_BASE}`,
+    // No SMTP configured yet, so a signup that waited on a confirmation
+    // email would never complete. Autoconfirm is the deliberate tradeoff for
+    // "prove sign-up/sign-in works end to end" -- the first thing to revisit
+    // once this needs to be real rather than a demo.
+    "-e", `GOTRUE_MAILER_AUTOCONFIRM=true`,
+    "-e", `GOTRUE_DISABLE_SIGNUP=false`,
+    GOTRUE_IMAGE,
+  ]);
+}
+
+async function writeNginxConf(id, port) {
+  await mkdir(NGINX_CONF_DIR, { recursive: true });
+  const confPath = path.join(NGINX_CONF_DIR, `${id}.conf`);
+  // Trailing slash on proxy_pass is load-bearing: it strips the `/<id>`
+  // location prefix before forwarding, so GoTrue sees `/signup`, not
+  // `/<id>/signup`, without needing to know its own mount point.
+  const conf = `location /${id}/ {\n    proxy_pass http://127.0.0.1:${port}/;\n    proxy_set_header Host $host;\n}\n`;
+  await writeFile(confPath, conf);
+  await run("nginx", ["-t"]);
+  await run("nginx", ["-s", "reload"]);
+}
+
+async function provision(id, authBase) {
+  const registry = await loadRegistry();
+  if (registry[id]) {
+    return { auth_url: `${authBase}/${id}` };
+  }
+
+  const port = nextPort(registry);
+  const dbName = `proj_${id}`;
+  const containerName = `gotrue-${id}`;
+  const jwtSecret = randomBytes(32).toString("hex");
+  const siteUrl = `${SITE_BASE}/artifacts/${id}`;
+
+  await createDatabase(dbName);
+  await startGoTrue({ containerName, port, dbName, jwtSecret, siteUrl });
+  await writeNginxConf(id, port);
+
+  registry[id] = { port, dbName, containerName, createdAt: new Date().toISOString() };
+  await saveRegistry(registry);
+
+  return { auth_url: `${authBase}/${id}` };
+}
+
+async function main() {
+  // Resolved once at startup, not per-request -- see resolveAuthBase's own
+  // comment for why a value that cannot change without a process restart
+  // does not need to be re-fetched on every call.
+  const authBase = await resolveAuthBase();
+  console.log(`auth base resolved to ${authBase}`);
+
+  const server = createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/provision") {
+      return fail(res, 404, "POST /provision only");
+    }
+
+    let body = "";
+    for await (const chunk of req) body += chunk;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(body || "{}");
+    } catch {
+      return fail(res, 400, "body is not JSON");
+    }
+
+    const id = parsed.project_id;
+    if (typeof id !== "string" || !PROJECT_ID_RE.test(id)) {
+      return fail(res, 400, "project_id must look like a boxcode artifact id");
+    }
+
+    try {
+      const result = await provision(id, authBase);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(result));
+    } catch (e) {
+      // Deliberately not attempting a rollback of whatever partially
+      // succeeded (a database with no container, say): this is the "prove
+      // the flow works" phase, and a human reading this message can finish
+      // or clean up a rare failure by hand far more easily than a rollback
+      // path that has to get every combination of partial failure right.
+      console.error(`provision(${id}) failed:`, e);
+      fail(res, 500, `provisioning failed: ${e.message}`);
+    }
+  });
+
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`boxcode auth control-plane listening on 127.0.0.1:${PORT}`);
+  });
+}
+
+main().catch((e) => {
+  console.error("failed to start:", e);
+  process.exit(1);
+});
