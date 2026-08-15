@@ -1,0 +1,38 @@
+# Base vhost for auth.boxcode.sh.
+#
+# This is NOT swappable for the EC2 instance's own AWS-assigned hostname
+# (ec2-x-x-x-x.compute-1.amazonaws.com) -- that was tried first and Let's
+# Encrypt refuses it outright ("forbidden by policy"): `*.compute.
+# amazonaws.com` is deliberately blocklisted by the CA, since anyone can
+# get a matching hostname for free, so it is not accepted as proof of
+# ownership the way a real domain is. AWS Certificate Manager does not
+# route around this either -- it has the same domain-ownership requirement,
+# and its certs are not usable by plain nginx regardless (only
+# ALB/CloudFront/API Gateway can present them). A real, owned domain is not
+# optional here; `auth.boxcode.sh` is it.
+#
+# Listens on 80 only; setup.sh runs `certbot --nginx` after this file is in
+# place, which adds the 443/TLS server block and the redirect itself --
+# hand-writing that block here would just be something for certbot's own
+# edit to immediately diverge from.
+server {
+    listen 80;
+    server_name auth.boxcode.sh;
+
+    # The one control-plane route the boxcode client itself calls (see
+    # src/auth.rs). Everything else nginx routes is a per-project GoTrue
+    # container, added below by the control-plane service, never this file.
+    location = /provision {
+        proxy_pass http://127.0.0.1:8080/provision;
+        proxy_set_header Host $host;
+    }
+    # A request to a project id nobody has provisioned falls through to
+    # here rather than nginx's default "welcome" page -- a clearer signal
+    # than a generic 404 that the id itself is the problem.
+    location / {
+        return 404 "no project provisioned at this path\n";
+        add_header Content-Type text/plain;
+    }
+
+    include /etc/nginx/conf.d/auth-projects/*.conf;
+}

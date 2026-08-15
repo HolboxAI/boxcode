@@ -59,6 +59,7 @@ pub const EDIT_FILE: &str = "edit_file";
 pub const WEB_SEARCH: &str = "web_search";
 pub const DEPLOY_PROJECT: &str = "deploy_project";
 pub const PUBLISH_ARTIFACT: &str = "publish_artifact";
+pub const ENABLE_AUTH: &str = "enable_auth";
 pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
 pub const PLAN_PROGRESS: &str = "plan_progress";
 
@@ -408,6 +409,35 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                         "path": {
                             "type": "string",
                             "description": "File or directory to publish, relative to the project. For a site, the BUILT output directory (dist/, build/, out/, public/) -- not the project root, which has no index.html."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": ENABLE_AUTH,
+                "description": "Give an already-published project real sign-up/sign-in. Requires \
+                                the path to have been published with publish_artifact first -- \
+                                auth is added to a project, not a substitute for one. Returns an \
+                                auth base URL and the two endpoints to call from the page's own \
+                                JavaScript: POST {auth_url}/signup with {\"email\",\"password\"} \
+                                to create an account, POST {auth_url}/token?grant_type=password \
+                                with the same body to sign in and get back an access_token. This \
+                                tool does not write anything -- after calling it, add the actual \
+                                sign-up/sign-in form and the fetch calls to the project's HTML/JS \
+                                yourself with write_file/edit_file, then publish_artifact again \
+                                to ship it (it updates the same URL). Calling this again for the \
+                                same project returns the same auth base URL rather than making a \
+                                new one.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The same path already given to publish_artifact for this project."
                         }
                     },
                     "required": ["path"]
@@ -1015,6 +1045,11 @@ pub enum Action {
     /// Uploads static files to a temporary public URL so the user can look at
     /// them. Always approved, for the same reason `Deploy` is: it publishes.
     Publish { path: String },
+    /// Provisions a live sign-up/sign-in service for an already-published
+    /// project. Always approved, same reasoning as `Publish`/`Deploy`: it
+    /// stands up a real backend on the public internet, not something a
+    /// blanket "skip approval" setting should silently cover.
+    EnableAuth { path: String },
     /// Puts this project on the internet. Always approved -- see `action_risk`.
     Deploy {
         provider: String,
@@ -1081,6 +1116,7 @@ impl Action {
                 if *production { "Production" } else { "Preview" }
             ),
             Action::Publish { path } => format!("🌐 preview {path} — public link, 48h"),
+            Action::EnableAuth { path } => format!("🔐 auth {path} — sign-up/sign-in"),
             Action::Plan(p) => format!("📋 plan: {}", p.title),
             Action::Progress { step, done, .. } => {
                 format!("{} step {step}", if *done { "☑" } else { "☐" })
@@ -1103,6 +1139,10 @@ pub fn action_risk(action: &Action, workspace_root: &Path) -> danger::Risk {
         // unattended-mode setting made an hour ago should silently cover.
         Action::Publish { .. } => danger::Risk::Dangerous(
             "uploads these files to a public URL anyone with the link can open".to_string(),
+        ),
+        Action::EnableAuth { .. } => danger::Risk::Dangerous(
+            "provisions a live sign-up/sign-in service on the public internet for this project"
+                .to_string(),
         ),
         Action::Deploy { production: true, .. } => danger::Risk::Dangerous(
             "publishes to the live production URL, replacing whatever is served there now"
@@ -1164,6 +1204,13 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
         Action::Publish { .. } => Some(
             "Plan mode does not publish anything, so nothing was uploaded. Say in your plan \
              what you would show the user and call ".to_string() + EXIT_PLAN_MODE + ".",
+        ),
+        Action::EnableAuth { .. } => Some(
+            "Plan mode does not provision anything, so no auth service was created. Say in \
+             your plan that this project will get sign-up/sign-in and call "
+                .to_string()
+                + EXIT_PLAN_MODE
+                + ".",
         ),
         Action::Deploy { provider, .. } => Some(format!(
             "Plan mode changes nothing, and deploying to {provider} would put this project on \
@@ -1247,6 +1294,16 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
                 return None;
             }
             Some(Action::Publish { path })
+        }
+        ENABLE_AUTH => {
+            #[derive(serde::Deserialize)]
+            struct Args { path: String }
+            let args: Args = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            Some(Action::EnableAuth { path })
         }
         WEB_SEARCH => {
             let args: WebSearchArgs = serde_json::from_str(&call.function.arguments).ok()?;
@@ -1527,6 +1584,7 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         WEB_SEARCH => execute_web_search(call, config).await,
         DEPLOY_PROJECT => execute_deploy_project(call, workspace).await,
         PUBLISH_ARTIFACT => execute_publish_artifact(call, workspace, config).await,
+        ENABLE_AUTH => execute_enable_auth(call, workspace, config).await,
         // Never reached: `app::advance_approvals` resolves this one itself,
         // because accepting it changes `App`'s mode and the runner has no
         // access to `App`. Handled anyway so a routing mistake produces a
@@ -2199,6 +2257,55 @@ async fn execute_publish_artifact(
         Err(e) => outcome(
             &call.id,
             format!("\u{1F310} preview {} \u{2014} failed", clip(&path, 40)),
+            format!("Error: {e}"),
+        ),
+    }
+}
+
+/// Provision sign-up/sign-in for an already-published project.
+///
+/// The path is resolved inside the workspace like `publish_artifact`'s,
+/// then handed to `artifacts::remembered_id` to find the project id it was
+/// last published under -- `auth::provision` refuses on its own if that
+/// comes back empty, so the error the model sees either way is the same
+/// "publish this first" message.
+async fn execute_enable_auth(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
+    let Some(Action::EnableAuth { path }) = describe_action(call) else {
+        return outcome(
+            &call.id,
+            "\u{1F510} auth \u{2014} unusable arguments".to_string(),
+            format!("Error: {ENABLE_AUTH} needs a `path`."),
+        );
+    };
+    let resolved = match resolve_in_workspace(workspace, &path) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("\u{1F510} auth {} \u{2014} refused", clip(&path, 40)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    match crate::auth::provision(&resolved, &config.auth_endpoint).await {
+        Ok(provisioned) => outcome(
+            &call.id,
+            format!("\u{1F510} auth \u{2014} {}", provisioned.auth_url),
+            format!(
+                "Auth base URL: {}\n\n\
+                 POST {{auth_url}}/signup with {{\"email\",\"password\"}} to create an account.\n\
+                 POST {{auth_url}}/token?grant_type=password with the same body to sign in; the \
+                 response's access_token is what the page should hold onto (e.g. localStorage) \
+                 and send back on later requests that need to know who is asking.\n\n\
+                 Now add the actual sign-up/sign-in form and these fetch calls to the project's \
+                 HTML/JS with write_file/edit_file, then call {PUBLISH_ARTIFACT} again to ship it.",
+                provisioned.auth_url
+            ),
+        ),
+        Err(e) => outcome(
+            &call.id,
+            format!("\u{1F510} auth {} \u{2014} failed", clip(&path, 40)),
             format!("Error: {e}"),
         ),
     }
@@ -3887,10 +3994,34 @@ mod tests {
                 GREP_SEARCH,
                 EDIT_FILE,
                 PUBLISH_ARTIFACT,
+                ENABLE_AUTH,
                 WEB_SEARCH,
                 DEPLOY_PROJECT
             ]
         );
+    }
+
+    // ---- enable_auth ---------------------------------------------------------
+
+    #[test]
+    fn enable_auth_parses_into_an_action_and_is_always_dangerous() {
+        let call = tool_call(ENABLE_AUTH, json!({ "path": "dist" }));
+        let action = describe_action(&call).expect("should parse");
+        assert_eq!(action, Action::EnableAuth { path: "dist".to_string() });
+
+        // Same reasoning as publish_artifact/deploy_project: it stands up a
+        // real service on the public internet, so it must stay `Dangerous`
+        // (always approved) regardless of `require_approval`.
+        let risk = action_risk(&action, Path::new("/tmp"));
+        assert!(matches!(risk, danger::Risk::Dangerous(_)), "{risk:?}");
+
+        assert!(plan_mode_block(&action).is_some(), "plan mode must not provision anything");
+    }
+
+    #[test]
+    fn enable_auth_with_no_path_does_not_parse() {
+        let call = tool_call(ENABLE_AUTH, json!({ "path": "" }));
+        assert!(describe_action(&call).is_none());
     }
 
     // ---- deploy_project ----------------------------------------------------

@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod approval;
 mod artifacts;
+mod auth;
 mod config;
 mod danger;
 mod dateutil;

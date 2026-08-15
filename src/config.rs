@@ -298,6 +298,12 @@ pub struct ToolsConfig {
     /// who would rather boxcode could not publish anything.
     #[serde(default = "default_artifact_endpoint")]
     pub artifact_endpoint: String,
+    /// Where `enable_auth` sends a project id to be provisioned with
+    /// sign-up/sign-in. Same reasoning as `artifact_endpoint`: a URL, not a
+    /// constant, so a fork or a self-hosted control-plane can be pointed at
+    /// without rebuilding, and "" switches the feature off.
+    #[serde(default = "default_auth_endpoint")]
+    pub auth_endpoint: String,
 }
 
 fn yes() -> bool {
@@ -342,6 +348,10 @@ fn default_artifact_endpoint() -> String {
     "https://boxcode.sh/api/artifact".to_string()
 }
 
+fn default_auth_endpoint() -> String {
+    "https://auth.boxcode.sh/provision".to_string()
+}
+
 fn default_search_timeout() -> u64 {
     20
 }
@@ -359,6 +369,7 @@ impl Default for ToolsConfig {
             python_bin: default_python_bin(),
             search_timeout_secs: default_search_timeout(),
             artifact_endpoint: default_artifact_endpoint(),
+            auth_endpoint: default_auth_endpoint(),
         }
     }
 }
