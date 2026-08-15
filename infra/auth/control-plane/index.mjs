@@ -92,7 +92,13 @@ async function createDatabase(name) {
 }
 
 async function containerIsRunning(name) {
-  const { stdout } = await run("docker", ["ps", "-q", "-f", `name=^${name}$`]);
+  // `docker ps` without -a already excludes exited/created containers, but
+  // -- confirmed live, the reason the self-healing recreate never actually
+  // fired the first time -- it does NOT exclude a container stuck
+  // crash-looping in "Restarting (1) ... ago": that status still shows up
+  // in the default (non -a) list. `status=running` is the one filter value
+  // that means what this function's name says.
+  const { stdout } = await run("docker", ["ps", "-q", "-f", `name=^${name}$`, "-f", "status=running"]);
   return stdout.trim().length > 0;
 }
 
