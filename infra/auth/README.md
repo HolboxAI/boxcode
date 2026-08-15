@@ -22,31 +22,34 @@ for routing between several backend services, and there is only one here
   route for it. Idempotent — calling it again for a project that already
   has a container just returns the same `auth_url`.
 - `control-plane/boxcode-auth-control-plane.service` — the systemd unit.
-- `nginx/auth.conf.template` — the base vhost. No custom domain: `boxcode.sh`
-  turned out to be managed at the registrar (Namecheap), not Route53, and
-  the published page needs an HTTPS origin to call regardless (mixed
-  content is blocked outright), so this uses the EC2 instance's own
-  AWS-assigned public hostname instead — real, publicly resolvable, free,
-  and available the instant the instance launches, no DNS step by anyone.
-  `setup.sh` substitutes it in and gets a Let's Encrypt cert for it. Per-
-  project `location` blocks live in `/etc/nginx/conf.d/auth-projects/`,
-  written by the control-plane service, never edited by hand. If this ever
-  gets a real subdomain later, that's a DNS change plus a `certbot --nginx
-  -d <domain>` re-run, nothing here needs to change to support it.
+- `nginx/auth.conf.template` — the base vhost for `auth.boxcode.sh`. This
+  domain is not optional: an earlier version of this tried using the EC2
+  instance's own AWS-assigned hostname instead (real and free, no DNS step
+  needed), but Let's Encrypt refuses to issue for `*.compute.amazonaws.com`
+  outright ("forbidden by policy") since anyone can get one of those for
+  free, so it doesn't count as proof of ownership. AWS Certificate Manager
+  doesn't substitute either -- same ownership requirement, and its certs
+  can't be handed to a plain nginx process regardless. A real, owned domain
+  is required, and `auth.boxcode.sh`'s DNS is at Namecheap (`boxcode.sh`
+  is not in Route53) -- an A record pointing it at this box's IP has to
+  exist before `setup.sh`'s certbot step will succeed. Per-project
+  `location` blocks live in `/etc/nginx/conf.d/auth-projects/`, written by
+  the control-plane service, never edited by hand.
 - `setup.sh` — idempotent bootstrap for a fresh Amazon Linux 2023 box:
   Docker, Postgres, nginx + certbot, Node, and the control-plane service
-  under systemd.
+  under systemd. Checks that `auth.boxcode.sh` actually resolves to the
+  box before attempting the certbot step, with a clear message if not,
+  rather than letting certbot's own error be the first sign of it.
 
 ## Deploying a change
 
 No CI/CD yet — same as `boxcode-artifact-signer`'s Lambda, which also has
-no pipeline. From a checkout of this repo, with SSM access to the instance:
+no pipeline. From a checkout of this repo, on the instance itself (via
+Session Manager -- automated remote command execution against this box is
+intentionally not something this project's tooling does on its own):
 
 ```
-aws ssm send-command \
-  --instance-ids <instance-id> \
-  --document-name AWS-RunShellScript \
-  --parameters commands='["cd /path/to/boxcode && git pull && bash infra/auth/setup.sh"]'
+git pull && bash infra/auth/setup.sh
 ```
 
 `setup.sh` is safe to re-run on a box that already has everything installed
@@ -66,8 +69,7 @@ aws ssm send-command \
   service and every GoTrue container run with `--network host`, and
   Postgres is configured for peer auth on `local` connections only. Nothing
   here is reachable except through nginx.
-- `auth_url` in every response is `https://<this box's public hostname>/<id>`
-  — no custom domain, see the `nginx/auth.conf.template` note above.
+- `auth_url` in every response is `https://auth.boxcode.sh/<id>`.
 
 ## Known limitations (explicitly deferred, matching the "prove the flow
 works first" goal this was built for)

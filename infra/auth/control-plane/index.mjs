@@ -26,30 +26,16 @@ const run = promisify(execFile);
 const REGISTRY_PATH = process.env.REGISTRY_PATH || "/opt/boxcode-auth/registry.json";
 const NGINX_CONF_DIR = process.env.NGINX_CONF_DIR || "/etc/nginx/conf.d/auth-projects";
 const SITE_BASE = process.env.SITE_BASE || "https://boxcode.sh";
+// A real, owned domain, not this box's own AWS-assigned hostname -- that
+// was tried first and Let's Encrypt refuses to issue for
+// `*.compute.amazonaws.com` ("forbidden by policy"), and ACM cannot
+// substitute either (same ownership requirement, plus its certs are not
+// usable by plain nginx at all). See infra/auth/README.md and setup.sh's
+// own header for the fuller explanation.
+const AUTH_BASE = process.env.AUTH_BASE || "https://auth.boxcode.sh";
 const PORT = Number(process.env.PORT || 8080);
 const GOTRUE_PORT_BASE = 9000;
 const GOTRUE_IMAGE = process.env.GOTRUE_IMAGE || "supabase/gotrue:latest";
-
-// No custom domain (see infra/auth/README.md for why): AUTH_BASE is this
-// box's own AWS-assigned public hostname unless something more permanent
-// overrides it. Resolved once at startup via IMDSv2, the same way
-// setup.sh finds it for nginx/certbot -- asking on every request would be
-// needless latency for a value that cannot change without the process
-// restarting anyway (a new public hostname means a new instance).
-async function resolveAuthBase() {
-  if (process.env.AUTH_BASE) return process.env.AUTH_BASE;
-  const tokenRes = await fetch("http://169.254.169.254/latest/api/token", {
-    method: "PUT",
-    headers: { "X-aws-ec2-metadata-token-ttl-seconds": "60" },
-  });
-  const token = await tokenRes.text();
-  const hostRes = await fetch("http://169.254.169.254/latest/meta-data/public-hostname", {
-    headers: { "X-aws-ec2-metadata-token": token },
-  });
-  const hostname = (await hostRes.text()).trim();
-  if (!hostname) throw new Error("could not resolve this instance's public hostname from IMDS");
-  return `https://${hostname}`;
-}
 
 // Same shape as an artifact id (see boxcode-artifact-signer's `ID_RE`):
 // lowercase letters minus i/l/o (visually ambiguous) plus 2-9, 8 chars. A
@@ -142,10 +128,10 @@ async function writeNginxConf(id, port) {
   await run("nginx", ["-s", "reload"]);
 }
 
-async function provision(id, authBase) {
+async function provision(id) {
   const registry = await loadRegistry();
   if (registry[id]) {
-    return { auth_url: `${authBase}/${id}` };
+    return { auth_url: `${AUTH_BASE}/${id}` };
   }
 
   const port = nextPort(registry);
@@ -161,57 +147,44 @@ async function provision(id, authBase) {
   registry[id] = { port, dbName, containerName, createdAt: new Date().toISOString() };
   await saveRegistry(registry);
 
-  return { auth_url: `${authBase}/${id}` };
+  return { auth_url: `${AUTH_BASE}/${id}` };
 }
 
-async function main() {
-  // Resolved once at startup, not per-request -- see resolveAuthBase's own
-  // comment for why a value that cannot change without a process restart
-  // does not need to be re-fetched on every call.
-  const authBase = await resolveAuthBase();
-  console.log(`auth base resolved to ${authBase}`);
+const server = createServer(async (req, res) => {
+  if (req.method !== "POST" || req.url !== "/provision") {
+    return fail(res, 404, "POST /provision only");
+  }
 
-  const server = createServer(async (req, res) => {
-    if (req.method !== "POST" || req.url !== "/provision") {
-      return fail(res, 404, "POST /provision only");
-    }
+  let body = "";
+  for await (const chunk of req) body += chunk;
 
-    let body = "";
-    for await (const chunk of req) body += chunk;
+  let parsed;
+  try {
+    parsed = JSON.parse(body || "{}");
+  } catch {
+    return fail(res, 400, "body is not JSON");
+  }
 
-    let parsed;
-    try {
-      parsed = JSON.parse(body || "{}");
-    } catch {
-      return fail(res, 400, "body is not JSON");
-    }
+  const id = parsed.project_id;
+  if (typeof id !== "string" || !PROJECT_ID_RE.test(id)) {
+    return fail(res, 400, "project_id must look like a boxcode artifact id");
+  }
 
-    const id = parsed.project_id;
-    if (typeof id !== "string" || !PROJECT_ID_RE.test(id)) {
-      return fail(res, 400, "project_id must look like a boxcode artifact id");
-    }
+  try {
+    const result = await provision(id);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(result));
+  } catch (e) {
+    // Deliberately not attempting a rollback of whatever partially
+    // succeeded (a database with no container, say): this is the "prove
+    // the flow works" phase, and a human reading this message can finish
+    // or clean up a rare failure by hand far more easily than a rollback
+    // path that has to get every combination of partial failure right.
+    console.error(`provision(${id}) failed:`, e);
+    fail(res, 500, `provisioning failed: ${e.message}`);
+  }
+});
 
-    try {
-      const result = await provision(id, authBase);
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(result));
-    } catch (e) {
-      // Deliberately not attempting a rollback of whatever partially
-      // succeeded (a database with no container, say): this is the "prove
-      // the flow works" phase, and a human reading this message can finish
-      // or clean up a rare failure by hand far more easily than a rollback
-      // path that has to get every combination of partial failure right.
-      console.error(`provision(${id}) failed:`, e);
-      fail(res, 500, `provisioning failed: ${e.message}`);
-    }
-  });
-
-  server.listen(PORT, "127.0.0.1", () => {
-    console.log(`boxcode auth control-plane listening on 127.0.0.1:${PORT}`);
-  });
-}
-
-main().catch((e) => {
-  console.error("failed to start:", e);
-  process.exit(1);
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`boxcode auth control-plane listening on 127.0.0.1:${PORT}`);
 });

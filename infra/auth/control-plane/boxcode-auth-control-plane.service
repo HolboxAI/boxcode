@@ -11,10 +11,9 @@ Environment=REGISTRY_PATH=/opt/boxcode-auth/registry.json
 Environment=NGINX_CONF_DIR=/etc/nginx/conf.d/auth-projects
 Environment=SITE_BASE=https://boxcode.sh
 Environment=PORT=8080
-# AUTH_BASE is deliberately not set here: index.mjs resolves it itself from
-# this instance's own public hostname via IMDS at startup (see
-# resolveAuthBase in index.mjs). Set it explicitly only if this box ever
-# gets a real domain instead.
+# AUTH_BASE is deliberately not set here: index.mjs already defaults to
+# https://auth.boxcode.sh. Override only if this box is ever reachable
+# under a different domain.
 # Needs root: it runs `docker run`, `sudo -u postgres psql`, and reloads
 # nginx. All three are already root-equivalent operations on this box; a
 # dedicated service user with a narrow sudoers file is the first thing to

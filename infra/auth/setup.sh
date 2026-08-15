@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # Bootstraps a fresh Amazon Linux 2023 box into the auth control-plane host:
 # Docker (for per-project GoTrue containers), Postgres (one shared instance,
-# one database per project), nginx + a Let's Encrypt cert for the box's own
-# AWS-assigned public hostname (routes <hostname>/<id>/* to the right
-# container), and the control-plane service itself under systemd.
+# one database per project), nginx + a Let's Encrypt cert for auth.boxcode.sh
+# (routes auth.boxcode.sh/<id>/* to the right container), and the
+# control-plane service itself under systemd.
 #
-# No custom domain, deliberately: the published page needs an HTTPS origin
-# to call, and EC2 already hands out a real, publicly-resolvable hostname
-# for free the moment the instance launches -- Let's Encrypt only needs
-# that, not a registrar-managed subdomain. If this box gets a nicer domain
-# later, that is a DNS change plus a `certbot --nginx -d <domain>` re-run,
-# not a change to anything in this script.
+# A real, owned domain is not optional here, and auth.boxcode.sh's DNS A
+# record has to already point at this box's public IP before this script
+# reaches the certbot step, or that step fails. An earlier version of this
+# script tried to sidestep needing one by using the EC2 instance's own
+# AWS-assigned hostname (ec2-x-x-x-x.compute-1.amazonaws.com) -- Let's
+# Encrypt refuses to issue for `*.compute.amazonaws.com` outright
+# ("forbidden by policy"), specifically because anyone can obtain a
+# matching hostname for free, so it does not count as proof of ownership.
+# AWS Certificate Manager has the identical ownership requirement and, on
+# top of that, cannot hand a plain nginx process its private key at all
+# (only ALB/CloudFront/API Gateway can use an ACM cert directly) -- so it
+# is not a way around this either. There genuinely is no substitute for an
+# owned domain.
 #
 # Idempotent -- every step here is safe to run again on a box that already
 # has some or all of this, which is the point: this is meant to be re-run
@@ -19,23 +26,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR=/opt/boxcode-auth
+DOMAIN=auth.boxcode.sh
 
 echo "== packages =="
-sudo dnf install -y docker postgresql15-server postgresql15 nginx nodejs certbot python3-certbot-nginx >/dev/null
-
-echo "== this box's own public hostname =="
-# IMDSv2: a token is required before the metadata service answers anything,
-# so a plain unauthenticated GET (IMDSv1) is not an option here even for a
-# read this harmless.
-IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
-    -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
-HOSTNAME_PUBLIC=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
-    "http://169.254.169.254/latest/meta-data/public-hostname")
-if [ -z "$HOSTNAME_PUBLIC" ]; then
-    echo "could not determine this instance's public hostname from IMDS -- is it in a public subnet with a public IP?" >&2
-    exit 1
-fi
-echo "$HOSTNAME_PUBLIC"
+sudo dnf install -y docker postgresql15-server postgresql15 nginx nodejs certbot python3-certbot-nginx bind-utils git >/dev/null
 
 echo "== docker =="
 sudo systemctl enable --now docker
@@ -58,16 +52,29 @@ sudo systemctl restart postgresql
 
 echo "== nginx =="
 sudo mkdir -p /etc/nginx/conf.d/auth-projects
-sed "s/__HOSTNAME__/$HOSTNAME_PUBLIC/" "$SCRIPT_DIR/nginx/auth.conf.template" | sudo tee /etc/nginx/conf.d/auth.conf >/dev/null
+sudo cp "$SCRIPT_DIR/nginx/auth.conf.template" /etc/nginx/conf.d/auth.conf
 sudo nginx -t
 sudo systemctl enable --now nginx
 sudo systemctl reload nginx
 
-echo "== TLS (Let's Encrypt, for $HOSTNAME_PUBLIC) =="
+echo "== DNS check =="
+# certbot's HTTP-01 challenge fails opaquely if this is not already true, so
+# check it here with a clear message rather than letting certbot's own error
+# be the first anyone hears about it.
+RESOLVED=$(dig +short "$DOMAIN" | tail -1)
+THIS_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 \
+    -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')")
+if [ "$RESOLVED" != "$THIS_IP" ]; then
+    echo "$DOMAIN resolves to '$RESOLVED', not this box's IP ($THIS_IP)." >&2
+    echo "Add/update the A record at whoever manages boxcode.sh's DNS before re-running this." >&2
+    exit 1
+fi
+
+echo "== TLS (Let's Encrypt, for $DOMAIN) =="
 # --redirect adds the plain-80-to-443 redirect and the whole HTTPS server
 # block to /etc/nginx/conf.d/auth.conf itself -- run once per box, safe to
 # re-run (certbot renews in place rather than erroring on an existing cert).
-sudo certbot --nginx -d "$HOSTNAME_PUBLIC" --non-interactive --agree-tos \
+sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos \
     --register-unsafely-without-email --redirect
 
 echo "== control-plane service =="

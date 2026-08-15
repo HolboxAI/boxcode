@@ -302,12 +302,6 @@ pub struct ToolsConfig {
     /// sign-up/sign-in. Same reasoning as `artifact_endpoint`: a URL, not a
     /// constant, so a fork or a self-hosted control-plane can be pointed at
     /// without rebuilding, and "" switches the feature off.
-    ///
-    /// Empty by default, unlike `artifact_endpoint` -- the auth
-    /// control-plane runs on its own EC2 instance with no fixed domain of
-    /// its own yet (see `infra/auth/README.md`), so there is no stable URL
-    /// to bake in here the way `boxcode.sh/api/artifact` is. Set it to
-    /// wherever that instance actually is.
     #[serde(default = "default_auth_endpoint")]
     pub auth_endpoint: String,
 }
@@ -355,7 +349,7 @@ fn default_artifact_endpoint() -> String {
 }
 
 fn default_auth_endpoint() -> String {
-    String::new()
+    "https://auth.boxcode.sh/provision".to_string()
 }
 
 fn default_search_timeout() -> u64 {

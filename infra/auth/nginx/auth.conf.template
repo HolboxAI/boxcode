@@ -1,12 +1,15 @@
-# Base vhost for this box's own AWS-assigned public hostname (see
-# setup.sh -- `__HOSTNAME__` below is substituted with it, e.g.
-# ec2-54-123-45-67.compute-1.amazonaws.com). No custom domain: the
-# published page needs an HTTPS origin to call (mixed content is blocked
-# outright, not a config option), and Let's Encrypt only needs *some* real
-# public hostname to validate against -- the one EC2 already hands out for
-# free is enough, so there is nothing to wait on a registrar for. If this
-# box ever gets a real subdomain later, point it here and re-run certbot;
-# nothing else about this file changes.
+# Base vhost for auth.boxcode.sh.
+#
+# This is NOT swappable for the EC2 instance's own AWS-assigned hostname
+# (ec2-x-x-x-x.compute-1.amazonaws.com) -- that was tried first and Let's
+# Encrypt refuses it outright ("forbidden by policy"): `*.compute.
+# amazonaws.com` is deliberately blocklisted by the CA, since anyone can
+# get a matching hostname for free, so it is not accepted as proof of
+# ownership the way a real domain is. AWS Certificate Manager does not
+# route around this either -- it has the same domain-ownership requirement,
+# and its certs are not usable by plain nginx regardless (only
+# ALB/CloudFront/API Gateway can present them). A real, owned domain is not
+# optional here; `auth.boxcode.sh` is it.
 #
 # Listens on 80 only; setup.sh runs `certbot --nginx` after this file is in
 # place, which adds the 443/TLS server block and the redirect itself --
@@ -14,7 +17,7 @@
 # edit to immediately diverge from.
 server {
     listen 80;
-    server_name __HOSTNAME__;
+    server_name auth.boxcode.sh;
 
     # The one control-plane route the boxcode client itself calls (see
     # src/auth.rs). Everything else nginx routes is a per-project GoTrue
@@ -23,7 +26,6 @@ server {
         proxy_pass http://127.0.0.1:8080/provision;
         proxy_set_header Host $host;
     }
-
     # A request to a project id nobody has provisioned falls through to
     # here rather than nginx's default "welcome" page -- a clearer signal
     # than a generic 404 that the id itself is the problem.
