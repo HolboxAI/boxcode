@@ -35,7 +35,11 @@ const SITE_BASE = process.env.SITE_BASE || "https://boxcode.sh";
 const AUTH_BASE = process.env.AUTH_BASE || "https://auth.boxcode.sh";
 const PORT = Number(process.env.PORT || 8080);
 const GOTRUE_PORT_BASE = 9000;
-const GOTRUE_IMAGE = process.env.GOTRUE_IMAGE || "supabase/gotrue:latest";
+// Pinned, not `:latest` -- Supabase does not publish a `:latest` tag for
+// this image at all ("manifest unknown", confirmed live), only versioned
+// ones. v2.189.0 matches supabase/supabase's own reference
+// docker-compose.yml as of this writing.
+const GOTRUE_IMAGE = process.env.GOTRUE_IMAGE || "supabase/gotrue:v2.189.0";
 
 // Same shape as an artifact id (see boxcode-artifact-signer's `ID_RE`):
 // lowercase letters minus i/l/o (visually ambiguous) plus 2-9, 8 chars. A
@@ -103,6 +107,10 @@ async function startGoTrue({ containerName, port, dbName, jwtSecret, siteUrl }) 
     "-e", `GOTRUE_DB_DRIVER=postgres`,
     "-e", `GOTRUE_DB_DATABASE_URL=postgres://postgres@127.0.0.1:5432/${dbName}`,
     "-e", `GOTRUE_JWT_SECRET=${jwtSecret}`,
+    // Required for a login to actually issue a usable token -- confirmed
+    // against Supabase's own reference docker-compose.yml, which sets this
+    // unconditionally alongside GOTRUE_JWT_SECRET.
+    "-e", `GOTRUE_JWT_AUD=authenticated`,
     "-e", `GOTRUE_JWT_EXP=3600`,
     "-e", `GOTRUE_SITE_URL=${siteUrl}`,
     "-e", `GOTRUE_URI_ALLOW_LIST=${SITE_BASE}`,

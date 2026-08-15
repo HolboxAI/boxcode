@@ -51,12 +51,21 @@ if [ ! -f /var/lib/pgsql/data/PG_VERSION ]; then
     sudo postgresql-setup --initdb
 fi
 sudo systemctl enable --now postgresql
-# Peer auth for the local `postgres` OS user only -- the control-plane
-# service always connects as `sudo -u postgres`, never over the network, so
-# there is no password to manage or leak. Widening this to accept network
-# connections is the first thing to change if Postgres ever needs to be
-# reached from anywhere but this box.
-echo "local all postgres peer" | sudo tee /var/lib/pgsql/data/pg_hba.conf >/dev/null
+# Two different callers, two different auth methods, both loopback-only:
+# the control-plane service itself always connects as `sudo -u postgres`
+# over the Unix socket (peer auth, no password anywhere) -- but every
+# GoTrue container also talks to Postgres, over TCP to 127.0.0.1 (it runs
+# with --network host), which `local` rules do not cover at all. `trust`
+# on 127.0.0.1/32 only, not a wider CIDR: nothing outside this box can
+# reach port 5432 regardless (no security group rule opens it, see the
+# instance's inbound rules), so this is loopback-only in practice, not
+# "no password on the open internet". Widening either rule is the first
+# thing to change if Postgres ever needs to be reached from anywhere but
+# this box.
+sudo tee /var/lib/pgsql/data/pg_hba.conf >/dev/null << 'EOF'
+local all postgres peer
+host  all postgres 127.0.0.1/32 trust
+EOF
 sudo systemctl restart postgresql
 
 echo "== nginx =="
