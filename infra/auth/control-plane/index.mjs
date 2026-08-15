@@ -18,7 +18,7 @@ import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomBytes } from "node:crypto";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
 import path from "node:path";
 
 const run = promisify(execFile);
@@ -64,7 +64,11 @@ async function loadRegistry() {
 
 async function saveRegistry(registry) {
   await mkdir(path.dirname(REGISTRY_PATH), { recursive: true });
-  await writeFile(REGISTRY_PATH, JSON.stringify(registry, null, 2));
+  await writeFile(REGISTRY_PATH, JSON.stringify(registry, null, 2), { mode: 0o600 });
+  // `mode` above only applies when writeFile creates the file -- an
+  // existing file (e.g. from before this file started holding secrets)
+  // keeps its old, wider permissions unless explicitly chmod'd here too.
+  await chmod(REGISTRY_PATH, 0o600);
 }
 
 function nextPort(registry) {
@@ -87,13 +91,28 @@ async function createDatabase(name) {
   await run("sudo", ["-u", "postgres", "psql", "-c", `CREATE DATABASE ${name}`]);
 }
 
-async function containerExists(name) {
-  const { stdout } = await run("docker", ["ps", "-aq", "-f", `name=^${name}$`]);
+async function containerIsRunning(name) {
+  const { stdout } = await run("docker", ["ps", "-q", "-f", `name=^${name}$`]);
   return stdout.trim().length > 0;
 }
 
-async function startGoTrue({ containerName, port, dbName, jwtSecret, siteUrl }) {
-  if (await containerExists(containerName)) return;
+async function removeContainerIfPresent(name) {
+  try {
+    await run("docker", ["rm", "-f", name]);
+  } catch {
+    // Nothing to remove -- fine, that's the common case.
+  }
+}
+
+async function startGoTrue({ containerName, port, dbName, jwtSecret, siteUrl, apiExternalUrl }) {
+  // A container that exists but is not running (crash-looping on bad
+  // config, most often) is worse than no container: it satisfies "does
+  // gotrue-<id> exist" checks forever without ever becoming reachable.
+  // Recreating it, rather than only creating when totally absent, is what
+  // makes a config fix on this file actually take effect on retry instead
+  // of silently no-op'ing against the broken one.
+  if (await containerIsRunning(containerName)) return;
+  await removeContainerIfPresent(containerName);
   // --network host: simplest way for the container to reach Postgres on
   // 127.0.0.1 and for nginx on the same box to reach the container by port,
   // with no Docker network/DNS layer in between to debug. Acceptable on a
@@ -114,6 +133,11 @@ async function startGoTrue({ containerName, port, dbName, jwtSecret, siteUrl }) 
     "-e", `GOTRUE_JWT_EXP=3600`,
     "-e", `GOTRUE_SITE_URL=${siteUrl}`,
     "-e", `GOTRUE_URI_ALLOW_LIST=${SITE_BASE}`,
+    // Required -- GoTrue refuses to start without it ("Failed to load
+    // configuration: required key API_EXTERNAL_URL missing value",
+    // confirmed live). This project's own auth_url, i.e. where GoTrue
+    // itself is externally reachable, not SITE_URL (the published page).
+    "-e", `API_EXTERNAL_URL=${apiExternalUrl}`,
     // No SMTP configured yet, so a signup that waited on a confirmation
     // email would never complete. Autoconfirm is the deliberate tradeoff for
     // "prove sign-up/sign-in works end to end" -- the first thing to revisit
@@ -136,23 +160,40 @@ async function writeNginxConf(id, port) {
   await run("nginx", ["-s", "reload"]);
 }
 
+// Self-healing, not just idempotent: an id already in the registry still
+// runs the full sequence again rather than trusting the record blindly,
+// because every step below is now cheap to repeat when already satisfied
+// (containerIsRunning, databaseExists) and a real one is not -- a project
+// whose container crash-looped on a bad config would otherwise stay
+// silently broken behind a "successful" registry entry forever, with no
+// way for a retry to ever reach the fix. Port and JWT secret are reused
+// from the existing entry rather than regenerated, so re-running this for
+// an already-healthy project is a true no-op: a fresh port would orphan
+// the old nginx route, and a fresh secret would invalidate every session
+// already issued.
 async function provision(id) {
   const registry = await loadRegistry();
-  if (registry[id]) {
-    return { auth_url: `${AUTH_BASE}/${id}` };
-  }
+  const existing = registry[id];
 
-  const port = nextPort(registry);
-  const dbName = `proj_${id}`;
-  const containerName = `gotrue-${id}`;
-  const jwtSecret = randomBytes(32).toString("hex");
+  const port = existing?.port ?? nextPort(registry);
+  const dbName = existing?.dbName ?? `proj_${id}`;
+  const containerName = existing?.containerName ?? `gotrue-${id}`;
+  const jwtSecret = existing?.jwtSecret ?? randomBytes(32).toString("hex");
   const siteUrl = `${SITE_BASE}/artifacts/${id}`;
+  const apiExternalUrl = `${AUTH_BASE}/${id}`;
 
   await createDatabase(dbName);
-  await startGoTrue({ containerName, port, dbName, jwtSecret, siteUrl });
+  await startGoTrue({ containerName, port, dbName, jwtSecret, siteUrl, apiExternalUrl });
   await writeNginxConf(id, port);
 
-  registry[id] = { port, dbName, containerName, createdAt: new Date().toISOString() };
+  // Carries `jwtSecret` now, where it did not before -- needed so a
+  // container recreated after a crash reuses the same signing key instead
+  // of silently invalidating every session already issued. This file is
+  // therefore secret-bearing; its permissions matter more than they did.
+  registry[id] = {
+    port, dbName, containerName, jwtSecret,
+    createdAt: existing?.createdAt ?? new Date().toISOString(),
+  };
   await saveRegistry(registry);
 
   return { auth_url: `${AUTH_BASE}/${id}` };
