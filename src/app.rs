@@ -111,12 +111,16 @@ pub enum Overlay {
         model: String,
     },
     CustomEndpoint(CustomStep),
-    /// `/pull`. Every project this machine has published, (path, artifact id)
-    /// pairs from `artifacts::all_local` -- picking one sets
-    /// `pending_relaunch` rather than switching in place, since `Workspace`
-    /// is built once at startup and held for the process's whole life (see
-    /// `workspace.rs`); `main.rs` does the actual relaunch once this loop
-    /// exits.
+    /// `/pull`. Projects this machine has published in the last
+    /// `artifacts::EXPIRY_HOURS`, (path, artifact id) pairs from
+    /// `artifacts::all_local` -- picking one sets `pending_relaunch` rather
+    /// than switching in place, since `Workspace` is built once at startup
+    /// and held for the process's whole life (see `workspace.rs`); `main.rs`
+    /// does the actual relaunch once this loop exits. The path travels with
+    /// each item for that relaunch, but only the id is ever shown on screen
+    /// (see `ui.rs`) -- a full path clips against the popup's fixed width,
+    /// and the id is the one thing a dev running several projects can
+    /// recognize without leaving the terminal.
     ArtifactPicker {
         items: Vec<(String, String)>,
         selected: usize,
@@ -2427,11 +2431,12 @@ impl App {
 
     // ---- /pull -------------------------------------------------------
 
-    /// Lists every project this machine has published (`artifacts::all_local`
-    /// -- a plain read of `~/.boxcode/artifacts.json`, no network call) so the
-    /// user can switch to one that is not the directory this session started
-    /// in. Refused while busy, same reasoning as `/resume`: mid-turn is not a
-    /// moment to hand the workspace to a different project out from under it.
+    /// Lists projects this machine has published in the last
+    /// `artifacts::EXPIRY_HOURS` (`artifacts::all_local` -- a plain read of
+    /// `~/.boxcode/artifacts.json`, no network call) so the user can switch
+    /// to one that is not the directory this session started in. Refused
+    /// while busy, same reasoning as `/resume`: mid-turn is not a moment to
+    /// hand the workspace to a different project out from under it.
     pub fn open_pull_picker(&mut self) {
         if self.is_busy() {
             return;
@@ -2440,9 +2445,12 @@ impl App {
         if items.is_empty() {
             self.messages.push(Message::new(
                 Role::System,
-                "No published projects found on this machine yet. Publish something with \
-                 publish_artifact first -- /pull switches between projects you have already \
-                 published, it does not create one.",
+                format!(
+                    "No projects published on this machine in the last {}h. Publish something \
+                     with publish_artifact first -- /pull switches between projects you have \
+                     recently published, it does not create one.",
+                    crate::artifacts::EXPIRY_HOURS
+                ),
             ));
             return;
         }
@@ -4111,7 +4119,7 @@ mod tests {
             type_str(&mut a, "/pull");
             a.handle_key(key(KeyCode::Enter));
             let out: String = a.messages.iter().map(|m| m.content.as_str()).collect();
-            assert!(out.contains("No published projects"), "{out}");
+            assert!(out.contains("No projects published"), "{out}");
             assert!(a.overlay.is_none(), "nothing to pick from");
         });
     }
@@ -4126,7 +4134,11 @@ mod tests {
             // to -- `artifacts::remember` is private to that module, so this
             // writes the file directly rather than reaching into it.
             let canonical = target.canonicalize().expect("canonicalize").to_string_lossy().into_owned();
-            let registry = serde_json::json!({ canonical: "abc12345" });
+            let published_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs();
+            let registry = serde_json::json!({ canonical: { "id": "abc12345", "published_at": published_at } });
             let config_dir = crate::config::Config::config_dir();
             std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
             std::fs::write(config_dir.join("artifacts.json"), registry.to_string())
