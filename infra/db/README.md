@@ -93,6 +93,43 @@ has to write the `WHERE` clause. Closing that fully would mean a real
 policy layer, which is deliberately out of scope for the same "prove it
 works" phase the rest of this README describes.
 
+## `/db/named-query`: letting the page itself reach in, safely
+
+`/query` needs the project's key, which is why the model that writes a
+published page's client-side JS can never be handed it — that key
+authorizes *arbitrary* SQL, and a key that could do that cannot safely
+reach a browser. But that also means, until this route existed, a signed-in
+visitor's own page had no way to read or write their own data at all: the
+key gap that protects the database also blocked the one thing a real
+"account" is supposed to do.
+
+`POST /db/named-query {project_id, access_token, name, params}` closes
+that gap without reopening it: no project key, ever — verified purely by
+the caller's own `access_token`, same `verifyUser` check `/query`'s own
+`access_token` support already does. What makes this safe to leave
+key-less is that it never accepts SQL from the caller, only a `name`. The
+only statements it will ever run are ones the developer already wrote and
+registered themselves, through the key-authorized `/query` route, into an
+ordinary table in their own project's database:
+
+```sql
+CREATE TABLE IF NOT EXISTS __boxcode_named_queries__ (
+  name TEXT PRIMARY KEY,
+  sql  TEXT NOT NULL
+);
+INSERT INTO __boxcode_named_queries__ VALUES
+  ('my_todos', 'SELECT id, text FROM todos WHERE user_id = :current_user_id');
+```
+
+A visitor can only ever invoke a query their own developer chose to
+expose by name; they can never write one from devtools. `:current_user_id`
+binds exactly the same way `/query`'s does — verified against the
+project's own GoTrue, not trusted from `params`. The same caveat as
+`/query`'s own scoping applies here too: this is not row-level security,
+just verification of *who's asking*; a registered query that doesn't
+reference `:current_user_id` in its own `WHERE` clause will still return
+every row to whoever calls it.
+
 ## Statement shape
 
 One statement per call — `.prepare()` only ever runs one, unlike `exec()`
@@ -118,3 +155,9 @@ is the same idea); everything else runs as a write and returns
 - SQLite's own concurrency limits (single-writer file locking) apply.
   Fine for the traffic this was built to prove out; a real concern if a
   project's data workload ever gets genuinely concurrent.
+- No rate limiting on `/db/named-query`. It needs a valid `access_token`,
+  but signing up for a project's own `enable_auth` is free and open to
+  anyone, so a signed-in visitor can call a registered query as many times
+  as they like. Fine for the single-developer, small-audience phase this
+  is built for; worth revisiting alongside the same gap `/query` and
+  `/uploads` already carry.
