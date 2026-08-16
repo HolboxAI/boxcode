@@ -822,6 +822,14 @@ variables override values in `config.toml`.
 - **`/resume`** — Reloads this directory's most recent recorded session and
   carries on from it — see "Sessions survive the terminal" above. Only into a
   fresh conversation; `boxcode --resume` does it from launch.
+- **`/pull`** — Opens a picker of every project this machine has published
+  (from `~/.boxcode/artifacts.json` — a local file, no network call), so you
+  can switch to one that isn't the directory this session started in.
+  Selecting one relaunches boxcode rooted there — a fresh process, not an
+  in-place switch, since the workspace is fixed for the life of a session —
+  and, if that project has pending change requests waiting in its
+  `list_change_requests` mailbox (see `enable_auth`/`db_query`'s companion
+  tools), says so before your first prompt.
 - **`/new`** — Forgets the current conversation. The configured provider and
   model are untouched; only the message history and tool-step count reset.
   The forgotten session's file stays on disk, so `/resume` can bring it back.
