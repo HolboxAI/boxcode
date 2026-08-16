@@ -2438,24 +2438,43 @@ async fn execute_publish_artifact(
     };
 
     match crate::artifacts::publish(&resolved, &config.artifact_endpoint).await {
-        Ok(published) => outcome(
-            &call.id,
-            format!(
-                "\u{1F310} preview \u{2014} {} file{}, expires in {}h",
-                published.files,
-                if published.files == 1 { "" } else { "s" },
-                published.expires_in_hours
-            ),
-            format!(
-                "Published {} file{} ({:.0} KB).\n\nURL: {}\n\nTell the user this link is \
-                 public to anyone who has it and stops working in {} hours.",
-                published.files,
-                if published.files == 1 { "" } else { "s" },
-                published.bytes as f64 / 1024.0,
-                published.url,
-                published.expires_in_hours
-            ),
-        ),
+        Ok(published) => {
+            // `published.verified` is a real live GET this call already made
+            // against the URL below, not the model's own judgment -- so it is
+            // the one thing here safe to state as fact rather than repeat as
+            // a claim. Say which happened plainly: reporting "published"
+            // either way, unqualified, is exactly the gap between a claim
+            // and a checked fact this field exists to close.
+            let confirmation = if published.verified {
+                "Confirmed live: the URL was fetched right after upload and served what was \
+                 just written."
+            } else {
+                "Could not confirm the URL is actually serving this yet (the read-back after \
+                 upload failed or found a mismatch) -- the upload itself succeeded, but say so \
+                 as unconfirmed rather than as done, and check the URL yourself before telling \
+                 the user it works."
+            };
+            outcome(
+                &call.id,
+                format!(
+                    "\u{1F310} preview \u{2014} {} file{}, expires in {}h{}",
+                    published.files,
+                    if published.files == 1 { "" } else { "s" },
+                    published.expires_in_hours,
+                    if published.verified { "" } else { ", unconfirmed" }
+                ),
+                format!(
+                    "Published {} file{} ({:.0} KB).\n\nURL: {}\n\n{confirmation}\n\nTell the \
+                     user this link is public to anyone who has it and stops working in {} \
+                     hours.",
+                    published.files,
+                    if published.files == 1 { "" } else { "s" },
+                    published.bytes as f64 / 1024.0,
+                    published.url,
+                    published.expires_in_hours
+                ),
+            )
+        }
         Err(e) => outcome(
             &call.id,
             format!("\u{1F310} preview {} \u{2014} failed", clip(&path, 40)),

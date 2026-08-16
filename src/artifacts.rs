@@ -47,6 +47,17 @@ pub struct Published {
     pub files: usize,
     pub bytes: u64,
     pub expires_in_hours: u32,
+    /// Whether a live GET against `url`, right after every upload reported
+    /// success, actually served what was just written -- not just that S3
+    /// accepted the PUTs. The presigned upload succeeding proves the bytes
+    /// reached the bucket; it says nothing about whether the developer-
+    /// and visitor-facing URL serves them, or whether a diffing signer even
+    /// re-sent `index.html` this call. `false` means the check failed or
+    /// was inconclusive (network hiccup, no fresh `index.html` to compare
+    /// against, ...), not that the publish itself failed -- see
+    /// `verify_live`. The caller decides how much to make of it; this
+    /// module only refuses to claim more certainty than it actually has.
+    pub verified: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -429,6 +440,13 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
     let signed: SignResponse = serde_json::from_str(&text)
         .map_err(|e| format!("the artifact service returned something unexpected ({e})"))?;
 
+    // Captured so the post-upload check below has something concrete to
+    // compare the live URL against -- `None` if this call's upload batch
+    // did not include `index.html` (a diffing signer may only have asked
+    // for the files that actually changed), in which case there is nothing
+    // fresh to verify against and `verify_live` degrades to a reachability
+    // check.
+    let mut index_len = None;
     for upload in &signed.uploads {
         let candidate = files
             .iter()
@@ -437,6 +455,9 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
         let bytes = std::fs::read(&candidate.source)
             .map_err(|e| format!("could not read {}: {e}", candidate.source.display()))?;
         let bytes = if is_html(&candidate.key) { inject_live_reload(bytes) } else { bytes };
+        if candidate.key == "index.html" {
+            index_len = Some(bytes.len());
+        }
         let put = client
             .put(&upload.url)
             .header("content-type", &upload.content_type)
@@ -457,13 +478,45 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
         }
     }
 
+    let verified = verify_live(&client, &signed.url, index_len).await;
+
     remember(path, &signed.id);
     Ok(Published {
         url: signed.url,
         files: files.len(),
         bytes: total,
         expires_in_hours: signed.expires_in_hours,
+        verified,
     })
+}
+
+/// Confirms the just-published URL actually serves what was just uploaded,
+/// instead of trusting a successful presigned `PUT` as proof on its own --
+/// that only shows S3 accepted the bytes, not that `url` (what a developer
+/// or visitor actually opens) serves them. Best-effort and deliberately
+/// never turns into an `Err`: a flaky read-back (a transient network error,
+/// a CDN edge that has not yet propagated) must not make a real publish
+/// come back as a reported failure. Same "no-cache" header set on every
+/// upload above is what makes this check meaningful the moment it runs,
+/// not just eventually -- see that header's own comment.
+async fn verify_live(client: &reqwest::Client, url: &str, expected_index_len: Option<usize>) -> bool {
+    // Bounded well under the client's own 60s request timeout: this check
+    // exists to make a publish more trustworthy, not to let a slow CDN edge
+    // make every publish take up to a minute longer. A timeout here reports
+    // as unverified, same as any other failure -- never as an error the
+    // whole publish has to fail over.
+    let Ok(response) = client.get(url).timeout(Duration::from_secs(10)).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    match expected_index_len {
+        Some(expected) => response.bytes().await.map(|b| b.len() == expected).unwrap_or(false),
+        // Nothing fresh to compare against this call -- reachability is all
+        // that can honestly be claimed.
+        None => true,
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -720,6 +773,79 @@ mod tests {
         assert!(error.contains("[artifacts]"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A minimal HTTP/1.1 GET-only server on a real socket: accepts one
+    /// connection, ignores whatever request arrives (`verify_live` only
+    /// ever sends a bare GET), and replies with the given status/body.
+    /// Reused across the `verify_live` cases below rather than mocking the
+    /// whole `publish` round trip, since the thing actually under test is
+    /// this one read-back, not the upload flow already covered elsewhere.
+    async fn serve_once(status_line: &'static str, body: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = [
+                status_line.as_bytes(),
+                format!("\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes(),
+                body,
+            ]
+            .concat();
+            let _ = socket.write_all(&response).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// The whole point of `verify_live`: a byte-length match against a
+    /// freshly-uploaded `index.html` is what "actually serving it" means
+    /// here, not just a 200 status.
+    #[tokio::test]
+    async fn verify_live_confirms_a_matching_index_html() {
+        let url = serve_once("HTTP/1.1 200 OK", b"<h1>hi</h1>").await;
+        let client = reqwest::Client::new();
+        assert!(verify_live(&client, &url, Some(b"<h1>hi</h1>".len())).await);
+    }
+
+    /// A live URL that answers but with the wrong length is exactly the
+    /// case this exists to catch: something reachable, just not what was
+    /// just uploaded (stale cache, wrong prefix, a signer bug).
+    #[tokio::test]
+    async fn verify_live_flags_a_length_mismatch() {
+        let url = serve_once("HTTP/1.1 200 OK", b"<h1>stale</h1>").await;
+        let client = reqwest::Client::new();
+        assert!(!verify_live(&client, &url, Some(999)).await);
+    }
+
+    /// An HTTP error status is not "reachable" for this purpose.
+    #[tokio::test]
+    async fn verify_live_flags_a_non_success_status() {
+        let url = serve_once("HTTP/1.1 404 Not Found", b"").await;
+        let client = reqwest::Client::new();
+        assert!(!verify_live(&client, &url, None).await);
+    }
+
+    /// Nothing listening at all -- the network-error path, distinct from a
+    /// server that responds but wrongly.
+    #[tokio::test]
+    async fn verify_live_flags_an_unreachable_host() {
+        let client = reqwest::Client::new();
+        assert!(!verify_live(&client, "http://127.0.0.1:1", Some(3)).await);
+    }
+
+    /// No fresh `index.html` this call (a diffing signer only re-asked for
+    /// other files) -- reachability is all that can honestly be claimed,
+    /// so a 200 with any body at all passes.
+    #[tokio::test]
+    async fn verify_live_without_an_expected_length_only_checks_reachability() {
+        let url = serve_once("HTTP/1.1 200 OK", b"whatever is there already").await;
+        let client = reqwest::Client::new();
+        assert!(verify_live(&client, &url, None).await);
+    }
 }
 
 #[cfg(test)]
@@ -747,6 +873,11 @@ mod live_check {
         let published = publish(&dir, &endpoint).await.expect("publish");
         println!("PUBLISHED_URL={}", published.url);
         println!("files={} bytes={} expires={}h", published.files, published.bytes, published.expires_in_hours);
+        // publish() already did this exact check against the real bucket and
+        // CDN; asserting it here confirms verify_live's own logic (unit-
+        // tested above against a fake server) also holds against the real
+        // one, not just a stand-in.
+        assert!(published.verified, "publish()'s own live read-back failed against the real infra");
 
         // Confirms the live-reload script actually reaches a real visitor's
         // browser through the real CDN, not just that inject_live_reload's
