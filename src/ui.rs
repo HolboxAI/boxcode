@@ -1028,6 +1028,38 @@ fn tool_approval_parts(
             }
             (" Run this against the project's database? ", "run", "skip")
         }
+        Action::ListChangeRequests { path } => {
+            for wrapped in wrap(path, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            for wrapped in wrap(
+                "Checks this project's change-request mailbox for pending requests.",
+                inner,
+            ) {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            (" Check the mailbox? ", "check", "skip")
+        }
+        Action::ResolveChangeRequest { path, id } => {
+            for wrapped in wrap(path, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            for wrapped in wrap(&format!("Mark request #{id} resolved."), inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            (" Resolve this request? ", "resolve", "skip")
+        }
         Action::Command { command, purpose } => {
             if let Some(purpose) = purpose {
                 for wrapped in wrap(purpose, inner) {

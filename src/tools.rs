@@ -61,6 +61,8 @@ pub const DEPLOY_PROJECT: &str = "deploy_project";
 pub const PUBLISH_ARTIFACT: &str = "publish_artifact";
 pub const ENABLE_AUTH: &str = "enable_auth";
 pub const DB_QUERY: &str = "db_query";
+pub const LIST_CHANGE_REQUESTS: &str = "list_change_requests";
+pub const RESOLVE_CHANGE_REQUEST: &str = "resolve_change_request";
 pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
 pub const PLAN_PROGRESS: &str = "plan_progress";
 
@@ -482,6 +484,59 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                         }
                     },
                     "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": LIST_CHANGE_REQUESTS,
+                "description": "Check an already-published project's change-request mailbox for \
+                                pending requests left by whoever is looking at the live page --\
+                                typically the developer themselves, from a phone, hours after \
+                                publishing. Requires the path to have been published with \
+                                publish_artifact first, same as enable_auth/db_query. To let \
+                                visitors leave requests in the first place, add this exact tag to \
+                                the published HTML with edit_file, then publish_artifact again: \
+                                <script src=\"https://auth.boxcode.sh/requests-widget.js\" \
+                                data-project=\"<the artifact id>\"></script> -- there is no \
+                                separate 'enable' tool for that, it is just a script tag like any \
+                                other. Each result has an id, the request text, and when it was \
+                                submitted. After acting on one (or deciding not to), call \
+                                resolve_change_request with its id so it does not keep showing up.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The same path already given to publish_artifact for this project."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": RESOLVE_CHANGE_REQUEST,
+                "description": "Mark one change request from list_change_requests as handled, so \
+                                it stops showing up as pending. Call this once you have made the \
+                                change it asked for (or decided not to) -- it does not undo or \
+                                re-apply anything by itself, it only clears the mailbox.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The same path already given to publish_artifact for this project."
+                        },
+                        "id": {
+                            "type": "string",
+                            "description": "The request's id, from list_change_requests."
+                        }
+                    },
+                    "required": ["path", "id"]
                 }
             }
         }),
@@ -1096,6 +1151,14 @@ pub enum Action {
     /// `EnableAuth` -- it does not put anything on the public internet by
     /// itself, so it is judged the same way `Write`/`Edit` are.
     DbQuery { path: String, sql: String },
+    /// Checks an already-published project's change-request mailbox.
+    /// Ordinary approval, same reasoning as `DbQuery`: a private call to
+    /// boxcode's own control-plane, not something that touches the public
+    /// internet by itself.
+    ListChangeRequests { path: String },
+    /// Marks one change request handled. Same risk reasoning as
+    /// `ListChangeRequests`.
+    ResolveChangeRequest { path: String, id: String },
     /// Puts this project on the internet. Always approved -- see `action_risk`.
     Deploy {
         provider: String,
@@ -1164,6 +1227,10 @@ impl Action {
             Action::Publish { path } => format!("🌐 preview {path} — public link, 48h"),
             Action::EnableAuth { path } => format!("🔐 auth {path} — sign-up/sign-in"),
             Action::DbQuery { path, sql } => format!("🗄️ db {path} — {}", clip(sql, 50)),
+            Action::ListChangeRequests { path } => format!("📨 requests {path} — check mailbox"),
+            Action::ResolveChangeRequest { path, id } => {
+                format!("📨 requests {path} — resolve #{id}")
+            }
             Action::Plan(p) => format!("📋 plan: {}", p.title),
             Action::Progress { step, done, .. } => {
                 format!("{} step {step}", if *done { "☑" } else { "☐" })
@@ -1241,6 +1308,14 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
         Action::DbQuery { path, .. } => Some(format!(
             "Plan mode is read-only, so nothing was run against {path}'s database. Describe the \
              statement in your plan, then call {EXIT_PLAN_MODE}."
+        )),
+        Action::ListChangeRequests { path } => Some(format!(
+            "Plan mode is read-only, so {path}'s change-request mailbox was not checked. \
+             Mention that in your plan, then call {EXIT_PLAN_MODE}."
+        )),
+        Action::ResolveChangeRequest { path, .. } => Some(format!(
+            "Plan mode is read-only, so nothing was resolved against {path}'s change-request \
+             mailbox. Say so in your plan, then call {EXIT_PLAN_MODE}."
         )),
         Action::Command { command, .. } => Some(format!(
             "Plan mode only runs commands that cannot change anything, and `{}` is not one of \
@@ -1356,6 +1431,27 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
                 return None;
             }
             Some(Action::DbQuery { path, sql })
+        }
+        LIST_CHANGE_REQUESTS => {
+            #[derive(serde::Deserialize)]
+            struct Args { path: String }
+            let args: Args = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            Some(Action::ListChangeRequests { path })
+        }
+        RESOLVE_CHANGE_REQUEST => {
+            #[derive(serde::Deserialize)]
+            struct Args { path: String, id: String }
+            let args: Args = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            let id = args.id.trim().to_string();
+            if path.is_empty() || id.is_empty() {
+                return None;
+            }
+            Some(Action::ResolveChangeRequest { path, id })
         }
         ENABLE_AUTH => {
             #[derive(serde::Deserialize)]
@@ -1648,6 +1744,8 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         PUBLISH_ARTIFACT => execute_publish_artifact(call, workspace, config).await,
         ENABLE_AUTH => execute_enable_auth(call, workspace, config).await,
         DB_QUERY => execute_db_query(call, workspace, config).await,
+        LIST_CHANGE_REQUESTS => execute_list_change_requests(call, workspace, config).await,
+        RESOLVE_CHANGE_REQUEST => execute_resolve_change_request(call, workspace, config).await,
         // Never reached: `app::advance_approvals` resolves this one itself,
         // because accepting it changes `App`'s mode and the runner has no
         // access to `App`. Handled anyway so a routing mistake produces a
@@ -2429,6 +2527,96 @@ async fn execute_db_query(call: &ToolCall, workspace: &Workspace, config: &Tools
         Err(e) => outcome(
             &call.id,
             format!("\u{1F5C4}\u{FE0F} db {} \u{2014} failed", clip(&path, 40)),
+            format!("Error: {e}"),
+        ),
+    }
+}
+
+/// Check an already-published project's change-request mailbox.
+async fn execute_list_change_requests(
+    call: &ToolCall,
+    workspace: &Workspace,
+    config: &ToolsConfig,
+) -> ToolOutcome {
+    let Some(Action::ListChangeRequests { path }) = describe_action(call) else {
+        return outcome(
+            &call.id,
+            "\u{1F4E8} requests \u{2014} unusable arguments".to_string(),
+            format!("Error: {LIST_CHANGE_REQUESTS} needs a `path`."),
+        );
+    };
+    let resolved = match resolve_in_workspace(workspace, &path) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("\u{1F4E8} requests {} \u{2014} refused", clip(&path, 40)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    match crate::requests::list_pending(&resolved, &config.requests_endpoint).await {
+        Ok(requests) if requests.is_empty() => outcome(
+            &call.id,
+            "\u{1F4E8} requests \u{2014} none pending".to_string(),
+            "No pending change requests.".to_string(),
+        ),
+        Ok(requests) => {
+            let count = requests.len();
+            let json = serde_json::to_string_pretty(&requests).unwrap_or_default();
+            outcome(
+                &call.id,
+                format!(
+                    "\u{1F4E8} requests \u{2014} {count} pending",
+                ),
+                format!(
+                    "{json}\n\nCall {RESOLVE_CHANGE_REQUEST} with an id once you have acted on \
+                     it (or decided not to)."
+                ),
+            )
+        }
+        Err(e) => outcome(
+            &call.id,
+            format!("\u{1F4E8} requests {} \u{2014} failed", clip(&path, 40)),
+            format!("Error: {e}"),
+        ),
+    }
+}
+
+/// Mark one change request handled.
+async fn execute_resolve_change_request(
+    call: &ToolCall,
+    workspace: &Workspace,
+    config: &ToolsConfig,
+) -> ToolOutcome {
+    let Some(Action::ResolveChangeRequest { path, id }) = describe_action(call) else {
+        return outcome(
+            &call.id,
+            "\u{1F4E8} requests \u{2014} unusable arguments".to_string(),
+            format!("Error: {RESOLVE_CHANGE_REQUEST} needs a `path` and an `id`."),
+        );
+    };
+    let resolved = match resolve_in_workspace(workspace, &path) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("\u{1F4E8} requests {} \u{2014} refused", clip(&path, 40)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    match crate::requests::resolve(&resolved, &config.requests_endpoint, &id).await {
+        Ok(()) => outcome(
+            &call.id,
+            format!("\u{1F4E8} requests \u{2014} #{id} resolved"),
+            format!("Request {id} marked resolved."),
+        ),
+        Err(e) => outcome(
+            &call.id,
+            format!("\u{1F4E8} requests {} \u{2014} failed", clip(&path, 40)),
             format!("Error: {e}"),
         ),
     }
@@ -4119,6 +4307,8 @@ mod tests {
                 PUBLISH_ARTIFACT,
                 DB_QUERY,
                 ENABLE_AUTH,
+                LIST_CHANGE_REQUESTS,
+                RESOLVE_CHANGE_REQUEST,
                 WEB_SEARCH,
                 DEPLOY_PROJECT
             ]
@@ -4145,6 +4335,49 @@ mod tests {
     #[test]
     fn db_query_with_no_sql_does_not_parse() {
         let call = tool_call(DB_QUERY, json!({ "path": "dist", "sql": "" }));
+        assert!(describe_action(&call).is_none());
+    }
+
+    // ---- list_change_requests / resolve_change_request ---------------------
+
+    #[test]
+    fn list_change_requests_parses_into_an_action_and_is_normal_risk() {
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "dist" }));
+        let action = describe_action(&call).expect("should parse");
+        assert_eq!(action, Action::ListChangeRequests { path: "dist".to_string() });
+
+        // Same reasoning as db_query: a private call to boxcode's own
+        // control-plane, never the public internet by itself.
+        let risk = action_risk(&action, Path::new("/tmp"));
+        assert!(matches!(risk, danger::Risk::Normal), "{risk:?}");
+
+        assert!(plan_mode_block(&action).is_some(), "plan mode must not check the mailbox");
+    }
+
+    #[test]
+    fn list_change_requests_with_no_path_does_not_parse() {
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "" }));
+        assert!(describe_action(&call).is_none());
+    }
+
+    #[test]
+    fn resolve_change_request_parses_into_an_action_and_is_normal_risk() {
+        let call = tool_call(RESOLVE_CHANGE_REQUEST, json!({ "path": "dist", "id": "abc123" }));
+        let action = describe_action(&call).expect("should parse");
+        assert_eq!(
+            action,
+            Action::ResolveChangeRequest { path: "dist".to_string(), id: "abc123".to_string() }
+        );
+
+        let risk = action_risk(&action, Path::new("/tmp"));
+        assert!(matches!(risk, danger::Risk::Normal), "{risk:?}");
+
+        assert!(plan_mode_block(&action).is_some(), "plan mode must not resolve anything");
+    }
+
+    #[test]
+    fn resolve_change_request_with_no_id_does_not_parse() {
+        let call = tool_call(RESOLVE_CHANGE_REQUEST, json!({ "path": "dist", "id": "" }));
         assert!(describe_action(&call).is_none());
     }
 
