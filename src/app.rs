@@ -1708,7 +1708,12 @@ impl App {
                 Some(tools::Action::Read { .. })
                 | Some(tools::Action::List { .. })
                 | Some(tools::Action::Glob { .. })
-                | Some(tools::Action::Grep { .. }) => return false,
+                | Some(tools::Action::Grep { .. })
+                // Neither touches a file or the network: a static embedded
+                // stylesheet and arithmetic on hex strings the model already
+                // sent. Even less to protect against than a read.
+                | Some(tools::Action::DesignStarter)
+                | Some(tools::Action::CheckContrast { .. }) => return false,
                 Some(tools::Action::Command { command, .. }) if tools::is_read_only(&command) => {
                     return false;
                 }

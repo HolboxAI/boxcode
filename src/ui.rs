@@ -1270,6 +1270,21 @@ fn tool_approval_parts(
             )));
             (" Search the web? ", "search", "skip")
         }
+        // Neither of these two is ever actually offered a prompt to render --
+        // `needs_approval` auto-approves both unconditionally (they touch no
+        // file and no network) -- but the match still has to be exhaustive,
+        // same reasoning `plan_mode_block`'s own comment gives for the same
+        // situation: a catch-all arm here would silently cover whatever
+        // writing tool gets added next, which is exactly the mistake this
+        // exhaustiveness exists to catch.
+        Action::DesignStarter => (" Fetch the design starter? ", "fetch", "skip"),
+        Action::CheckContrast { pairs } => {
+            lines.push(Line::from(Span::styled(
+                format!("{} pair{}", pairs.len(), if pairs.len() == 1 { "" } else { "s" }),
+                theme::faint(),
+            )));
+            (" Check contrast? ", "check", "skip")
+        }
         // The plan is shown in full, never capped the way a file preview is.
         // A file preview elides the tail because the file is not the decision
         // -- "write this path" is. Here the text *is* the decision, and the
