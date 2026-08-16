@@ -4,6 +4,7 @@ mod approval;
 mod artifacts;
 mod auth;
 mod config;
+mod contrast;
 mod danger;
 mod dateutil;
 mod db;

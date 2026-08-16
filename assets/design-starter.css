@@ -1,0 +1,236 @@
+/*
+  boxcode design starter -- a restrained token system + a handful of
+  accessible components, meant to be copied into a new project and then
+  DELIBERATELY CHANGED, not shipped as-is.
+
+  Before publishing anything built from this file:
+  1. Replace --accent (and --accent-hover) with a color grounded in the
+     actual subject -- a cafe and a bookstore should not end up with the
+     same accent. Check the result with the check_contrast tool against
+     both --surface and --surface-raised, in both light and dark.
+  2. Replace --font-display and --font-body with a real pairing chosen for
+     this subject, not left as the system-font fallback below. The system
+     stack here is an honest, fast default -- it is not "the boxcode font."
+  3. Do not reintroduce what this file was written to avoid: a
+     purple-to-blue gradient hero, Inter/Space Grotesk left as the final
+     choice, emoji as section markers, everything centered, rounded-lg on
+     every element, or an accent bar on rounded cards. If the finished page
+     could be mistaken for any other boxcode project, the first two steps
+     above were skipped.
+
+  Structure: :root carries the full light palette (the default any browser
+  without an explicit preference sees); the dark media query below
+  redefines only the color tokens. Everything else -- type scale, spacing,
+  components -- reads from these tokens and never hardcodes a color, so
+  changing the seven color variables re-themes the whole page.
+*/
+
+:root {
+  /* ---- color: light (default) ---- */
+  /* A slate neutral with a slight cool bias, not a flat mid-grey -- chosen,
+     not inherited. Compatible with most accent hues; shift it warmer if the
+     final accent is warm (see step 1 above). */
+  --surface: #fafafb;
+  --surface-raised: #ffffff;
+  --border: #e4e4e9;
+  --text: #1c1c22;
+  --text-muted: #6b6b76;
+
+  /* PLACEHOLDER -- see step 1 above. This exact blue must not survive to a
+     published page. Checked with check_contrast: 5.93:1 against white,
+     clearing AA normal-text (4.5:1), not just large-text -- a replacement
+     accent should clear the same bar against --accent-contrast. */
+  --accent: #3d54e0;
+  --accent-hover: #2f47c9;
+  --accent-contrast: #ffffff;
+
+  /* Semantic color is separate from --accent and never doubles as it. */
+  --success: #1a7d4f;
+  --warning: #a15c00;
+  --danger: #b3261e;
+
+  /* ---- type ---- */
+  /* Honest system-stack defaults -- fast, native-feeling, and specifically
+     not a webfont "safe choice." Replace both before anything editorial
+     ships (step 2 above); a utilitarian page (a form, a dashboard) can
+     reasonably keep this stack as-is. */
+  --font-display: -apple-system, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  --font-body: -apple-system, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+
+  /* A 1.25 (major third) modular scale, rem-based so it respects the
+     visitor's own font-size setting. */
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.563rem;
+  --text-2xl: 1.953rem;
+  --text-3xl: 2.441rem;
+  --text-4xl: 3.052rem;
+
+  /* ---- spacing: 4px base unit ---- */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+
+  /* Moderate, not maximalist -- deliberately short of the rounded-lg/rounded-pill
+     look. Sharpen toward 2px for a more serious/editorial subject, or open it
+     up for a playful one; the point is that this was picked, not defaulted. */
+  --radius: 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #121216;
+    --surface-raised: #1b1b21;
+    --border: #303038;
+    --text: #f2f2f5;
+    --text-muted: #9a9aa6;
+
+    --accent: #7d94ff;
+    --accent-hover: #94a7ff;
+    --accent-contrast: #0c0c10;
+
+    --success: #3fbd82;
+    --warning: #e0a138;
+    --danger: #f0685f;
+  }
+}
+
+/* ---- base ---- */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4 {
+  font-family: var(--font-display);
+  line-height: 1.15;
+  margin: 0 0 var(--space-4);
+  text-wrap: balance;
+}
+
+h1 { font-size: var(--text-4xl); }
+h2 { font-size: var(--text-3xl); }
+h3 { font-size: var(--text-2xl); }
+h4 { font-size: var(--text-xl); }
+
+p {
+  margin: 0 0 var(--space-4);
+  /* ~65 characters at this size and font; narrower reads as considered,
+     wider starts to fight readability regardless of how good the type is. */
+  max-width: 65ch;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ---- button ---- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.btn-secondary:hover {
+  border-color: var(--text-muted);
+}
+
+/* ---- card ---- */
+
+.card {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-6);
+  /* A soft, close shadow, not a heavy drop shadow -- the border already
+     does most of the separation work. */
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+/* ---- form input ---- */
+
+.input {
+  display: block;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+}
+
+.input::placeholder {
+  color: var(--text-muted);
+}
+
+.input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+
+/* ---- utility ---- */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}

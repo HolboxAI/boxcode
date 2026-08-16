@@ -56,6 +56,8 @@ pub const LIST_DIR: &str = "list_dir";
 pub const GLOB: &str = "glob";
 pub const GREP_SEARCH: &str = "grep_search";
 pub const EDIT_FILE: &str = "edit_file";
+pub const GET_DESIGN_STARTER: &str = "get_design_starter";
+pub const CHECK_CONTRAST: &str = "check_contrast";
 pub const WEB_SEARCH: &str = "web_search";
 pub const DEPLOY_PROJECT: &str = "deploy_project";
 pub const PUBLISH_ARTIFACT: &str = "publish_artifact";
@@ -399,6 +401,68 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> 
                         }
                     },
                     "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": GET_DESIGN_STARTER,
+                "description": "Returns a restrained, accessible starting-point stylesheet (color \
+                                tokens for both light and dark, a modular type scale, spacing \
+                                scale, and a few components: button, card, input) -- write it into \
+                                the project with write_file, then edit it before shipping: replace \
+                                --accent and --font-display/--font-body with choices grounded in \
+                                this project's actual subject, never leave the placeholders in a \
+                                published page. Use this once per project, early -- before writing \
+                                page HTML, not after -- so every page in the project reads colors \
+                                and type from the same file instead of each one inventing its own. \
+                                Check any accent you choose with check_contrast before publishing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": CHECK_CONTRAST,
+                "description": "Computes the real WCAG contrast ratio for one or more foreground/ \
+                                background color pairs and reports whether each passes AA for \
+                                normal text (4.5:1) and large text (3:1). You have no way to look \
+                                at a page you write, so this is the one part of 'does this look \
+                                right' that can actually be checked instead of assumed -- use it \
+                                on every text/background token pairing in a project's palette \
+                                (get_design_starter's output or your own), in both light and dark, \
+                                before publishing. A failing pair is not a judgment call to argue \
+                                with: darken or lighten one side and check again.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pairs": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {
+                                        "type": "string",
+                                        "description": "What this pair is, e.g. \"body text on surface, dark mode\"."
+                                    },
+                                    "foreground": {
+                                        "type": "string",
+                                        "description": "Hex color, e.g. \"#1c1c22\" or \"#fff\"."
+                                    },
+                                    "background": {
+                                        "type": "string",
+                                        "description": "Hex color."
+                                    }
+                                },
+                                "required": ["label", "foreground", "background"]
+                            }
+                        }
+                    },
+                    "required": ["pairs"]
                 }
             }
         }),
@@ -869,7 +933,13 @@ pub fn system_prompt(
            Needs Python 3 + the `ddgs` package on the user's machine -- if that's missing you'll \
            get a clear error instead of results; tell the user plainly rather than retrying.\n\
          - {DEPLOY_PROJECT}(provider, production): deploy this project to Vercel or Netlify and \
-           get back the live URL.\n\n\
+           get back the live URL.\n\
+         - {GET_DESIGN_STARTER}(): a restrained starting-point stylesheet (tokens for both \
+           light and dark, type scale, spacing scale, a few components) to write into a new \
+           project and then deliberately change, not ship as-is.\n\
+         - {CHECK_CONTRAST}(pairs): the real WCAG contrast ratio for foreground/background hex \
+           pairs. You cannot see the page you write, so this is the one part of \"does this \
+           read clearly\" that is arithmetic instead of a guess.\n\n\
          Rules:\n\
          - {os_hint}\n\
          - Narrate in plain sentences, not just tool calls. Before acting, say in one short \
@@ -934,6 +1004,18 @@ pub fn system_prompt(
          - If output comes back truncated, narrow the query -- more `--jq`, fewer fields, a \
            smaller `--limit` -- and run it again. Do not extrapolate from a partial result or \
            present it as the whole.\n\
+         - When building a UI from scratch, establish {GET_DESIGN_STARTER}'s tokens file first, \
+           before writing page HTML -- every later page reads colors and type from that one \
+           file instead of each inventing its own. Then change it: ground the accent and \
+           typefaces in this project's actual subject (a cafe and a bookstore should not end up \
+           with the same look), and do not default to a purple-to-blue gradient hero, Inter or \
+           Space Grotesk left as the final choice, emoji as section markers, everything \
+           centered, or rounded-lg on every element -- these are the tells of an unconsidered \
+           default, not a look someone chose. Check any resulting text/background pairing with \
+           {CHECK_CONTRAST} before publishing; you have no way to look at the result yourself, \
+           so this is the one part of the claim that is actually verified rather than assumed. \
+           A utilitarian page (a form, an internal tool) does not need this treatment -- \
+           calibrate to what was asked for, not every page into a landing page.\n\
          - {PUBLISH_ARTIFACT} is for when the user wants to LOOK at something: \"show me\", \
            \"let me see it\", \"how does it look\", \"preview\", \"open it\", \"share this\". \
            Only then, for a path never published before. Once a path HAS been published, an \
@@ -1222,6 +1304,12 @@ pub enum Action {
     /// one file into one approval.
     Edit { path: String, edits: Vec<EditSpan> },
     Search { query: String, max_results: u32 },
+    /// Read-only, like `Read`: returns a static embedded stylesheet, touches
+    /// no file and no network.
+    DesignStarter,
+    /// Read-only, like `Read`: pure arithmetic on the hex strings the model
+    /// already sent, touches no file and no network.
+    CheckContrast { pairs: Vec<(String, String, String)> },
     /// Uploads static files to a temporary public URL so the user can look at
     /// them. Always approved, for the same reason `Deploy` is: it publishes.
     Publish { path: String },
@@ -1304,6 +1392,12 @@ impl Action {
             },
             Action::Edit { path, .. } => format!("✏️ edit {path}"),
             Action::Search { query, .. } => format!("🔎 search \"{query}\""),
+            Action::DesignStarter => "🎨 design starter".to_string(),
+            Action::CheckContrast { pairs } => format!(
+                "🎨 contrast — {} pair{}",
+                pairs.len(),
+                if pairs.len() == 1 { "" } else { "s" }
+            ),
             Action::Deploy { provider, production, .. } => format!(
                 "🚀 deploy → {provider} ({})",
                 if *production { "Production" } else { "Preview" }
@@ -1374,6 +1468,8 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
         | Action::Glob { .. }
         | Action::Grep { .. }
         | Action::Search { .. }
+        | Action::DesignStarter
+        | Action::CheckContrast { .. }
         | Action::Plan(_)
         // Cannot arise in plan mode -- there is no approved plan to record
         // against -- but listing it keeps this match exhaustive by intent
@@ -1558,6 +1654,29 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
                 .unwrap_or(DEFAULT_SEARCH_RESULTS)
                 .clamp(MIN_SEARCH_RESULTS, MAX_SEARCH_RESULTS);
             Some(Action::Search { query, max_results })
+        }
+        GET_DESIGN_STARTER => Some(Action::DesignStarter),
+        CHECK_CONTRAST => {
+            #[derive(serde::Deserialize)]
+            struct Pair {
+                label: String,
+                foreground: String,
+                background: String,
+            }
+            #[derive(serde::Deserialize)]
+            struct Args {
+                pairs: Vec<Pair>,
+            }
+            let args: Args = serde_json::from_str(&call.function.arguments).ok()?;
+            if args.pairs.is_empty() {
+                return None;
+            }
+            let pairs = args
+                .pairs
+                .into_iter()
+                .map(|p| (p.label, p.foreground, p.background))
+                .collect();
+            Some(Action::CheckContrast { pairs })
         }
         DEPLOY_PROJECT => {
             let args: DeployArgs = serde_json::from_str(&call.function.arguments).ok()?;
@@ -1823,6 +1942,8 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         GLOB => execute_glob(call, workspace),
         GREP_SEARCH => execute_grep_search(call, workspace),
         EDIT_FILE => execute_edit_file(call, workspace),
+        GET_DESIGN_STARTER => execute_get_design_starter(call),
+        CHECK_CONTRAST => execute_check_contrast(call),
         WEB_SEARCH => execute_web_search(call, config).await,
         DEPLOY_PROJECT => execute_deploy_project(call, workspace).await,
         PUBLISH_ARTIFACT => execute_publish_artifact(call, workspace, config).await,
@@ -2214,6 +2335,89 @@ fn web_search_command(python_bin: &std::ffi::OsStr, query: &str, max_results: u3
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     cmd
+}
+
+/// Embedded at compile time, not read from disk at runtime -- the same
+/// stance as everything else this binary ships with, no install-time asset
+/// to go missing. See the file's own header for what it is and, more
+/// importantly, what must change before it ships on a real page.
+const DESIGN_STARTER_CSS: &str = include_str!("../assets/design-starter.css");
+
+fn execute_get_design_starter(call: &ToolCall) -> ToolOutcome {
+    outcome(
+        &call.id,
+        "🎨 design starter".to_string(),
+        format!(
+            "{DESIGN_STARTER_CSS}\n\nWrite this into the project (design-tokens.css or similar), \
+             then replace --accent, --accent-hover, --font-display and --font-body before \
+             publishing anything meant to feel distinctive -- the file's own header explains why. \
+             Check any accent you land on with check_contrast against both --surface and \
+             --surface-raised, in both light and dark."
+        ),
+    )
+}
+
+fn execute_check_contrast(call: &ToolCall) -> ToolOutcome {
+    #[derive(serde::Deserialize)]
+    struct Pair {
+        label: String,
+        foreground: String,
+        background: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Args {
+        pairs: Vec<Pair>,
+    }
+    let Ok(args) = serde_json::from_str::<Args>(&call.function.arguments) else {
+        return outcome(
+            &call.id,
+            "🎨 contrast — unusable arguments".to_string(),
+            format!(
+                r##"Error: could not read the arguments. Expected {{"pairs": [{{"label": "...", \
+                 "foreground": "#000", "background": "#fff"}}]}}, got: {}"##,
+                clip(&call.function.arguments, 200)
+            ),
+        );
+    };
+    if args.pairs.is_empty() {
+        return outcome(
+            &call.id,
+            "🎨 contrast — no pairs".to_string(),
+            "Error: pairs must not be empty.".to_string(),
+        );
+    }
+
+    let mut lines = Vec::new();
+    let mut any_failed = false;
+    for pair in &args.pairs {
+        match crate::contrast::check(&pair.label, &pair.foreground, &pair.background) {
+            Ok(result) => {
+                let verdict = if result.passes_normal_text {
+                    "PASS (normal text)"
+                } else if result.passes_large_text {
+                    "fails normal text, PASS (large text only)"
+                } else {
+                    any_failed = true;
+                    "FAIL"
+                };
+                lines.push(format!(
+                    "{} ({} on {}): {:.2}:1 -- {verdict}",
+                    pair.label, pair.foreground, pair.background, result.ratio
+                ));
+            }
+            Err(e) => {
+                any_failed = true;
+                lines.push(format!("{}: {e}", pair.label));
+            }
+        }
+    }
+    let summary = format!(
+        "🎨 contrast — {} pair{}{}",
+        args.pairs.len(),
+        if args.pairs.len() == 1 { "" } else { "s" },
+        if any_failed { ", 1+ failing" } else { ", all pass" }
+    );
+    outcome(&call.id, summary, lines.join("\n"))
 }
 
 async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcome {
@@ -4465,6 +4669,8 @@ mod tests {
                 GLOB,
                 GREP_SEARCH,
                 EDIT_FILE,
+                GET_DESIGN_STARTER,
+                CHECK_CONTRAST,
                 PUBLISH_ARTIFACT,
                 DB_QUERY,
                 ENABLE_AUTH,
@@ -4474,6 +4680,81 @@ mod tests {
                 DEPLOY_PROJECT
             ]
         );
+    }
+
+    // ---- get_design_starter / check_contrast ------------------------------
+
+    /// The starter has to actually contain what its own tool description and
+    /// header promise -- both themes defined, the placeholder marked as a
+    /// placeholder -- or the tool is handing out something that contradicts
+    /// what it tells the model to do with it.
+    #[test]
+    fn design_starter_defines_both_themes_and_marks_its_placeholder() {
+        let call = tool_call(GET_DESIGN_STARTER, json!({}));
+        let out = execute_get_design_starter(&call);
+        assert!(out.content.contains(":root"), "{}", out.content);
+        assert!(
+            out.content.contains("prefers-color-scheme: dark"),
+            "only one theme defined: {}",
+            out.content
+        );
+        assert!(out.content.contains("PLACEHOLDER"), "{}", out.content);
+        // The guidance telling the model to replace it travels with the CSS,
+        // not left implicit for the model to infer.
+        assert!(out.content.contains("--accent"), "{}", out.content);
+    }
+
+    #[test]
+    fn check_contrast_reports_pass_and_fail_correctly() {
+        let call = tool_call(
+            CHECK_CONTRAST,
+            json!({
+                "pairs": [
+                    { "label": "black on white", "foreground": "#000000", "background": "#ffffff" },
+                    { "label": "light grey on white", "foreground": "#dddddd", "background": "#ffffff" }
+                ]
+            }),
+        );
+        let out = execute_check_contrast(&call);
+        assert!(out.content.contains("black on white"), "{}", out.content);
+        assert!(out.content.contains("PASS"), "{}", out.content);
+        assert!(out.content.contains("FAIL"), "{}", out.content);
+        assert!(out.display.contains("1+ failing"), "{}", out.display);
+    }
+
+    #[test]
+    fn check_contrast_names_which_pair_had_a_bad_hex_value() {
+        let call = tool_call(
+            CHECK_CONTRAST,
+            json!({ "pairs": [{ "label": "oops", "foreground": "#000", "background": "nope" }] }),
+        );
+        let out = execute_check_contrast(&call);
+        assert!(out.content.contains("oops"), "{}", out.content);
+        assert!(out.content.contains("background:"), "{}", out.content);
+    }
+
+    #[test]
+    fn check_contrast_refuses_an_empty_pair_list() {
+        let call = tool_call(CHECK_CONTRAST, json!({ "pairs": [] }));
+        let out = execute_check_contrast(&call);
+        assert!(out.content.contains("Error"), "{}", out.content);
+    }
+
+    /// Both tools touch no file and no network, so neither should ever
+    /// interrupt the flow with an approval prompt -- same reasoning already
+    /// established for Read/List/Glob/Grep.
+    #[test]
+    fn both_new_tools_are_read_only_actions() {
+        let starter = describe_action(&tool_call(GET_DESIGN_STARTER, json!({})))
+            .expect("should parse");
+        assert!(matches!(starter, Action::DesignStarter));
+
+        let contrast = describe_action(&tool_call(
+            CHECK_CONTRAST,
+            json!({ "pairs": [{ "label": "x", "foreground": "#000", "background": "#fff" }] }),
+        ))
+        .expect("should parse");
+        assert!(matches!(contrast, Action::CheckContrast { .. }));
     }
 
     // ---- db_query --------------------------------------------------------
