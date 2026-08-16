@@ -476,10 +476,18 @@ pub fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         theme::muted(),
     ));
     if !app.workspace_status.is_empty() {
-        let alarming = app.workspace_status.contains("UNATTENDED");
+        // A workspace that failed to open at all ("off") gets the same
+        // treatment as UNATTENDED, not the milder "broad" warning: every
+        // file tool has nothing to resolve against for the entire
+        // session, which is a worse state than a working-but-wide
+        // directory, and a single warning-coloured line at startup was
+        // easy to read past -- confirmed live, a real /pull session ran
+        // for several turns in this state before anyone noticed.
+        let workspace_failed = app.workspace_status.starts_with("off");
+        let alarming = app.workspace_status.contains("UNATTENDED") || workspace_failed;
         let colour = if alarming {
             theme::p().danger
-        } else if app.workspace_status.starts_with("off") || app.workspace_status.contains("broad") {
+        } else if app.workspace_status.contains("broad") {
             theme::p().warning
         } else {
             theme::p().muted
