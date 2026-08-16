@@ -55,7 +55,18 @@ pub fn fire_request(
         _ if app.compacting => (Vec::new(), None),
         Some(ws) => (
             if budget_left {
-                tools::schemas(app.mode, app.active_plan.is_some(), app.config.deploy.enabled)
+                // Whether anything in this workspace has ever been
+                // published, not just this session -- reads the same
+                // on-disk registry `/pull`'s picker does, so a resumed or
+                // relaunched session picks the four gated tools back up
+                // immediately rather than waiting for a fresh
+                // publish_artifact call. `any_published_under`, not
+                // `remembered_id`: a project published as a single file
+                // registers under that file's own path, never equal to
+                // (only nested under) the directory `Workspace::new`
+                // resolves it to.
+                let published = crate::artifacts::any_published_under(ws.root());
+                tools::schemas(app.mode, app.active_plan.is_some(), app.config.deploy.enabled, published)
             } else {
                 Vec::new()
             },
