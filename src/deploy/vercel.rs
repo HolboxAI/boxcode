@@ -52,9 +52,9 @@ impl VercelProvider {
     }
 
     /// Environment variables the user configured, for builds that run locally.
-    /// See the note in `README.md`: Vercel builds remotely by default, so
-    /// these reach the build only for a prebuilt/local build, and persistent
-    /// runtime values belong in the project's own settings.
+    /// See the note in `docs/deploying.md`: Vercel builds remotely by
+    /// default, so these reach the build only for a prebuilt/local build,
+    /// and persistent runtime values belong in the project's own settings.
     fn build_env(plan: &DeployPlan) -> Vec<(String, Secret)> {
         plan.env
             .iter()
