@@ -1,0 +1,27 @@
+[Unit]
+Description=boxcode uploads control-plane
+After=network.target
+
+[Service]
+# System node is fine here -- same reasoning as the requests control-plane:
+# nothing in this service needs node:sqlite or any other recent-Node
+# feature, just node:http/node:crypto, both long-standing.
+ExecStart=/usr/bin/node /opt/boxcode-uploads/control-plane/index.mjs
+Restart=on-failure
+RestartSec=2
+Environment=PORT=8083
+Environment=AUTH_BASE=https://auth.boxcode.sh
+Environment=BUCKET=boxcode-artifacts
+Environment=REGION=us-east-1
+Environment=PUBLIC_BASE=https://boxcode.sh
+# Root only for consistency with the other control-planes on this box, not
+# because this one needs it -- it touches no local filesystem state at all
+# (no registry, no data directory), only IMDS and outbound HTTPS. Signing
+# credentials come from the instance's own IAM role (see
+# infra/uploads/README.md), which is scoped to `s3:PutObject` under
+# `boxcode-artifacts/uploads/*` alone -- nothing else in the bucket, and no
+# read access even to that prefix.
+User=root
+
+[Install]
+WantedBy=multi-user.target
