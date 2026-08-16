@@ -175,7 +175,24 @@ pub fn shell() -> (&'static str, &'static str) {
 /// `deploy` is the same idea for `[deploy] enabled = false`: a schema the
 /// model can see is one it will eventually call, and answering "that is turned
 /// off" afterwards is a worse experience than never offering it.
-pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
+///
+/// `published` extends that same idea to db_query/enable_auth/
+/// list_change_requests/resolve_change_request: all four already require, in
+/// their own descriptions, that the workspace has been published with
+/// publish_artifact first -- calling any of them before that is a hard error,
+/// never a legitimate use. That was a precondition enforced only after a
+/// call, not a reason not to offer the call, even though the caller (see
+/// `agent.rs`'s `artifacts::remembered_id` check) already knows the answer
+/// for free before ever sending the request. Fifteen tools measurably
+/// degrades tool-selection accuracy in a model's own attention over the
+/// schema list (research on tool-schema bloat, cited where this landed);
+/// withholding four the model structurally cannot use yet, for the common
+/// case of a session before its first publish, is not just tidiness -- it
+/// moves that case out of the range where the degradation research applies.
+/// Once a publish succeeds, all fifteen return for the rest of that
+/// workspace's life; this narrows the exposure window, it does not remove
+/// the underlying tradeoff.
+pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> Vec<Value> {
     let (shell_name, shell_flag) = shell();
     let mut schemas = vec![
         json!({
@@ -658,6 +675,15 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
 
     if !deploy {
         schemas.retain(|schema| schema["function"]["name"] != DEPLOY_PROJECT);
+    }
+    if !published {
+        schemas.retain(|schema| {
+            let name = schema["function"]["name"].as_str().unwrap_or_default();
+            name != DB_QUERY
+                && name != ENABLE_AUTH
+                && name != LIST_CHANGE_REQUESTS
+                && name != RESOLVE_CHANGE_REQUEST
+        });
     }
     if mode.is_plan() {
         schemas.retain(|schema| {
@@ -3649,7 +3675,7 @@ mod tests {
     #[test]
     fn grep_is_allowed_in_plan_mode_and_offered_to_the_model() {
         assert!(plan_mode_block(&Action::Grep { pattern: "x".into(), path: None }).is_none());
-        let names: Vec<String> = schemas(Mode::Plan, false, true)
+        let names: Vec<String> = schemas(Mode::Plan, false, true, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
             .collect();
@@ -4345,14 +4371,14 @@ mod tests {
     /// turned off" is a worse experience than never offering it.
     #[test]
     fn disabling_deployment_withholds_the_schema_entirely() {
-        let names: Vec<String> = schemas(Mode::Normal, false, false)
+        let names: Vec<String> = schemas(Mode::Normal, false, false, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
             .collect();
         assert!(!names.iter().any(|n| n == DEPLOY_PROJECT), "{names:?}");
         // ...and the rest are untouched.
         assert!(names.iter().any(|n| n == RUN_COMMAND), "{names:?}");
-        assert_eq!(names.len(), schemas(Mode::Normal, false, true).len() - 1);
+        assert_eq!(names.len(), schemas(Mode::Normal, false, true, true).len() - 1);
     }
 
     /// The two gates are independent and must compose: plan mode withholds
@@ -4362,7 +4388,7 @@ mod tests {
     #[test]
     fn the_deploy_gates_compose() {
         let has_deploy = |mode, deploy| {
-            schemas(mode, false, deploy)
+            schemas(mode, false, deploy, true)
                 .iter()
                 .any(|s| s["function"]["name"] == DEPLOY_PROJECT)
         };
@@ -4372,9 +4398,62 @@ mod tests {
         assert!(!has_deploy(Mode::Plan, false), "both at once");
     }
 
+    /// db_query/enable_auth/list_change_requests/resolve_change_request all
+    /// require a prior publish_artifact by their own description -- calling
+    /// any of them first is a hard error, never legitimate. Withholding all
+    /// four until `published` is known true keeps a session's common early
+    /// phase (before its first publish) out of the tool-count range where
+    /// selection accuracy measurably degrades, the same reasoning
+    /// `disabling_deployment_withholds_the_schema_entirely` already
+    /// established for a single tool.
+    #[test]
+    fn an_unpublished_workspace_withholds_the_four_publish_gated_tools() {
+        let names: Vec<String> = schemas(Mode::Normal, false, true, false)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == DB_QUERY), "{names:?}");
+        assert!(!names.iter().any(|n| n == ENABLE_AUTH), "{names:?}");
+        assert!(!names.iter().any(|n| n == LIST_CHANGE_REQUESTS), "{names:?}");
+        assert!(!names.iter().any(|n| n == RESOLVE_CHANGE_REQUEST), "{names:?}");
+        // ...and the rest are untouched.
+        assert!(names.iter().any(|n| n == RUN_COMMAND), "{names:?}");
+        assert!(names.iter().any(|n| n == PUBLISH_ARTIFACT), "{names:?}");
+        assert_eq!(names.len(), schemas(Mode::Normal, false, true, true).len() - 4);
+    }
+
+    /// Once a workspace has been published, all four return -- this is a
+    /// gate on precondition, not a permanent restriction.
+    #[test]
+    fn a_published_workspace_offers_all_four() {
+        let names: Vec<String> = schemas(Mode::Normal, false, true, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == DB_QUERY), "{names:?}");
+        assert!(names.iter().any(|n| n == ENABLE_AUTH), "{names:?}");
+        assert!(names.iter().any(|n| n == LIST_CHANGE_REQUESTS), "{names:?}");
+        assert!(names.iter().any(|n| n == RESOLVE_CHANGE_REQUEST), "{names:?}");
+    }
+
+    /// The publish gate and the deploy gate are independent and must
+    /// compose, same reasoning as `the_deploy_gates_compose`.
+    #[test]
+    fn the_publish_gate_composes_with_the_deploy_gate() {
+        let has_db_query = |deploy, published| {
+            schemas(Mode::Normal, false, deploy, published)
+                .iter()
+                .any(|s| s["function"]["name"] == DB_QUERY)
+        };
+        assert!(has_db_query(true, true), "the ordinary case offers it");
+        assert!(!has_db_query(true, false), "unpublished withholds it");
+        assert!(!has_db_query(false, false), "both at once");
+        assert!(has_db_query(false, true), "deploy being off does not touch this gate");
+    }
+
     #[test]
     fn the_schemas_name_exactly_the_tools_that_execute() {
-        let schemas = schemas(Mode::Normal, false, true);
+        let schemas = schemas(Mode::Normal, false, true, true);
         let names: Vec<_> = schemas.iter().map(|s| s["function"]["name"].clone()).collect();
         assert_eq!(
             names,
@@ -4595,7 +4674,7 @@ mod tests {
     /// `/deploy`, where the user types them into a masked field.
     #[test]
     fn the_deploy_schema_gives_the_model_no_way_to_pass_a_secret() {
-        let schema = schemas(Mode::Normal, false, true)
+        let schema = schemas(Mode::Normal, false, true, true)
             .into_iter()
             .find(|s| s["function"]["name"] == DEPLOY_PROJECT)
             .expect("the deploy schema");
@@ -4623,7 +4702,7 @@ mod tests {
     /// no prompt to mistakenly accept.
     #[test]
     fn plan_mode_withholds_the_writing_tools_and_offers_the_way_out() {
-        let names: Vec<String> = schemas(Mode::Plan, false, true)
+        let names: Vec<String> = schemas(Mode::Plan, false, true, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect();
@@ -4646,7 +4725,7 @@ mod tests {
     /// reversible thing this program does.
     #[test]
     fn plan_mode_withholds_and_refuses_deployment() {
-        let names: Vec<String> = schemas(Mode::Plan, false, true)
+        let names: Vec<String> = schemas(Mode::Plan, false, true, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect();
@@ -4667,7 +4746,7 @@ mod tests {
     /// nobody asked to approve.
     #[test]
     fn normal_mode_does_not_offer_exit_plan_mode() {
-        let names: Vec<String> = schemas(Mode::Normal, false, true)
+        let names: Vec<String> = schemas(Mode::Normal, false, true, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect();
@@ -4778,13 +4857,13 @@ mod tests {
     /// `plan_progress` is only offered when there is a plan to record against.
     #[test]
     fn plan_progress_is_offered_only_alongside_an_active_plan() {
-        let without: Vec<String> = schemas(Mode::Normal, false, true)
+        let without: Vec<String> = schemas(Mode::Normal, false, true, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect();
         assert!(!without.contains(&PLAN_PROGRESS.to_string()), "{without:?}");
 
-        let with: Vec<String> = schemas(Mode::Normal, true, true)
+        let with: Vec<String> = schemas(Mode::Normal, true, true, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect();

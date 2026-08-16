@@ -248,6 +248,24 @@ pub(crate) fn remembered_id(path: &Path) -> Option<String> {
     load_registry().get(&key).map(|e| e.id.clone())
 }
 
+/// Whether anything at or under `root` has ever been published -- unlike
+/// `remembered_id`, not an exact-key lookup. `root` here is a *workspace*
+/// root (see `agent.rs`'s `schemas` call), and `Workspace::new` resolves a
+/// published single file to its containing project directory, not the file
+/// itself (see `workspace.rs`) -- so the registry key for a project
+/// published as one file (`project/todo.html`) is never equal to that
+/// project's own workspace root (`project/`), only nested under it. An
+/// exact match here would report "never published" for exactly the
+/// projects tonight's workspace-resolution fix exists to handle correctly.
+/// Deliberately not filtered by `EXPIRY_HOURS` like `all_local` is, same
+/// reasoning as `remembered_id`: an expired preview link does not make the
+/// tools that manage it stop being relevant to a workspace that has
+/// genuinely published from before.
+pub(crate) fn any_published_under(root: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else { return false };
+    load_registry().keys().any(|key| Path::new(key).starts_with(&root))
+}
+
 /// Projects this machine has published within the last `EXPIRY_HOURS` --
 /// path (already canonicalized, since that is how the registry keys it)
 /// paired with its artifact id, newest first. Bounded to the link's own
@@ -608,6 +626,48 @@ mod tests {
             // A later publish's id replaces the old one for this same path.
             remember(&target, "zzz98765");
             assert_eq!(remembered_id(&target).as_deref(), Some("zzz98765"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The case `remembered_id` alone gets wrong: a project published as a
+    /// single file registers under that file's path, never equal to the
+    /// directory `Workspace::new` resolves the same file to -- only nested
+    /// under it. `any_published_under` has to see through that.
+    #[test]
+    fn any_published_under_finds_a_file_published_inside_the_root() {
+        crate::config::test_support::with_isolated_home(|| {
+            let dir = temp("published-under");
+            let file = dir.join("todo.html");
+            write(&dir, "todo.html", "hi");
+
+            assert!(!any_published_under(&dir), "nothing published yet");
+
+            remember(&file, "hs3c6cb7");
+            assert!(any_published_under(&dir), "todo.html is published, root should see it");
+            assert!(any_published_under(&file), "the exact published path itself still counts");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// An unrelated sibling directory that merely shares a path prefix
+    /// (`.../boxcode-other`) must not be mistaken for a project nested
+    /// inside `.../boxcode` -- `Path::starts_with` is component-aware for
+    /// exactly this reason, confirmed here rather than assumed.
+    #[test]
+    fn any_published_under_does_not_match_a_sibling_with_a_shared_prefix() {
+        crate::config::test_support::with_isolated_home(|| {
+            let dir = temp("published-under-sibling");
+            std::fs::create_dir_all(&dir).unwrap();
+            let root = dir.join("boxcode");
+            let sibling = dir.join("boxcode-other");
+            std::fs::create_dir_all(&root).unwrap();
+            write(&sibling, "todo.html", "hi");
+
+            remember(&sibling.join("todo.html"), "zzz99999");
+            assert!(!any_published_under(&root), "boxcode-other is not under boxcode");
 
             let _ = std::fs::remove_dir_all(&dir);
         });
