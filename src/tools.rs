@@ -485,7 +485,17 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                                 with the same body to sign in and get back an access_token. Keep \
                                 that access_token around (e.g. localStorage) -- db_query accepts \
                                 it too, to scope a query to whoever is signed in without trusting \
-                                a user id the client merely claims. This \
+                                a user id the client merely claims. A signed-in visitor can also \
+                                upload an image: POST https://auth.boxcode.sh/uploads with \
+                                {\"project_id\",\"access_token\",\"content_type\",\"content_length\"} \
+                                (content_type must be image/png, image/jpeg, image/gif or \
+                                image/webp; content_length is the file's exact byte size, capped \
+                                at 5MB) returns {\"put_url\",\"public_url\"} -- PUT the file's \
+                                bytes to put_url with the identical Content-Type and Content-Length \
+                                headers and no others, then public_url is the permanent image URL \
+                                to use in the page (store it with db_query if it needs to be found \
+                                again later, e.g. against current_user_id). Uploading requires a \
+                                signed-in visitor; there is no anonymous upload path. This \
                                 tool does not write anything -- after calling it, add the actual \
                                 sign-up/sign-in form and the fetch calls to the project's HTML/JS \
                                 yourself with write_file/edit_file, then publish_artifact again \
