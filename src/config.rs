@@ -308,6 +308,11 @@ pub struct ToolsConfig {
     /// database. Same reasoning as `artifact_endpoint`/`auth_endpoint`.
     #[serde(default = "default_db_endpoint")]
     pub db_endpoint: String,
+    /// Where `list_change_requests`/`resolve_change_request` read and
+    /// consume the change-request mailbox for a project. Same reasoning as
+    /// `artifact_endpoint`/`auth_endpoint`/`db_endpoint`.
+    #[serde(default = "default_requests_endpoint")]
+    pub requests_endpoint: String,
 }
 
 fn yes() -> bool {
@@ -362,6 +367,11 @@ fn default_db_endpoint() -> String {
     "https://auth.boxcode.sh/db/query".to_string()
 }
 
+fn default_requests_endpoint() -> String {
+    // Same box, same vhost and cert as auth/db -- see infra/requests/README.md.
+    "https://auth.boxcode.sh/requests".to_string()
+}
+
 fn default_search_timeout() -> u64 {
     20
 }
@@ -381,6 +391,7 @@ impl Default for ToolsConfig {
             artifact_endpoint: default_artifact_endpoint(),
             auth_endpoint: default_auth_endpoint(),
             db_endpoint: default_db_endpoint(),
+            requests_endpoint: default_requests_endpoint(),
         }
     }
 }

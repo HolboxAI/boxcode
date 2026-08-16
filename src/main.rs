@@ -13,6 +13,7 @@ mod notice;
 mod plan;
 mod providers;
 mod quota;
+mod requests;
 mod session;
 mod telemetry;
 mod tools;
