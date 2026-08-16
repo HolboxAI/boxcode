@@ -221,6 +221,18 @@ pub(crate) fn remembered_id(path: &Path) -> Option<String> {
     load_registry().get(&key).cloned()
 }
 
+/// Every project this machine has ever published, path (already
+/// canonicalized, since that is how the registry keys it) paired with its
+/// artifact id -- sorted by path for a stable listing. Used by `/pull` (see
+/// `app.rs`) to let a developer switch to a different local project without
+/// needing to remember or retype its path; nothing here reaches the network
+/// or the control-plane, it only reads this machine's own registry file.
+pub(crate) fn all_local() -> Vec<(String, String)> {
+    let mut all: Vec<(String, String)> = load_registry().into_iter().collect();
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    all
+}
+
 /// A registry write is an amenity, not a correctness requirement: losing it
 /// just means the next publish of this path starts a new artifact instead of
 /// updating the old one, so every failure here is swallowed rather than
@@ -430,6 +442,36 @@ mod tests {
             // A later publish's id replaces the old one for this same path.
             remember(&target, "zzz98765");
             assert_eq!(remembered_id(&target).as_deref(), Some("zzz98765"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// `/pull`'s picker needs every locally published project, not just one
+    /// looked up by path -- and sorted, so the list on screen does not
+    /// reorder itself between runs for no reason a user could see.
+    #[test]
+    fn all_local_lists_every_published_project_sorted_by_path() {
+        crate::config::test_support::with_isolated_home(|| {
+            assert!(all_local().is_empty(), "nothing published yet");
+
+            let dir = temp("all-local");
+            let b = dir.join("b-project/index.html");
+            let a = dir.join("a-project/index.html");
+            write(&dir, "b-project/index.html", "hi");
+            write(&dir, "a-project/index.html", "hi");
+
+            remember(&b, "bproj123");
+            remember(&a, "aproj456");
+
+            let all = all_local();
+            assert_eq!(all.len(), 2);
+            // Sorted by (canonicalized) path, not insertion order -- "a-project"
+            // was remembered second but its path sorts first.
+            assert!(all[0].0.ends_with("a-project/index.html"), "{all:?}");
+            assert_eq!(all[0].1, "aproj456");
+            assert!(all[1].0.ends_with("b-project/index.html"), "{all:?}");
+            assert_eq!(all[1].1, "bproj123");
 
             let _ = std::fs::remove_dir_all(&dir);
         });

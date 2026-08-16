@@ -111,6 +111,16 @@ pub enum Overlay {
         model: String,
     },
     CustomEndpoint(CustomStep),
+    /// `/pull`. Every project this machine has published, (path, artifact id)
+    /// pairs from `artifacts::all_local` -- picking one sets
+    /// `pending_relaunch` rather than switching in place, since `Workspace`
+    /// is built once at startup and held for the process's whole life (see
+    /// `workspace.rs`); `main.rs` does the actual relaunch once this loop
+    /// exits.
+    ArtifactPicker {
+        items: Vec<(String, String)>,
+        selected: usize,
+    },
     /// Asks about `pending_tools.front()`. Unlike the other overlays this one
     /// appears while the app is busy, mid-turn.
     /// One `ApprovalRequest`, on screen. The popup renders the request's
@@ -146,6 +156,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "switch model"),
     ("/init", "write a BOXCODE.md the model reads every session"),
     ("/resume", "pick up this directory's last session"),
+    ("/pull", "switch to a different local project"),
     ("/new", "forget the current conversation"),
     ("/compact", "summarise the conversation to free up context"),
     ("/usage", "what today cost, and the history"),
@@ -387,6 +398,11 @@ pub struct App {
     /// The resolved working directory, shown on the approval prompt so it is
     /// always clear *where* a command is about to run.
     pub workspace_root: String,
+    /// Set by `/pull` when the user picks a different local project. `main`'s
+    /// loop exits on `should_exit` same as it always does; once it does, it
+    /// checks this and relaunches boxcode rooted there instead of just
+    /// quitting. `None` means an ordinary exit.
+    pub pending_relaunch: Option<std::path::PathBuf>,
     /// Prompts already sent this session, oldest first, for ↑/↓ recall.
     pub prompt_history: Vec<String>,
     /// Where ↑/↓ currently sit in `prompt_history`. `None` means "not
@@ -482,6 +498,7 @@ impl App {
             warned_today: false,
             quota_dirty: false,
             workspace_status: String::new(),
+            pending_relaunch: None,
             startup_notices: Vec::new(),
             workspace_root: String::new(),
             prompt_history: Vec::new(),
@@ -590,6 +607,7 @@ impl App {
                         "/model" => self.open_model_picker_from_config(),
                         "/init" => self.start_init(),
                         "/resume" => self.resume_latest(),
+                        "/pull" => self.open_pull_picker(),
                         "/new" => self.start_new_conversation(),
                         "/compact" => self.start_compaction(),
                         "/usage" => self.show_usage(),
@@ -2407,6 +2425,61 @@ impl App {
         self.overlay = Some(Overlay::ProviderPicker { selected: 0 });
     }
 
+    // ---- /pull -------------------------------------------------------
+
+    /// Lists every project this machine has published (`artifacts::all_local`
+    /// -- a plain read of `~/.boxcode/artifacts.json`, no network call) so the
+    /// user can switch to one that is not the directory this session started
+    /// in. Refused while busy, same reasoning as `/resume`: mid-turn is not a
+    /// moment to hand the workspace to a different project out from under it.
+    pub fn open_pull_picker(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        let items = crate::artifacts::all_local();
+        if items.is_empty() {
+            self.messages.push(Message::new(
+                Role::System,
+                "No published projects found on this machine yet. Publish something with \
+                 publish_artifact first -- /pull switches between projects you have already \
+                 published, it does not create one.",
+            ));
+            return;
+        }
+        self.overlay = Some(Overlay::ArtifactPicker { items, selected: 0 });
+    }
+
+    /// `Enter` on the picker does not switch anything itself -- see
+    /// `Overlay::ArtifactPicker`'s doc comment for why this only records the
+    /// choice and asks the loop to exit, leaving the actual relaunch to
+    /// `main.rs` once the terminal is no longer in raw/alternate-screen mode.
+    fn handle_artifact_picker_key(&mut self, key: KeyEvent, items: Vec<(String, String)>, selected: usize) {
+        let last = items.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up => {
+                self.overlay = Some(Overlay::ArtifactPicker {
+                    items,
+                    selected: selected.saturating_sub(1),
+                });
+            }
+            KeyCode::Down => {
+                self.overlay = Some(Overlay::ArtifactPicker {
+                    items,
+                    selected: (selected + 1).min(last),
+                });
+            }
+            KeyCode::Esc => {}
+            KeyCode::Enter => {
+                let (path, _id) = items[selected].clone();
+                self.pending_relaunch = Some(std::path::PathBuf::from(path));
+                self.should_exit = true;
+            }
+            _ => {
+                self.overlay = Some(Overlay::ArtifactPicker { items, selected });
+            }
+        }
+    }
+
     /// Entry point for standalone `/model` (no fresh `/provider` first) — scopes
     /// to whichever provider is already in `config.llm.provider`, if any.
     fn open_model_picker_from_config(&mut self) {
@@ -2725,6 +2798,9 @@ impl App {
                 self.handle_api_key_prompt_key(key, provider_id, model)
             }
             Overlay::CustomEndpoint(step) => self.handle_custom_endpoint_key(key, step),
+            Overlay::ArtifactPicker { items, selected } => {
+                self.handle_artifact_picker_key(key, items, selected)
+            }
             // Put back first: an unrecognised key must leave the prompt standing
             // rather than silently dismissing it, and `handle_overlay_key` took
             // the overlay before dispatching here.
@@ -4026,6 +4102,67 @@ mod tests {
         assert!(last.content.contains("/new first"), "{}", last.content);
     }
 
+    // ---- /pull -------------------------------------------------------
+
+    #[test]
+    fn slash_pull_with_nothing_published_says_so() {
+        crate::config::test_support::with_isolated_home(|| {
+            let mut a = app();
+            type_str(&mut a, "/pull");
+            a.handle_key(key(KeyCode::Enter));
+            let out: String = a.messages.iter().map(|m| m.content.as_str()).collect();
+            assert!(out.contains("No published projects"), "{out}");
+            assert!(a.overlay.is_none(), "nothing to pick from");
+        });
+    }
+
+    #[test]
+    fn slash_pull_opens_a_picker_listing_locally_published_projects() {
+        crate::config::test_support::with_isolated_home(|| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let target = dir.path().join("index.html");
+            std::fs::write(&target, "hi").expect("write");
+            // Seeds the same registry `publish_artifact` would have written
+            // to -- `artifacts::remember` is private to that module, so this
+            // writes the file directly rather than reaching into it.
+            let canonical = target.canonicalize().expect("canonicalize").to_string_lossy().into_owned();
+            let registry = serde_json::json!({ canonical: "abc12345" });
+            let config_dir = crate::config::Config::config_dir();
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(config_dir.join("artifacts.json"), registry.to_string())
+                .expect("write registry");
+
+            let mut a = app();
+            a.open_pull_picker();
+
+            match &a.overlay {
+                Some(Overlay::ArtifactPicker { items, selected }) => {
+                    assert_eq!(*selected, 0);
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].1, "abc12345");
+                }
+                other => panic!("expected an ArtifactPicker, got {other:?}"),
+            }
+        });
+    }
+
+    /// `Enter` does not switch anything in place -- it records the choice for
+    /// `main.rs` to act on once this loop exits, since `Workspace` cannot be
+    /// swapped mid-process (see `relaunch_in` in main.rs).
+    #[test]
+    fn selecting_a_project_in_the_picker_queues_a_relaunch_and_exits() {
+        let mut a = app();
+        a.overlay = Some(Overlay::ArtifactPicker {
+            items: vec![("/tmp/boxcode1".to_string(), "abc12345".to_string())],
+            selected: 0,
+        });
+        a.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(a.pending_relaunch, Some(std::path::PathBuf::from("/tmp/boxcode1")));
+        assert!(a.should_exit);
+        assert!(a.overlay.is_none(), "the picker itself is done with");
+    }
+
     #[test]
     fn slash_compact_sends_the_conversation_and_an_instruction_to_summarise_it() {
         let mut a = a_conversation();
@@ -4370,11 +4507,12 @@ mod tests {
     #[test]
     fn typing_narrows_the_matches_to_a_shared_prefix() {
         let mut a = app();
-        // "/p" is deliberately ambiguous -- /plan and /provider share it -- so
-        // this checks the menu keeps every match rather than guessing at one.
+        // "/p" is deliberately ambiguous -- /plan, /provider and /pull share
+        // it -- so this checks the menu keeps every match rather than
+        // guessing at one.
         type_str(&mut a, "/p");
         let names: Vec<&str> = a.matching_commands().iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, vec!["/plan", "/provider"]);
+        assert_eq!(names, vec!["/plan", "/provider", "/pull"]);
 
         // One more character settles it.
         let mut a = app();

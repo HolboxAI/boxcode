@@ -908,6 +908,11 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
             };
             render_text_prompt(f, area, title, hint, &app.overlay_input, masked);
         }
+        Some(Overlay::ArtifactPicker { items, selected }) => {
+            let labels: Vec<String> =
+                items.iter().map(|(path, id)| format!("{path}  ({id})")).collect();
+            render_picker(f, area, " Pull a project ", &labels, *selected);
+        }
         // Drawn inline at the bottom of the frame by `render`, not as a
         // floating overlay -- see the comment there.
         Some(Overlay::ToolApproval { .. }) | Some(Overlay::Deploy) => {}

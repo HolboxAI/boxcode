@@ -119,7 +119,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let (workspace, workspace_status) = open_workspace(&config);
+    // Set only by a `/pull` relaunch (see `relaunch_in`), never by a user --
+    // this is how the new process knows both where to root itself and that
+    // it should check for pending change requests below, instead of every
+    // ordinary launch paying for that check.
+    let pull_dir = std::env::var("BOXCODE_PULL_DIR").ok();
+    let (workspace, workspace_status) = open_workspace(&config, pull_dir.as_deref());
 
     // Detached, not awaited: a slow or unreachable telemetry endpoint must
     // never delay the terminal coming up. See telemetry.rs -- this is a
@@ -203,6 +208,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
             None => {}
         }
     }
+    // Only checked on a `/pull` relaunch, not every ordinary launch -- the
+    // whole point of `/pull` landing here is "select, then see the changes"
+    // in one motion (see the design discussion this came out of), so this is
+    // where that promise gets kept. A failure here (no endpoint configured,
+    // not actually published, the control-plane unreachable) says nothing
+    // rather than turning a step /pull was never really about into a reason
+    // landing in the project fails.
+    if pull_dir.is_some() {
+        if let Some(ws) = workspace.as_ref() {
+            if let Ok(requests) =
+                requests::list_pending(ws.root(), &app.config.tools.requests_endpoint).await
+            {
+                if !requests.is_empty() {
+                    app.startup_notices.push(format!(
+                        "{} pending change request{} for this project -- call \
+                         list_change_requests to see them.",
+                        requests.len(),
+                        if requests.len() == 1 { "" } else { "s" }
+                    ));
+                }
+            }
+        }
+    }
     // Everything said in this conversation lands in a session file as it
     // happens; `--resume` reloads the last one before the first keystroke.
     // The log itself creates no file until there is a message to put in it.
@@ -232,11 +260,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await;
 
     restore_terminal(enhanced, alternate_screen)?;
+    // `/pull` set this instead of just exiting -- checked only after the
+    // terminal is back to normal (raw mode and the alternate screen both
+    // released), since the relaunched process needs the real terminal to set
+    // up its own. See `relaunch_in` for why this is a fresh process at all
+    // rather than an in-place switch.
+    if let Some(dir) = app.pending_relaunch.take() {
+        relaunch_in(&dir)?;
+        // Reaching here at all means `relaunch_in` could not replace this
+        // process (the non-Unix path exits directly on success) -- fall
+        // through to the ordinary exit rather than pretending nothing
+        // happened.
+    }
     if let Err(e) = &result {
         eprintln!("Error: {e}");
     }
     println!("Goodbye!");
     result
+}
+
+/// Re-launches the boxcode binary rooted at `dir`, in place of this process
+/// on Unix (`exec` -- never returns on success) or by spawning and waiting on
+/// platforms without one. `Workspace` is built once at startup and held for
+/// the life of the process (see `workspace.rs`); there is no in-place way to
+/// point a running session at a different project, so `/pull` is a fresh
+/// process, not a live switch.
+fn relaunch_in(dir: &std::path::Path) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env("BOXCODE_PULL_DIR", dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Only returns at all if exec itself failed -- success replaces this
+        // process outright, so there is nothing after this line to reach.
+        Err(cmd.exec())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status()?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
 }
 
 /// Resolve the root the model is confined to, and a line describing the outcome.
@@ -328,11 +392,17 @@ fn flush_to_scrollback<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-fn open_workspace(config: &Config) -> (Option<Workspace>, String) {
+/// `override_root` is `/pull`'s doing: a relaunch (see `relaunch_in`) passes
+/// the chosen project's path via `BOXCODE_PULL_DIR` rather than trusting
+/// `config.tools.workspace`, since a developer who has customized that
+/// setting to something other than the default "." must not have `/pull`
+/// silently land in the wrong place.
+fn open_workspace(config: &Config, override_root: Option<&str>) -> (Option<Workspace>, String) {
     if !config.tools.enabled {
         return (None, "off (enabled = false in config.toml)".to_string());
     }
-    match Workspace::new(&config.tools.workspace) {
+    let root = override_root.unwrap_or(&config.tools.workspace);
+    match Workspace::new(root) {
         Ok(workspace) => {
             let root = workspace.root().display().to_string();
             // Every one of these is worth seeing before typing the first prompt:
@@ -745,5 +815,38 @@ mod tests {
         restore_cooked_mode();
         // Twice, because the failure path can reach it more than once.
         restore_cooked_mode();
+    }
+
+    /// `/pull`'s relaunch passes the chosen project via `override_root` --
+    /// this has to win over `config.tools.workspace`, or a developer who
+    /// customized that setting away from the default "." would find `/pull`
+    /// silently landing back in their configured directory instead of the
+    /// one they picked.
+    #[test]
+    fn a_pull_relaunch_overrides_the_configured_workspace() {
+        let configured = tempfile::tempdir().expect("temp dir");
+        let picked = tempfile::tempdir().expect("temp dir");
+
+        let mut config = Config::default();
+        config.tools.workspace = configured.path().display().to_string();
+
+        let (ws, _status) =
+            open_workspace(&config, Some(&picked.path().display().to_string()));
+        let ws = ws.expect("workspace should open");
+        assert_eq!(ws.root(), picked.path().canonicalize().expect("canonicalize"));
+    }
+
+    /// No override at all (an ordinary launch, not a `/pull` relaunch) still
+    /// falls back to whatever the config says, exactly as before this
+    /// override existed.
+    #[test]
+    fn no_override_falls_back_to_the_configured_workspace() {
+        let configured = tempfile::tempdir().expect("temp dir");
+        let mut config = Config::default();
+        config.tools.workspace = configured.path().display().to_string();
+
+        let (ws, _status) = open_workspace(&config, None);
+        let ws = ws.expect("workspace should open");
+        assert_eq!(ws.root(), configured.path().canonicalize().expect("canonicalize"));
     }
 }
