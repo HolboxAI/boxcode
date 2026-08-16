@@ -252,7 +252,11 @@ mod tests {
         let key = project_dir.canonicalize().expect("canonicalize").to_string_lossy().into_owned();
         let registry_path = fake_home.join(".boxcode").join("artifacts.json");
         std::fs::create_dir_all(registry_path.parent().unwrap()).expect("mkdir");
-        let map: HashMap<String, String> = HashMap::from([(key, id.to_string())]);
+        let published_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let map = serde_json::json!({ key: { "id": id, "published_at": published_at } });
         std::fs::write(registry_path, serde_json::to_string_pretty(&map).unwrap()).expect("write registry");
     }
 

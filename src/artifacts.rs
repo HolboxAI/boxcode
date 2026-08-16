@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Files the preview host will accept, and nothing else.
 ///
@@ -202,11 +202,24 @@ fn registry_path() -> Option<PathBuf> {
     Some(crate::config::Config::config_dir().join("artifacts.json"))
 }
 
-fn load_registry() -> HashMap<String, String> {
+/// One publish, as recorded locally. `published_at` is unix seconds -- kept
+/// so `all_local` can drop entries once the link itself has expired (see
+/// `EXPIRY_HOURS`) instead of listing dead links next to live ones forever.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct RegistryEntry {
+    id: String,
+    published_at: u64,
+}
+
+fn load_registry() -> HashMap<String, RegistryEntry> {
     registry_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// The id `path` was last published under, keyed by its canonicalized form
@@ -215,22 +228,35 @@ fn load_registry() -> HashMap<String, String> {
 /// `pub(crate)`, not private: `enable_auth` (see `tools.rs`) needs the same
 /// id to provision a project's auth against -- a project's identity to the
 /// rest of boxcode *is* the artifact id it already published under, not a
-/// second id invented for this.
+/// second id invented for this. Deliberately not filtered by `EXPIRY_HOURS`
+/// like `all_local` is: republishing a path whose old link expired should
+/// still reuse that id (see `publish`'s comment on `remembered_id`), it just
+/// won't show up in the `/pull` list until it is published again.
 pub(crate) fn remembered_id(path: &Path) -> Option<String> {
     let key = path.canonicalize().ok()?.to_string_lossy().into_owned();
-    load_registry().get(&key).cloned()
+    load_registry().get(&key).map(|e| e.id.clone())
 }
 
-/// Every project this machine has ever published, path (already
-/// canonicalized, since that is how the registry keys it) paired with its
-/// artifact id -- sorted by path for a stable listing. Used by `/pull` (see
-/// `app.rs`) to let a developer switch to a different local project without
-/// needing to remember or retype its path; nothing here reaches the network
-/// or the control-plane, it only reads this machine's own registry file.
+/// Projects this machine has published within the last `EXPIRY_HOURS` --
+/// path (already canonicalized, since that is how the registry keys it)
+/// paired with its artifact id, newest first. Bounded to the link's own
+/// lifetime because a `/pull` entry for a link that has already expired on
+/// the server is just noise: nothing left for the id to identify. Used by
+/// `/pull` (see `app.rs`) to let a developer switch to a different local
+/// project without needing to remember or retype its path; nothing here
+/// reaches the network or the control-plane, it only reads this machine's
+/// own registry file.
 pub(crate) fn all_local() -> Vec<(String, String)> {
-    let mut all: Vec<(String, String)> = load_registry().into_iter().collect();
-    all.sort_by(|a, b| a.0.cmp(&b.0));
-    all
+    let cutoff = now_secs().saturating_sub(EXPIRY_HOURS as u64 * 3600);
+    let mut all: Vec<(String, RegistryEntry)> = load_registry()
+        .into_iter()
+        .filter(|(_, e)| e.published_at >= cutoff)
+        .collect();
+    // Newest first (what a developer picking up recent work wants); ties
+    // broken by path so the order is still deterministic, not by whichever
+    // way the HashMap happened to iterate.
+    all.sort_by(|a, b| b.1.published_at.cmp(&a.1.published_at).then_with(|| a.0.cmp(&b.0)));
+    all.into_iter().map(|(path, e)| (path, e.id)).collect()
 }
 
 /// A registry write is an amenity, not a correctness requirement: losing it
@@ -247,7 +273,7 @@ fn remember(path: &Path, id: &str) {
         return;
     }
     let mut map = load_registry();
-    map.insert(key, id.to_string());
+    map.insert(key, RegistryEntry { id: id.to_string(), published_at: now_secs() });
     if let Ok(s) = serde_json::to_string_pretty(&map) {
         let _ = std::fs::write(reg_path, s);
     }
@@ -535,10 +561,10 @@ mod tests {
     }
 
     /// `/pull`'s picker needs every locally published project, not just one
-    /// looked up by path -- and sorted, so the list on screen does not
-    /// reorder itself between runs for no reason a user could see.
+    /// looked up by path -- newest first, so the most recent work a
+    /// developer switched away from is always the top entry.
     #[test]
-    fn all_local_lists_every_published_project_sorted_by_path() {
+    fn all_local_lists_every_published_project_newest_first() {
         crate::config::test_support::with_isolated_home(|| {
             assert!(all_local().is_empty(), "nothing published yet");
 
@@ -553,12 +579,48 @@ mod tests {
 
             let all = all_local();
             assert_eq!(all.len(), 2);
-            // Sorted by (canonicalized) path, not insertion order -- "a-project"
-            // was remembered second but its path sorts first.
+            // Newest first, not path order -- "a-project" was remembered
+            // second so it leads even though its path sorts first.
             assert!(all[0].0.ends_with("a-project/index.html"), "{all:?}");
             assert_eq!(all[0].1, "aproj456");
             assert!(all[1].0.ends_with("b-project/index.html"), "{all:?}");
             assert_eq!(all[1].1, "bproj123");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The whole point of bounding `/pull` to `EXPIRY_HOURS`: an entry for a
+    /// link that has already died on the server must not linger in the list
+    /// forever just because the local registry file never forgets on its own.
+    #[test]
+    fn all_local_drops_entries_older_than_the_link_lifetime() {
+        crate::config::test_support::with_isolated_home(|| {
+            let dir = temp("all-local-expiry");
+            let stale = dir.join("stale/index.html");
+            let fresh = dir.join("fresh/index.html");
+            write(&dir, "stale/index.html", "hi");
+            write(&dir, "fresh/index.html", "hi");
+
+            remember(&fresh, "fresh123");
+            // Backdate `stale` past the cutoff directly in the registry file,
+            // since `remember` always stamps "now" -- same seam the /pull
+            // picker test in app.rs uses to seed the registry.
+            let reg_path = crate::config::Config::config_dir().join("artifacts.json");
+            let mut map = load_registry();
+            let stale_key = stale.canonicalize().expect("canonicalize").to_string_lossy().into_owned();
+            map.insert(
+                stale_key,
+                RegistryEntry {
+                    id: "stale999".to_string(),
+                    published_at: now_secs() - (EXPIRY_HOURS as u64 * 3600) - 1,
+                },
+            );
+            std::fs::write(&reg_path, serde_json::to_string(&map).expect("serialize")).expect("write");
+
+            let all = all_local();
+            assert_eq!(all.len(), 1, "{all:?}");
+            assert_eq!(all[0].1, "fresh123");
 
             let _ = std::fs::remove_dir_all(&dir);
         });

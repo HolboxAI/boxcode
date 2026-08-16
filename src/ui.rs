@@ -909,9 +909,14 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
             render_text_prompt(f, area, title, hint, &app.overlay_input, masked);
         }
         Some(Overlay::ArtifactPicker { items, selected }) => {
-            let labels: Vec<String> =
-                items.iter().map(|(path, id)| format!("{path}  ({id})")).collect();
-            render_picker(f, area, " Pull a project ", &labels, *selected);
+            // Just the id, not the full path: a picker row is one line and a
+            // canonicalized absolute path routinely runs past the popup
+            // width with nothing to wrap it, so it silently clipped mid-word
+            // (e.g. ".../hello-bo"). The id alone always fits; disambiguating
+            // several ids from the same dev session is left to the dev for
+            // now (they can still open the published URL to check).
+            let labels: Vec<String> = items.iter().map(|(_, id)| id.clone()).collect();
+            render_picker(f, area, " Pull a project (last 48h) ", &labels, *selected);
         }
         // Drawn inline at the bottom of the frame by `render`, not as a
         // floating overlay -- see the comment there.
