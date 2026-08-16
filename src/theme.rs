@@ -35,6 +35,18 @@ use std::time::Duration;
 /// terminal that actually has truecolor is a worse failure than leaving an
 /// untested one on the (correct, common) default path.
 ///
+/// That ratatui-documented brokenness stopped being universally true in
+/// macOS 26 "Tahoe": Apple rewrote Terminal.app and it genuinely supports
+/// 24-bit color now (confirmed: WWDC 2025's Platforms State of the Union,
+/// and independently at github.com/termstandard/colors/issues/69) -- but
+/// the new Terminal.app does not reliably set `COLORTERM=truecolor` to
+/// announce it the way iTerm2/kitty/WezTerm/Ghostty do, so `COLORTERM`
+/// alone cannot tell a fixed Tahoe Terminal.app apart from a genuinely
+/// broken pre-Tahoe one. The OS version can, though (`sw_vers
+/// -productVersion`, unambiguous): only macOS 25 (Sequoia) and earlier
+/// keep the blanket distrust: `Some("Apple_Terminal")` on macOS 26+
+/// terminal.app is trusted like everything else.
+///
 /// Cached: this is checked on every cell of every frame, and the answer can't
 /// change mid-process.
 pub fn supports_truecolor() -> bool {
@@ -43,18 +55,55 @@ pub fn supports_truecolor() -> bool {
         supports_truecolor_given(
             std::env::var("COLORTERM").ok().as_deref(),
             std::env::var("TERM_PROGRAM").ok().as_deref(),
+            macos_major_version(),
         )
     })
 }
 
-/// The actual decision, taking its inputs as plain `Option<&str>` rather than
-/// reading the environment directly so it can be tested without mutating real
-/// process state.
-fn supports_truecolor_given(colorterm: Option<&str>, term_program: Option<&str>) -> bool {
+/// The first macOS release whose Terminal.app genuinely supports 24-bit
+/// color -- see `supports_truecolor`'s doc comment for the sourcing. macOS's
+/// own version numbering jumped straight from 15 (Sequoia) to 26 (Tahoe) as
+/// part of Apple's move to year-based versions, so there is no gap of
+/// unknown-status version numbers to worry about between the last broken
+/// release and this one.
+const FIRST_MACOS_WITH_TRUECOLOR_TERMINAL: u32 = 26;
+
+/// The running machine's major macOS version (`sw_vers -productVersion`'s
+/// leading component, e.g. `26` from `"26.0.1"`), or `None` on any failure
+/// -- not on macOS at all, the command is missing, or its output does not
+/// parse. `None` is treated the same as "too old to trust" by
+/// `supports_truecolor_given`, which keeps the existing conservative
+/// default for every case this function cannot positively confirm as fixed.
+fn macos_major_version() -> Option<u32> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8(output.stdout).ok()?;
+    version.trim().split('.').next()?.parse().ok()
+}
+
+/// The actual decision, taking its inputs as plain values rather than
+/// reading the environment/OS directly so it can be tested without mutating
+/// real process state.
+fn supports_truecolor_given(
+    colorterm: Option<&str>,
+    term_program: Option<&str>,
+    macos_major_version: Option<u32>,
+) -> bool {
     if matches!(colorterm, Some("truecolor") | Some("24bit")) {
         return true;
     }
-    term_program != Some("Apple_Terminal")
+    if term_program != Some("Apple_Terminal") {
+        return true;
+    }
+    macos_major_version.is_some_and(|v| v >= FIRST_MACOS_WITH_TRUECOLOR_TERMINAL)
 }
 
 /// The nearest xterm 256-colour palette index to an RGB triple: the 6×6×6
@@ -680,31 +729,45 @@ mod tests {
 
     // ---- truecolor fallback -------------------------------------------------
 
-    /// The one confirmed-bad case: Apple's Terminal.app, with no COLORTERM
-    /// override. This is the exact bug report that started this module.
+    /// The one confirmed-bad case: Apple's Terminal.app pre-Tahoe (macOS 25
+    /// Sequoia or earlier, or the OS version genuinely unknown), with no
+    /// COLORTERM override. This is the exact bug report that started this
+    /// module.
     #[test]
-    fn apple_terminal_without_a_colorterm_override_is_not_trusted_with_truecolor() {
-        assert!(!supports_truecolor_given(None, Some("Apple_Terminal")));
+    fn apple_terminal_on_old_macos_without_a_colorterm_override_is_not_trusted_with_truecolor() {
+        assert!(!supports_truecolor_given(None, Some("Apple_Terminal"), Some(25)));
+        assert!(!supports_truecolor_given(None, Some("Apple_Terminal"), None));
     }
 
-    /// COLORTERM is a terminal saying so itself -- that outranks the
-    /// TERM_PROGRAM guess even for the one program on the deny list, since a
-    /// future Terminal.app that gains real truecolor support and starts
-    /// setting COLORTERM should not be second-guessed.
+    /// The fixed case: macOS 26 "Tahoe" rewrote Terminal.app with genuine
+    /// 24-bit color support (see `supports_truecolor`'s doc comment for the
+    /// sourcing) -- this is the regression this behavior exists to prevent,
+    /// the flip side of the bug report above.
     #[test]
-    fn an_explicit_colorterm_truecolor_claim_is_trusted_even_for_apple_terminal() {
-        assert!(supports_truecolor_given(Some("truecolor"), Some("Apple_Terminal")));
-        assert!(supports_truecolor_given(Some("24bit"), Some("Apple_Terminal")));
+    fn apple_terminal_on_macos_tahoe_or_later_is_trusted_with_truecolor() {
+        assert!(supports_truecolor_given(None, Some("Apple_Terminal"), Some(26)));
+        assert!(supports_truecolor_given(None, Some("Apple_Terminal"), Some(27)));
+    }
+
+    /// COLORTERM is a terminal saying so itself -- that outranks both the
+    /// TERM_PROGRAM guess and the OS-version check, since a terminal that
+    /// explicitly claims truecolor should not be second-guessed regardless
+    /// of what program or OS it's running on.
+    #[test]
+    fn an_explicit_colorterm_truecolor_claim_is_trusted_even_for_apple_terminal_on_old_macos() {
+        assert!(supports_truecolor_given(Some("truecolor"), Some("Apple_Terminal"), Some(25)));
+        assert!(supports_truecolor_given(Some("24bit"), Some("Apple_Terminal"), None));
     }
 
     /// Everything not on the deny list defaults to truecolor -- the whole
-    /// point is not trying to enumerate every terminal that works.
+    /// point is not trying to enumerate every terminal that works. The OS
+    /// version is irrelevant here; it only ever matters for Apple_Terminal.
     #[test]
     fn unknown_or_absent_term_program_defaults_to_truecolor() {
-        assert!(supports_truecolor_given(None, None));
-        assert!(supports_truecolor_given(None, Some("iTerm.app")));
-        assert!(supports_truecolor_given(None, Some("vscode")));
-        assert!(supports_truecolor_given(None, Some("WarpTerminal")));
+        assert!(supports_truecolor_given(None, None, None));
+        assert!(supports_truecolor_given(None, Some("iTerm.app"), Some(15)));
+        assert!(supports_truecolor_given(None, Some("vscode"), None));
+        assert!(supports_truecolor_given(None, Some("WarpTerminal"), None));
     }
 
     #[test]
