@@ -61,6 +61,38 @@ single-developer-per-project "prove it works" phase this was built for
 doesn't hit in practice. Worth revisiting if that assumption stops
 holding.
 
+## Scoping a query to the signed-in user
+
+The key above proves which *project* a request belongs to, not which of
+that project's own users is asking — on its own, "only show my rows" has
+to be SQL the model writes trusting a user id the page's own client-side
+JS supplies as a param, which any visitor can forge from devtools. This is
+the same gap Postgres RLS (`auth.uid()`) closes for Supabase; the version
+here is much smaller, on purpose.
+
+A request may include `access_token` — the same token `enable_auth`'s
+`{auth_url}/token` endpoint hands back on sign-in (see `infra/auth/`).
+When present, this relay spends one request against that project's own
+GoTrue (`AUTH_BASE/${project_id}/user`) to turn the token into a verified
+user id, and — only if `sql` actually references it — binds that id as the
+named parameter `:current_user_id` (`@current_user_id`/`$current_user_id`
+also work; `node:sqlite`'s own sigil rules). A bad or expired token is
+rejected with 401 before the query ever runs, regardless of whether the
+query needed it — sending an access_token is a signal the caller wanted it
+checked, so a wrong one fails closed rather than silently running
+unscoped. A query that references `:current_user_id` with **no**
+access_token sent at all is not an error either: `node:sqlite` binds an
+absent named parameter as `NULL`, which matches no real row, so it fails
+closed too (returns nothing) rather than leaking every project's rows.
+
+Not row-level security: this is one placeholder, not a policy engine —
+there's nothing stopping a query from ignoring `:current_user_id` entirely
+and reading every row anyway if the model's SQL doesn't filter on it. It
+verifies *who's asking*, not what they're allowed to see; the model still
+has to write the `WHERE` clause. Closing that fully would mean a real
+policy layer, which is deliberately out of scope for the same "prove it
+works" phase the rest of this README describes.
+
 ## Statement shape
 
 One statement per call — `.prepare()` only ever runs one, unlike `exec()`

@@ -18,6 +18,19 @@
 // then on (trust-on-first-use); every later request must match it
 // exactly. See infra/db/README.md for why this, not open access by
 // project id alone, and the known limitation TOFU carries.
+//
+// A request may also carry an access_token -- a project's own GoTrue
+// token, the same one enable_auth's sign-in endpoint hands back (see
+// src/auth.rs, infra/auth/). The key above proves which *project* a
+// request belongs to; it says nothing about which of that project's own
+// users is asking, so on its own it cannot back a query scoped to "my
+// rows only" -- that would otherwise be enforced by nothing but a user id
+// the page's own client-side JS supplies as a param, which any visitor to
+// the live site can forge from devtools. verifyUser below spends one
+// request against that project's own GoTrue (`AUTH_BASE`, the same box
+// this control-plane runs on) to turn the token into a verified user id,
+// bound into the query as the named parameter `:current_user_id` instead
+// of trusted from the caller.
 import { createServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
 import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
@@ -26,6 +39,12 @@ import path from "node:path";
 const REGISTRY_PATH = process.env.REGISTRY_PATH || "/opt/boxcode-db/registry.json";
 const DATA_DIR = process.env.DATA_DIR || "/opt/boxcode-db/data";
 const PORT = Number(process.env.PORT || 8081);
+// Same default as the auth control-plane's own AUTH_BASE (see
+// infra/auth/control-plane/index.mjs) -- both run on the same box behind
+// the same domain, and a project's auth is always reachable at
+// `${AUTH_BASE}/${projectId}/`, the nginx route writeNginxConf there sets
+// up. Overridable independently in case that ever stops being true.
+const AUTH_BASE = process.env.AUTH_BASE || "https://auth.boxcode.sh";
 
 // Same shape as the auth control-plane's PROJECT_ID_RE: an artifact id is
 // how every project is identified everywhere in boxcode, so this has to
@@ -86,17 +105,69 @@ function isReadStatement(sql) {
   return head.startsWith("SELECT") || head.startsWith("PRAGMA") || head.startsWith("EXPLAIN");
 }
 
-function runQuery(projectId, sql, params) {
+// Resolves to the caller's verified user id, or throws with a message
+// meant to reach the model as-is (same style as runQuery's own SQL
+// errors): a 401/network failure from GoTrue means the token is wrong or
+// stale, not that this control-plane is broken, so it is not a 500.
+//
+// GoTrue's own `/user` endpoint (not something this repo owns -- see
+// infra/auth/README.md) is the one already-correct place to ask "does this
+// token identify a real, current session", the same check the auth
+// control-plane itself never has to reimplement.
+async function verifyUser(projectId, accessToken) {
+  const url = `${AUTH_BASE}/${projectId}/user`;
+  let response;
+  try {
+    response = await fetch(url, { headers: { authorization: `Bearer ${accessToken}` } });
+  } catch (e) {
+    throw new HttpError(401, `could not verify access_token: ${e.message}`);
+  }
+  if (!response.ok) {
+    throw new HttpError(401, "access_token is invalid or expired");
+  }
+  const user = await response.json().catch(() => null);
+  if (!user || typeof user.id !== "string" || user.id === "") {
+    throw new HttpError(401, "access_token verified but returned no user id");
+  }
+  return user.id;
+}
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// node:sqlite throws "Unknown named parameter" for any name in the bound
+// object that the statement doesn't actually reference (confirmed live) --
+// so a query that doesn't mention :current_user_id at all must never be
+// handed the object, even when the caller sent a perfectly valid
+// access_token "just in case". This is only ever a gate on *whether to
+// bind*, never on *whether to verify*: verifyUser above still runs
+// unconditionally whenever access_token is present, so a bad token is
+// still rejected regardless of what a query happens to reference.
+function referencesCurrentUserId(sql) {
+  return /[:@$]current_user_id\b/.test(sql);
+}
+
+// `namedParams` is only ever `{ current_user_id }`, and only ever passed
+// at all when the caller sent a verified access_token -- omitting it
+// entirely for every other request (rather than passing `{}`) keeps
+// today's access-token-less queries running through node:sqlite exactly
+// as they did before this existed.
+function runQuery(projectId, sql, params, namedParams) {
   const dbPath = path.join(DATA_DIR, `${projectId}.sqlite`);
   const db = new DatabaseSync(dbPath);
   try {
     const stmt = db.prepare(sql);
+    const args = namedParams ? [namedParams, ...params] : params;
     if (isReadStatement(sql)) {
-      const rows = stmt.all(...params);
+      const rows = stmt.all(...args);
       const truncated = rows.length > MAX_ROWS;
       return { rows: truncated ? rows.slice(0, MAX_ROWS) : rows, truncated };
     }
-    const result = stmt.run(...params);
+    const result = stmt.run(...args);
     return { changes: result.changes, last_insert_rowid: Number(result.lastInsertRowid) };
   } finally {
     db.close();
@@ -118,7 +189,7 @@ const server = createServer(async (req, res) => {
     return fail(res, 400, "body is not JSON");
   }
 
-  const { project_id: projectId, key, sql } = parsed;
+  const { project_id: projectId, key, sql, access_token: accessToken } = parsed;
   const params = Array.isArray(parsed.params) ? parsed.params : [];
 
   if (typeof projectId !== "string" || !PROJECT_ID_RE.test(projectId)) {
@@ -130,17 +201,35 @@ const server = createServer(async (req, res) => {
   if (typeof sql !== "string" || sql.trim() === "") {
     return fail(res, 400, "sql must be a non-empty string");
   }
+  if (accessToken !== undefined && (typeof accessToken !== "string" || accessToken === "")) {
+    return fail(res, 400, "access_token must be a non-empty string if present");
+  }
 
   if (!(await authorize(projectId, key))) {
     return fail(res, 403, "key does not match this project's stored key");
   }
 
   try {
+    // Verified before the query runs, not fallen back on silently if it
+    // fails: a caller that sent an access_token meant for it to matter, so
+    // a bad one fails closed (401) rather than quietly running the query
+    // with no :current_user_id bound, which would surface as a confusing
+    // "missing named parameter" from node:sqlite instead of the real
+    // reason.
+    let namedParams;
+    if (accessToken) {
+      const userId = await verifyUser(projectId, accessToken);
+      if (referencesCurrentUserId(sql)) namedParams = { current_user_id: userId };
+    }
+
     await mkdir(DATA_DIR, { recursive: true });
-    const result = runQuery(projectId, sql, params);
+    const result = runQuery(projectId, sql, params, namedParams);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(result));
   } catch (e) {
+    if (e instanceof HttpError) {
+      return fail(res, e.status, e.message);
+    }
     // A SQL error here is the ordinary, expected outcome of a bad
     // statement or a constraint violation, not a control-plane failure --
     // node:sqlite's own messages ("UNIQUE constraint failed: ...", "near
