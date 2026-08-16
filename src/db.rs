@@ -13,6 +13,17 @@
 //! see `infra/db/README.md` for the full reasoning, but the short version
 //! is that a key the model never holds is a key that can never end up
 //! embedded in the published page's client-side JS by accident.
+//!
+//! `query`'s optional `access_token` closes the other half of a gap: the
+//! project key above proves *which project* a request belongs to, not
+//! *which of the project's own users* is asking. Without this, the only
+//! way to scope a row to a signed-in user is SQL the model writes trusting
+//! a client-supplied id -- nothing stops a page's own JS from sending
+//! someone else's. Passing the access_token `enable_auth`'s sign-in
+//! response handed back lets the control-plane verify it against that
+//! project's own GoTrue instance and bind the resulting, verified user id
+//! as `:current_user_id`, so `WHERE user_id = :current_user_id` is backed
+//! by the token, not by whatever the page claims.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -87,11 +98,18 @@ fn key_for(project_id: &str) -> String {
 /// Requires `path` to have already been published, same reasoning as
 /// `auth::provision`: the project id this needs only exists once
 /// `publish_artifact` has minted it.
+///
+/// `access_token` is optional and orthogonal to the project key: omit it
+/// for queries that don't need to know who's asking, pass it (the value
+/// `auth::provision`'s sign-in endpoint returned) to have `:current_user_id`
+/// available in `sql`, verified server-side rather than trusted from the
+/// caller.
 pub async fn query(
     path: &Path,
     endpoint: &str,
     sql: &str,
     params: &[serde_json::Value],
+    access_token: Option<&str>,
 ) -> Result<QueryResult, String> {
     if endpoint.trim().is_empty() {
         return Err(
@@ -115,8 +133,11 @@ pub async fn query(
         .build()
         .map_err(|e| format!("could not build an HTTP client: {e}"))?;
 
-    let body = serde_json::json!({ "project_id": project_id, "key": key, "sql": sql, "params": params })
-        .to_string();
+    let mut body = serde_json::json!({ "project_id": project_id, "key": key, "sql": sql, "params": params });
+    if let Some(token) = access_token {
+        body["access_token"] = serde_json::Value::String(token.to_string());
+    }
+    let body = body.to_string();
     let response = client
         .post(endpoint)
         .header("content-type", "application/json")
@@ -147,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unconfigured_endpoint_explains_itself() {
-        let error = query(Path::new("/tmp/does-not-matter"), "  ", "SELECT 1", &[])
+        let error = query(Path::new("/tmp/does-not-matter"), "  ", "SELECT 1", &[], None)
             .await
             .expect_err("should refuse");
         assert!(error.contains("[tools]"), "{error}");
@@ -161,12 +182,131 @@ mod tests {
         let target = dir.join("index.html");
         std::fs::write(&target, "hi").expect("write");
 
-        let error = query(&target, "http://127.0.0.1:1", "SELECT 1", &[])
+        let error = query(&target, "http://127.0.0.1:1", "SELECT 1", &[], None)
             .await
             .expect_err("should refuse");
         assert!(error.contains("publish_artifact"), "{error}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal HTTP/1.1 server on a real socket, not a fake address like
+    /// the tests above -- this one has to inspect what actually went out on
+    /// the wire, which an unreachable address can't show.
+    async fn serve_once_and_capture_body(response_json: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut content_length = None;
+            loop {
+                let n = socket.read(&mut chunk).await.expect("read");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(header_end) = find_subslice(&buf, b"\r\n\r\n") {
+                    if content_length.is_none() {
+                        let headers = String::from_utf8_lossy(&buf[..header_end]);
+                        content_length = headers.lines().find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        });
+                    }
+                    let body_so_far = buf.len() - (header_end + 4);
+                    if content_length.map(|cl| body_so_far >= cl).unwrap_or(false) {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let header_end = find_subslice(&buf, b"\r\n\r\n").expect("headers");
+            let body = String::from_utf8_lossy(&buf[header_end + 4..]).to_string();
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_json.len(),
+                response_json
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+            socket.shutdown().await.ok();
+            body
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Writes straight into `artifacts.json` in the same shape
+    /// `artifacts::publish` itself would leave, since `remember` there is
+    /// private to that module -- this is the one other place (besides
+    /// `enable_auth`) that needs a path to already read back as published.
+    fn fake_publish(fake_home: &Path, project_dir: &Path, id: &str) {
+        let key = project_dir.canonicalize().expect("canonicalize").to_string_lossy().into_owned();
+        let registry_path = fake_home.join(".boxcode").join("artifacts.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).expect("mkdir");
+        let map: HashMap<String, String> = HashMap::from([(key, id.to_string())]);
+        std::fs::write(registry_path, serde_json::to_string_pretty(&map).unwrap()).expect("write registry");
+    }
+
+    /// Locks `HOME_LOCK` directly rather than going through
+    /// `with_isolated_home`, same reasoning as `tools.rs`'s
+    /// `web_search_falls_back_to_the_embedded_python...`: this test needs
+    /// `query`'s own `.await`, and `with_isolated_home`'s closure runs
+    /// synchronously already inside `#[tokio::test]`'s runtime.
+    #[tokio::test]
+    async fn an_access_token_is_forwarded_in_the_request_body() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-with-token");
+        let (endpoint, handle) = serve_once_and_capture_body(r#"{"rows":[],"truncated":false}"#).await;
+
+        let result = query(project.path(), &endpoint, "SELECT 1", &[], Some("the-access-token")).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(result.is_ok(), "{result:?}");
+        let body = handle.await.expect("server task");
+        assert!(body.contains("\"access_token\":\"the-access-token\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn no_access_token_means_no_access_token_field_at_all() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-without-token");
+        let (endpoint, handle) = serve_once_and_capture_body(r#"{"rows":[],"truncated":false}"#).await;
+
+        let result = query(project.path(), &endpoint, "SELECT 1", &[], None).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(result.is_ok(), "{result:?}");
+        let body = handle.await.expect("server task");
+        assert!(!body.contains("access_token"), "{body}");
     }
 
     #[test]
