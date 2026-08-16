@@ -216,7 +216,22 @@ pub fn message_lines(msg: &Message, width: usize) -> Vec<Line<'static>> {
                 ]));
             }
         }
-        Role::Assistant => lines.extend(wrapped_lines(msg.body(), width)),
+        Role::Assistant => {
+            lines.extend(wrapped_lines(msg.body(), width));
+            // A reply that made no tool calls reads identically on screen to
+            // one that did real work -- that gap is exactly what let a
+            // fabricated "I've created the tables" pass as a real status
+            // update with nothing to contradict it. Say which this was,
+            // always: unremarkable on a plain answer to a plain question,
+            // the one place it matters it is now impossible to miss without
+            // reading a raw session log by hand.
+            if msg.tool_calls.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  (no tool call this turn)",
+                    theme::faint(),
+                )));
+            }
+        }
         Role::Error => {
             // Classified rather than uniformly red: "you have used today's
             // allowance" and "the endpoint is unreachable" are different
@@ -4039,6 +4054,42 @@ mod tests {
             .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(!joined.contains('*'), "markers reached the screen: {joined}");
+    }
+
+    /// Regression: a live session had the model claim "I'm about halfway
+    /// through... Prepared the db_query calls to create the tables" across
+    /// several turns with zero tool calls behind any of it -- indistinguishable
+    /// on screen from a turn that did real work, confirmed only by hand-reading
+    /// the raw session log afterward. This is the fix: the gap between "said it
+    /// happened" and "actually happened" must be visible on the message itself,
+    /// not just inferable from a missing `· $` line a few messages later.
+    #[test]
+    fn a_reply_with_no_tool_calls_is_marked_as_such() {
+        let msg = Message::new(
+            Role::Assistant,
+            "I'm about halfway through the implementation. Prepared the db_query calls \
+             to create the tables.",
+        );
+        let joined: String = message_lines(&msg, 80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(joined.contains("no tool call this turn"), "{joined:?}");
+    }
+
+    /// The same reply, this time backed by a real tool call, must not carry
+    /// the marker -- it would be false on the one turn where something
+    /// actually did happen, exactly the kind of noise that trains people to
+    /// stop reading it.
+    #[test]
+    fn a_reply_with_a_real_tool_call_is_not_marked() {
+        let mut msg = Message::new(Role::Assistant, "Creating the tables now.");
+        msg.tool_calls = vec![crate::llm::ToolCall::default()];
+        let joined: String = message_lines(&msg, 80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(!joined.contains("no tool call"), "{joined:?}");
     }
 
     /// The markers are removed before wrapping, so the width has to be spent
