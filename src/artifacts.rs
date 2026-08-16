@@ -263,6 +263,47 @@ fn is_html(name: &str) -> bool {
     matches!(extension(name).as_deref(), Some("html") | Some("htm"))
 }
 
+/// A small self-polling script, appended to every published HTML page, so a
+/// tab already open on the artifact's URL picks up the *next* publish
+/// automatically instead of the developer refreshing by hand.
+///
+/// Needs no new backend endpoint: every upload here already carries
+/// `cache-control: no-cache` (see the comment on it a few lines up in
+/// `publish`), which is what makes CloudFront revalidate instead of serving
+/// a stale edge copy -- confirmed live when that header was added for the
+/// same reason. S3/CloudFront already put a fresh ETag on every response, so
+/// polling the page's own URL with `HEAD` and comparing ETags is enough; no
+/// websocket, no control-plane, nothing else to operate.
+///
+/// Only ever changes the bytes sent to S3 -- the developer's own file on
+/// disk is untouched, so nothing accumulates across repeated publishes and
+/// there is no marker to strip back out.
+const LIVE_RELOAD_SCRIPT: &str = r#"<script>(function(){var u=location.href.split('#')[0].split('?')[0];var t=null;setInterval(function(){fetch(u,{method:'HEAD',cache:'no-store'}).then(function(r){var e=r.headers.get('etag');if(!e)return;if(t===null){t=e;return;}if(e!==t){location.reload();}}).catch(function(){});},2000);})();</script>"#;
+
+/// Inserts [`LIVE_RELOAD_SCRIPT`] just before `</body>` (or `</html>`, or at
+/// the very end, whichever is found first) -- case-insensitively, since
+/// hand-written HTML is not guaranteed to use lowercase tags.
+///
+/// Non-UTF-8 content is returned unchanged rather than corrupted: HTML this
+/// old signer already accepts is `.html`/`.htm` by extension, which is
+/// always meant to be text, but a byte-for-byte guarantee is worth more here
+/// than a script tag on the one file that would not decode.
+fn inject_live_reload(bytes: Vec<u8>) -> Vec<u8> {
+    let Ok(html) = String::from_utf8(bytes.clone()) else {
+        return bytes;
+    };
+    let lower = html.to_ascii_lowercase();
+    let insert_at = lower.rfind("</body>").or_else(|| lower.rfind("</html>"));
+    let Some(idx) = insert_at else {
+        return format!("{html}{LIVE_RELOAD_SCRIPT}").into_bytes();
+    };
+    let mut out = String::with_capacity(html.len() + LIVE_RELOAD_SCRIPT.len());
+    out.push_str(&html[..idx]);
+    out.push_str(LIVE_RELOAD_SCRIPT);
+    out.push_str(&html[idx..]);
+    out.into_bytes()
+}
+
 fn extension(name: &str) -> Option<String> {
     name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase())
 }
@@ -369,6 +410,7 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
             .ok_or_else(|| format!("the service asked for a file that was not offered: {}", upload.path))?;
         let bytes = std::fs::read(&candidate.source)
             .map_err(|e| format!("could not read {}: {e}", candidate.source.display()))?;
+        let bytes = if is_html(&candidate.key) { inject_live_reload(bytes) } else { bytes };
         let put = client
             .put(&upload.url)
             .header("content-type", &upload.content_type)
@@ -422,6 +464,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
+    }
+
+    // ---- inject_live_reload -------------------------------------------
+
+    #[test]
+    fn inserts_before_a_lowercase_closing_body_tag() {
+        let out = inject_live_reload(b"<html><body><h1>hi</h1></body></html>".to_vec());
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with("<html><body><h1>hi</h1>"), "{out}");
+        assert!(out.ends_with("</body></html>"), "{out}");
+        assert!(out.contains(LIVE_RELOAD_SCRIPT), "{out}");
+    }
+
+    #[test]
+    fn matches_the_closing_body_tag_case_insensitively() {
+        let out = inject_live_reload(b"<HTML><BODY>hi</BODY></HTML>".to_vec());
+        let out = String::from_utf8(out).unwrap();
+        // The original casing of the tag itself is preserved -- only the
+        // search for *where* to insert is case-insensitive.
+        assert!(out.ends_with("</BODY></HTML>"), "{out}");
+        assert!(out.contains(LIVE_RELOAD_SCRIPT), "{out}");
+    }
+
+    #[test]
+    fn falls_back_to_before_closing_html_when_there_is_no_body_tag() {
+        let out = inject_live_reload(b"<html><h1>hi</h1></html>".to_vec());
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.ends_with("</html>"), "{out}");
+        assert!(out.contains(LIVE_RELOAD_SCRIPT), "{out}");
+    }
+
+    #[test]
+    fn appends_at_the_end_when_neither_closing_tag_is_present() {
+        // The real case this hits: a bare fragment, same shape as the live
+        // end-to-end test's own fixture (`<h1>live</h1><script ...>`).
+        let out = inject_live_reload(b"<h1>fragment, no wrapper tags</h1>".to_vec());
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.ends_with(LIVE_RELOAD_SCRIPT), "{out}");
+    }
+
+    #[test]
+    fn non_utf8_bytes_are_returned_unchanged_rather_than_corrupted() {
+        let invalid = vec![0x68, 0x69, 0xff, 0xfe]; // "hi" + invalid UTF-8
+        let out = inject_live_reload(invalid.clone());
+        assert_eq!(out, invalid);
     }
 
     /// Republishing a path recovers the id it got last time, so `publish`
@@ -598,6 +685,13 @@ mod live_check {
         let published = publish(&dir, &endpoint).await.expect("publish");
         println!("PUBLISHED_URL={}", published.url);
         println!("files={} bytes={} expires={}h", published.files, published.bytes, published.expires_in_hours);
+
+        // Confirms the live-reload script actually reaches a real visitor's
+        // browser through the real CDN, not just that inject_live_reload's
+        // own unit tests are internally consistent.
+        let body = reqwest::get(&published.url).await.expect("fetch published page").text().await.expect("body");
+        assert!(body.contains(LIVE_RELOAD_SCRIPT), "published page missing live-reload script: {body}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
