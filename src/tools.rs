@@ -436,7 +436,14 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                                 This tool never publishes anything and holds no secret the \
                                 published page's own JS needs -- data access from the live page \
                                 still has to go through code you write and ship with \
-                                write_file/edit_file, the same as any other backend logic.",
+                                write_file/edit_file, the same as any other backend logic. If the \
+                                project has enable_auth turned on and this query should be scoped \
+                                to whoever is signed in, do not trust a user id the page's own JS \
+                                hands you as a param -- pass their access_token instead and \
+                                reference `:current_user_id` in sql (mix freely with `?` \
+                                placeholders); it is verified against that project's auth before \
+                                the query runs, so the id in the query is the one the token \
+                                actually proves, not one the client merely claims.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -452,6 +459,13 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                             "type": "array",
                             "items": { "type": ["string", "number", "boolean", "null"] },
                             "description": "Values for `?` placeholders in sql, in order. Omit if sql has none."
+                        },
+                        "access_token": {
+                            "type": "string",
+                            "description": "The signed-in user's access_token (the value enable_auth's \
+                                            {auth_url}/token endpoint returned), needed only if sql \
+                                            references `:current_user_id`. Omit for queries that don't \
+                                            need to know who's asking."
                         }
                     },
                     "required": ["path", "sql"]
@@ -468,7 +482,10 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                                 auth base URL and the two endpoints to call from the page's own \
                                 JavaScript: POST {auth_url}/signup with {\"email\",\"password\"} \
                                 to create an account, POST {auth_url}/token?grant_type=password \
-                                with the same body to sign in and get back an access_token. This \
+                                with the same body to sign in and get back an access_token. Keep \
+                                that access_token around (e.g. localStorage) -- db_query accepts \
+                                it too, to scope a query to whoever is signed in without trusting \
+                                a user id the client merely claims. This \
                                 tool does not write anything -- after calling it, add the actual \
                                 sign-up/sign-in form and the fetch calls to the project's HTML/JS \
                                 yourself with write_file/edit_file, then publish_artifact again \
@@ -2458,7 +2475,10 @@ async fn execute_enable_auth(call: &ToolCall, workspace: &Workspace, config: &To
                  POST {{auth_url}}/signup with {{\"email\",\"password\"}} to create an account.\n\
                  POST {{auth_url}}/token?grant_type=password with the same body to sign in; the \
                  response's access_token is what the page should hold onto (e.g. localStorage) \
-                 and send back on later requests that need to know who is asking.\n\n\
+                 and send back on later requests that need to know who is asking. It's also what \
+                 {DB_QUERY} accepts as its own access_token argument, to bind `:current_user_id` \
+                 in a query's sql to whoever that token proves is signed in -- use that instead \
+                 of a user id the page's own JS supplies as a param, which nothing would verify.\n\n\
                  Now add the actual sign-up/sign-in form and these fetch calls to the project's \
                  HTML/JS with write_file/edit_file, then call {PUBLISH_ARTIFACT} again to ship it.",
                 provisioned.auth_url
@@ -2490,10 +2510,12 @@ async fn execute_db_query(call: &ToolCall, workspace: &Workspace, config: &Tools
     struct ParamsArgs {
         #[serde(default)]
         params: Vec<serde_json::Value>,
+        #[serde(default)]
+        access_token: Option<String>,
     }
-    let params = serde_json::from_str::<ParamsArgs>(&call.function.arguments)
-        .map(|a| a.params)
-        .unwrap_or_default();
+    let extra = serde_json::from_str::<ParamsArgs>(&call.function.arguments).unwrap_or_default();
+    let params = extra.params;
+    let access_token = extra.access_token.filter(|t| !t.trim().is_empty());
 
     let resolved = match resolve_in_workspace(workspace, &path) {
         Ok(resolved) => resolved,
@@ -2506,7 +2528,7 @@ async fn execute_db_query(call: &ToolCall, workspace: &Workspace, config: &Tools
         }
     };
 
-    match crate::db::query(&resolved, &config.db_endpoint, &sql, &params).await {
+    match crate::db::query(&resolved, &config.db_endpoint, &sql, &params, access_token.as_deref()).await {
         Ok(crate::db::QueryResult::Rows { rows, truncated }) => {
             let count = rows.len();
             let json = serde_json::to_string_pretty(&rows).unwrap_or_default();
