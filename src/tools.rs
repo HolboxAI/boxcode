@@ -433,10 +433,24 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                                 PRAGMA or EXPLAIN returns {\"rows\": [...], \"truncated\": bool} \
                                 (capped at 500 rows); anything else (CREATE TABLE, INSERT, UPDATE, \
                                 DELETE, ...) returns {\"changes\": n, \"last_insert_rowid\": n}. \
-                                This tool never publishes anything and holds no secret the \
-                                published page's own JS needs -- data access from the live page \
-                                still has to go through code you write and ship with \
-                                write_file/edit_file, the same as any other backend logic. If the \
+                                This tool is agent-side only: unlike enable_auth's signup/token \
+                                endpoints and the upload endpoint documented there, there is NO \
+                                HTTP endpoint for a published page's own JavaScript to call this \
+                                database -- none exists to find, so do not probe auth.boxcode.sh \
+                                or any other host with guessed paths looking for one. A \
+                                publish_artifact page ships static files only, with no server of \
+                                its own to hold the project's key safely, which is exactly why no \
+                                such endpoint exists. If a live page needs data to persist per \
+                                visitor without you being asked to run a query yourself: for state \
+                                scoped to just that browser, write to localStorage in the page's \
+                                own JS instead. For data that must be authoritative across \
+                                devices, this tool can only be called by you, not the page -- \
+                                either run db_query yourself whenever asked to read or write \
+                                something, or, if the developer needs the page itself to persist \
+                                data live and server-side, tell them that needs deploy_project \
+                                (Vercel/Netlify), which gives you a real server (a serverless \
+                                function) able to hold the project's key as a server-side secret -- \
+                                something a publish_artifact page structurally cannot do. If the \
                                 project has enable_auth turned on and this query should be scoped \
                                 to whoever is signed in, do not trust a user id the page's own JS \
                                 hands you as a param -- pass their access_token instead and \
