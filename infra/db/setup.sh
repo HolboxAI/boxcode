@@ -46,11 +46,15 @@ if [ ! -x "$NODE_DIR/bin/node" ] || [ "$("$NODE_DIR/bin/node" --version)" != "$N
 fi
 "$NODE_DIR/bin/node" --version
 
-echo "== nginx route for /db/query =="
+echo "== nginx routes for /db/query and /db/named-query =="
 sudo mkdir -p /etc/nginx/conf.d/auth-projects
 cat << 'EOF' | sudo tee /etc/nginx/conf.d/auth-projects/_db-route.conf >/dev/null
 location = /db/query {
     proxy_pass http://127.0.0.1:8081/query;
+    proxy_set_header Host $host;
+}
+location = /db/named-query {
+    proxy_pass http://127.0.0.1:8081/named-query;
     proxy_set_header Host $host;
 }
 EOF

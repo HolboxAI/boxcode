@@ -24,6 +24,16 @@
 //! project's own GoTrue instance and bind the resulting, verified user id
 //! as `:current_user_id`, so `WHERE user_id = :current_user_id` is backed
 //! by the token, not by whatever the page claims.
+//!
+//! `query` (and the key above) is the agent-side half only. The published
+//! page's own JS has a separate, narrower door in: `POST
+//! {auth_url}/db/named-query {project_id, access_token, name, params}`,
+//! no key, verified purely by `access_token` -- but it can only ever run a
+//! query the model already registered by name through `query` itself,
+//! never SQL the page supplies. Nothing in this module implements that
+//! route; it is documented in `DB_QUERY`'s and `ENABLE_AUTH`'s tool
+//! descriptions in `tools.rs` (what the model needs to know to use it) and
+//! `infra/db/README.md` (the control-plane side).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

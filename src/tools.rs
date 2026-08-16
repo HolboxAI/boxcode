@@ -433,31 +433,42 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                                 PRAGMA or EXPLAIN returns {\"rows\": [...], \"truncated\": bool} \
                                 (capped at 500 rows); anything else (CREATE TABLE, INSERT, UPDATE, \
                                 DELETE, ...) returns {\"changes\": n, \"last_insert_rowid\": n}. \
-                                This tool is agent-side only: unlike enable_auth's signup/token \
-                                endpoints and the upload endpoint documented there, there is NO \
-                                HTTP endpoint for a published page's own JavaScript to call this \
-                                database -- none exists to find, so do not probe auth.boxcode.sh \
-                                or any other host with guessed paths looking for one. A \
-                                publish_artifact page ships static files only, with no server of \
-                                its own to hold the project's key safely, which is exactly why no \
-                                such endpoint exists. If a live page needs data to persist per \
-                                visitor without you being asked to run a query yourself: for state \
-                                scoped to just that browser, write to localStorage in the page's \
-                                own JS instead. For data that must be authoritative across \
-                                devices, this tool can only be called by you, not the page -- \
-                                either run db_query yourself whenever asked to read or write \
-                                something, or, if the developer needs the page itself to persist \
-                                data live and server-side, tell them that needs deploy_project \
-                                (Vercel/Netlify), which gives you a real server (a serverless \
-                                function) able to hold the project's key as a server-side secret -- \
-                                something a publish_artifact page structurally cannot do. If the \
-                                project has enable_auth turned on and this query should be scoped \
-                                to whoever is signed in, do not trust a user id the page's own JS \
-                                hands you as a param -- pass their access_token instead and \
-                                reference `:current_user_id` in sql (mix freely with `?` \
-                                placeholders); it is verified against that project's auth before \
-                                the query runs, so the id in the query is the one the token \
-                                actually proves, not one the client merely claims.",
+                                This tool itself is agent-side only: there is no HTTP endpoint \
+                                for a published page's own JavaScript to run arbitrary SQL \
+                                through -- do not probe auth.boxcode.sh or any other host with \
+                                guessed paths looking for one, and do not tell a developer the \
+                                live page can send you SQL to run. If the project has enable_auth \
+                                turned on and this query should be scoped to whoever is signed \
+                                in, do not trust a user id the page's own JS hands you as a param \
+                                -- pass their access_token instead and reference \
+                                `:current_user_id` in sql (mix freely with `?` placeholders); it \
+                                is verified against that project's auth before the query runs, so \
+                                the id in the query is the one the token actually proves, not one \
+                                the client merely claims. \
+                                \
+                                To let signed-in visitors read or write their own data live, \
+                                without you being asked to run a query every time: create \
+                                `__boxcode_named_queries__ (name TEXT PRIMARY KEY, sql TEXT NOT \
+                                NULL)` with this tool if it does not exist yet, INSERT one row \
+                                per query you want to expose (name, then sql -- e.g. `SELECT id, \
+                                text FROM todos WHERE user_id = :current_user_id`), then have the \
+                                page's own JS POST {\"project_id\", \"access_token\", \"name\", \
+                                \"params\"} to https://auth.boxcode.sh/db/named-query. That route \
+                                needs no project key at all -- verified purely by the visitor's \
+                                own access_token, same as enable_auth's other endpoints -- and it \
+                                will only ever run a query you already registered this way, never \
+                                SQL the page supplies directly. Not row-level security: nothing \
+                                stops a registered query from ignoring `:current_user_id` and \
+                                reading every row anyway if you do not write the WHERE clause to \
+                                filter on it -- this verifies who is asking, not what they are \
+                                allowed to see. For state scoped to just one visitor's own \
+                                browser, localStorage is still simpler than any of this. For \
+                                anything beyond a named, parameterized SELECT/INSERT/UPDATE/ \
+                                DELETE -- real server-side logic, calling a third-party API, \
+                                sending email -- that is still out of reach here; tell the \
+                                developer that needs deploy_project (Vercel/Netlify), which gives \
+                                you a real server able to hold secrets safely, something a \
+                                publish_artifact page structurally cannot do.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -509,7 +520,13 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool) -> Vec<Value> {
                                 headers and no others, then public_url is the permanent image URL \
                                 to use in the page (store it with db_query if it needs to be found \
                                 again later, e.g. against current_user_id). Uploading requires a \
-                                signed-in visitor; there is no anonymous upload path. This \
+                                signed-in visitor; there is no anonymous upload path. A signed-in \
+                                visitor can also read or write their own data: POST \
+                                {\"project_id\",\"access_token\",\"name\",\"params\"} to \
+                                https://auth.boxcode.sh/db/named-query -- but only for a query \
+                                you already registered with db_query first (see that tool's own \
+                                description for how); the page's own JS can never send this \
+                                endpoint SQL directly. This \
                                 tool does not write anything -- after calling it, add the actual \
                                 sign-up/sign-in form and the fetch calls to the project's HTML/JS \
                                 yourself with write_file/edit_file, then publish_artifact again \

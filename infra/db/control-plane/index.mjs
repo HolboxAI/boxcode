@@ -95,6 +95,17 @@ async function authorize(projectId, key) {
   return registry;
 }
 
+// Name of the reserved table a developer's own agent-authenticated /query
+// calls create and populate to expose a query to the live page -- an
+// ordinary table in that project's own SQLite file, nothing this
+// control-plane creates or manages itself. There is nothing new for the
+// model to learn to register one: `CREATE TABLE IF NOT EXISTS
+// __boxcode_named_queries__ (name TEXT PRIMARY KEY, sql TEXT NOT NULL)`
+// then an INSERT, both ordinary db_query calls. See DB_QUERY's tool
+// description in tools.rs for the exact contract handed to the model.
+const NAMED_QUERIES_TABLE = "__boxcode_named_queries__";
+const NAMED_QUERY_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/;
+
 // A prepared statement only ever runs one SQL statement -- unlike exec(),
 // which accepts several semicolon-separated ones but returns nothing
 // useful from any of them. One statement per call is the deliberate
@@ -174,17 +185,16 @@ function runQuery(projectId, sql, params, namedParams) {
   }
 }
 
-const server = createServer(async (req, res) => {
-  if (req.method !== "POST" || req.url !== "/query") {
-    return fail(res, 404, "POST /query only");
-  }
-
+async function readJsonBody(req) {
   let body = "";
   for await (const chunk of req) body += chunk;
+  return JSON.parse(body || "{}");
+}
 
+async function handleQuery(req, res) {
   let parsed;
   try {
-    parsed = JSON.parse(body || "{}");
+    parsed = await readJsonBody(req);
   } catch {
     return fail(res, 400, "body is not JSON");
   }
@@ -237,6 +247,95 @@ const server = createServer(async (req, res) => {
     // rather than wrapping them in something vaguer.
     fail(res, 400, e.message);
   }
+}
+
+// Looks up the SQL text registered under `name` for `projectId`. A missing
+// table (nothing registered yet) and a missing row (wrong name) both
+// resolve to `null` -- a public caller does not need to know which, only
+// that there is nothing to run under that name.
+function lookupNamedQuery(projectId, name) {
+  const dbPath = path.join(DATA_DIR, `${projectId}.sqlite`);
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db.prepare(`SELECT sql FROM ${NAMED_QUERIES_TABLE} WHERE name = ?`).get(name);
+    return row ? row.sql : null;
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+// The client-facing counterpart to /query: reachable with nothing but a
+// signed-in visitor's own access_token, no project key at all, because a
+// key that authorized arbitrary SQL cannot safely be handed to a browser --
+// see infra/db/README.md. What closes that gap without reopening it is
+// that this route never accepts SQL from the caller, only a `name` -- the
+// only statements it will ever run are ones the developer already wrote
+// and registered themselves through the agent-authenticated /query route
+// above. A visitor can only ever invoke a query their own developer chose
+// to expose, never write one.
+async function handleNamedQuery(req, res) {
+  let parsed;
+  try {
+    parsed = await readJsonBody(req);
+  } catch {
+    return fail(res, 400, "body is not JSON");
+  }
+
+  const { project_id: projectId, access_token: accessToken, name } = parsed;
+  const params = Array.isArray(parsed.params) ? parsed.params : [];
+
+  if (typeof projectId !== "string" || !PROJECT_ID_RE.test(projectId)) {
+    return fail(res, 400, "project_id must look like a boxcode artifact id");
+  }
+  // Required, not optional like /query's: this route exists specifically so
+  // a signed-in visitor can reach their own data without the project's key
+  // -- there is no anonymous path here, same stance infra/uploads/ already
+  // takes and for the same reason.
+  if (typeof accessToken !== "string" || accessToken === "") {
+    return fail(res, 400, "access_token is required");
+  }
+  if (typeof name !== "string" || !NAMED_QUERY_NAME_RE.test(name)) {
+    return fail(res, 400, `name must match ${NAMED_QUERY_NAME_RE}`);
+  }
+
+  try {
+    const userId = await verifyUser(projectId, accessToken);
+
+    const sql = lookupNamedQuery(projectId, name);
+    if (sql === null) {
+      return fail(res, 404, `no named query "${name}" is registered for this project`);
+    }
+
+    // Not row-level security, same caveat /query's own :current_user_id
+    // support already carries: this verifies *who's asking*, nothing stops
+    // the registered SQL itself from ignoring current_user_id and reading
+    // every row anyway. The developer who wrote and registered it still
+    // has to get the WHERE clause right.
+    const namedParams = referencesCurrentUserId(sql) ? { current_user_id: userId } : undefined;
+    const result = runQuery(projectId, sql, params, namedParams);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(result));
+  } catch (e) {
+    if (e instanceof HttpError) {
+      return fail(res, e.status, e.message);
+    }
+    fail(res, 400, e.message);
+  }
+}
+
+const server = createServer(async (req, res) => {
+  if (req.method !== "POST") {
+    return fail(res, 404, "POST only");
+  }
+  if (req.url === "/query") {
+    return handleQuery(req, res);
+  }
+  if (req.url === "/named-query") {
+    return handleNamedQuery(req, res);
+  }
+  return fail(res, 404, "POST /query or /named-query only");
 });
 
 server.listen(PORT, "127.0.0.1", () => {
