@@ -1112,7 +1112,7 @@ fn tool_approval_parts(
         }
         Action::Read { path } => {
             lines.push(Line::from(Span::styled(
-                format!("📄 {path}"),
+                path.clone(),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1121,7 +1121,7 @@ fn tool_approval_parts(
         }
         Action::Write { path, content } => {
             lines.push(Line::from(Span::styled(
-                format!("📝 {path}"),
+                path.clone(),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1152,7 +1152,7 @@ fn tool_approval_parts(
         }
         Action::List { path } => {
             lines.push(Line::from(Span::styled(
-                format!("📁 {path}"),
+                path.clone(),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1161,7 +1161,7 @@ fn tool_approval_parts(
         }
         Action::Glob { pattern } => {
             lines.push(Line::from(Span::styled(
-                format!("🔎 {pattern}"),
+                pattern.clone(),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1171,7 +1171,7 @@ fn tool_approval_parts(
         Action::Grep { pattern, path } => {
             let scope = path.as_deref().map(|p| format!(" in {p}")).unwrap_or_default();
             lines.push(Line::from(Span::styled(
-                format!("🔎 {pattern}{scope}"),
+                format!("{pattern}{scope}"),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1193,7 +1193,7 @@ fn tool_approval_parts(
                 String::new()
             };
             lines.push(Line::from(Span::styled(
-                format!("✏️ {path}{suffix}"),
+                format!("{path}{suffix}"),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1238,7 +1238,7 @@ fn tool_approval_parts(
         Action::Deploy { provider, production, summary } => {
             lines.push(Line::from(Span::styled(
                 format!(
-                    "🚀 {provider} · {}",
+                    "{provider} · {}",
                     if *production { "Production" } else { "Preview" }
                 ),
                 Style::default()
@@ -1256,7 +1256,7 @@ fn tool_approval_parts(
         }
         Action::Search { query, max_results } => {
             lines.push(Line::from(Span::styled(
-                format!("🔎 {query}"),
+                query.clone(),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1754,7 +1754,7 @@ fn deployment_parts(
                     )));
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        format!("🌐 {} URL", session.target.label()),
+                        format!("{} URL", session.target.label()),
                         theme::faint(),
                     )));
                     // Never wrapped: a URL broken across two rows cannot be

@@ -1382,32 +1382,32 @@ impl Action {
     pub fn label(&self) -> String {
         match self {
             Action::Command { command, .. } => format!("$ {command}"),
-            Action::Read { path } => format!("📄 read {path}"),
-            Action::Write { path, .. } => format!("📝 write {path}"),
-            Action::List { path } => format!("📁 list {path}"),
-            Action::Glob { pattern } => format!("🔎 find {pattern}"),
+            Action::Read { path } => format!("read {path}"),
+            Action::Write { path, .. } => format!("write {path}"),
+            Action::List { path } => format!("list {path}"),
+            Action::Glob { pattern } => format!("find {pattern}"),
             Action::Grep { pattern, path } => match path {
-                Some(path) => format!("🔎 grep {pattern} in {path}"),
-                None => format!("🔎 grep {pattern}"),
+                Some(path) => format!("grep {pattern} in {path}"),
+                None => format!("grep {pattern}"),
             },
-            Action::Edit { path, .. } => format!("✏️ edit {path}"),
-            Action::Search { query, .. } => format!("🔎 search \"{query}\""),
-            Action::DesignStarter => "🎨 design starter".to_string(),
+            Action::Edit { path, .. } => format!("edit {path}"),
+            Action::Search { query, .. } => format!("search \"{query}\""),
+            Action::DesignStarter => "design starter".to_string(),
             Action::CheckContrast { pairs } => format!(
-                "🎨 contrast — {} pair{}",
+                "contrast — {} pair{}",
                 pairs.len(),
                 if pairs.len() == 1 { "" } else { "s" }
             ),
             Action::Deploy { provider, production, .. } => format!(
-                "🚀 deploy → {provider} ({})",
+                "deploy → {provider} ({})",
                 if *production { "Production" } else { "Preview" }
             ),
-            Action::Publish { path } => format!("🌐 preview {path} — public link, 48h"),
-            Action::EnableAuth { path } => format!("🔐 auth {path} — sign-up/sign-in"),
-            Action::DbQuery { path, sql } => format!("🗄️ db {path} — {}", clip(sql, 50)),
-            Action::ListChangeRequests { path } => format!("📨 requests {path} — check mailbox"),
+            Action::Publish { path } => format!("preview {path} — public link, 48h"),
+            Action::EnableAuth { path } => format!("auth {path} — sign-up/sign-in"),
+            Action::DbQuery { path, sql } => format!("db {path} — {}", clip(sql, 50)),
+            Action::ListChangeRequests { path } => format!("requests {path} — check mailbox"),
             Action::ResolveChangeRequest { path, id } => {
-                format!("📨 requests {path} — resolve #{id}")
+                format!("requests {path} — resolve #{id}")
             }
             Action::Plan(p) => format!("📋 plan: {}", p.title),
             Action::Progress { step, done, .. } => {
@@ -2082,7 +2082,7 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
     let Ok(args) = serde_json::from_str::<ReadFileArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "📄 read_file — unusable arguments".to_string(),
+            "read_file — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"path": "src/main.rs"}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -2093,7 +2093,7 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
     if path.is_empty() {
         return outcome(
             &call.id,
-            "📄 read_file — empty path".to_string(),
+            "read_file — empty path".to_string(),
             "Error: the path was empty. Nothing was read.".to_string(),
         );
     }
@@ -2103,7 +2103,7 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("📄 read {} — refused", clip(path, 50)),
+                format!("read {} — refused", clip(path, 50)),
                 format!("Error: {e}"),
             )
         }
@@ -2136,7 +2136,7 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
                 return outcome(
                     &call.id,
                     format!(
-                        "📄 read {} — {total} line{}",
+                        "read {} — {total} line{}",
                         clip(path, 50),
                         if total == 1 { "" } else { "s" }
                     ),
@@ -2153,7 +2153,7 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
                 // An answer, not a failure -- same contract as an empty glob.
                 return outcome(
                     &call.id,
-                    format!("📄 read {} — past the end", clip(path, 50)),
+                    format!("read {} — past the end", clip(path, 50)),
                     format!("'{path}' has only {total} line{}; nothing at offset {offset}.",
                         if total == 1 { "" } else { "s" }),
                 );
@@ -2168,13 +2168,13 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
             let end = offset + numbered.len() - 1;
             outcome(
                 &call.id,
-                format!("📄 read {} — lines {offset}-{end} of {total}", clip(path, 50)),
+                format!("read {} — lines {offset}-{end} of {total}", clip(path, 50)),
                 clip(&numbered.join("\n"), config.max_output_bytes),
             )
         }
         Err(e) => outcome(
             &call.id,
-            format!("📄 read {} — failed", clip(path, 50)),
+            format!("read {} — failed", clip(path, 50)),
             format!("Error: could not read {path}: {e}"),
         ),
     }
@@ -2184,7 +2184,7 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
     let Ok(args) = serde_json::from_str::<WriteFileArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "📝 write_file — unusable arguments".to_string(),
+            "write_file — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"path": "hello.py", "content": "..."}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -2195,7 +2195,7 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
     if path.is_empty() {
         return outcome(
             &call.id,
-            "📝 write_file — empty path".to_string(),
+            "write_file — empty path".to_string(),
             "Error: the path was empty. Nothing was written.".to_string(),
         );
     }
@@ -2205,7 +2205,7 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("📝 write {} — refused", clip(path, 50)),
+                format!("write {} — refused", clip(path, 50)),
                 format!("Error: {e}"),
             )
         }
@@ -2216,7 +2216,7 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return outcome(
                     &call.id,
-                    format!("📝 write {} — failed", clip(path, 50)),
+                    format!("write {} — failed", clip(path, 50)),
                     format!("Error: could not create the directory for {path}: {e}"),
                 );
             }
@@ -2226,12 +2226,12 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
     match tokio::fs::write(&resolved, &args.content).await {
         Ok(()) => outcome(
             &call.id,
-            format!("📝 write {} — {} bytes", clip(path, 50), args.content.len()),
+            format!("write {} — {} bytes", clip(path, 50), args.content.len()),
             format!("Wrote {} bytes to {path}", args.content.len()),
         ),
         Err(e) => outcome(
             &call.id,
-            format!("📝 write {} — failed", clip(path, 50)),
+            format!("write {} — failed", clip(path, 50)),
             format!("Error: could not write {path}: {e}"),
         ),
     }
@@ -2346,7 +2346,7 @@ const DESIGN_STARTER_CSS: &str = include_str!("../assets/design-starter.css");
 fn execute_get_design_starter(call: &ToolCall) -> ToolOutcome {
     outcome(
         &call.id,
-        "🎨 design starter".to_string(),
+        "design starter".to_string(),
         format!(
             "{DESIGN_STARTER_CSS}\n\nWrite this into the project (design-tokens.css or similar), \
              then replace --accent, --accent-hover, --font-display and --font-body before \
@@ -2371,7 +2371,7 @@ fn execute_check_contrast(call: &ToolCall) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<Args>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "🎨 contrast — unusable arguments".to_string(),
+            "contrast — unusable arguments".to_string(),
             format!(
                 r##"Error: could not read the arguments. Expected {{"pairs": [{{"label": "...", \
                  "foreground": "#000", "background": "#fff"}}]}}, got: {}"##,
@@ -2382,7 +2382,7 @@ fn execute_check_contrast(call: &ToolCall) -> ToolOutcome {
     if args.pairs.is_empty() {
         return outcome(
             &call.id,
-            "🎨 contrast — no pairs".to_string(),
+            "contrast — no pairs".to_string(),
             "Error: pairs must not be empty.".to_string(),
         );
     }
@@ -2412,7 +2412,7 @@ fn execute_check_contrast(call: &ToolCall) -> ToolOutcome {
         }
     }
     let summary = format!(
-        "🎨 contrast — {} pair{}{}",
+        "contrast — {} pair{}{}",
         args.pairs.len(),
         if args.pairs.len() == 1 { "" } else { "s" },
         if any_failed { ", 1+ failing" } else { ", all pass" }
@@ -2424,7 +2424,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
     let Ok(args) = serde_json::from_str::<WebSearchArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "🔎 web_search — unusable arguments".to_string(),
+            "web_search — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"query": "..."}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -2435,7 +2435,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
     if query.is_empty() {
         return outcome(
             &call.id,
-            "🔎 web_search — empty query".to_string(),
+            "web_search — empty query".to_string(),
             "Error: the query was empty. Nothing was searched.".to_string(),
         );
     }
@@ -2471,7 +2471,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
                     None => {
                         return outcome(
                             &call.id,
-                            format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
+                            format!("search \"{}\" — could not start", clip(&query, 50)),
                             format!(
                                 "Error: '{}' resolved to Windows' \"App Execution Alias\" stub, not \
                                  a real Python install. web_search needs Python 3 with the `ddgs` \
@@ -2517,7 +2517,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
                     None => {
                         return outcome(
                             &call.id,
-                            format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
+                            format!("search \"{}\" — could not start", clip(&query, 50)),
                             format!(
                                 "Error: could not run '{}': {e}. web_search needs Python 3 with the \
                                  `ddgs` package installed (pip install ddgs). If Python is installed \
@@ -2532,7 +2532,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
             Ok(Err(e)) => {
                 return outcome(
                     &call.id,
-                    format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
+                    format!("search \"{}\" — could not start", clip(&query, 50)),
                     format!(
                         "Error: could not run '{}': {e}. web_search needs Python 3 with the `ddgs` \
                          package installed (pip install ddgs). If Python is installed under a \
@@ -2544,7 +2544,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
             Err(_) => {
                 return outcome(
                     &call.id,
-                    format!("🔎 search \"{}\" — timed out", clip(&query, 50)),
+                    format!("search \"{}\" — timed out", clip(&query, 50)),
                     format!(
                         "Error: killed after {}s waiting for search results. Try again, or a \
                          narrower query.",
@@ -2559,7 +2559,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
         let stderr = String::from_utf8_lossy(&output.stderr);
         return outcome(
             &call.id,
-            format!("🔎 search \"{}\" — failed", clip(&query, 50)),
+            format!("search \"{}\" — failed", clip(&query, 50)),
             format!(
                 "Error: the search process exited with {:?}: {}",
                 output.status.code(),
@@ -2585,7 +2585,7 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) else {
         return outcome(
             call_id,
-            format!("🔎 search \"{}\" — unreadable response", clip(query, 50)),
+            format!("search \"{}\" — unreadable response", clip(query, 50)),
             format!(
                 "Error: could not parse the search driver's output: {}",
                 clip(trimmed, 300)
@@ -2597,7 +2597,7 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
         return if reason == "ddgs_not_installed" {
             outcome(
                 call_id,
-                format!("🔎 search \"{}\" — ddgs not installed", clip(query, 50)),
+                format!("search \"{}\" — ddgs not installed", clip(query, 50)),
                 "Error: the `ddgs` Python package is not installed. Install it with: \
                  pip install ddgs"
                     .to_string(),
@@ -2605,7 +2605,7 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
         } else {
             outcome(
                 call_id,
-                format!("🔎 search \"{}\" — failed", clip(query, 50)),
+                format!("search \"{}\" — failed", clip(query, 50)),
                 format!("Error: web search failed: {reason}"),
             )
         };
@@ -2619,7 +2619,7 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
     if results.is_empty() {
         return outcome(
             call_id,
-            format!("🔎 search \"{}\" — 0 results", clip(query, 50)),
+            format!("search \"{}\" — 0 results", clip(query, 50)),
             format!("No results found for '{query}'."),
         );
     }
@@ -2636,7 +2636,7 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
     outcome(
         call_id,
         format!(
-            "🔎 search \"{}\" — {count} result{}",
+            "search \"{}\" — {count} result{}",
             clip(query, 50),
             if count == 1 { "" } else { "s" }
         ),
@@ -2669,7 +2669,7 @@ async fn execute_publish_artifact(
     let Some(Action::Publish { path }) = describe_action(call) else {
         return outcome(
             &call.id,
-            "\u{1F310} preview \u{2014} unusable arguments".to_string(),
+            "preview \u{2014} unusable arguments".to_string(),
             format!("Error: {PUBLISH_ARTIFACT} needs a `path`."),
         );
     };
@@ -2678,7 +2678,7 @@ async fn execute_publish_artifact(
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("\u{1F310} preview {} \u{2014} refused", clip(&path, 40)),
+                format!("preview {} \u{2014} refused", clip(&path, 40)),
                 format!("Error: {e}"),
             )
         }
@@ -2704,7 +2704,7 @@ async fn execute_publish_artifact(
             outcome(
                 &call.id,
                 format!(
-                    "\u{1F310} preview \u{2014} {} file{}, expires in {}h{}",
+                    "preview \u{2014} {} file{}, expires in {}h{}",
                     published.files,
                     if published.files == 1 { "" } else { "s" },
                     published.expires_in_hours,
@@ -2724,7 +2724,7 @@ async fn execute_publish_artifact(
         }
         Err(e) => outcome(
             &call.id,
-            format!("\u{1F310} preview {} \u{2014} failed", clip(&path, 40)),
+            format!("preview {} \u{2014} failed", clip(&path, 40)),
             format!("Error: {e}"),
         ),
     }
@@ -2741,7 +2741,7 @@ async fn execute_enable_auth(call: &ToolCall, workspace: &Workspace, config: &To
     let Some(Action::EnableAuth { path }) = describe_action(call) else {
         return outcome(
             &call.id,
-            "\u{1F510} auth \u{2014} unusable arguments".to_string(),
+            "auth \u{2014} unusable arguments".to_string(),
             format!("Error: {ENABLE_AUTH} needs a `path`."),
         );
     };
@@ -2750,7 +2750,7 @@ async fn execute_enable_auth(call: &ToolCall, workspace: &Workspace, config: &To
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("\u{1F510} auth {} \u{2014} refused", clip(&path, 40)),
+                format!("auth {} \u{2014} refused", clip(&path, 40)),
                 format!("Error: {e}"),
             )
         }
@@ -2759,7 +2759,7 @@ async fn execute_enable_auth(call: &ToolCall, workspace: &Workspace, config: &To
     match crate::auth::provision(&resolved, &config.auth_endpoint).await {
         Ok(provisioned) => outcome(
             &call.id,
-            format!("\u{1F510} auth \u{2014} {}", provisioned.auth_url),
+            format!("auth \u{2014} {}", provisioned.auth_url),
             format!(
                 "Auth base URL: {}\n\n\
                  POST {{auth_url}}/signup with {{\"email\",\"password\"}} to create an account.\n\
@@ -2776,7 +2776,7 @@ async fn execute_enable_auth(call: &ToolCall, workspace: &Workspace, config: &To
         ),
         Err(e) => outcome(
             &call.id,
-            format!("\u{1F510} auth {} \u{2014} failed", clip(&path, 40)),
+            format!("auth {} \u{2014} failed", clip(&path, 40)),
             format!("Error: {e}"),
         ),
     }
@@ -2792,7 +2792,7 @@ async fn execute_db_query(call: &ToolCall, workspace: &Workspace, config: &Tools
     let Some(Action::DbQuery { path, sql }) = describe_action(call) else {
         return outcome(
             &call.id,
-            "\u{1F5C4}\u{FE0F} db \u{2014} unusable arguments".to_string(),
+            "db \u{2014} unusable arguments".to_string(),
             format!("Error: {DB_QUERY} needs a `path` and a `sql` statement."),
         );
     };
@@ -2812,7 +2812,7 @@ async fn execute_db_query(call: &ToolCall, workspace: &Workspace, config: &Tools
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("\u{1F5C4}\u{FE0F} db {} \u{2014} refused", clip(&path, 40)),
+                format!("db {} \u{2014} refused", clip(&path, 40)),
                 format!("Error: {e}"),
             )
         }
@@ -2824,7 +2824,7 @@ async fn execute_db_query(call: &ToolCall, workspace: &Workspace, config: &Tools
             let json = serde_json::to_string_pretty(&rows).unwrap_or_default();
             outcome(
                 &call.id,
-                format!("\u{1F5C4}\u{FE0F} db \u{2014} {count} row{}", if count == 1 { "" } else { "s" }),
+                format!("db \u{2014} {count} row{}", if count == 1 { "" } else { "s" }),
                 format!(
                     "{json}{}",
                     if truncated { "\n\n(truncated at 500 rows)" } else { "" }
@@ -2833,12 +2833,12 @@ async fn execute_db_query(call: &ToolCall, workspace: &Workspace, config: &Tools
         }
         Ok(crate::db::QueryResult::Write { changes, last_insert_rowid }) => outcome(
             &call.id,
-            format!("\u{1F5C4}\u{FE0F} db \u{2014} {changes} change{}", if changes == 1 { "" } else { "s" }),
+            format!("db \u{2014} {changes} change{}", if changes == 1 { "" } else { "s" }),
             format!("changes: {changes}\nlast_insert_rowid: {last_insert_rowid}"),
         ),
         Err(e) => outcome(
             &call.id,
-            format!("\u{1F5C4}\u{FE0F} db {} \u{2014} failed", clip(&path, 40)),
+            format!("db {} \u{2014} failed", clip(&path, 40)),
             format!("Error: {e}"),
         ),
     }
@@ -2853,7 +2853,7 @@ async fn execute_list_change_requests(
     let Some(Action::ListChangeRequests { path }) = describe_action(call) else {
         return outcome(
             &call.id,
-            "\u{1F4E8} requests \u{2014} unusable arguments".to_string(),
+            "requests \u{2014} unusable arguments".to_string(),
             format!("Error: {LIST_CHANGE_REQUESTS} needs a `path`."),
         );
     };
@@ -2862,7 +2862,7 @@ async fn execute_list_change_requests(
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("\u{1F4E8} requests {} \u{2014} refused", clip(&path, 40)),
+                format!("requests {} \u{2014} refused", clip(&path, 40)),
                 format!("Error: {e}"),
             )
         }
@@ -2871,7 +2871,7 @@ async fn execute_list_change_requests(
     match crate::requests::list_pending(&resolved, &config.requests_endpoint).await {
         Ok(requests) if requests.is_empty() => outcome(
             &call.id,
-            "\u{1F4E8} requests \u{2014} none pending".to_string(),
+            "requests \u{2014} none pending".to_string(),
             "No pending change requests.".to_string(),
         ),
         Ok(requests) => {
@@ -2880,7 +2880,7 @@ async fn execute_list_change_requests(
             outcome(
                 &call.id,
                 format!(
-                    "\u{1F4E8} requests \u{2014} {count} pending",
+                    "requests \u{2014} {count} pending",
                 ),
                 format!(
                     "{json}\n\nCall {RESOLVE_CHANGE_REQUEST} with an id once you have acted on \
@@ -2890,7 +2890,7 @@ async fn execute_list_change_requests(
         }
         Err(e) => outcome(
             &call.id,
-            format!("\u{1F4E8} requests {} \u{2014} failed", clip(&path, 40)),
+            format!("requests {} \u{2014} failed", clip(&path, 40)),
             format!("Error: {e}"),
         ),
     }
@@ -2905,7 +2905,7 @@ async fn execute_resolve_change_request(
     let Some(Action::ResolveChangeRequest { path, id }) = describe_action(call) else {
         return outcome(
             &call.id,
-            "\u{1F4E8} requests \u{2014} unusable arguments".to_string(),
+            "requests \u{2014} unusable arguments".to_string(),
             format!("Error: {RESOLVE_CHANGE_REQUEST} needs a `path` and an `id`."),
         );
     };
@@ -2914,7 +2914,7 @@ async fn execute_resolve_change_request(
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("\u{1F4E8} requests {} \u{2014} refused", clip(&path, 40)),
+                format!("requests {} \u{2014} refused", clip(&path, 40)),
                 format!("Error: {e}"),
             )
         }
@@ -2923,12 +2923,12 @@ async fn execute_resolve_change_request(
     match crate::requests::resolve(&resolved, &config.requests_endpoint, &id).await {
         Ok(()) => outcome(
             &call.id,
-            format!("\u{1F4E8} requests \u{2014} #{id} resolved"),
+            format!("requests \u{2014} #{id} resolved"),
             format!("Request {id} marked resolved."),
         ),
         Err(e) => outcome(
             &call.id,
-            format!("\u{1F4E8} requests {} \u{2014} failed", clip(&path, 40)),
+            format!("requests {} \u{2014} failed", clip(&path, 40)),
             format!("Error: {e}"),
         ),
     }
@@ -2938,7 +2938,7 @@ async fn execute_deploy_project(call: &ToolCall, workspace: &Workspace) -> ToolO
     let Some(Action::Deploy { provider, .. }) = describe_action(call) else {
         return outcome(
             &call.id,
-            "🚀 deploy — unusable arguments".to_string(),
+            "deploy — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"provider": "vercel"}} or {{"provider": "netlify"}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -2950,14 +2950,14 @@ async fn execute_deploy_project(call: &ToolCall, workspace: &Workspace) -> ToolO
     if let Err(e) = crate::deploy::detect::detect(workspace.root()) {
         return outcome(
             &call.id,
-            format!("🚀 deploy → {provider} — nothing to deploy"),
+            format!("deploy → {provider} — nothing to deploy"),
             format!("Error: {e}"),
         );
     }
 
     outcome(
         &call.id,
-        format!("🚀 deploy → {provider} — not started"),
+        format!("deploy → {provider} — not started"),
         "Error: a deployment could not be started this turn. It has to be the only tool call in \
          the turn, because it takes over the screen until it finishes. Ask for it on its own."
             .to_string(),
@@ -2976,7 +2976,7 @@ fn execute_list_dir(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
 
     let dir = match resolve_in_workspace(workspace, &requested) {
         Ok(p) => p,
-        Err(e) => return outcome(&call.id, format!("📁 list {requested} — {e}"), format!("Error: {e}")),
+        Err(e) => return outcome(&call.id, format!("list {requested} — {e}"), format!("Error: {e}")),
     };
 
     let entries = match std::fs::read_dir(&dir) {
@@ -2984,7 +2984,7 @@ fn execute_list_dir(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("📁 list {requested} — {e}"),
+                format!("list {requested} — {e}"),
                 format!("Error: could not list '{requested}': {e}"),
             )
         }
@@ -3023,7 +3023,7 @@ fn execute_list_dir(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
 
     outcome(
         &call.id,
-        format!("📁 list {requested} — {total} entries"),
+        format!("list {requested} — {total} entries"),
         clip(&body, 32_000),
     )
 }
@@ -3033,7 +3033,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<GlobArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "🔎 glob — unusable arguments".to_string(),
+            "glob — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"pattern": "src/**/*.rs"}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -3044,7 +3044,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     if pattern.is_empty() {
         return outcome(
             &call.id,
-            "🔎 glob — empty pattern".to_string(),
+            "glob — empty pattern".to_string(),
             "Error: pattern must not be empty.".to_string(),
         );
     }
@@ -3053,7 +3053,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let Some(joined) = joined.to_str() else {
         return outcome(
             &call.id,
-            "🔎 glob — invalid pattern".to_string(),
+            "glob — invalid pattern".to_string(),
             "Error: pattern is not valid UTF-8.".to_string(),
         );
     };
@@ -3063,7 +3063,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("🔎 glob {pattern} — invalid"),
+                format!("glob {pattern} — invalid"),
                 format!("Error: '{pattern}' is not a valid glob: {e}"),
             )
         }
@@ -3088,7 +3088,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         // model toward retrying instead of concluding.
         return outcome(
             &call.id,
-            format!("🔎 glob {pattern} — no matches"),
+            format!("glob {pattern} — no matches"),
             format!("No files match '{pattern}'."),
         );
     }
@@ -3105,7 +3105,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
 
     outcome(
         &call.id,
-        format!("🔎 glob {pattern} — {total} match(es)"),
+        format!("glob {pattern} — {total} match(es)"),
         clip(&body, 32_000),
     )
 }
@@ -3144,7 +3144,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<GrepSearchArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "🔎 grep — unusable arguments".to_string(),
+            "grep — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"pattern": "fn main"}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -3155,7 +3155,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     if pattern.is_empty() {
         return outcome(
             &call.id,
-            "🔎 grep — empty pattern".to_string(),
+            "grep — empty pattern".to_string(),
             "Error: pattern must not be empty.".to_string(),
         );
     }
@@ -3164,7 +3164,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("🔎 grep {pattern} — invalid"),
+                format!("grep {pattern} — invalid"),
                 format!("Error: '{pattern}' is not a valid regular expression: {e}"),
             )
         }
@@ -3179,13 +3179,13 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let root = match resolve_in_workspace(workspace, &requested) {
         Ok(p) => p,
         Err(e) => {
-            return outcome(&call.id, format!("🔎 grep {pattern} — {e}"), format!("Error: {e}"))
+            return outcome(&call.id, format!("grep {pattern} — {e}"), format!("Error: {e}"))
         }
     };
     if !root.exists() {
         return outcome(
             &call.id,
-            format!("🔎 grep {pattern} — no such path"),
+            format!("grep {pattern} — no such path"),
             format!("Error: '{requested}' does not exist."),
         );
     }
@@ -3274,7 +3274,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         };
         return outcome(
             &call.id,
-            format!("🔎 grep {pattern} — no matches"),
+            format!("grep {pattern} — no matches"),
             format!("No lines match '{pattern}'{scope}."),
         );
     }
@@ -3289,7 +3289,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
 
     outcome(
         &call.id,
-        format!("🔎 grep {pattern} — {matched_lines} match(es) in {files_with_matches} file(s)"),
+        format!("grep {pattern} — {matched_lines} match(es) in {files_with_matches} file(s)"),
         clip(&body, 32_000),
     )
 }
@@ -3299,7 +3299,7 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<EditFileArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "✏️ edit_file — unusable arguments".to_string(),
+            "edit_file — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"path": "src/main.rs", "old_string": "...", "new_string": "..."}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -3308,7 +3308,7 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     };
 
     let requested = args.path.trim().to_string();
-    let fail = |msg: String| outcome(&call.id, format!("✏️ edit {requested} — failed"), msg);
+    let fail = |msg: String| outcome(&call.id, format!("edit {requested} — failed"), msg);
 
     if requested.is_empty() {
         return fail("Error: path must not be empty.".to_string());
@@ -3406,7 +3406,7 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     };
     outcome(
         &call.id,
-        format!("✏️ edit {requested} — {replaced_total} replacement(s)"),
+        format!("edit {requested} — {replaced_total} replacement(s)"),
         summary,
     )
 }
@@ -4497,7 +4497,7 @@ mod tests {
     }
 
     /// Regression: without this, a model that only emits tool calls leaves the
-    /// transcript as a bare log of "$ ..."/"📝 ..." lines with nothing said
+    /// transcript as a bare log of "$ ..."/"write ..." lines with nothing said
     /// about them -- what a user pointed at directly when comparing this to
     /// Claude Code's narrated "I'll just run it." / "Ran it — output: ...".
     #[test]
