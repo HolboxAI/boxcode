@@ -310,6 +310,18 @@ fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
                     ),
                     Span::styled(label, role_style(Role::Tool)),
                 ]));
+                // A running subagent gets one live sub-line: which round it
+                // is on and the last thing it did. One line, not the whole
+                // trail -- this area redraws every frame, and the full story
+                // is `/subagents`' job once the child is done.
+                if let Some(trail) = app.running_subagent_trail(&call.id) {
+                    if let Some(step) = trail.steps.last() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  └ round {} · {step}", trail.rounds.max(1)),
+                            theme::faint(),
+                        )));
+                    }
+                }
             }
         }
         if app.state == AppState::Streaming {
@@ -381,8 +393,17 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
         }
         AppState::ExecutingTools => {
             let n = app.running_tools.len();
+            // "command" would be a small lie about a subagent, which runs
+            // many commands of its own -- and "waiting on a child" is worth
+            // saying, since it can take noticeably longer than one command.
+            let agents = app
+                .running_tools
+                .iter()
+                .filter(|c| c.function.name == crate::tools::AGENT)
+                .count();
+            let noun = if agents == n && n > 0 { "subagent" } else { "command" };
             (
-                format!("Running {n} command{}", if n == 1 { "" } else { "s" }),
+                format!("Running {n} {noun}{}", if n == 1 { "" } else { "s" }),
                 String::new(),
             )
         }

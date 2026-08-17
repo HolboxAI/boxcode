@@ -129,6 +129,9 @@ pub fn handle_event(app: &mut App, id: u64, event: StreamEvent) {
         StreamEvent::Token(token) => app.append_token(&token),
         StreamEvent::ToolCalls(calls) => app.request_tools(calls),
         StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
+        StreamEvent::AgentActivity { call_id, label, rounds } => {
+            app.record_subagent_activity(&call_id, label, rounds)
+        }
         StreamEvent::Usage(u) => app.record_exact_usage(u),
         StreamEvent::Done => app.finish_stream(),
         StreamEvent::Notice(note) => app.note(note),
@@ -170,7 +173,7 @@ pub fn execute_approved(
                     // conversation, a stream, a tool runner -- and because the
                     // runner deliberately never sees the LLM config.
                     outcomes.push(if call.function.name == tools::AGENT {
-                        run_subagent(call, &ws, &config).await
+                        run_subagent(call, &ws, &config, Some((id, &tx))).await
                     } else {
                         tools::execute(call, &ws, &config.tools).await
                     });
@@ -204,8 +207,20 @@ pub fn execute_approved(
 /// The stream is driven with `select!` in this task rather than spawned, so
 /// when the user cancels the turn (aborting the runner task in
 /// `execute_approved`), the child's in-flight request is dropped with it --
-/// no orphaned stream spending tokens after Esc.
-pub async fn run_subagent(call: &ToolCall, workspace: &Workspace, config: &Config) -> ToolOutcome {
+/// and the same abort kills any command the child had running, via the
+/// `kill_on_drop` the command runner already sets. No orphaned stream, no
+/// orphaned process, no tokens spent after Esc.
+///
+/// `progress` is how the child stays visible while it works: one
+/// [`StreamEvent::AgentActivity`] per tool call it makes, sent on the same
+/// channel as everything else so the stale-id guard covers it too. `None`
+/// runs silently -- the loop is not entitled to a UI.
+pub async fn run_subagent(
+    call: &ToolCall,
+    workspace: &Workspace,
+    config: &Config,
+    progress: Option<(u64, &mpsc::Sender<(u64, StreamEvent)>)>,
+) -> ToolOutcome {
     let Some(tools::Action::Agent { task, agent_type }) = tools::describe_action(call) else {
         return ToolOutcome {
             call_id: call.id.clone(),
@@ -285,9 +300,15 @@ pub async fn run_subagent(call: &ToolCall, workspace: &Workspace, config: &Confi
                     Some((_, StreamEvent::ToolCalls(c))) => calls = c,
                     Some((_, StreamEvent::Usage(u))) => usage = Some(u),
                     // Notices ("answer was truncated") are addressed to a
-                    // user, and this loop has none; ToolsFinished never
-                    // arrives here -- the child runs its tools inline below.
-                    Some((_, StreamEvent::Notice(_) | StreamEvent::ToolsFinished(_))) => {}
+                    // user, and this loop has none; ToolsFinished and
+                    // AgentActivity never arrive here -- the child runs its
+                    // tools inline below, and only *sends* activity, upward.
+                    Some((
+                        _,
+                        StreamEvent::Notice(_)
+                        | StreamEvent::ToolsFinished(_)
+                        | StreamEvent::AgentActivity { .. },
+                    )) => {}
                     Some((_, StreamEvent::Done)) | None => break None,
                     Some((_, StreamEvent::Error(e))) => break Some(e),
                 },
@@ -354,17 +375,41 @@ pub async fn run_subagent(call: &ToolCall, workspace: &Workspace, config: &Confi
         }
         steps += 1;
         for c in &calls {
+            // Judged before the activity event is sent, so a refused call is
+            // *reported* as refused -- a trail that said "📝 write notes.md"
+            // about a write that never happened would be a lie in the UI.
+            let gate = if !budget_left {
+                Err("Your budget is spent. Write your report now, from what you have seen."
+                    .to_string())
+            } else {
+                tools::subagent_call_allowed(c)
+            };
+            if let Some((id, tx)) = progress {
+                let mut label = tools::describe_action(c)
+                    .map(|a| a.label())
+                    .unwrap_or_else(|| c.function.name.clone());
+                if gate.is_err() {
+                    label.push_str(" — refused");
+                }
+                // Best-effort: a full channel or a gone receiver must never
+                // stall or fail the child, so the error is dropped.
+                let _ = tx
+                    .send((
+                        id,
+                        StreamEvent::AgentActivity {
+                            call_id: call.id.clone(),
+                            label,
+                            rounds: steps,
+                        },
+                    ))
+                    .await;
+            }
             // Answered in order, one message per call, even the refused ones
             // -- an unanswered tool call leaves the transcript invalid and
             // fails the *next* request instead of this one.
-            let content = if !budget_left {
-                "Your budget is spent. Write your report now, from what you have seen."
-                    .to_string()
-            } else {
-                match tools::subagent_call_allowed(c) {
-                    Ok(()) => tools::execute(c, workspace, &config.tools).await.content,
-                    Err(reason) => reason,
-                }
+            let content = match gate {
+                Ok(()) => tools::execute(c, workspace, &config.tools).await.content,
+                Err(reason) => reason,
             };
             history.push(ChatMessage {
                 role: "tool".to_string(),
@@ -508,7 +553,7 @@ mod tests {
         let config = config_for(&endpoint);
 
         let outcome =
-            run_subagent(&agent_call(json!({ "task": "count lines in hello.txt" })), &ws, &config)
+            run_subagent(&agent_call(json!({ "task": "count lines in hello.txt" })), &ws, &config, None)
                 .await;
 
         assert_eq!(outcome.content, "hello.txt has three lines.");
@@ -539,7 +584,7 @@ mod tests {
         let config = config_for(&endpoint);
 
         let outcome =
-            run_subagent(&agent_call(json!({ "task": "write up findings" })), &ws, &config).await;
+            run_subagent(&agent_call(json!({ "task": "write up findings" })), &ws, &config, None).await;
 
         assert_eq!(outcome.content, "Report without writing.");
         assert!(!dir.path().join("notes.md").exists(), "nothing may reach disk");
@@ -560,6 +605,7 @@ mod tests {
             &agent_call(json!({ "task": "fix the bug", "agent_type": "worker" })),
             &ws,
             &config,
+            None,
         )
         .await;
         assert!(outcome.content.contains("'explore'"), "{}", outcome.content);
@@ -572,8 +618,50 @@ mod tests {
         let config = config_for("http://127.0.0.1:9"); // never contacted
         let mut call = agent_call(json!({}));
         call.function.arguments = "not json".to_string();
-        let outcome = run_subagent(&call, &ws, &config).await;
+        let outcome = run_subagent(&call, &ws, &config, None).await;
         assert!(outcome.content.contains("task"), "{}", outcome.content);
+    }
+
+    /// While it works, the child announces each tool call on the parent's
+    /// event channel -- executed ones plainly, refused ones saying so -- and
+    /// every event carries the parent call's id and request id, so the
+    /// stale-id guard and the trail bookkeeping both work unchanged.
+    #[tokio::test]
+    async fn a_subagent_reports_each_step_while_it_works() {
+        let (_dir, ws) = workspace_with_hello();
+        let (endpoint, _requests) = serve_rounds(vec![
+            tool_call_round(tools::READ_FILE, r#"{"path":"hello.txt"}"#),
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"n.md","content":"x"}"#),
+            text_round("Report."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let outcome = run_subagent(
+            &agent_call(json!({ "task": "look around" })),
+            &ws,
+            &config,
+            Some((7, &tx)),
+        )
+        .await;
+        drop(tx); // so the drain below ends instead of waiting forever
+
+        assert_eq!(outcome.content, "Report.");
+        let mut activities = Vec::new();
+        while let Some((id, event)) = rx.recv().await {
+            let StreamEvent::AgentActivity { call_id, label, rounds } = event else {
+                panic!("the child must only send activity, got {event:?}");
+            };
+            assert_eq!(id, 7, "tagged with the parent's request id");
+            assert_eq!(call_id, "call_agent", "tagged with the parent call");
+            activities.push((label, rounds));
+        }
+        assert_eq!(activities.len(), 2, "one event per tool call the child made");
+        assert!(activities[0].0.contains("read"), "{}", activities[0].0);
+        assert_eq!(activities[0].1, 1);
+        assert!(activities[1].0.ends_with("— refused"), "{}", activities[1].0);
+        assert_eq!(activities[1].1, 2);
     }
 
     /// With the step budget already spent, the one request made carries the
@@ -586,7 +674,7 @@ mod tests {
         config.tools.subagent_max_steps = 0;
 
         let outcome =
-            run_subagent(&agent_call(json!({ "task": "anything" })), &ws, &config).await;
+            run_subagent(&agent_call(json!({ "task": "anything" })), &ws, &config, None).await;
 
         assert_eq!(outcome.content, "Forced report.");
         let requests = requests.await.expect("round served");

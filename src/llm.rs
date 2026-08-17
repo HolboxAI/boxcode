@@ -163,6 +163,12 @@ pub enum StreamEvent {
     /// channel, so the event loop has one place to drain and one stale-id guard
     /// covering both sources.
     ToolsFinished(Vec<crate::tools::ToolOutcome>),
+    /// Not from the endpoint either: a running subagent saying what it just
+    /// did -- one event per tool call the child makes, carrying the parent
+    /// call's id, the child call's one-line label, and which round the child
+    /// is on. The transcript's live area shows the latest one under the
+    /// agent's entry, and `/subagents` replays the whole trail afterwards.
+    AgentActivity { call_id: String, label: String, rounds: usize },
     /// Exact token counts for the request that just finished, when the endpoint
     /// reports them. Absent rather than guessed: the caller keeps its own
     /// character estimate as the fallback, and knowing which one it has is the
@@ -867,6 +873,7 @@ mod tests {
                 StreamEvent::Token(_) => "token",
                 StreamEvent::ToolCalls(_) => "tools",
                 StreamEvent::ToolsFinished(_) => "finished",
+                StreamEvent::AgentActivity { .. } => "activity",
                 StreamEvent::Usage(_) => "usage",
                 StreamEvent::Done => "done",
                 StreamEvent::Notice(_) => "notice",

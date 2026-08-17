@@ -165,6 +165,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/compact", "summarise the conversation to free up context"),
     ("/usage", "what today cost, and the history"),
     ("/quota", "what is left today, and your own limits"),
+    ("/subagents", "what each subagent did, step by step"),
 ];
 
 /// Roughly how many characters one token is worth.
@@ -261,6 +262,30 @@ fn compaction_readout(
     out
 }
 
+/// One subagent's visible history: the task it was given and the one-line
+/// label of every tool call it made, in order. This is the "expanded" form
+/// of the collapsed `⛭ agent …` transcript entry -- kept out of `messages`
+/// because it is commentary about the session, not part of any conversation
+/// the model should ever be sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentTrail {
+    /// The parent `agent` call this trail belongs to.
+    pub call_id: String,
+    pub task: String,
+    /// One `Action::label()`-style line per tool call the child made.
+    pub steps: Vec<String>,
+    /// Which request round the child was last seen on.
+    pub rounds: usize,
+    /// The outcome's one-liner once the child is done; `None` while it runs,
+    /// which is what the live view keys on.
+    pub finished: Option<String>,
+}
+
+/// Ceiling on remembered subagent trails. Old ones fall off the front: this
+/// is display history for `/subagents`, and a session that spawned hundreds
+/// of children should not carry all of them in memory forever.
+pub const MAX_SUBAGENT_TRAILS: usize = 20;
+
 /// How big the conversation is, in both senses that can be known here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContextSize {
@@ -353,6 +378,12 @@ pub struct App {
     /// without this copy "Running N commands…" would show N for one frame and
     /// then silently go blank while the commands were still running.
     pub running_tools: Vec<ToolCall>,
+    /// What each subagent did, one entry per `agent` call this session,
+    /// appended to live as `AgentActivity` events arrive from the runner.
+    /// The transcript's live area shows a running child's latest step under
+    /// its entry; `/subagents` replays whole trails afterwards. Capped at
+    /// `MAX_SUBAGENT_TRAILS` -- display history, never load-bearing state.
+    pub subagent_trails: Vec<SubagentTrail>,
     /// Tool rounds spent on the current prompt, reset by `submit`. Once this hits
     /// the configured ceiling the schemas stop being sent, which is what makes a
     /// model that will not stop calling tools produce an answer instead.
@@ -493,6 +524,7 @@ impl App {
             pending_tools: VecDeque::new(),
             approved_tools: Vec::new(),
             running_tools: Vec::new(),
+            subagent_trails: Vec::new(),
             tool_steps: 0,
             busy_started: None,
             streamed_chars: 0,
@@ -616,6 +648,7 @@ impl App {
                         "/compact" => self.start_compaction(),
                         "/usage" => self.show_usage(),
                         "/quota" => self.show_quota(),
+                        "/subagents" => self.show_subagents(),
                         other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
                     }
                 } else {
@@ -826,6 +859,12 @@ impl App {
         self.approved_tools.clear();
         self.running_tools.clear();
         self.overlay = None;
+        // Children die with the turn (the abort above dropped their loops),
+        // so their trails must say so -- "running…" about a dead child would
+        // be the display lying.
+        for trail in self.subagent_trails.iter_mut().filter(|t| t.finished.is_none()) {
+            trail.finished = Some("cancelled".to_string());
+        }
 
         // Before anything else is appended: synthetic results have to sit
         // directly after the calls they answer.
@@ -2008,12 +2047,98 @@ impl App {
             return;
         }
         for outcome in outcomes {
+            // A subagent's trail closes with the outcome's own status -- the
+            // part after the dash, since the display line already repeats the
+            // task the trail is titled with.
+            if let Some(trail) = self
+                .subagent_trails
+                .iter_mut()
+                .find(|t| t.call_id == outcome.call_id && t.finished.is_none())
+            {
+                trail.finished = Some(
+                    outcome
+                        .display
+                        .rsplit(" — ")
+                        .next()
+                        .unwrap_or(&outcome.display)
+                        .to_string(),
+                );
+            }
             self.push_tool_outcome(outcome);
         }
         self.running_tools.clear();
         self.follow_tail = true;
         // Back around: the model needs a turn to use what it just got.
         self.state = AppState::Sending;
+    }
+
+    /// A running subagent reported one tool call. Appends to its trail,
+    /// creating the trail on the first event -- the task is read from the
+    /// running call itself, which is still in the display snapshot.
+    pub fn record_subagent_activity(&mut self, call_id: &str, label: String, rounds: usize) {
+        if let Some(trail) = self
+            .subagent_trails
+            .iter_mut()
+            .find(|t| t.call_id == call_id && t.finished.is_none())
+        {
+            trail.steps.push(label);
+            trail.rounds = rounds;
+            return;
+        }
+        let task = self.running_tools.iter().find(|c| c.id == call_id).and_then(|c| {
+            match tools::describe_action(c) {
+                Some(tools::Action::Agent { task, .. }) => Some(task),
+                _ => None,
+            }
+        });
+        // An event for a call that is not a running subagent is stale or
+        // invented. This is display history, so dropping it beats guessing.
+        let Some(task) = task else { return };
+        if self.subagent_trails.len() >= MAX_SUBAGENT_TRAILS {
+            self.subagent_trails.remove(0);
+        }
+        self.subagent_trails.push(SubagentTrail {
+            call_id: call_id.to_string(),
+            task,
+            steps: vec![label],
+            rounds,
+            finished: None,
+        });
+    }
+
+    /// The live trail for one running `agent` call, for the transcript's
+    /// live area. `None` until the child's first tool call arrives.
+    pub fn running_subagent_trail(&self, call_id: &str) -> Option<&SubagentTrail> {
+        self.subagent_trails
+            .iter()
+            .find(|t| t.call_id == call_id && t.finished.is_none())
+    }
+
+    /// `/subagents`: replay what each child did, step by step -- the
+    /// expansion of the collapsed one-line entries in the transcript. Local
+    /// commentary, never sent to the model.
+    fn show_subagents(&mut self) {
+        if self.subagent_trails.is_empty() {
+            self.messages.push(Message::new(
+                Role::System,
+                "No subagents have run in this session.",
+            ));
+            self.follow_tail = true;
+            return;
+        }
+        let mut out = String::from("Subagents this session:");
+        for trail in &self.subagent_trails {
+            let status = trail.finished.as_deref().unwrap_or("running…");
+            out.push_str(&format!("\n\n⛭ \"{}\" — {status}", trail.task));
+            if trail.steps.is_empty() {
+                out.push_str("\n   (answered without using any tools)");
+            }
+            for step in &trail.steps {
+                out.push_str(&format!("\n   · {step}"));
+            }
+        }
+        self.messages.push(Message::new(Role::System, out));
+        self.follow_tail = true;
     }
 
     pub fn push_tool_outcome(&mut self, outcome: ToolOutcome) {
@@ -5407,22 +5532,143 @@ mod tests {
     /// tool set is the read-only slice, so there is nothing for a prompt to
     /// protect -- and being approval-free is what makes delegating to it
     /// worth anything.
+    fn agent_tool_call(id: &str, task: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::AGENT.to_string(),
+                arguments: serde_json::json!({ "task": task }).to_string(),
+            },
+        }
+    }
+
     #[test]
     fn an_agent_call_skips_the_prompt_when_the_fast_path_is_on() {
         let mut a = streaming_app();
         a.config.tools.auto_approve_read_only = true;
-        a.request_tools(vec![ToolCall {
-            id: "call_1".to_string(),
-            kind: "function".to_string(),
-            function: crate::llm::FunctionCall {
-                name: crate::tools::AGENT.to_string(),
-                arguments: serde_json::json!({ "task": "map the config loading" }).to_string(),
-            },
-        }]);
+        a.request_tools(vec![agent_tool_call("call_1", "map the config loading")]);
 
         assert_eq!(a.state, AppState::ExecutingTools);
         assert_eq!(a.overlay, None);
         assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// The trail is born from the first activity event, titled with the task
+    /// read off the running call, and grows one step per event.
+    #[test]
+    fn subagent_activity_builds_a_live_trail() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![agent_tool_call("call_1", "map the config loading")]);
+        assert_eq!(a.state, AppState::ExecutingTools);
+
+        a.record_subagent_activity("call_1", "📄 read config.rs".to_string(), 1);
+        a.record_subagent_activity("call_1", "🔎 grep load".to_string(), 2);
+
+        let trail = a.running_subagent_trail("call_1").expect("a live trail");
+        assert_eq!(trail.task, "map the config loading");
+        assert_eq!(trail.steps, vec!["📄 read config.rs", "🔎 grep load"]);
+        assert_eq!(trail.rounds, 2);
+        assert_eq!(trail.finished, None);
+    }
+
+    /// An activity event for a call that is not a running subagent is stale
+    /// or invented; display history drops it rather than guessing a title.
+    #[test]
+    fn subagent_activity_for_an_unknown_call_is_dropped() {
+        let mut a = streaming_app();
+        a.record_subagent_activity("call_9", "📄 read x".to_string(), 1);
+        assert!(a.subagent_trails.is_empty());
+    }
+
+    /// When the child finishes, the trail closes with the outcome's status
+    /// and stops being the "live" trail -- but stays replayable.
+    #[test]
+    fn a_finished_subagent_trail_keeps_its_history_for_replay() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![agent_tool_call("call_1", "map the config loading")]);
+        a.record_subagent_activity("call_1", "📄 read config.rs".to_string(), 1);
+
+        a.finish_tools(vec![tools::ToolOutcome {
+            call_id: "call_1".to_string(),
+            display: "⛭ agent \"map the config loading\" — done (1 tool round, ~2k tokens)"
+                .to_string(),
+            content: "It loads from ~/.boxcode/config.toml.".to_string(),
+        }]);
+
+        assert_eq!(a.running_subagent_trail("call_1"), None, "no longer live");
+        let trail = &a.subagent_trails[0];
+        assert_eq!(trail.finished.as_deref(), Some("done (1 tool round, ~2k tokens)"));
+        assert_eq!(trail.steps.len(), 1, "the history survives for /subagents");
+    }
+
+    /// Esc kills the children with the turn, and the trails must say so --
+    /// "running…" about a dead child would be the display lying.
+    #[test]
+    fn cancelling_marks_running_subagent_trails_cancelled() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![agent_tool_call("call_1", "map the config loading")]);
+        a.record_subagent_activity("call_1", "📄 read config.rs".to_string(), 1);
+
+        a.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(a.subagent_trails[0].finished.as_deref(), Some("cancelled"));
+    }
+
+    /// `/subagents` is the expansion of the collapsed transcript entries:
+    /// each task, its status, and every step, as local commentary the model
+    /// never sees.
+    #[test]
+    fn the_subagents_command_replays_each_trail() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![agent_tool_call("call_1", "map the config loading")]);
+        a.record_subagent_activity("call_1", "📄 read config.rs".to_string(), 1);
+        a.finish_tools(vec![tools::ToolOutcome {
+            call_id: "call_1".to_string(),
+            display: "⛭ agent \"map the config loading\" — done (1 tool round)".to_string(),
+            content: "report".to_string(),
+        }]);
+
+        a.show_subagents();
+
+        let last = a.messages.last().expect("a message");
+        assert!(last.role == Role::System, "commentary, never sent to the model");
+        assert!(last.content.contains("map the config loading"), "{}", last.content);
+        assert!(last.content.contains("📄 read config.rs"), "{}", last.content);
+        assert!(last.content.contains("done (1 tool round)"), "{}", last.content);
+    }
+
+    #[test]
+    fn the_subagents_command_says_so_when_none_have_run() {
+        let mut a = app();
+        a.show_subagents();
+        let last = a.messages.last().expect("a message");
+        assert!(last.content.contains("No subagents"), "{}", last.content);
+    }
+
+    /// The cap drops the oldest trail, not the newest -- and never a live one
+    /// in practice, since 20 finished trails precede any running one.
+    #[test]
+    fn subagent_trails_are_capped_at_the_oldest_end() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        for i in 0..(MAX_SUBAGENT_TRAILS + 3) {
+            let id = format!("call_{i}");
+            a.state = AppState::Streaming;
+            a.request_tools(vec![agent_tool_call(&id, &format!("task {i}"))]);
+            a.record_subagent_activity(&id, "📄 read x".to_string(), 1);
+            a.finish_tools(vec![tools::ToolOutcome {
+                call_id: id,
+                display: "⛭ agent — done".to_string(),
+                content: "r".to_string(),
+            }]);
+        }
+        assert_eq!(a.subagent_trails.len(), MAX_SUBAGENT_TRAILS);
+        assert_eq!(a.subagent_trails[0].task, "task 3", "oldest fell off");
     }
 
     /// Unlike a shell command's read-only-ness, "this writes a file" is
