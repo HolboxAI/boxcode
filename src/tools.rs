@@ -67,6 +67,7 @@ pub const LIST_CHANGE_REQUESTS: &str = "list_change_requests";
 pub const RESOLVE_CHANGE_REQUEST: &str = "resolve_change_request";
 pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
 pub const PLAN_PROGRESS: &str = "plan_progress";
+pub const AGENT: &str = "agent";
 
 /// Whether the model is allowed to change anything yet.
 ///
@@ -737,6 +738,44 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> 
         }),
     ];
 
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": AGENT,
+            "description": format!(
+                "Delegate one focused research question to a subagent and get back only its \
+                 final report. The subagent works in the same project with read-only tools \
+                 ({READ_FILE}, {LIST_DIR}, {GLOB}, {GREP_SEARCH}, and read-only shell \
+                 commands) -- it cannot change anything, so it runs without approval prompts. \
+                 Use it when answering would mean reading many files whose contents you do \
+                 not need afterwards: 'find every caller of X', 'how does the config loading \
+                 work', 'which tests cover Y'. Its transcript never enters yours -- you pay \
+                 one tool result for work that would otherwise fill your context. Give it a \
+                 self-contained task: it cannot see this conversation and cannot ask you \
+                 questions. Not for writing or running builds -- do those yourself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "The question to research, self-contained: name the \
+                                        files, symbols or behavior of interest and say what \
+                                        the report should cover. The subagent sees only this \
+                                        text, not the conversation."
+                    },
+                    "agent_type": {
+                        "type": "string",
+                        "enum": ["explore"],
+                        "description": "What kind of subagent. Only 'explore' (read-only \
+                                        research) exists today; omit it."
+                    }
+                },
+                "required": ["task"]
+            }
+        }
+    }));
+
     if !deploy {
         schemas.retain(|schema| schema["function"]["name"] != DEPLOY_PROJECT);
     }
@@ -858,6 +897,113 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> 
     schemas
 }
 
+/// Tools a subagent may call: the names in [`SUBAGENT_TOOLS`], nothing else.
+///
+/// Derived from `schemas()` by filtering rather than written out again, so a
+/// tool's parameters can never drift between the two lists. Read-only by
+/// construction is the entire design: a child that cannot write needs no
+/// approval prompts, which is what makes delegating to it free. `agent`
+/// itself is absent -- children do not spawn children (depth 1 only, until
+/// the plumbing has earned more), and `web_search` too: it sends the query to
+/// a third party, which is the parent's decision to make, not a child's.
+pub fn subagent_schemas() -> Vec<Value> {
+    let mut schemas = schemas(Mode::Normal, false, false, false);
+    schemas.retain(|schema| {
+        let name = schema["function"]["name"].as_str().unwrap_or_default();
+        SUBAGENT_TOOLS.contains(&name)
+    });
+    schemas
+}
+
+/// The tools a subagent is offered -- and, via `subagent_call_allowed`, the
+/// only ones it can execute even if it hallucinates another.
+pub const SUBAGENT_TOOLS: &[&str] = &[RUN_COMMAND, READ_FILE, LIST_DIR, GLOB, GREP_SEARCH];
+
+/// Why `call` may not run inside a subagent, or `Ok` if it may.
+///
+/// The second fence around the child (the first is never advertising the
+/// other tools in `subagent_schemas`): every call is checked against the
+/// allowlist before execution, and a command additionally against the same
+/// `is_read_only` judgement the approval layer trusts. The child runs with
+/// nobody watching a prompt, so anything this cannot vouch for is refused --
+/// the messages tell the model what to do instead, because a bare "no" gets
+/// retried.
+pub fn subagent_call_allowed(call: &ToolCall) -> Result<(), String> {
+    let name = call.function.name.as_str();
+    if name == AGENT {
+        return Err(
+            "Subagents cannot spawn further subagents. Do the research yourself with \
+             read_file, grep_search, glob and list_dir."
+                .to_string(),
+        );
+    }
+    if !SUBAGENT_TOOLS.contains(&name) {
+        return Err(format!(
+            "You are a read-only research subagent; '{name}' is not available here. Your \
+             tools are {RUN_COMMAND} (read-only commands), {READ_FILE}, {LIST_DIR}, {GLOB} \
+             and {GREP_SEARCH}. If the task needs anything else, say so in your report and \
+             let the requester decide."
+        ));
+    }
+    if name == RUN_COMMAND {
+        let command = serde_json::from_str::<RunArgs>(&call.function.arguments)
+            .map(|args| args.command.trim().to_string())
+            .unwrap_or_default();
+        if !command.is_empty() && !is_read_only(&command) {
+            return Err(format!(
+                "Subagents only run commands that cannot change anything, and `{}` is not \
+                 on that list. Use {READ_FILE}/{GREP_SEARCH}/{GLOB} instead, or note in \
+                 your report that the command is worth running.",
+                clip(&command, 60)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What a subagent is told about its situation. The counterpart of
+/// `system_prompt` for a child loop: same workspace and OS facts, but the
+/// job description is inverted -- research and report, never change anything,
+/// and the final message *is* the deliverable, because it is the only thing
+/// the requester ever sees.
+pub fn subagent_system_prompt(workspace: &Workspace, steps_used: usize, max_steps: usize) -> String {
+    if steps_used >= max_steps {
+        return format!(
+            "You are a read-only research subagent working in {}.\n\
+             You have used up your tool budget. Write your report now, in text, from what \
+             you have already seen. State plainly anything you could not verify.",
+            workspace.root().display()
+        );
+    }
+    let os_hint = if cfg!(windows) {
+        "This is Windows: use `dir`, `type`, `findstr`. Do NOT use ls/cat/grep."
+    } else {
+        "This is a Unix-like system: use `ls`, `cat`, `grep`, `find`."
+    };
+    format!(
+        "You are a read-only research subagent inside boxcode, a terminal coding assistant. \
+         A larger agent delegated one task to you; it sees ONLY your final message, never \
+         your tool calls or their output, so your last message must be a self-contained \
+         report: findings with file paths (and line numbers where they matter), not a \
+         narration of what you did. There is no user to converse with and nobody will \
+         answer a question -- if something is ambiguous, pick the reasonable reading, say \
+         so, and report what you found.\n\
+         \n\
+         Project directory: {root}\n\
+         Operating system: {os}. {os_hint}\n\
+         \n\
+         Tools: {READ_FILE}(path, offset?, limit?), {LIST_DIR}(path?), {GLOB}(pattern), \
+         {GREP_SEARCH}(pattern, path?, context?), and {RUN_COMMAND} for read-only commands \
+         only (`git log`, `cargo tree`, ...) -- anything that could change files, state or \
+         the network is refused, so do not try. You have {steps_left} tool round{plural} \
+         left; be economical, then answer.",
+        root = workspace.root().display(),
+        os = std::env::consts::OS,
+        steps_left = max_steps - steps_used,
+        plural = if max_steps - steps_used == 1 { "" } else { "s" },
+    )
+}
+
 /// What the model is told about its situation.
 ///
 /// The operating system is stated outright because the single most common way
@@ -939,7 +1085,12 @@ pub fn system_prompt(
            project and then deliberately change, not ship as-is.\n\
          - {CHECK_CONTRAST}(pairs): the real WCAG contrast ratio for foreground/background hex \
            pairs. You cannot see the page you write, so this is the one part of \"does this \
-           read clearly\" that is arithmetic instead of a guess.\n\n\
+           read clearly\" that is arithmetic instead of a guess.\n\
+         - {AGENT}(task): delegate one focused research question to a read-only subagent and \
+           get back only its final report. Use it when answering means reading many files whose \
+           contents you will not need afterwards -- the child's transcript never enters yours. \
+           Give it a self-contained task; it cannot see this conversation. Read-only, runs \
+           without asking.\n\n\
          Rules:\n\
          - {os_hint}\n\
          - Narrate in plain sentences, not just tool calls. Before acting, say in one short \
@@ -1159,6 +1310,13 @@ struct RunArgs {
 }
 
 #[derive(Deserialize)]
+struct AgentArgs {
+    task: String,
+    #[serde(default)]
+    agent_type: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ReadFileArgs {
     path: String,
     #[serde(default)]
@@ -1341,6 +1499,12 @@ pub enum Action {
         /// line would be a filesystem read per redraw.
         summary: Option<String>,
     },
+    /// Delegates one research task to a read-only subagent. Read-only by
+    /// construction, like `Read`: the child is offered nothing but reading
+    /// tools and its commands are filtered through the same `is_read_only`
+    /// allowlist the approval layer trusts, so there is nothing a prompt
+    /// would protect. See `agent::run_subagent`.
+    Agent { task: String, agent_type: String },
     /// `exit_plan_mode`: the one action that changes nothing on disk *yet* and
     /// is still always worth stopping for. Approving it hands the writing
     /// tools back and saves the plan as a file, so it is two consequential
@@ -1409,6 +1573,7 @@ impl Action {
             Action::ResolveChangeRequest { path, id } => {
                 format!("📨 requests {path} — resolve #{id}")
             }
+            Action::Agent { task, .. } => format!("⛭ agent: \"{}\"", clip(task, 60)),
             Action::Plan(p) => format!("📋 plan: {}", p.title),
             Action::Progress { step, done, .. } => {
                 format!("{} step {step}", if *done { "☑" } else { "☐" })
@@ -1470,6 +1635,10 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
         | Action::Search { .. }
         | Action::DesignStarter
         | Action::CheckContrast { .. }
+        // A subagent is exactly what plan mode is for -- cheap research. Its
+        // whole tool set is the read-only slice this very function allows,
+        // so there is nothing it could do that a plan-mode parent could not.
+        | Action::Agent { .. }
         | Action::Plan(_)
         // Cannot arise in plan mode -- there is no approved plan to record
         // against -- but listing it keeps this match exhaustive by intent
@@ -1541,6 +1710,24 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
             Some(Action::Command {
                 command,
                 purpose: args.purpose.filter(|p| !p.trim().is_empty()),
+            })
+        }
+        AGENT => {
+            let args: AgentArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let task = args.task.trim().to_string();
+            if task.is_empty() {
+                return None;
+            }
+            Some(Action::Agent {
+                task,
+                // The default is spelled out here rather than downstream so
+                // everything after this point -- popup, label, runner -- agrees
+                // on what an omitted type means.
+                agent_type: args
+                    .agent_type
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| "explore".to_string()),
             })
         }
         READ_FILE => {
@@ -1951,6 +2138,18 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         DB_QUERY => execute_db_query(call, workspace, config).await,
         LIST_CHANGE_REQUESTS => execute_list_change_requests(call, workspace, config).await,
         RESOLVE_CHANGE_REQUEST => execute_resolve_change_request(call, workspace, config).await,
+        // Never reached: `agent::execute_approved` intercepts agent calls and
+        // runs the child loop itself, because spawning one takes the LLM
+        // config and this runner deliberately has no access to it. Handled
+        // anyway for the same reason as the plan tools below: a routing
+        // mistake should produce a sentence the model can act on.
+        AGENT => outcome(
+            &call.id,
+            "⛭ agent — not handled".to_string(),
+            "Error: the subagent was not started. Do the research yourself with \
+             read_file/grep_search/glob instead."
+                .to_string(),
+        ),
         // Never reached: `app::advance_approvals` resolves this one itself,
         // because accepting it changes `App`'s mode and the runner has no
         // access to `App`. Handled anyway so a routing mistake produces a
@@ -4677,9 +4876,106 @@ mod tests {
                 LIST_CHANGE_REQUESTS,
                 RESOLVE_CHANGE_REQUEST,
                 WEB_SEARCH,
-                DEPLOY_PROJECT
+                DEPLOY_PROJECT,
+                AGENT
             ]
         );
+    }
+
+    // ---- the agent tool (Phase 4.1) ----------------------------------------
+
+    #[test]
+    fn an_agent_call_describes_with_the_default_type() {
+        let call = tool_call(AGENT, json!({ "task": "find every caller of resolve_in_workspace" }));
+        assert_eq!(
+            describe_action(&call),
+            Some(Action::Agent {
+                task: "find every caller of resolve_in_workspace".to_string(),
+                agent_type: "explore".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_agent_call_with_an_empty_task_describes_nothing() {
+        let call = tool_call(AGENT, json!({ "task": "   " }));
+        assert_eq!(describe_action(&call), None, "nothing coherent to run or approve");
+    }
+
+    #[test]
+    fn an_explicit_agent_type_is_kept() {
+        let call = tool_call(AGENT, json!({ "task": "look around", "agent_type": "worker" }));
+        let Some(Action::Agent { agent_type, .. }) = describe_action(&call) else {
+            panic!("should describe");
+        };
+        // Kept, not rejected here: the runner is what refuses unknown types,
+        // with a message the model can act on.
+        assert_eq!(agent_type, "worker");
+    }
+
+    /// The recursion guard and the read-only guarantee are both structural:
+    /// the child's schema list simply does not contain anything else.
+    #[test]
+    fn subagent_schemas_offer_exactly_the_read_only_slice() {
+        let names: Vec<String> = subagent_schemas()
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(names, SUBAGENT_TOOLS, "same order as the parent list, nothing extra");
+        assert!(!names.iter().any(|n| n == AGENT), "children do not spawn children");
+        assert!(!names.iter().any(|n| n == WRITE_FILE || n == EDIT_FILE));
+    }
+
+    #[test]
+    fn a_subagent_may_read_but_never_write() {
+        assert!(subagent_call_allowed(&tool_call(READ_FILE, json!({ "path": "a.txt" }))).is_ok());
+        assert!(subagent_call_allowed(&tool_call(GREP_SEARCH, json!({ "pattern": "x" }))).is_ok());
+        let refusal = subagent_call_allowed(&tool_call(
+            WRITE_FILE,
+            json!({ "path": "a.txt", "content": "x" }),
+        ));
+        assert!(refusal.is_err(), "writing is exactly what a child cannot do");
+    }
+
+    #[test]
+    fn a_subagent_command_is_held_to_the_read_only_allowlist() {
+        assert!(subagent_call_allowed(&call("git log --oneline")).is_ok());
+        assert!(
+            subagent_call_allowed(&call("cargo build")).is_err(),
+            "a build changes the target directory, and nobody is watching a prompt"
+        );
+        assert!(subagent_call_allowed(&call("rm -rf /")).is_err());
+    }
+
+    #[test]
+    fn a_subagent_cannot_spawn_a_subagent() {
+        let refusal = subagent_call_allowed(&tool_call(AGENT, json!({ "task": "recurse" })));
+        assert!(refusal.is_err(), "depth 1 only, until Phase 5 proves the plumbing");
+    }
+
+    #[test]
+    fn plan_mode_lets_a_subagent_through() {
+        let action = Action::Agent { task: "research".to_string(), agent_type: "explore".to_string() };
+        assert_eq!(plan_mode_block(&action), None, "a read-only child is what plan mode is for");
+    }
+
+    #[test]
+    fn a_subagent_is_normal_risk() {
+        let (_dir, ws, _config) = fixture();
+        let action = Action::Agent { task: "research".to_string(), agent_type: "explore".to_string() };
+        assert_eq!(action_risk(&action, ws.root()), danger::Risk::Normal);
+    }
+
+    /// The exhausted prompt must demand an answer, because withheld schemas
+    /// only work if the prompt says why they are gone.
+    #[test]
+    fn the_subagent_prompt_turns_into_answer_now_when_the_budget_is_spent() {
+        let (_dir, ws, _config) = fixture();
+        let fresh = subagent_system_prompt(&ws, 0, 15);
+        assert!(fresh.contains("read-only research subagent"));
+        assert!(fresh.contains("15 tool rounds left"));
+        let spent = subagent_system_prompt(&ws, 15, 15);
+        assert!(spent.contains("Write your report now"));
     }
 
     // ---- get_design_starter / check_contrast ------------------------------

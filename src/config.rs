@@ -313,6 +313,19 @@ pub struct ToolsConfig {
     /// `artifact_endpoint`/`auth_endpoint`/`db_endpoint`.
     #[serde(default = "default_requests_endpoint")]
     pub requests_endpoint: String,
+    /// How many request rounds one subagent may take before its schemas are
+    /// withheld and it is made to answer. Separate from `max_steps`: a child
+    /// exists to answer one focused question, so its budget is deliberately
+    /// smaller than the loop that spawned it.
+    #[serde(default = "default_subagent_max_steps")]
+    pub subagent_max_steps: usize,
+    /// Ceiling on the tokens one subagent may spend across all of its rounds
+    /// (exact counts when the endpoint reports them, the usual character
+    /// estimate when it does not). Steps bound how many *turns* a child takes;
+    /// this bounds how much each of those turns is allowed to cost -- without
+    /// it, fifteen rounds over a growing transcript is an unbounded bill.
+    #[serde(default = "default_subagent_token_budget")]
+    pub subagent_token_budget: usize,
 }
 
 fn yes() -> bool {
@@ -376,6 +389,20 @@ fn default_search_timeout() -> u64 {
     20
 }
 
+fn default_subagent_max_steps() -> usize {
+    // Enough to explore a question properly (a child that greps, reads five
+    // files and answers uses six), small enough that a child which has lost
+    // the thread is cut off well before the parent's own 40-round budget.
+    15
+}
+
+fn default_subagent_token_budget() -> usize {
+    // Roomy for research over a real codebase, but a hard ceiling: at typical
+    // per-round transcript growth this is the cost of one thorough child, not
+    // a runaway one.
+    200_000
+}
+
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
@@ -392,6 +419,8 @@ impl Default for ToolsConfig {
             auth_endpoint: default_auth_endpoint(),
             db_endpoint: default_db_endpoint(),
             requests_endpoint: default_requests_endpoint(),
+            subagent_max_steps: default_subagent_max_steps(),
+            subagent_token_budget: default_subagent_token_budget(),
         }
     }
 }
