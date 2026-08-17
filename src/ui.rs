@@ -825,21 +825,26 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
 /// line in the transcript instead -- next to the work, not stranded at the
 /// bottom of the screen.
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let keys: &[(&str, &str)] = match &app.state {
+    let keys: Vec<(&str, &str)> = match &app.state {
         // Same reasoning as the approval box below: the deployment panel
         // prints its own keys, directly under the choices they act on.
-        _ if app.overlay == Some(Overlay::Deploy) => &[("^c", "exit")],
+        _ if app.overlay == Some(Overlay::Deploy) => vec![("^c", "exit")],
         // The approval box prints y/n/esc itself, directly under the command
         // they act on. Repeating them here put the same three keys on screen
         // twice, one row apart, which reads as two different prompts.
-        AppState::AwaitingApproval => &[("^c", "exit")],
-        _ if app.is_busy() => &[("esc", "interrupt"), ("^c", "exit")],
-        _ => &[
-            ("↵", "send"),
-            ("⌥↵", "newline"),
-            ("↑↓", "history"),
-            ("^c", "exit"),
-        ],
+        AppState::AwaitingApproval => vec![("^c", "exit")],
+        _ if app.is_busy() => vec![("esc", "interrupt"), ("^c", "exit")],
+        _ => {
+            let mut keys = vec![("↵", "send"), ("⌥↵", "newline")];
+            // Only worth a slot once there is something to clear -- e.g. right
+            // after pasting a prompt too long to want to retype.
+            if !app.input_buffer.is_empty() {
+                keys.push(("^u", "clear"));
+            }
+            keys.push(("↑↓", "history"));
+            keys.push(("^c", "exit"));
+            keys
+        }
     };
 
     let mut spans = vec![Span::raw("  ")];
@@ -2024,11 +2029,17 @@ fn render_text_prompt(
 
 // ---- text layout helpers ------------------------------------------------------
 
+/// Row count for a logical line hard-wrapped at `width`, matching `hard_wrap`
+/// chunk-for-chunk. Must agree with it exactly: this feeds the cursor's row
+/// position (see `render_input`), and a row count one higher than the chunks
+/// `hard_wrap` actually produces points the cursor at a row that does not
+/// exist -- for a paste whose length divides `width` evenly, that used to
+/// mean `index == len`, an out-of-bounds panic on a long enough paste.
 fn hard_wrap_rows(len: usize, width: usize) -> usize {
-    if width == 0 {
+    if width == 0 || len == 0 {
         1
     } else {
-        (len / width) + 1
+        (len + width - 1) / width
     }
 }
 
@@ -4417,6 +4428,45 @@ mod tests {
         for expected in ["line 01", "line 02", "line 03"] {
             assert!(joined.contains(expected), "{expected} missing:\n{joined}");
         }
+    }
+
+    /// `hard_wrap_rows` is a row-count *shortcut* for the same wrapping
+    /// `hard_wrap` actually performs on the input box's content -- the two
+    /// must always agree, char for char, across widths that do and do not
+    /// divide the length evenly. They fell out of sync exactly on the "divides
+    /// evenly" case, which pointed the cursor's row one past the box's real
+    /// content and panicked on a long enough paste (see the test below).
+    #[test]
+    fn hard_wrap_rows_matches_the_row_count_hard_wrap_actually_produces() {
+        for width in [1, 2, 5, 7, 56] {
+            for len in 0..=(width * 4 + 3) {
+                let line = "x".repeat(len);
+                assert_eq!(
+                    hard_wrap_rows(len, width),
+                    hard_wrap(&line, width).len(),
+                    "len={len} width={width}"
+                );
+            }
+        }
+    }
+
+    /// A single pasted line whose length is an exact multiple of the box's
+    /// width used to make the independently-recomputed cursor row land one
+    /// past the last row `hard_wrap` actually produced -- `index == len` --
+    /// and panic. This is that shape, reproduced through the real render path
+    /// rather than by calling the row-count helpers directly.
+    #[test]
+    fn a_pasted_line_whose_length_divides_the_box_width_evenly_does_not_panic() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        // Terminal width 60 -> input_width(60) == 56 (see `input_width`); three
+        // full rows with nothing left over is exactly the boundary that broke.
+        let text = "x".repeat(56 * 3);
+        app.cursor = text.len();
+        app.input_buffer = text;
+        // Panics (in the old code) before returning, so reaching this line at
+        // all is the assertion.
+        let _ = rendered_rows(&mut app, 60, 24);
     }
 
     /// Walking back up a long prompt has to bring the earlier lines back into

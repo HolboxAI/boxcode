@@ -346,7 +346,12 @@ fn default_max_tokens() -> u32 {
 }
 
 fn default_command_timeout() -> u64 {
-    60
+    // 60s was sized for shell one-liners -- search, tests, a build. It is
+    // routinely too short for a package manager's first install (`npm
+    // install` alone commonly clears a minute once the registry is slow),
+    // which kills the process mid-write and leaves a half-populated
+    // `node_modules` behind for every command after it to trip over.
+    120
 }
 
 fn default_max_output_bytes() -> usize {
