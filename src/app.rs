@@ -1713,7 +1713,12 @@ impl App {
                 // stylesheet and arithmetic on hex strings the model already
                 // sent. Even less to protect against than a read.
                 | Some(tools::Action::DesignStarter)
-                | Some(tools::Action::CheckContrast { .. }) => return false,
+                | Some(tools::Action::CheckContrast { .. })
+                // Read-only by construction: the child is offered nothing but
+                // the reading tools, and its commands are filtered through
+                // the same `is_read_only` allowlist as the arm below. What it
+                // spends is the endpoint the parent is already talking to.
+                | Some(tools::Action::Agent { .. }) => return false,
                 Some(tools::Action::Command { command, .. }) if tools::is_read_only(&command) => {
                     return false;
                 }
@@ -5392,6 +5397,28 @@ mod tests {
         let mut a = streaming_app();
         a.config.tools.auto_approve_read_only = true;
         a.request_tools(vec![read_file_call("call_1", "src/main.rs")]);
+
+        assert_eq!(a.state, AppState::ExecutingTools);
+        assert_eq!(a.overlay, None);
+        assert_eq!(a.approved_tools.len(), 1);
+    }
+
+    /// A subagent rides the fast path with the reads it is made of: its whole
+    /// tool set is the read-only slice, so there is nothing for a prompt to
+    /// protect -- and being approval-free is what makes delegating to it
+    /// worth anything.
+    #[test]
+    fn an_agent_call_skips_the_prompt_when_the_fast_path_is_on() {
+        let mut a = streaming_app();
+        a.config.tools.auto_approve_read_only = true;
+        a.request_tools(vec![ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::AGENT.to_string(),
+                arguments: serde_json::json!({ "task": "map the config loading" }).to_string(),
+            },
+        }]);
 
         assert_eq!(a.state, AppState::ExecutingTools);
         assert_eq!(a.overlay, None);

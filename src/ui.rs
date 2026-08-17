@@ -1178,6 +1178,27 @@ fn tool_approval_parts(
             )));
             (" Search file contents? ", "search", "skip")
         }
+        // Only ever shown with `auto_approve_read_only = false` -- a subagent
+        // is auto-approved alongside the reads it is made of. The task is the
+        // whole decision, so it is the whole popup.
+        Action::Agent { task, .. } => {
+            for wrapped in wrap(task, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default()
+                        .fg(theme::p().text)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            for wrapped in wrap(
+                "Researches this with read-only tools in a separate conversation and reports back.",
+                inner,
+            ) {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            (" Spawn a research subagent? ", "spawn", "skip")
+        }
         // An edit shows every span, because approving a replacement you cannot
         // see is not approval. Unlike a write it does not need the whole file --
         // showing only what changes is the reason to prefer this tool. A batch
