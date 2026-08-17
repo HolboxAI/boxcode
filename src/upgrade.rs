@@ -132,7 +132,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn Error>> {
 }
 
 async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
-    println!("🔎 Checking {} for a newer version...", base_url());
+    println!("Checking {} for a newer version...", base_url());
 
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))

@@ -4,6 +4,19 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// How long to wait for the *next* chunk of a streaming response before
+/// giving up -- not a cap on the response as a whole. A real completion can
+/// legitimately run for minutes once started; a provider that has quietly
+/// stopped sending anything is a different situation, and this is the
+/// signal that tells them apart. Long enough to tolerate a real thinking
+/// gap between chunks (seconds, not minutes, for any provider actually
+/// working), short enough to catch a genuine hang well before it reads as
+/// "still working" for two minutes with nothing to show for it -- the
+/// exact gap `run_command`'s own `command_timeout_secs` already closes for
+/// shell commands, applied here to the one other place boxcode can wait
+/// indefinitely with no way to notice.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[derive(Serialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -260,6 +273,28 @@ pub async fn stream_chat(
     let _ = tx.send((request_id, event)).await;
 }
 
+/// Waits for `stream`'s next item, but no longer than `idle_timeout`. Split
+/// out from `run`'s own read loop purely so the timeout path is directly
+/// testable with a short duration against a real (if silent) mock server,
+/// instead of a test having to wait out the real `STREAM_IDLE_TIMEOUT` to
+/// prove the mechanism works at all.
+async fn next_chunk_within<T, E: std::fmt::Display>(
+    stream: &mut (impl futures::Stream<Item = Result<T, E>> + Unpin),
+    idle_timeout: Duration,
+) -> Result<Option<T>, String> {
+    match tokio::time::timeout(idle_timeout, stream.next()).await {
+        Ok(Some(Ok(item))) => Ok(Some(item)),
+        Ok(Some(Err(e))) => Err(format!("Stream interrupted: {e}")),
+        Ok(None) => Ok(None),
+        Err(_) => Err(format!(
+            "No response from the endpoint for {}s -- the connection is open but nothing is \
+             arriving. This is not a rate limit or a bad request; the endpoint has gone quiet. \
+             Retry, or check its status page.",
+            idle_timeout.as_secs()
+        )),
+    }
+}
+
 async fn run(
     target: Target<'_>,
     messages: Vec<ChatMessage>,
@@ -283,6 +318,12 @@ async fn run(
         stream_options: include_usage.then_some(StreamOptions { include_usage: true }),
     };
 
+    // Deliberately not `.timeout(...)` on the client: that bounds the whole
+    // request including the time spent reading the streamed body, which
+    // would kill a real, still-producing completion just for taking a
+    // while. `connect_timeout` only covers the handshake; the gap-between-
+    // chunks case is handled separately, per-chunk, around the read loop
+    // below (`STREAM_IDLE_TIMEOUT`) -- see that constant's own comment.
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .build()
@@ -384,8 +425,21 @@ async fn run(
     let mut finish_reason: Option<String> = None;
     let mut reported_usage: Option<ApiUsage> = None;
 
-    'read: while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Stream interrupted: {e}"))?;
+    'read: loop {
+        // Bounds the gap between chunks, not the whole response -- a real
+        // completion can legitimately run for minutes once it has started
+        // (a long file, a reasoning model's own thinking budget), so a
+        // fixed cap on total duration would kill useful work exactly as
+        // often as it catches a real hang. The client's own
+        // `connect_timeout` only covers establishing the connection; once
+        // connected, a provider that accepts the request and then goes
+        // quiet mid-stream had nothing to time it out before this existed
+        // -- confirmed live, a real session sat at zero output for over a
+        // minute with no way to tell "still working" from "never coming
+        // back" apart.
+        let Some(chunk) = next_chunk_within(&mut stream, STREAM_IDLE_TIMEOUT).await? else {
+            break;
+        };
         buf.extend_from_slice(&chunk);
 
         while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
@@ -591,6 +645,50 @@ mod tests {
             chat_completions_url("https://llm.internal/v1/chat/completions"),
             "https://llm.internal/v1/chat/completions"
         );
+    }
+
+    // ---- next_chunk_within -------------------------------------------------
+
+    /// The ordinary case: a chunk arrives well within the deadline.
+    #[tokio::test]
+    async fn next_chunk_within_returns_a_chunk_that_arrives_in_time() {
+        let mut stream = Box::pin(futures::stream::once(async { Ok::<_, String>(vec![1u8, 2, 3]) }));
+        let result = next_chunk_within(&mut stream, Duration::from_secs(5)).await;
+        assert_eq!(result, Ok(Some(vec![1, 2, 3])));
+    }
+
+    /// The stream ending cleanly is not a timeout -- `run`'s own loop reads
+    /// `Ok(None)` as "response finished", the same as today.
+    #[tokio::test]
+    async fn next_chunk_within_returns_none_when_the_stream_ends() {
+        let mut stream = futures::stream::empty::<Result<Vec<u8>, String>>();
+        let result = next_chunk_within(&mut stream, Duration::from_secs(5)).await;
+        assert_eq!(result, Ok(None));
+    }
+
+    /// The regression this exists for: a stream that never produces
+    /// anything and never closes -- an open connection to an endpoint that
+    /// has gone quiet, exactly what a real session hit live. Uses
+    /// `stream::pending`, not a slow real server, so this runs in
+    /// milliseconds instead of waiting out a real timeout.
+    #[tokio::test]
+    async fn next_chunk_within_times_out_on_a_stream_that_never_produces_anything() {
+        let mut stream = futures::stream::pending::<Result<Vec<u8>, String>>();
+        let result = next_chunk_within(&mut stream, Duration::from_millis(20)).await;
+        let error = result.expect_err("should time out");
+        assert!(error.contains("gone quiet"), "{error}");
+    }
+
+    /// An error from the stream itself (a real transport failure) is
+    /// distinct from a timeout and must not be reported as one.
+    #[tokio::test]
+    async fn next_chunk_within_propagates_a_real_stream_error() {
+        let mut stream = Box::pin(futures::stream::once(async { Err::<Vec<u8>, _>("connection reset") }));
+        let error = next_chunk_within(&mut stream, Duration::from_secs(5))
+            .await
+            .expect_err("should propagate");
+        assert!(error.contains("Stream interrupted"), "{error}");
+        assert!(error.contains("connection reset"), "{error}");
     }
 
     #[test]
