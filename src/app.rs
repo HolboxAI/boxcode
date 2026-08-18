@@ -61,6 +61,19 @@ pub struct Message {
     /// Which call this message answers. Only ever set on `Role::Tool`.
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// What this tool call changed on disk, if it changed a file. Only ever
+    /// set on `Role::Tool`, and drawn under the tool line as a `-`/`+` diff.
+    ///
+    /// Carried on the message rather than re-derived at render time for the
+    /// same reason `Deploy`'s summary is: the file has already been written by
+    /// the time this is drawn, so asking the disk again would show the diff
+    /// against the *new* contents -- which is to say, nothing. It has to be
+    /// captured at the moment of the change or not at all.
+    ///
+    /// `#[serde(default)]`, like every field above it, so a session file
+    /// written before this existed still loads.
+    #[serde(default)]
+    pub diff: Option<crate::diff::FileDiff>,
 }
 
 impl Message {
@@ -71,6 +84,7 @@ impl Message {
             display: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            diff: None,
         }
     }
 
@@ -963,6 +977,7 @@ impl App {
             display: None,
             tool_calls: calls.clone(),
             tool_call_id: None,
+            diff: None,
         });
         self.pending_tools = calls.into();
         self.tool_steps += 1;
@@ -1053,10 +1068,17 @@ impl App {
                                 )
                             });
                     }
+                    // Reading the file happens here, once per approval, for
+                    // the same reason detection above does: the renderer would
+                    // repeat it on every frame, and by the time the *result*
+                    // is drawn the file has already changed underneath it.
+                    let preview =
+                        tools::preview_change(&action, Path::new(&self.workspace_root));
                     self.show_approval(crate::approval::ApprovalRequest {
                         call: call.clone(),
                         action,
                         remaining: self.pending_tools.len().saturating_sub(1),
+                        preview,
                     });
                     return;
                 }
@@ -1464,6 +1486,7 @@ impl App {
             display: Some(summary),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            diff: None,
         });
         // That figure described the conversation this just replaced; carrying
         // it forward would report the old context's size as the new one's.
@@ -2179,6 +2202,7 @@ impl App {
             display: Some(outcome.display),
             tool_calls: Vec::new(),
             tool_call_id: Some(outcome.call_id),
+            diff: outcome.diff,
         });
     }
 
@@ -2926,6 +2950,7 @@ impl App {
                 call_id: call.id.clone(),
                 display,
                 content: session.report(),
+                diff: None,
             });
             self.overlay = None;
             self.follow_tail = true;
@@ -5192,6 +5217,7 @@ mod tests {
             call_id: call_id.to_string(),
             display: format!("$ … — {content}"),
             content: content.to_string(),
+            diff: None,
         }
     }
 
@@ -5674,6 +5700,7 @@ mod tests {
             display: "⛭ agent \"map the config loading\" — done (1 tool round, ~2k tokens)"
                 .to_string(),
             content: "It loads from ~/.boxcode/config.toml.".to_string(),
+            diff: None,
         }]);
 
         assert_eq!(a.running_subagent_trail("call_1"), None, "no longer live");
@@ -5709,6 +5736,7 @@ mod tests {
             call_id: "call_1".to_string(),
             display: "⛭ agent \"map the config loading\" — done (1 tool round)".to_string(),
             content: "report".to_string(),
+            diff: None,
         }]);
 
         a.show_subagents();
@@ -5743,6 +5771,7 @@ mod tests {
                 call_id: id,
                 display: "⛭ agent — done".to_string(),
                 content: "r".to_string(),
+                diff: None,
             }]);
         }
         assert_eq!(a.subagent_trails.len(), MAX_SUBAGENT_TRAILS);
@@ -5872,6 +5901,7 @@ mod tests {
             call_id: "call_1".to_string(),
             display: "$ cat a.rs — 3 lines".to_string(),
             content: "exit code: 0\n--- stdout ---\nfn main() {}\n".to_string(),
+            diff: None,
         }]);
 
         assert_eq!(a.state, AppState::Sending);

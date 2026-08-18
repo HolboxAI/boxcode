@@ -9,6 +9,7 @@ mod danger;
 mod dateutil;
 mod db;
 mod deploy;
+mod diff;
 mod llm;
 mod notice;
 mod plan;

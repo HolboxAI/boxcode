@@ -193,6 +193,25 @@ mod tests {
         });
     }
 
+    /// A session recorded by a build that predates a field must still load.
+    /// This is what makes `--resume` survive an upgrade instead of silently
+    /// starting the conversation over.
+    #[test]
+    fn a_session_written_before_diffs_existed_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("old.jsonl");
+        std::fs::write(
+            &path,
+            "{\"role\":\"tool\",\"content\":\"Wrote 12 bytes\",\"display\":\"📝 write a.rs\"}\n",
+        )
+        .expect("write");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.len(), 1, "the line was dropped instead of loaded");
+        assert!(loaded[0].role == Role::Tool);
+        assert!(loaded[0].diff.is_none());
+    }
+
     /// Appending is incremental: calling with the same list twice writes
     /// nothing new, and growing the list writes only the growth.
     #[test]
