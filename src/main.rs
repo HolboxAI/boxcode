@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Err via Debug, which turns a connection failure into a wall of
         // struct-dump instead of a sentence.
         if let Err(e) = upgrade::run(true).await {
-            eprintln!("❌ Upgrade failed: {e}");
+            eprintln!("✗ Upgrade failed: {e}");
             std::process::exit(1);
         }
         return Ok(());
@@ -604,7 +604,7 @@ async fn offer_upgrade(latest: &str) -> bool {
     }
 
     println!();
-    println!("⬆️  boxcode {latest} is available (you have {VERSION}).");
+    println!("↑ boxcode {latest} is available (you have {VERSION}).");
     print!("   Install it now? [y/N] ");
     let _ = io::stdout().flush();
 
@@ -644,7 +644,7 @@ async fn offer_upgrade(latest: &str) -> bool {
         // Not fatal: the install failed, but the build already here still
         // runs, and refusing to start it would turn a missed update into an
         // unusable tool.
-        eprintln!("❌ Upgrade failed: {e}");
+        eprintln!("✗ Upgrade failed: {e}");
         eprintln!("   Carrying on with {VERSION}.");
         eprintln!();
         return false;

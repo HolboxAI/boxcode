@@ -224,7 +224,7 @@ pub async fn run_subagent(
     let Some(tools::Action::Agent { task, agent_type }) = tools::describe_action(call) else {
         return ToolOutcome {
             call_id: call.id.clone(),
-            display: "⛭ agent — bad arguments".to_string(),
+            display: "agent — bad arguments".to_string(),
             content: "Error: could not parse the arguments. Pass {\"task\": \"...\"} with a \
                       non-empty task describing what to research."
                 .to_string(),
@@ -234,7 +234,7 @@ pub async fn run_subagent(
     if agent_type != "explore" {
         return ToolOutcome {
             call_id: call.id.clone(),
-            display: format!("⛭ agent — no such type '{agent_type}'"),
+            display: format!("agent — no such type '{agent_type}'"),
             content: format!(
                 "Error: there is no '{agent_type}' subagent. Only 'explore' (read-only \
                  research) exists; omit agent_type to get it, and do any writing yourself."
@@ -320,7 +320,7 @@ pub async fn run_subagent(
             record_subagent_usage(spent, config);
             return ToolOutcome {
                 call_id: call.id.clone(),
-                display: format!("⛭ agent \"{}\" — failed", brief(&task, 40)),
+                display: format!("agent \"{}\" — failed", brief(&task, 40)),
                 content: format!(
                     "The subagent failed before finishing: {e}\nDo the research yourself \
                      with read_file/grep_search/glob, or try the agent again."
@@ -343,7 +343,7 @@ pub async fn run_subagent(
             return ToolOutcome {
                 call_id: call.id.clone(),
                 display: format!(
-                    "⛭ agent \"{}\" — done ({} tool round{}, ~{}k tokens)",
+                    "agent \"{}\" — done ({} tool round{}, ~{}k tokens)",
                     brief(&task, 40),
                     steps,
                     if steps == 1 { "" } else { "s" },
@@ -371,7 +371,7 @@ pub async fn run_subagent(
                 record_subagent_usage(spent, config);
                 return ToolOutcome {
                     call_id: call.id.clone(),
-                    display: format!("⛭ agent \"{}\" — budget spent", brief(&task, 40)),
+                    display: format!("agent \"{}\" — budget spent", brief(&task, 40)),
                     content: "The subagent spent its whole budget without writing a report."
                         .to_string(),
                     diff: None,
@@ -381,7 +381,7 @@ pub async fn run_subagent(
         steps += 1;
         for c in &calls {
             // Judged before the activity event is sent, so a refused call is
-            // *reported* as refused -- a trail that said "📝 write notes.md"
+            // *reported* as refused -- a trail that said "write notes.md"
             // about a write that never happened would be a lie in the UI.
             let gate = if !budget_left {
                 Err("Your budget is spent. Write your report now, from what you have seen."

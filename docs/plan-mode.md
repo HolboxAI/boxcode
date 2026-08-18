@@ -86,9 +86,9 @@ is quiet:
 
 ```
   I'll look at how the routes and config are set up first.
-  · 📁 list src
-  · 📄 read src/app.py
-  · 📄 read src/config.py
+  · list src
+  · read src/app.py
+  · read src/config.py
   · $ git log --oneline -20 — 20 lines
 ```
 
@@ -132,12 +132,12 @@ plan is never written.
 **`y`** writes `plan.md`, ends plan mode, and starts the work:
 
 ```
-  📋 Plan approved — saved to plan.md
+  Plan approved — saved to plan.md
 
   Starting on step 1.
-  · 📝 write src/rate_limit.py
+  · write src/rate_limit.py
   · ☑ Add the limiter in src/rate_limit.py
-  · ✏️ edit src/app.py
+  · edit src/app.py
   · ☑ Wrap the router in src/app.py
 ```
 
