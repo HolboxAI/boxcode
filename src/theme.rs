@@ -361,12 +361,33 @@ fn mode_from_colorfgbg(value: Option<&str>) -> Option<Mode> {
 
 // ---- glyphs -------------------------------------------------------------------
 
+// Nothing in here is a pictograph, and nothing anywhere else should be either.
+//
+// Emoji were used as per-tool icons -- a page for a read, a pencil for an
+// edit, a rocket for a deploy -- and they were wrong on three counts. They are
+// double-width in some terminals and single-width in others, so a column of
+// tool lines did not line up; several carry a U+FE0F variation selector that a
+// terminal may or may not honour, which changes the width again; and on a
+// terminal without an emoji font they arrive as replacement boxes. That is the
+// same reasoning the mascot below is drawn from block characters.
+//
+// They were also redundant. Every tool line already begins with one of the
+// state marks here, and the label right after it starts with a verb. A rocket
+// in front of the word "deploy" is a second, vaguer copy of the word.
+//
+// What replaces them is state, not decoration: a line that is still running
+// gets the spinner, a finished one gets `TOOL_MARK`. That distinction is
+// something the reader could not get from the text, which is what earns a
+// glyph its column.
+
 /// Prefix on the line the user typed.
 pub const USER_MARK: &str = "❯";
 /// Prefix inside the prompt box.
 pub const PROMPT_MARK: &str = "❯";
-/// Leads a tool line in the transcript.
+/// Leads a tool line in the transcript once it has finished.
 pub const TOOL_MARK: &str = "·";
+/// Leads the sub-line under a running subagent.
+pub const BRANCH_MARK: &str = "└";
 
 /// The mascot on the welcome panel.
 ///

@@ -15,7 +15,7 @@ OpenAI-compatible LLM endpoint.
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v1.7.0
+  ▟█▙       ▟█▙    boxcode  v1.7.1
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -115,6 +115,12 @@ to ask for the same thing.
 
 ## Usage
 
+- **The transcript is marks, not emoji** — a tool line that is still running
+  wears a spinner and a finished one wears a `·`, so you can see *which* of
+  four commands is the slow one rather than only that four are running. No
+  pictographs anywhere: they are double-width in some terminals, single in
+  others, and replacement boxes without an emoji font — the verb after the mark
+  says `read`/`write`/`grep` more precisely than a picture of a page did.
 - **Type prompt, Enter to send** — Alt/Shift-Enter for a newline, Esc to
   cancel, ↑/↓ to recall previous prompts, Ctrl-A/E/W/U/K for line editing,
   Ctrl-C to exit. Paste works; your terminal's own scrollback, search and

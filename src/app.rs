@@ -278,7 +278,7 @@ fn compaction_readout(
 
 /// One subagent's visible history: the task it was given and the one-line
 /// label of every tool call it made, in order. This is the "expanded" form
-/// of the collapsed `⛭ agent …` transcript entry -- kept out of `messages`
+/// of the collapsed `agent …` transcript entry -- kept out of `messages`
 /// because it is commentary about the session, not part of any conversation
 /// the model should ever be sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1956,7 +1956,7 @@ impl App {
         if !approved {
             self.messages.push(Message::new(
                 Role::System,
-                format!("📋 Plan declined — still in plan mode\n\n{rendered}"),
+                format!("Plan declined — still in plan mode\n\n{rendered}"),
             ));
             self.push_tool_outcome(tools::plan_declined(call));
             self.messages.push(Message::new(
@@ -1998,7 +1998,7 @@ impl App {
         let steps = plan.steps.len();
         self.messages.push(Message::new(
             Role::System,
-            format!("📋 Plan approved — saved to {shown}\n\n{rendered}"),
+            format!("Plan approved — saved to {shown}\n\n{rendered}"),
         ));
         self.push_tool_outcome(tools::plan_approved(call, &shown, steps));
         self.active_plan = Some(plan);
@@ -2039,7 +2039,7 @@ impl App {
         // history and hoping a later message outweighs it.
         if let Some(last) = self.messages.iter_mut().rev().find(|m| m.role == Role::Tool) {
             last.content = tools::plan_save_failed(reason);
-            last.display = Some("📋 plan approved — but could not be saved".to_string());
+            last.display = Some("plan approved — but could not be saved".to_string());
         }
         self.messages.push(Message::new(
             Role::Error,
@@ -2086,7 +2086,7 @@ impl App {
                 if complete {
                     self.messages.push(Message::new(
                         Role::System,
-                        format!("📋 Plan complete — all {total} steps done. {shown} is up to date."),
+                        format!("Plan complete — all {total} steps done. {shown} is up to date."),
                     ));
                 }
             }
@@ -2183,7 +2183,7 @@ impl App {
         let mut out = String::from("Subagents this session:");
         for trail in &self.subagent_trails {
             let status = trail.finished.as_deref().unwrap_or("running…");
-            out.push_str(&format!("\n\n⛭ \"{}\" — {status}", trail.task));
+            out.push_str(&format!("\n\n\"{}\" — {status}", trail.task));
             if trail.steps.is_empty() {
                 out.push_str("\n   (answered without using any tools)");
             }
@@ -5667,12 +5667,12 @@ mod tests {
         a.request_tools(vec![agent_tool_call("call_1", "map the config loading")]);
         assert_eq!(a.state, AppState::ExecutingTools);
 
-        a.record_subagent_activity("call_1", "📄 read config.rs".to_string(), 1);
-        a.record_subagent_activity("call_1", "🔎 grep load".to_string(), 2);
+        a.record_subagent_activity("call_1", "read config.rs".to_string(), 1);
+        a.record_subagent_activity("call_1", "grep load".to_string(), 2);
 
         let trail = a.running_subagent_trail("call_1").expect("a live trail");
         assert_eq!(trail.task, "map the config loading");
-        assert_eq!(trail.steps, vec!["📄 read config.rs", "🔎 grep load"]);
+        assert_eq!(trail.steps, vec!["read config.rs", "grep load"]);
         assert_eq!(trail.rounds, 2);
         assert_eq!(trail.finished, None);
     }
@@ -5682,7 +5682,7 @@ mod tests {
     #[test]
     fn subagent_activity_for_an_unknown_call_is_dropped() {
         let mut a = streaming_app();
-        a.record_subagent_activity("call_9", "📄 read x".to_string(), 1);
+        a.record_subagent_activity("call_9", "read x".to_string(), 1);
         assert!(a.subagent_trails.is_empty());
     }
 
@@ -5693,11 +5693,11 @@ mod tests {
         let mut a = streaming_app();
         a.config.tools.auto_approve_read_only = true;
         a.request_tools(vec![agent_tool_call("call_1", "map the config loading")]);
-        a.record_subagent_activity("call_1", "📄 read config.rs".to_string(), 1);
+        a.record_subagent_activity("call_1", "read config.rs".to_string(), 1);
 
         a.finish_tools(vec![tools::ToolOutcome {
             call_id: "call_1".to_string(),
-            display: "⛭ agent \"map the config loading\" — done (1 tool round, ~2k tokens)"
+            display: "agent \"map the config loading\" — done (1 tool round, ~2k tokens)"
                 .to_string(),
             content: "It loads from ~/.boxcode/config.toml.".to_string(),
             diff: None,
@@ -5716,7 +5716,7 @@ mod tests {
         let mut a = streaming_app();
         a.config.tools.auto_approve_read_only = true;
         a.request_tools(vec![agent_tool_call("call_1", "map the config loading")]);
-        a.record_subagent_activity("call_1", "📄 read config.rs".to_string(), 1);
+        a.record_subagent_activity("call_1", "read config.rs".to_string(), 1);
 
         a.handle_key(key(KeyCode::Esc));
 
@@ -5731,10 +5731,10 @@ mod tests {
         let mut a = streaming_app();
         a.config.tools.auto_approve_read_only = true;
         a.request_tools(vec![agent_tool_call("call_1", "map the config loading")]);
-        a.record_subagent_activity("call_1", "📄 read config.rs".to_string(), 1);
+        a.record_subagent_activity("call_1", "read config.rs".to_string(), 1);
         a.finish_tools(vec![tools::ToolOutcome {
             call_id: "call_1".to_string(),
-            display: "⛭ agent \"map the config loading\" — done (1 tool round)".to_string(),
+            display: "agent \"map the config loading\" — done (1 tool round)".to_string(),
             content: "report".to_string(),
             diff: None,
         }]);
@@ -5744,7 +5744,7 @@ mod tests {
         let last = a.messages.last().expect("a message");
         assert!(last.role == Role::System, "commentary, never sent to the model");
         assert!(last.content.contains("map the config loading"), "{}", last.content);
-        assert!(last.content.contains("📄 read config.rs"), "{}", last.content);
+        assert!(last.content.contains("read config.rs"), "{}", last.content);
         assert!(last.content.contains("done (1 tool round)"), "{}", last.content);
     }
 
@@ -5766,10 +5766,10 @@ mod tests {
             let id = format!("call_{i}");
             a.state = AppState::Streaming;
             a.request_tools(vec![agent_tool_call(&id, &format!("task {i}"))]);
-            a.record_subagent_activity(&id, "📄 read x".to_string(), 1);
+            a.record_subagent_activity(&id, "read x".to_string(), 1);
             a.finish_tools(vec![tools::ToolOutcome {
                 call_id: id,
-                display: "⛭ agent — done".to_string(),
+                display: "agent — done".to_string(),
                 content: "r".to_string(),
                 diff: None,
             }]);

@@ -26,7 +26,7 @@ log — comes back to the model, so it can read the error, fix it, and try again
 │ uploads this project to a third-party host and puts it on the public │
 │ internet                                                             │
 │                                                                      │
-│ 🚀 vercel · Preview                                                  │
+│ vercel · Preview                                                     │
 │ Vite · npm run build · dist                                          │
 │                                                                      │
 │ in /tmp/deploy-demo                                                  │
@@ -38,7 +38,7 @@ log — comes back to the model, so it can read the error, fix it, and try again
   (the deployment panel takes over here: install prompts, sign-in and the
    streaming build all happen in it)
 
-  · 🚀 deploy → vercel (Preview) — https://my-app-x1.vercel.app
+  · deploy → vercel (Preview) — https://my-app-x1.vercel.app
 
   Deployed. It's live at https://my-app-x1.vercel.app
 ```
@@ -114,7 +114,7 @@ simply grew would push off the screen.
 │                                                              │
 │  Deployment successful!                                      │
 │                                                              │
-│  🌐 Production URL                                           │
+│  Production URL                                              │
 │  https://my-app.vercel.app                                   │
 ╰──────────────────────────────────────────────────────────────╯
 ```
