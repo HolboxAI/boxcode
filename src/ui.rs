@@ -1,5 +1,7 @@
 use crate::app::{App, AppState, CustomStep, Message, Overlay, Role};
+use crate::approval::ApprovalRequest;
 use crate::deploy::{DeploySession, DeployStatus, Menu, Stage, StepState};
+use crate::diff::{Change, FileDiff};
 use crate::providers;
 use crate::theme;
 use crate::tools::Action;
@@ -34,7 +36,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // that spot is for. The transcript stays fully visible and in place, the
     // way it does for every other kind of turn.
     let approval = match &app.overlay {
-        Some(Overlay::ToolApproval(request)) => Some((request.action.clone(), request.remaining)),
+        Some(Overlay::ToolApproval(request)) => Some(request.clone()),
         _ => None,
     };
 
@@ -53,9 +55,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
         (lines.len() as u16 + 2).clamp(MIN_INPUT_HEIGHT, MAX_DEPLOY_HEIGHT)
     } else {
         match &approval {
-            Some((action, remaining)) => {
+            Some(request) => {
                 let inner_width = size.width.saturating_sub(4).max(1) as usize;
-                let (_, lines) = tool_approval_lines(app, action, *remaining, inner_width);
+                let (_, lines) = tool_approval_lines(app, request, inner_width);
                 (lines.len() as u16 + 2).clamp(MIN_INPUT_HEIGHT, MAX_APPROVAL_HEIGHT)
             }
             None => input_height(app, size.width),
@@ -98,9 +100,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_deployment(f, chunks[2], app);
     } else {
         match &approval {
-            Some((action, remaining)) => {
-                render_tool_approval_inline(f, chunks[2], app, action, *remaining)
-            }
+            Some(request) => render_tool_approval_inline(f, chunks[2], app, request),
             None => render_input(f, chunks[2], app),
         }
     }
@@ -175,6 +175,14 @@ pub fn message_lines(msg: &Message, width: usize) -> Vec<Line<'static>> {
                 Span::styled(format!("{marker} "), Style::default().fg(theme::p().faint)),
                 Span::styled(wrapped, role_style(Role::Tool)),
             ]));
+        }
+        // A file change gets its diff underneath, indented under the tool
+        // line it belongs to. This is the only tool output drawn in full
+        // rather than summarised, and deliberately: "wrote 4kb" and "changed
+        // these four lines" are not the same statement, and only one of them
+        // can be checked.
+        if let Some(diff) = &msg.diff {
+            lines.extend(diff_lines(diff, width, 2));
         }
         // Tool lines get no trailing blank: a run of six should read as one
         // compact block, not six separated ones.
@@ -277,6 +285,157 @@ pub fn message_lines(msg: &Message, width: usize) -> Vec<Line<'static>> {
 
     lines.push(Line::from(""));
     lines
+}
+
+/// Tabs are drawn as this many spaces.
+///
+/// Not left as `\t`: a terminal resolves a tab against its own column, but a
+/// diff row has already spent columns on the line number and the `+`, so the
+/// stop lands somewhere different on every row and tab-indented code comes out
+/// with a ragged left edge. Expanding it here means the gutter and the code
+/// agree about where a column is.
+const DIFF_TAB: &str = "    ";
+
+/// One file change, drawn the way a diff is read: a line number, a `+`/`-`,
+/// and the line itself, with removals in red and additions in green.
+///
+/// The unchanged lines around a change are kept and dimmed. They are what make
+/// a diff answer "what is this doing" rather than only "what did it type" --
+/// three lines of context is the difference between `+    return None` on its
+/// own and the same line under the `if` it belongs to.
+///
+/// Long lines are hard-wrapped rather than word-wrapped, and the wrap is
+/// indented under the text rather than under the gutter: code has no word
+/// boundaries worth preserving, and re-flowing it would silently change the
+/// indentation that is often the thing being reviewed.
+fn diff_lines(diff: &FileDiff, width: usize, indent: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line> = Vec::new();
+    if diff.is_empty() {
+        return out;
+    }
+
+    // One number column, sized to the largest number actually shown, so a
+    // 40-line file does not get the gutter of a 4000-line one. Removals show
+    // where they were, everything else shows where it now is.
+    let widest = diff
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter_map(|l| l.new_no.or(l.old_no))
+        .max()
+        .unwrap_or(0);
+    let numw = widest.to_string().len().max(2);
+    let pad = " ".repeat(indent);
+    // gutter = indent + number + space + mark + space
+    let text_width = width.saturating_sub(indent + numw + 3).max(8);
+
+    for (h, hunk) in diff.hunks.iter().enumerate() {
+        // Between hunks, and only between them: a marker before the first or
+        // after the last would claim something was skipped at an end where
+        // nothing was.
+        if h > 0 {
+            out.push(Line::from(Span::styled(
+                format!("{pad}{:>numw$} ⋮", ""),
+                theme::faint(),
+            )));
+        }
+        for line in &hunk.lines {
+            let (mark, style) = match line.change {
+                Change::Added => ('+', Style::default().fg(theme::p().success)),
+                Change::Removed => ('-', Style::default().fg(theme::p().danger)),
+                Change::Context => (' ', theme::faint()),
+            };
+            let number = match line.change {
+                Change::Removed => line.old_no,
+                _ => line.new_no,
+            };
+            let number = number.map(|n| n.to_string()).unwrap_or_default();
+            let body = line.text.replace('\t', DIFF_TAB);
+            for (i, chunk) in hard_chunks(&body, text_width).into_iter().enumerate() {
+                let gutter = if i == 0 {
+                    format!("{pad}{number:>numw$} {mark} ")
+                } else {
+                    // A continuation carries neither a number nor a sign: it
+                    // is not another line, and showing the `+` twice would
+                    // read as two additions.
+                    format!("{pad}{:>numw$}   ", "")
+                };
+                out.push(Line::from(vec![
+                    Span::styled(gutter, theme::faint()),
+                    Span::styled(chunk, style),
+                ]));
+            }
+        }
+    }
+
+    if diff.clipped > 0 {
+        out.push(Line::from(Span::styled(
+            format!(
+                "{pad}{:>numw$} … {} more line{}",
+                "",
+                diff.clipped,
+                if diff.clipped == 1 { "" } else { "s" }
+            ),
+            theme::faint(),
+        )));
+    }
+    out
+}
+
+/// The literal replacement spans, shown when no diff could be produced.
+///
+/// This was the whole of an edit approval before diffs existed, and it is kept
+/// for the cases a diff cannot describe: the file is missing, or `old_string`
+/// does not match anything in it. Both are edits that will fail -- but the
+/// user is still being asked, so the question still has to show what was asked
+/// about rather than an empty box.
+fn render_edit_spans(
+    lines: &mut Vec<Line<'static>>,
+    edits: &[crate::tools::EditSpan],
+    batch: bool,
+    inner: usize,
+) {
+    let mut span = |label: &str, body: &str, colour| {
+        lines.push(Line::from(Span::styled(label.to_string(), theme::faint())));
+        let total = body.lines().count();
+        for (i, line) in body.lines().enumerate() {
+            if i >= WRITE_PREVIEW_LINES {
+                lines.push(Line::from(Span::styled(
+                    format!("… {} more line(s)", total - i),
+                    theme::faint(),
+                )));
+                break;
+            }
+            for wrapped in wrap(line, inner) {
+                lines.push(Line::from(Span::styled(wrapped, Style::default().fg(colour))));
+            }
+        }
+        lines.push(Line::from(""));
+    };
+    for (i, edit) in edits.iter().enumerate() {
+        let replace_label = if batch {
+            let all = if edit.replace_all { ", all occurrences" } else { "" };
+            format!("edit {} of {} — replace:{all}", i + 1, edits.len())
+        } else {
+            "replace:".to_string()
+        };
+        span(&replace_label, &edit.old, theme::p().danger);
+        span("with:", &edit.new, theme::p().success);
+    }
+}
+
+/// Split a line into `width`-column pieces without looking for word breaks.
+/// An empty line still yields one (empty) piece, so it occupies a row.
+fn hard_chunks(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars
+        .chunks(width)
+        .map(|c| c.iter().collect::<String>())
+        .collect()
 }
 
 /// The part of the transcript that is still moving: the welcome panel before
@@ -981,18 +1140,22 @@ const WRITE_PREVIEW_LINES: usize = 20;
 
 /// The approval prompt's content, shared by sizing (`render` needs the line
 /// count before it can lay out the frame) and drawing. This is the only thing
-/// standing between the model and the machine, so a command or a write's
-/// content is shown verbatim and in full -- never elided, never summarised
-/// (`write_file` content is capped at `WRITE_PREVIEW_LINES` purely so one huge
-/// file cannot produce an unusably tall prompt). Approving something you
+/// standing between the model and the machine, so a command is shown verbatim
+/// and in full -- never elided, never summarised. Approving something you
 /// cannot fully see is not approval.
+///
+/// A file change is shown as a diff of what it does to the file on disk, which
+/// is the same principle applied properly rather than a relaxation of it: the
+/// decision is about what changes, and the unchanged nine-tenths of a file
+/// were never the thing being approved. Only the two bounds in
+/// `tools::preview_change` limit it, and both announce themselves ("… N more
+/// lines") rather than quietly shortening the answer.
 fn tool_approval_lines(
     app: &App,
-    action: &Action,
-    remaining: usize,
+    request: &ApprovalRequest,
     inner: usize,
 ) -> (&'static str, Vec<Line<'static>>) {
-    let (title, body, footer) = tool_approval_parts(app, action, remaining, inner);
+    let (title, body, footer) = tool_approval_parts(app, request, inner);
     let mut lines = body;
     lines.extend(footer);
     (title, lines)
@@ -1008,10 +1171,11 @@ fn tool_approval_lines(
 /// screen said what to press.
 fn tool_approval_parts(
     app: &App,
-    action: &Action,
-    remaining: usize,
+    request: &ApprovalRequest,
     inner: usize,
 ) -> (&'static str, Vec<Line<'static>>, Vec<Line<'static>>) {
+    let action = &request.action;
+    let remaining = request.remaining;
     let mut lines: Vec<Line> = Vec::new();
 
     // A consequential action gets a banner before anything else. The prompt
@@ -1154,24 +1318,38 @@ fn tool_approval_parts(
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
-            if content.is_empty() {
-                lines.push(Line::from(Span::styled("(empty file)", theme::faint())));
-            } else {
-                let total = content.lines().count();
-                for (i, line) in content.lines().enumerate() {
-                    if i >= WRITE_PREVIEW_LINES {
-                        lines.push(Line::from(Span::styled(
-                            format!(
-                                "… {} more line{}",
-                                total - i,
-                                if total - i == 1 { "" } else { "s" }
-                            ),
-                            theme::faint(),
-                        )));
-                        break;
-                    }
-                    for wrapped in wrap(line, inner) {
-                        lines.push(Line::from(Span::styled(wrapped, theme::text())));
+            // The diff, when there is one: what this write *changes* is the
+            // decision, and for a file that already exists the whole content
+                // is mostly the part that stays the same. Falling back to the
+            // content listing is not a lesser answer, it is the right one for
+            // the case it covers -- a brand new file has no "before" worth
+            // drawing a gutter against, and an unreadable path has no diff at
+            // all.
+            match &request.preview {
+                Some(diff) => {
+                    lines.push(Line::from(Span::styled(diff.tally(), theme::faint())));
+                    lines.extend(diff_lines(diff, inner, 0));
+                }
+                None if content.is_empty() => {
+                    lines.push(Line::from(Span::styled("(empty file)", theme::faint())));
+                }
+                None => {
+                    let total = content.lines().count();
+                    for (i, line) in content.lines().enumerate() {
+                        if i >= WRITE_PREVIEW_LINES {
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "… {} more line{}",
+                                    total - i,
+                                    if total - i == 1 { "" } else { "s" }
+                                ),
+                                theme::faint(),
+                            )));
+                            break;
+                        }
+                        for wrapped in wrap(line, inner) {
+                            lines.push(Line::from(Span::styled(wrapped, theme::text())));
+                        }
                     }
                 }
             }
@@ -1247,35 +1425,21 @@ fn tool_approval_parts(
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
-            let mut span = |label: &str, body: &str, colour| {
-                lines.push(Line::from(Span::styled(label.to_string(), theme::faint())));
-                let total = body.lines().count();
-                for (i, line) in body.lines().enumerate() {
-                    if i >= WRITE_PREVIEW_LINES {
-                        lines.push(Line::from(Span::styled(
-                            format!("… {} more line(s)", total - i),
-                            theme::faint(),
-                        )));
-                        break;
-                    }
-                    for wrapped in wrap(line, inner) {
-                        lines.push(Line::from(Span::styled(wrapped, Style::default().fg(colour))));
-                    }
-                }
-                lines.push(Line::from(""));
-            };
-            for (i, edit) in edits.iter().enumerate() {
-                let (replace_label, with_label);
-                if batch {
-                    let all = if edit.replace_all { ", all occurrences" } else { "" };
-                    replace_label = format!("edit {} of {} — replace:{all}", i + 1, edits.len());
-                    with_label = "with:".to_string();
-                } else {
-                    replace_label = "replace:".to_string();
-                    with_label = "with:".to_string();
-                }
-                span(&replace_label, &edit.old, theme::p().danger);
-                span(&with_label, &edit.new, theme::p().success);
+            // A diff of the file as it is now, produced by the very code that
+            // will apply the edit, so the popup cannot promise something the
+            // runner then does differently. It also answers the question the
+            // old replace/with pair never could: *where* in the file this is.
+            if let Some(diff) = &request.preview {
+                lines.push(Line::from(Span::styled(diff.tally(), theme::faint())));
+                lines.extend(diff_lines(diff, inner, 0));
+            } else {
+                // No diff means the edit could not be resolved against the
+                // file -- a path that does not exist, or an `old_string` that
+                // does not match. The spans are still shown, because the
+                // answer is still a real decision and the model still has to
+                // be told one way or the other; it is the runner that reports
+                // the mismatch, and it does so in words the model can act on.
+                render_edit_spans(&mut lines, edits, batch, inner);
             }
             if batch {
                 (" Apply these edits? ", "edit", "skip")
@@ -1513,15 +1677,10 @@ fn tool_approval_parts(
 /// frame -- see the placement comment on `render`. No `Clear` and no
 /// centering: unlike a floating popup, this area belongs to the prompt alone,
 /// so there is nothing underneath it to protect or re-center against.
-fn render_tool_approval_inline(
-    f: &mut Frame,
-    area: Rect,
-    app: &App,
-    action: &Action,
-    remaining: usize,
-) {
+fn render_tool_approval_inline(f: &mut Frame, area: Rect, app: &App, request: &ApprovalRequest) {
+    let action = &request.action;
     let inner = area.width.saturating_sub(4).max(1) as usize;
-    let (title, body, mut footer) = tool_approval_parts(app, action, remaining, inner);
+    let (title, body, mut footer) = tool_approval_parts(app, request, inner);
 
     let destructive = matches!(action, Action::Command { command, .. }
         if crate::danger::classify(command, Path::new(&app.workspace_root)).is_dangerous());
@@ -2966,6 +3125,287 @@ mod tests {
             .collect()
     }
 
+    // ---- file-change diffs -----------------------------------------------
+
+    mod diffs {
+        use super::*;
+        use crate::diff::FileDiff;
+        use crate::tools::EditSpan;
+
+        /// An app whose workspace is a real directory holding `files`.
+        fn app_on(files: &[(&str, &str)]) -> (App, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for (name, body) in files {
+                std::fs::write(dir.path().join(name), body).expect("write fixture");
+            }
+            let mut app = App::new(crate::config::Config::default());
+            app.greeted = true;
+            app.workspace_root = dir.path().to_string_lossy().to_string();
+            (app, dir)
+        }
+
+        fn show(app: &mut App, action: Action, dir: &tempfile::TempDir) {
+            let preview = crate::tools::preview_change(&action, dir.path());
+            app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest {
+                call: Default::default(),
+                action,
+                remaining: 0,
+                preview,
+            }));
+        }
+
+        /// Rows of the approval box, so an assertion can talk about one line
+        /// rather than one long smear of the whole screen.
+        fn rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+            terminal.draw(|f| render(f, app)).expect("draw");
+            let buf = terminal.backend().buffer().clone();
+            (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf.get(x, y).symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        fn text_of(lines: &[Line<'static>]) -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        const FILE: &str = "fn one() {\n    let a = 1;\n    let b = 2;\n    done(a, b);\n}\n";
+
+        /// The point of the feature: an edit is approved by looking at the
+        /// change, in place, with the line numbers it will land on.
+        #[test]
+        fn an_edit_is_approved_as_a_diff() {
+            let (mut app, dir) = app_on(&[("lib.rs", FILE)]);
+            show(
+                &mut app,
+                Action::Edit {
+                    path: "lib.rs".into(),
+                    edits: vec![EditSpan {
+                        old: "    let b = 2;".into(),
+                        new: "    let b = 20;\n    let c = 30;".into(),
+                        replace_all: false,
+                    }],
+                },
+                &dir,
+            );
+            let rows = rows(&mut app, 72, 22);
+            let joined = rows.join("\n");
+            assert!(
+                joined.contains("2 additions and 1 removal"),
+                "expected a headline count:\n{joined}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("3 -     let b = 2;")),
+                "expected the old line, numbered and marked:\n{joined}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("3 +     let b = 20;")),
+                "expected the new line, numbered and marked:\n{joined}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("4 +     let c = 30;")),
+                "expected the second added line:\n{joined}"
+            );
+            // The unchanged line above it is what makes the change readable.
+            assert!(
+                rows.iter().any(|r| r.contains("2       let a = 1;")),
+                "expected context around the change:\n{joined}"
+            );
+            // And the old prose form is gone.
+            assert!(
+                !joined.contains("replace:"),
+                "the replace/with pair should have been superseded:\n{joined}"
+            );
+        }
+
+        /// Overwriting an existing file is a change, not a new file, and the
+        /// part worth reading is the part that differs.
+        #[test]
+        fn a_write_over_an_existing_file_shows_only_what_differs() {
+            let (mut app, dir) = app_on(&[("lib.rs", FILE)]);
+            show(
+                &mut app,
+                Action::Write {
+                    path: "lib.rs".into(),
+                    content: FILE.replace("done(a, b);", "done(a, b, c);"),
+                },
+                &dir,
+            );
+            let rows = rows(&mut app, 72, 22);
+            let joined = rows.join("\n");
+            assert!(
+                rows.iter().any(|r| r.contains("- ") && r.contains("done(a, b);")),
+                "expected the replaced line:\n{joined}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("+ ") && r.contains("done(a, b, c);")),
+                "expected the new line:\n{joined}"
+            );
+            assert!(
+                joined.contains("1 addition and 1 removal"),
+                "expected a headline count:\n{joined}"
+            );
+        }
+
+        /// There is no "before" to diff a brand new file against, so the old
+        /// content listing is still the right answer -- and must still appear.
+        #[test]
+        fn a_brand_new_file_still_shows_its_contents() {
+            let (mut app, dir) = app_on(&[]);
+            show(
+                &mut app,
+                Action::Write {
+                    path: "fresh.rs".into(),
+                    content: "fn fresh() {}\n".into(),
+                },
+                &dir,
+            );
+            let joined = rows(&mut app, 72, 16).join("\n");
+            assert!(joined.contains("fn fresh() {}"), "{joined}");
+        }
+
+        /// An edit that cannot be applied has no diff. The question is still
+        /// being asked, so it must still show what it is asking about.
+        #[test]
+        fn an_unmatchable_edit_falls_back_to_the_spans() {
+            let (mut app, dir) = app_on(&[("lib.rs", FILE)]);
+            show(
+                &mut app,
+                Action::Edit {
+                    path: "lib.rs".into(),
+                    edits: vec![EditSpan {
+                        old: "nothing like this is in the file".into(),
+                        new: "replacement".into(),
+                        replace_all: false,
+                    }],
+                },
+                &dir,
+            );
+            let joined = rows(&mut app, 72, 20).join("\n");
+            assert!(joined.contains("replace:"), "{joined}");
+            assert!(joined.contains("nothing like this"), "{joined}");
+        }
+
+        /// A finished change is worth seeing too -- "wrote 4kb" and "changed
+        /// these three lines" are not the same statement.
+        #[test]
+        fn a_finished_change_leaves_its_diff_in_the_transcript() {
+            let d = crate::diff::diff("a\nb\nc\n", "a\nB\nc\n");
+            let msg = Message {
+                role: Role::Tool,
+                content: "Replaced 1 occurrence(s)".into(),
+                display: Some("✏️ edit lib.rs — 1 addition and 1 removal".into()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                diff: Some(d),
+            };
+            let rendered = text_of(&message_lines(&msg, 60));
+            assert!(rendered[0].contains("1 addition and 1 removal"), "{rendered:?}");
+            assert!(rendered.iter().any(|l| l.contains("2 - b")), "{rendered:?}");
+            assert!(rendered.iter().any(|l| l.contains("2 + B")), "{rendered:?}");
+        }
+
+        /// A tool result that changed no file must not sprout a gutter.
+        #[test]
+        fn a_tool_result_without_a_diff_is_unchanged() {
+            let msg = Message {
+                role: Role::Tool,
+                content: "total 4".into(),
+                display: Some("📁 list .".into()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                diff: None,
+            };
+            assert_eq!(text_of(&message_lines(&msg, 60)), vec!["· 📁 list ."]);
+        }
+
+        /// Colour is how a removal is told from an addition at a glance, so it
+        /// is worth a test rather than left to the eye.
+        #[test]
+        fn additions_and_removals_are_coloured_apart() {
+            let d = crate::diff::diff("a\nb\n", "a\nB\n");
+            let lines = diff_lines(&d, 40, 0);
+            let colour_of = |needle: &str| {
+                lines
+                    .iter()
+                    .find(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                            .contains(needle)
+                    })
+                    .and_then(|l| l.spans.last())
+                    .and_then(|s| s.style.fg)
+                    .expect("a coloured span")
+            };
+            assert_eq!(colour_of("- b"), theme::p().danger);
+            assert_eq!(colour_of("+ B"), theme::p().success);
+        }
+
+        /// A line wider than the box must still be readable in full, and the
+        /// wrap must not look like a second changed line.
+        #[test]
+        fn a_long_line_wraps_without_repeating_its_marker() {
+            let long = "x".repeat(60);
+            let d = crate::diff::diff("a\n", &format!("a\n{long}\n"));
+            let rendered = text_of(&diff_lines(&d, 30, 0));
+            let added: Vec<&String> = rendered.iter().filter(|l| l.contains('+')).collect();
+            assert_eq!(added.len(), 1, "one '+' for one added line: {rendered:?}");
+            // Nothing of the line is dropped just because it did not fit.
+            let carried = rendered.iter().map(|r| r.matches('x').count()).sum::<usize>();
+            assert_eq!(carried, long.len(), "the whole line survives: {rendered:?}");
+        }
+
+        /// Tabs are expanded so the gutter and the code agree about columns.
+        #[test]
+        fn tabs_become_spaces() {
+            let d = crate::diff::diff("a\n", "a\n\tindented\n");
+            let rendered = text_of(&diff_lines(&d, 40, 0));
+            assert!(
+                rendered.iter().any(|l| l.ends_with("+     indented")),
+                "{rendered:?}"
+            );
+        }
+
+        /// A clipped diff must say so, or a shortened change passes for a
+        /// whole one.
+        #[test]
+        fn a_clipped_diff_says_how_much_is_missing() {
+            let old: String = (1..=60).map(|i| format!("line {i}\n")).collect();
+            let new: String = (1..=60).map(|i| format!("changed {i}\n")).collect();
+            let d = crate::diff::diff(&old, &new).clipped(10);
+            let rendered = text_of(&diff_lines(&d, 60, 0));
+            assert!(
+                rendered.last().expect("a last line").contains("more lines"),
+                "{rendered:?}"
+            );
+        }
+
+
+        /// Nothing to draw is nothing to draw -- not a stray blank gutter.
+        #[test]
+        fn an_empty_diff_draws_nothing() {
+            assert!(diff_lines(&FileDiff::default(), 40, 0).is_empty());
+        }
+    }
+
     fn frame(width: u16, height: u16) -> Rect {
         Rect {
             x: 0,
@@ -3310,6 +3750,7 @@ mod tests {
                 purpose: None,
             },
             remaining: 0,
+            preview: None,
         }));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -3400,6 +3841,7 @@ mod tests {
         app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Command { command: "ls -la".to_string(), purpose: None },
             remaining: 0,
+            preview: None,
         }));
 
         app.approval_selected = true;
@@ -3451,6 +3893,7 @@ mod tests {
                 purpose: Some("something alarming".to_string()),
             },
             remaining: 2,
+            preview: None,
         }));
 
         for (w, h) in [(1, 1), (2, 2), (10, 4), (80, 24)] {
@@ -3478,6 +3921,7 @@ mod tests {
                 purpose: Some("clear stale output".to_string()),
             },
             remaining: 0,
+            preview: None,
         }));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -3628,7 +4072,7 @@ mod tests {
             let mut app = App::new(crate::config::Config::default());
             app.greeted = true;
             app.workspace_root = "/tmp/project".into();
-            app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(), action, remaining: 0 }));
+            app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(), action, remaining: 0, preview: None }));
 
             for (w, h) in [(80, 24), (120, 40), (60, 12)] {
                 let rendered = rendered_text(&mut app, w, h);
@@ -3657,6 +4101,7 @@ mod tests {
                 content: (1..=200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
             },
             remaining: 0,
+            preview: None,
         }));
 
         let rendered = rendered_text(&mut app, 80, 24);
@@ -3676,6 +4121,7 @@ mod tests {
                 content: (1..=40).map(|i| format!("marker{i}")).collect::<Vec<_>>().join("\n"),
             },
             remaining: 0,
+            preview: None,
         }));
 
         let top = rendered_text(&mut app, 80, 24);
@@ -3709,6 +4155,7 @@ mod tests {
                 purpose: None,
             },
             remaining: 0,
+            preview: None,
         }));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -3746,6 +4193,7 @@ mod tests {
                 content: "print('hi')\n".to_string(),
             },
             remaining: 0,
+            preview: None,
         }));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -3781,6 +4229,7 @@ mod tests {
                 max_results: 5,
             },
             remaining: 0,
+            preview: None,
         }));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -4568,6 +5017,7 @@ mod tests {
                 not_doing: vec!["Distributed limiting".to_string()],
             }),
             remaining: 0,
+            preview: None,
         }));
 
         let rows = rendered_rows(&mut app, 80, 40);
@@ -4642,6 +5092,7 @@ mod tests {
         app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest { call: Default::default(),
             action: Action::Plan(proposal.clone()),
             remaining: 0,
+            preview: None,
         }));
 
         let joined = rendered_rows(&mut app, 80, 30).concat();
@@ -4669,6 +5120,7 @@ mod tests {
                 not_doing: Vec::new(),
             }),
             remaining: 0,
+            preview: None,
         }));
 
         let joined = rendered_rows(&mut app, 80, 30).concat();

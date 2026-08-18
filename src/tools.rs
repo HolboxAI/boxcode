@@ -144,6 +144,29 @@ fn relative_to(workspace: &Workspace, path: &Path) -> String {
         .to_string()
 }
 
+/// How many lines of diff the approval prompt will show before it starts
+/// counting the rest.
+///
+/// The prompt scrolls, so this is not about what fits on screen; it is a bound
+/// on work done per frame. `tool_approval_lines` runs twice a frame -- once to
+/// size the box, once to draw it -- so an unbounded diff of a generated file
+/// would rebuild tens of thousands of styled lines sixty times a second to
+/// show twenty of them.
+///
+/// It is ten times what the old whole-file write preview showed, and unlike
+/// that preview it spends its budget on the lines that *changed* rather than
+/// on the first twenty lines of the file, which for an edit to something long
+/// were usually not the edit.
+pub const APPROVAL_DIFF_LINES: usize = 200;
+
+/// How many lines of diff a finished file change leaves in the transcript.
+///
+/// The whole change is on disk and the model was told the byte count, so this
+/// is purely about what is worth reading back. It is also what stops the
+/// session file -- which every message is appended to -- from growing a
+/// verbatim copy of every generated file that passed through it.
+pub const TRANSCRIPT_DIFF_LINES: usize = 40;
+
 /// One executed (or declined) tool call, on its way back to the model.
 #[derive(Debug, Clone)]
 pub struct ToolOutcome {
@@ -152,6 +175,16 @@ pub struct ToolOutcome {
     pub display: String,
     /// What the model receives.
     pub content: String,
+    /// What the call changed on disk, when it changed a file. Drawn under
+    /// `display` as a `-`/`+` diff; `None` for everything that touches no
+    /// file, and for a change that failed before it wrote anything.
+    ///
+    /// Kept as structured lines rather than folded into `display`, because
+    /// the transcript colours additions and removals differently and a
+    /// pre-rendered string would arrive with that distinction already lost.
+    /// Not sent to the model: it already knows what it asked for, and
+    /// `content` reports the result.
+    pub diff: Option<crate::diff::FileDiff>,
 }
 
 /// The shell used to run a command, per platform.
@@ -1400,6 +1433,127 @@ fn edit_spans(args: EditFileArgs) -> Result<Vec<EditSpan>, String> {
     }
 }
 
+/// What a pending `write_file` or `edit_file` would do to the file on disk.
+///
+/// `None` for everything else, and for a change with nothing to show: a path
+/// that does not resolve, a file that is not readable as text, an edit whose
+/// `old_string` does not match, or a write whose content is what is already
+/// there. The popup falls back to its plain rendering in those cases rather
+/// than showing an empty diff, which is the difference between "no changes"
+/// and "we could not work out the changes".
+///
+/// Reads the file. Called once, when the approval request is built -- never
+/// from the renderer, which would repeat it on every frame.
+pub fn preview_change(action: &Action, workspace_root: &Path) -> Option<crate::diff::FileDiff> {
+    let workspace = Workspace::new(workspace_root).ok()?;
+    let changes = match action {
+        Action::Write { path, content } => {
+            let resolved = resolve_in_workspace(&workspace, path).ok()?;
+            // Missing means empty, so creating a file is an all-additions diff
+            // rather than a special case. Present-but-not-text means there is
+            // no line diff to draw -- see `execute_write_file` for why the two
+            // must not be conflated.
+            let before = match std::fs::read_to_string(&resolved) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(_) => return None,
+            };
+            crate::diff::diff(&before, content)
+        }
+        Action::Edit { path, edits } => {
+            let resolved = resolve_in_workspace(&workspace, path).ok()?;
+            let before = std::fs::read_to_string(&resolved).ok()?;
+            // The same function the runner will use, so what is approved and
+            // what happens cannot be two different things.
+            let (after, _) = apply_edits(&before, edits, path).ok()?;
+            crate::diff::diff(&before, &after)
+        }
+        _ => return None,
+    };
+    (!changes.is_empty()).then(|| changes.clipped(APPROVAL_DIFF_LINES))
+}
+
+/// Apply `spans` to `contents` in order, or say why they cannot be applied.
+/// Returns the resulting text and how many occurrences were replaced.
+///
+/// Extracted from `execute_edit_file` so that the approval popup can show the
+/// **actual** result of an edit rather than a re-implementation of it. A
+/// preview computed by a second copy of these rules would be a preview that
+/// can disagree with what runs, and the whole value of the popup is that it
+/// cannot. This touches no disk: the caller reads and the caller writes.
+///
+/// Nothing here is relaxed for the preview's benefit -- an edit that would be
+/// refused for being ambiguous is refused here too, so the popup shows the
+/// refusal instead of a change that will not happen.
+pub fn apply_edits(
+    contents: &str,
+    spans: &[EditSpan],
+    path: &str,
+) -> Result<(String, usize), String> {
+    let batch = spans.len() > 1;
+    // "which edit" for a batch's error messages; a lone edit needs no label.
+    let nth = |i: usize| {
+        if batch {
+            format!("edit {} of {}: ", i + 1, spans.len())
+        } else {
+            String::new()
+        }
+    };
+    for (i, span) in spans.iter().enumerate() {
+        if span.old.is_empty() {
+            return Err(format!(
+                "Error: {}old_string must not be empty. Use write_file to create a file.",
+                nth(i)
+            ));
+        }
+        if span.old == span.new {
+            return Err(format!(
+                "Error: {}old_string and new_string are identical.",
+                nth(i)
+            ));
+        }
+    }
+
+    // Applied in order, each span matched against the previous spans' result,
+    // and nothing touches the disk until every one has succeeded -- a batch
+    // that half-applied would leave the file in a state neither the model nor
+    // the user approved.
+    let untouched = if batch { " None of the edits were applied." } else { "" };
+    let mut working = contents.to_string();
+    let mut replaced_total = 0usize;
+    for (i, span) in spans.iter().enumerate() {
+        let matches = working.matches(&span.old).count();
+        match matches {
+            0 => {
+                return Err(format!(
+                    "Error: {}old_string was not found in '{path}'. It must match byte for \
+                     byte, including indentation. Read the file and copy the text exactly.{untouched}",
+                    nth(i)
+                ))
+            }
+            // Silently editing the wrong one of several identical spans is the
+            // most damaging thing this tool could do, so an ambiguous edit is
+            // refused rather than guessed at.
+            n if n > 1 && !span.replace_all => {
+                return Err(format!(
+                    "Error: {}old_string appears {n} times in '{path}'. Add surrounding \
+                     context to make it unique, or pass replace_all: true.{untouched}",
+                    nth(i)
+                ))
+            }
+            _ => {}
+        }
+        if span.replace_all {
+            working = working.replace(&span.old, &span.new);
+            replaced_total += matches;
+        } else {
+            working = working.replacen(&span.old, &span.new, 1);
+            replaced_total += 1;
+        }
+    }
+    Ok((working, replaced_total))
+}
+
 #[derive(Deserialize)]
 struct WebSearchArgs {
     query: String,
@@ -2422,12 +2576,41 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
         }
     }
 
+    // Read before writing, so the transcript can show what the write replaced
+    // rather than only how big it was.
+    //
+    // "Missing" and "unreadable" are told apart deliberately. A file that is
+    // not there yet stands in as empty, which makes creating one an
+    // all-additions diff -- correct, and the same shape as every other change.
+    // A file that is there but is not text (a binary being overwritten) is
+    // *not* empty, and treating it as such would draw the new content as pure
+    // additions against nothing, which is exactly the kind of confident-looking
+    // wrong picture a diff exists to prevent. That case gets the byte count it
+    // always got and no diff at all.
+    let before = match tokio::fs::read_to_string(&resolved).await {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+        Err(_) => None,
+    };
+
     match tokio::fs::write(&resolved, &args.content).await {
-        Ok(()) => outcome(
-            &call.id,
-            format!("📝 write {} — {} bytes", clip(path, 50), args.content.len()),
-            format!("Wrote {} bytes to {path}", args.content.len()),
-        ),
+        Ok(()) => {
+            let changes = before
+                .map(|before| crate::diff::diff(&before, &args.content))
+                .map(|d| d.clipped(TRANSCRIPT_DIFF_LINES));
+            let headline = match &changes {
+                Some(d) if !d.is_empty() => format!("📝 write {} — {}", clip(path, 50), d.tally()),
+                Some(_) => format!("📝 write {} — unchanged", clip(path, 50)),
+                None => format!("📝 write {} — {} bytes", clip(path, 50), args.content.len()),
+            };
+            let mut result = outcome(
+                &call.id,
+                headline,
+                format!("Wrote {} bytes to {path}", args.content.len()),
+            );
+            result.diff = changes.filter(|d| !d.is_empty());
+            result
+        }
         Err(e) => outcome(
             &call.id,
             format!("📝 write {} — failed", clip(path, 50)),
@@ -3517,28 +3700,6 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         Err(e) => return fail(format!("Error: {e}")),
     };
     let batch = spans.len() > 1;
-    // "which edit" for a batch's error messages; a lone edit needs no label.
-    let nth = |i: usize| {
-        if batch {
-            format!("edit {} of {}: ", i + 1, spans.len())
-        } else {
-            String::new()
-        }
-    };
-    for (i, span) in spans.iter().enumerate() {
-        if span.old.is_empty() {
-            return fail(format!(
-                "Error: {}old_string must not be empty. Use write_file to create a file.",
-                nth(i)
-            ));
-        }
-        if span.old == span.new {
-            return fail(format!(
-                "Error: {}old_string and new_string are identical.",
-                nth(i)
-            ));
-        }
-    }
 
     let path = match resolve_in_workspace(workspace, &requested) {
         Ok(p) => p,
@@ -3549,43 +3710,14 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         Err(e) => return fail(format!("Error: could not read '{requested}': {e}")),
     };
 
-    // Applied in order, each span matched against the previous spans' result,
-    // and nothing touches the disk until every one has succeeded -- a batch
-    // that half-applied would leave the file in a state neither the model nor
-    // the user approved.
-    let untouched = if batch { " None of the edits were applied." } else { "" };
-    let mut working = contents;
-    let mut replaced_total = 0usize;
-    for (i, span) in spans.iter().enumerate() {
-        let matches = working.matches(&span.old).count();
-        match matches {
-            0 => {
-                return fail(format!(
-                    "Error: {}old_string was not found in '{requested}'. It must match byte for \
-                     byte, including indentation. Read the file and copy the text exactly.{untouched}",
-                    nth(i)
-                ))
-            }
-            // Silently editing the wrong one of several identical spans is the
-            // most damaging thing this tool could do, so an ambiguous edit is
-            // refused rather than guessed at.
-            n if n > 1 && !span.replace_all => {
-                return fail(format!(
-                    "Error: {}old_string appears {n} times in '{requested}'. Add surrounding \
-                     context to make it unique, or pass replace_all: true.{untouched}",
-                    nth(i)
-                ))
-            }
-            _ => {}
-        }
-        if span.replace_all {
-            working = working.replace(&span.old, &span.new);
-            replaced_total += matches;
-        } else {
-            working = working.replacen(&span.old, &span.new, 1);
-            replaced_total += 1;
-        }
-    }
+    let (working, replaced_total) = match apply_edits(&contents, &spans, &requested) {
+        Ok(applied) => applied,
+        Err(e) => return fail(e),
+    };
+
+    // What actually changed, against what was on disk a moment ago -- the same
+    // comparison the approval popup showed, now describing the finished job.
+    let changes = crate::diff::diff(&contents, &working).clipped(TRANSCRIPT_DIFF_LINES);
 
     if let Err(e) = std::fs::write(&path, &working) {
         return fail(format!("Error: could not write '{requested}': {e}"));
@@ -3603,11 +3735,18 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
             working.len()
         )
     };
-    outcome(
+    // The headline says what changed in the file's terms rather than the
+    // tool's: "2 additions and 1 removal" is the thing worth knowing, where
+    // "1 replacement" describes the mechanism and leaves the size of it out.
+    let mut result = outcome(
         &call.id,
-        format!("✏️ edit {requested} — {replaced_total} replacement(s)"),
+        format!("✏️ edit {requested} — {}", changes.tally()),
         summary,
-    )
+    );
+    if !changes.is_empty() {
+        result.diff = Some(changes);
+    }
+    result
 }
 
 pub fn declined(call: &ToolCall) -> ToolOutcome {
@@ -3772,6 +3911,7 @@ fn outcome(call_id: &str, display: String, content: String) -> ToolOutcome {
         call_id: call_id.to_string(),
         display,
         content,
+        diff: None,
     }
 }
 
@@ -4083,6 +4223,219 @@ mod tests {
             .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
             .collect();
         assert!(names.contains(&GREP_SEARCH.to_string()), "{names:?}");
+    }
+
+    /// The preview and the runner have to agree, and the only way to make that
+    /// structural rather than hopeful is for both to call the same function.
+    /// This is the check that they still do.
+    #[tokio::test]
+    async fn the_previewed_diff_is_what_the_edit_actually_does() {
+        let (_d, ws, cfg) = tree();
+        let before = "one\ntwo\nthree\n";
+        std::fs::write(ws.root().join("src/app.rs"), before).unwrap();
+        let action = Action::Edit {
+            path: "src/app.rs".into(),
+            edits: vec![EditSpan {
+                old: "two".into(),
+                new: "TWO\nTWO AND A HALF".into(),
+                replace_all: false,
+            }],
+        };
+
+        let previewed = preview_change(&action, ws.root()).expect("a preview");
+        assert_eq!((previewed.added, previewed.removed), (2, 1));
+
+        execute(
+            &tool_call(EDIT_FILE, json!({
+                "path": "src/app.rs", "old_string": "two", "new_string": "TWO\nTWO AND A HALF"
+            })),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        let after = std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap();
+        assert_eq!(crate::diff::diff(before, &after).hunks, previewed.hunks);
+    }
+
+    /// A finished edit reports the size of the change in the file's terms.
+    /// "1 replacement" describes the mechanism and leaves out how much moved.
+    #[tokio::test]
+    async fn a_finished_edit_carries_its_diff_and_counts_the_lines() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "a\nb\nc\n").unwrap();
+
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({
+                "path": "src/app.rs", "old_string": "b", "new_string": "B\nB2"
+            })),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        assert!(out.display.contains("2 additions and 1 removal"), "{}", out.display);
+        let diff = out.diff.expect("a diff");
+        assert_eq!((diff.added, diff.removed), (2, 1));
+        // The model still gets the plain result, not the drawing.
+        assert!(out.content.contains("Replaced 1"), "{}", out.content);
+    }
+
+    /// A write over an existing file is a change like any other, and the
+    /// transcript should say what changed rather than how many bytes landed.
+    #[tokio::test]
+    async fn a_write_over_an_existing_file_carries_its_diff() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "one\ntwo\n").unwrap();
+
+        let out = execute(
+            &tool_call(WRITE_FILE, json!({"path": "src/app.rs", "content": "one\nTWO\n"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        assert!(out.display.contains("1 addition and 1 removal"), "{}", out.display);
+        assert_eq!(out.diff.expect("a diff").removed, 1);
+    }
+
+    /// Creating a file is an all-additions diff rather than a special case.
+    #[tokio::test]
+    async fn a_new_file_is_all_additions() {
+        let (_d, ws, cfg) = tree();
+
+        let out = execute(
+            &tool_call(WRITE_FILE, json!({"path": "src/fresh.rs", "content": "a\nb\n"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        let diff = out.diff.expect("a diff");
+        assert_eq!((diff.added, diff.removed), (2, 0));
+    }
+
+    /// Writing a file back exactly as it was is not a change, and saying "0
+    /// additions" under a diff with nothing in it would be worse than silence.
+    #[tokio::test]
+    async fn rewriting_identical_content_reports_no_change() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "same\n").unwrap();
+
+        let out = execute(
+            &tool_call(WRITE_FILE, json!({"path": "src/app.rs", "content": "same\n"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        assert!(out.display.contains("unchanged"), "{}", out.display);
+        assert!(out.diff.is_none());
+    }
+
+    /// Overwriting a binary file must not draw the new content as pure
+    /// additions against an imagined empty file. There is no line diff to
+    /// show, so none is shown.
+    #[tokio::test]
+    async fn overwriting_a_non_text_file_gets_no_diff() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let out = execute(
+            &tool_call(WRITE_FILE, json!({"path": "src/blob.bin", "content": "now text\n"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        assert!(out.diff.is_none());
+        assert!(out.display.contains("bytes"), "{}", out.display);
+
+        // And the approval prompt would have said nothing about it either --
+        // on a file the write above has not already turned into text.
+        std::fs::write(ws.root().join("src/other.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let action = Action::Write { path: "src/other.bin".into(), content: "x".into() };
+        assert!(preview_change(&action, ws.root()).is_none());
+    }
+
+    /// A failed edit changed nothing, so it must not claim a diff.
+    #[tokio::test]
+    async fn a_failed_edit_carries_no_diff() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "a\n").unwrap();
+
+        let out = execute(
+            &tool_call(EDIT_FILE, json!({
+                "path": "src/app.rs", "old_string": "not here", "new_string": "x"
+            })),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        assert!(out.content.contains("was not found"), "{}", out.content);
+        assert!(out.diff.is_none());
+    }
+
+    /// The preview refuses exactly what the runner refuses. An edit that will
+    /// fail must not be dressed up as a change that will happen.
+    #[test]
+    fn there_is_no_preview_for_an_edit_that_cannot_be_applied() {
+        let (_d, ws, _cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "x = 1;\nx = 1;\n").unwrap();
+
+        let missing = Action::Edit {
+            path: "src/app.rs".into(),
+            edits: vec![EditSpan { old: "absent".into(), new: "y".into(), replace_all: false }],
+        };
+        assert!(preview_change(&missing, ws.root()).is_none());
+
+        // Ambiguous without `replace_all`, so the runner would refuse it too.
+        let ambiguous = Action::Edit {
+            path: "src/app.rs".into(),
+            edits: vec![EditSpan { old: "x = 1;".into(), new: "x = 2;".into(), replace_all: false }],
+        };
+        assert!(preview_change(&ambiguous, ws.root()).is_none());
+
+        // A file that does not exist has nothing to edit.
+        let nowhere = Action::Edit {
+            path: "src/nope.rs".into(),
+            edits: vec![EditSpan { old: "a".into(), new: "b".into(), replace_all: false }],
+        };
+        assert!(preview_change(&nowhere, ws.root()).is_none());
+    }
+
+    /// Nothing that does not touch a file gets a diff, whatever else it does.
+    #[test]
+    fn only_file_changes_get_a_preview() {
+        let (_d, ws, _cfg) = tree();
+        let actions = [
+            Action::Read { path: "src/app.rs".into() },
+            Action::Command { command: "ls".into(), purpose: None },
+            Action::List { path: ".".into() },
+        ];
+        for action in actions {
+            assert!(preview_change(&action, ws.root()).is_none(), "{action:?}");
+        }
+    }
+
+    /// The preview is bounded so an approval prompt cannot be made to rebuild
+    /// ten thousand styled lines twice a frame -- but it must say it is short.
+    #[test]
+    fn an_enormous_write_is_previewed_up_to_the_cap() {
+        let (_d, ws, _cfg) = tree();
+        let before: String = (0..2_000).map(|i| format!("old {i}\n")).collect();
+        std::fs::write(ws.root().join("src/big.rs"), &before).unwrap();
+
+        let action = Action::Write {
+            path: "src/big.rs".into(),
+            content: (0..2_000).map(|i| format!("new {i}\n")).collect(),
+        };
+        let preview = preview_change(&action, ws.root()).expect("a preview");
+        assert_eq!(preview.line_count(), APPROVAL_DIFF_LINES);
+        assert!(preview.clipped > 0);
+        // The headline still describes the whole change.
+        assert_eq!(preview.added, 2_000);
     }
 
     #[tokio::test]
