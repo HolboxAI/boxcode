@@ -228,6 +228,7 @@ pub async fn run_subagent(
             content: "Error: could not parse the arguments. Pass {\"task\": \"...\"} with a \
                       non-empty task describing what to research."
                 .to_string(),
+            diff: None,
         };
     };
     if agent_type != "explore" {
@@ -238,6 +239,7 @@ pub async fn run_subagent(
                 "Error: there is no '{agent_type}' subagent. Only 'explore' (read-only \
                  research) exists; omit agent_type to get it, and do any writing yourself."
             ),
+            diff: None,
         };
     }
 
@@ -323,6 +325,7 @@ pub async fn run_subagent(
                     "The subagent failed before finishing: {e}\nDo the research yourself \
                      with read_file/grep_search/glob, or try the agent again."
                 ),
+                diff: None,
             };
         }
 
@@ -351,6 +354,7 @@ pub async fn run_subagent(
                 } else {
                     report
                 },
+                diff: None,
             };
         }
 
@@ -370,6 +374,7 @@ pub async fn run_subagent(
                     display: format!("⛭ agent \"{}\" — budget spent", brief(&task, 40)),
                     content: "The subagent spent its whole budget without writing a report."
                         .to_string(),
+                    diff: None,
                 };
             }
         }

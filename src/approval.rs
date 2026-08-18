@@ -32,6 +32,20 @@ pub struct ApprovalRequest {
     pub action: Action,
     /// How many more calls are queued behind this one.
     pub remaining: usize,
+    /// For a `Write` or an `Edit`, what the file looks like before and after
+    /// -- the diff the popup draws instead of describing the change in prose.
+    ///
+    /// It lives on the request rather than inside [`Action`] because it is not
+    /// part of what the call *means*; it is what the question looks like when
+    /// asked. `Action` stays a pure interpretation of the tool call, which is
+    /// what lets the same value be compared, logged and matched on without
+    /// dragging a snapshot of the filesystem along with it.
+    ///
+    /// Computed once, when the request is built, against the file as it is at
+    /// that moment. `None` when there is nothing to show -- see
+    /// [`crate::tools::preview_change`] -- and the popup falls back to its
+    /// plain rendering.
+    pub preview: Option<crate::diff::FileDiff>,
 }
 
 /// The user's answer to one [`ApprovalRequest`].

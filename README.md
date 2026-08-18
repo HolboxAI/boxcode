@@ -15,7 +15,7 @@ OpenAI-compatible LLM endpoint.
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v1.6.2
+  ▟█▙       ▟█▙    boxcode  v1.7.0
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -82,6 +82,13 @@ to ask for the same thing.
   first, shown in full (a file's real new content, not a shell string).
   Genuinely catastrophic commands (`rm -rf /`, disk formatting, fork bombs,
   `curl | sh`, ...) are never even offered as a yes/no — see `danger.rs`.
+- **Every file change is a diff, before and after** — a write or an edit is
+  approved by looking at red `-` and green `+` lines with real line numbers,
+  against the file as it is on disk right now, not by reading a whole new file
+  or a "replace this / with this" pair with no idea where it lands. The
+  approved change then leaves that same diff in the transcript, so "wrote 4kb"
+  becomes "changed these four lines". The preview is produced by the very code
+  that applies the edit, so what you approve and what happens cannot differ.
 - **`/plan`** — research first, get an editable plan, *then* approve the
   approach before any file changes. The plan lands as `plan.md` in your
   project, so it's a file you own, not hidden state. Full details:
@@ -178,6 +185,8 @@ chat-completions endpoint.
 - `src/session.rs`, `src/usage.rs`, `src/telemetry.rs` — local session log,
   local usage log, anonymous pings (all separate, see Privacy above)
 - `src/plan.rs` — `plan.md`'s format and progress tracking
+- `src/diff.rs` — the line diff behind every file-change preview and transcript
+  entry
 - `src/artifacts.rs`, `src/auth.rs`, `src/db.rs`, `src/requests.rs` —
   publishing, hosted auth, hosted per-project SQLite, the change-request
   mailbox; `infra/` holds the control-planes these talk to
@@ -187,7 +196,7 @@ chat-completions endpoint.
 
 ## What's Next
 
-- A diff preview when a command is about to modify tracked files
+- A diff preview when a *command* (not a write) is about to modify tracked files
 - Remembering per-command approvals across a session
 - GitHub integration (VPC-only)
 - Test generation
