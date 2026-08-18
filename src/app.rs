@@ -358,6 +358,15 @@ pub struct App {
     pub approval_scroll: u16,
     pub config: Config,
     pub should_exit: bool,
+    /// True once Ctrl-C has been pressed once and is waiting to be confirmed.
+    ///
+    /// Ctrl-C is the reflex for "stop what you are doing", and in a terminal
+    /// that reflex normally kills the process. Here it would also throw away
+    /// the conversation, the plan and anything half-typed -- so the first
+    /// press only arms this and says so, and any other key disarms it. The
+    /// cost of being wrong is one extra keystroke; the cost of the old
+    /// behaviour was a session.
+    pub quit_armed: bool,
     /// Set once the user has interacted, so the welcome panel gives way to the transcript.
     pub greeted: bool,
     /// `Some` while `/provider` or `/model` is active; see `Overlay`.
@@ -517,6 +526,7 @@ impl App {
             approval_scroll: 0,
             config,
             should_exit: false,
+            quit_armed: false,
             greeted: false,
             overlay: None,
             overlay_input: String::new(),
@@ -604,7 +614,28 @@ impl App {
         Some(matches[index].0)
     }
 
+    /// Ctrl-C. Returns `true` when the app should actually quit.
+    ///
+    /// Deliberately not a plain `should_exit = true`: see `quit_armed`. Kept
+    /// here rather than in the event loop so it can be tested without a
+    /// terminal, and so the footer and the decision cannot disagree about
+    /// whether a quit is pending.
+    pub fn request_quit(&mut self) -> bool {
+        if self.quit_armed {
+            self.should_exit = true;
+            return true;
+        }
+        self.quit_armed = true;
+        false
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Any other key means the Ctrl-C was a slip, or a change of mind.
+        // Disarming on the next keystroke is what keeps a stale "press again"
+        // from turning a much later, unrelated Ctrl-C into an instant exit.
+        if key.kind != KeyEventKind::Release {
+            self.quit_armed = false;
+        }
         // Terminals that support the kitty keyboard protocol also report key *releases*.
         // Without this guard every keystroke would be inserted twice.
         if key.kind == KeyEventKind::Release {
@@ -4072,6 +4103,53 @@ mod tests {
 
         let (tokens, _) = a.pending_usage.first().expect("a turn was logged");
         assert_eq!(*tokens, 53_410, "the log and the quota must agree about one turn");
+    }
+
+    // ---- Ctrl-C asks before quitting -----------------------------------------
+
+    /// Ctrl-C is the reflex for "stop", and it used to end the process on the
+    /// first press -- taking the conversation, the plan and anything
+    /// half-typed with it.
+    #[test]
+    fn one_ctrl_c_arms_the_quit_but_does_not_exit() {
+        let mut a = app();
+        assert!(!a.request_quit(), "the first press must not quit");
+        assert!(a.quit_armed);
+        assert!(!a.should_exit);
+    }
+
+    #[test]
+    fn a_second_ctrl_c_quits() {
+        let mut a = app();
+        a.request_quit();
+        assert!(a.request_quit(), "the second press quits");
+        assert!(a.should_exit);
+    }
+
+    /// The whole point of arming: a stale "press again" must not turn a much
+    /// later, unrelated Ctrl-C into an instant exit.
+    #[test]
+    fn any_other_key_disarms_the_pending_quit() {
+        let mut a = app();
+        a.request_quit();
+        assert!(a.quit_armed);
+
+        a.handle_key(key(KeyCode::Char('h')));
+        assert!(!a.quit_armed, "typing should cancel a pending quit");
+        assert!(!a.request_quit(), "so the next Ctrl-C is a first press again");
+        assert!(!a.should_exit);
+    }
+
+    /// Arrow keys and Esc count too -- anything that shows the user is still
+    /// working is a change of mind.
+    #[test]
+    fn navigation_keys_also_disarm_the_pending_quit() {
+        for code in [KeyCode::Esc, KeyCode::Up, KeyCode::Backspace] {
+            let mut a = app();
+            a.request_quit();
+            a.handle_key(key(code));
+            assert!(!a.quit_armed, "{code:?} should have disarmed the quit");
+        }
     }
 
     fn key(code: KeyCode) -> KeyEvent {

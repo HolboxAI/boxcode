@@ -826,6 +826,12 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
 /// bottom of the screen.
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let keys: &[(&str, &str)] = match &app.state {
+        // First, so it wins over every other state: once a quit is pending it
+        // is the most important thing on screen, and it is true whether or not
+        // an approval or a deployment happens to be open. Said here, where the
+        // keys are, because a confirmation printed into the transcript would
+        // scroll away -- and this is only true until the next keystroke.
+        _ if app.quit_armed => &[("^c", "press again to quit")],
         // Same reasoning as the approval box below: the deployment panel
         // prints its own keys, directly under the choices they act on.
         _ if app.overlay == Some(Overlay::Deploy) => &[("^c", "exit")],
@@ -4497,6 +4503,31 @@ mod tests {
         // ones being read.
         assert!(joined.contains("building chunk 19"), "{rows:?}");
         assert!(!joined.contains("building chunk 0 "), "it should have scrolled past: {rows:?}");
+    }
+
+    /// The confirmation has to be on screen, or the first Ctrl-C looks like
+    /// it did nothing and the second is a surprise.
+    #[test]
+    fn a_pending_quit_says_so_in_the_key_bar() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        assert!(!rendered_rows(&mut app, 80, 24).concat().contains("press again to quit"));
+
+        app.request_quit();
+        let shown = rendered_rows(&mut app, 80, 24).concat();
+        assert!(shown.contains("press again to quit"), "{shown}");
+    }
+
+    /// It has to win over the other key-bar states too: a quit is pending
+    /// whether or not an approval happens to be open.
+    #[test]
+    fn the_pending_quit_hint_outranks_the_busy_key_bar() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = crate::app::AppState::Streaming;
+        app.request_quit();
+        let shown = rendered_rows(&mut app, 80, 24).concat();
+        assert!(shown.contains("press again to quit"), "{shown}");
     }
 
     /// The cap on the menu's height has to stay above the number of commands.
