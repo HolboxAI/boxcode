@@ -1694,41 +1694,45 @@ pub struct Proposal {
 }
 
 impl Action {
-    /// One line for `$ ... —` / transcript-style summaries, with a leading
-    /// icon so the different kinds stay visually distinct in a transcript full
-    /// of them.
+    /// One line for `$ ... —` / transcript-style summaries.
+    ///
+    /// The verb comes first and carries the meaning -- `read`, `write`,
+    /// `grep`, `deploy`. There is no leading pictograph: see the glyph rule in
+    /// `theme.rs` for why, and note that the transcript already prefixes every
+    /// one of these with a state marker, so an icon here was a second marker
+    /// saying less than the word beside it.
     pub fn label(&self) -> String {
         match self {
             Action::Command { command, .. } => format!("$ {command}"),
-            Action::Read { path } => format!("📄 read {path}"),
-            Action::Write { path, .. } => format!("📝 write {path}"),
-            Action::List { path } => format!("📁 list {path}"),
-            Action::Glob { pattern } => format!("🔎 find {pattern}"),
+            Action::Read { path } => format!("read {path}"),
+            Action::Write { path, .. } => format!("write {path}"),
+            Action::List { path } => format!("list {path}"),
+            Action::Glob { pattern } => format!("find {pattern}"),
             Action::Grep { pattern, path } => match path {
-                Some(path) => format!("🔎 grep {pattern} in {path}"),
-                None => format!("🔎 grep {pattern}"),
+                Some(path) => format!("grep {pattern} in {path}"),
+                None => format!("grep {pattern}"),
             },
-            Action::Edit { path, .. } => format!("✏️ edit {path}"),
-            Action::Search { query, .. } => format!("🔎 search \"{query}\""),
-            Action::DesignStarter => "🎨 design starter".to_string(),
+            Action::Edit { path, .. } => format!("edit {path}"),
+            Action::Search { query, .. } => format!("search \"{query}\""),
+            Action::DesignStarter => "design starter".to_string(),
             Action::CheckContrast { pairs } => format!(
-                "🎨 contrast — {} pair{}",
+                "contrast — {} pair{}",
                 pairs.len(),
                 if pairs.len() == 1 { "" } else { "s" }
             ),
             Action::Deploy { provider, production, .. } => format!(
-                "🚀 deploy → {provider} ({})",
+                "deploy → {provider} ({})",
                 if *production { "Production" } else { "Preview" }
             ),
-            Action::Publish { path } => format!("🌐 preview {path} — public link, 48h"),
-            Action::EnableAuth { path } => format!("🔐 auth {path} — sign-up/sign-in"),
-            Action::DbQuery { path, sql } => format!("🗄️ db {path} — {}", clip(sql, 50)),
-            Action::ListChangeRequests { path } => format!("📨 requests {path} — check mailbox"),
+            Action::Publish { path } => format!("preview {path} — public link, 48h"),
+            Action::EnableAuth { path } => format!("auth {path} — sign-up/sign-in"),
+            Action::DbQuery { path, sql } => format!("db {path} — {}", clip(sql, 50)),
+            Action::ListChangeRequests { path } => format!("requests {path} — check mailbox"),
             Action::ResolveChangeRequest { path, id } => {
-                format!("📨 requests {path} — resolve #{id}")
+                format!("requests {path} — resolve #{id}")
             }
-            Action::Agent { task, .. } => format!("⛭ agent: \"{}\"", clip(task, 60)),
-            Action::Plan(p) => format!("📋 plan: {}", p.title),
+            Action::Agent { task, .. } => format!("agent: \"{}\"", clip(task, 60)),
+            Action::Plan(p) => format!("plan: {}", p.title),
             Action::Progress { step, done, .. } => {
                 format!("{} step {step}", if *done { "☑" } else { "☐" })
             }
@@ -2299,7 +2303,7 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         // mistake should produce a sentence the model can act on.
         AGENT => outcome(
             &call.id,
-            "⛭ agent — not handled".to_string(),
+            "agent — not handled".to_string(),
             "Error: the subagent was not started. Do the research yourself with \
              read_file/grep_search/glob instead."
                 .to_string(),
@@ -2311,7 +2315,7 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         // would send it hunting for a tool it just correctly used.
         EXIT_PLAN_MODE => outcome(
             &call.id,
-            "📋 plan — not handled".to_string(),
+            "plan — not handled".to_string(),
             "Error: the plan did not reach the user. Say what you were going to propose in \
              plain text instead."
                 .to_string(),
@@ -2325,7 +2329,7 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         ),
         other => outcome(
             &call.id,
-            format!("⚙ {other} — unknown tool"),
+            format!("{other} — unknown tool"),
             format!(
                 "Error: there is no tool named '{other}'. The tools are {RUN_COMMAND}, \
                  {READ_FILE}, {WRITE_FILE}, {LIST_DIR}, {GLOB}, {GREP_SEARCH}, {EDIT_FILE}, \
@@ -2339,7 +2343,7 @@ async fn execute_run_command(call: &ToolCall, workspace: &Workspace, config: &To
     let Ok(args) = serde_json::from_str::<RunArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "⚙ run_command — unusable arguments".to_string(),
+            "run_command — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"command": "ls -la"}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -2350,7 +2354,7 @@ async fn execute_run_command(call: &ToolCall, workspace: &Workspace, config: &To
     if command.is_empty() {
         return outcome(
             &call.id,
-            "⚙ run_command — empty command".to_string(),
+            "run_command — empty command".to_string(),
             "Error: the command was empty. Nothing was run.".to_string(),
         );
     }
@@ -2435,7 +2439,7 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
     let Ok(args) = serde_json::from_str::<ReadFileArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "📄 read_file — unusable arguments".to_string(),
+            "read_file — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"path": "src/main.rs"}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -2446,7 +2450,7 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
     if path.is_empty() {
         return outcome(
             &call.id,
-            "📄 read_file — empty path".to_string(),
+            "read_file — empty path".to_string(),
             "Error: the path was empty. Nothing was read.".to_string(),
         );
     }
@@ -2456,7 +2460,7 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("📄 read {} — refused", clip(path, 50)),
+                format!("read {} — refused", clip(path, 50)),
                 format!("Error: {e}"),
             )
         }
@@ -2489,7 +2493,7 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
                 return outcome(
                     &call.id,
                     format!(
-                        "📄 read {} — {total} line{}",
+                        "read {} — {total} line{}",
                         clip(path, 50),
                         if total == 1 { "" } else { "s" }
                     ),
@@ -2506,7 +2510,7 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
                 // An answer, not a failure -- same contract as an empty glob.
                 return outcome(
                     &call.id,
-                    format!("📄 read {} — past the end", clip(path, 50)),
+                    format!("read {} — past the end", clip(path, 50)),
                     format!("'{path}' has only {total} line{}; nothing at offset {offset}.",
                         if total == 1 { "" } else { "s" }),
                 );
@@ -2521,13 +2525,13 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
             let end = offset + numbered.len() - 1;
             outcome(
                 &call.id,
-                format!("📄 read {} — lines {offset}-{end} of {total}", clip(path, 50)),
+                format!("read {} — lines {offset}-{end} of {total}", clip(path, 50)),
                 clip(&numbered.join("\n"), config.max_output_bytes),
             )
         }
         Err(e) => outcome(
             &call.id,
-            format!("📄 read {} — failed", clip(path, 50)),
+            format!("read {} — failed", clip(path, 50)),
             format!("Error: could not read {path}: {e}"),
         ),
     }
@@ -2537,7 +2541,7 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
     let Ok(args) = serde_json::from_str::<WriteFileArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "📝 write_file — unusable arguments".to_string(),
+            "write_file — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"path": "hello.py", "content": "..."}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -2548,7 +2552,7 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
     if path.is_empty() {
         return outcome(
             &call.id,
-            "📝 write_file — empty path".to_string(),
+            "write_file — empty path".to_string(),
             "Error: the path was empty. Nothing was written.".to_string(),
         );
     }
@@ -2558,7 +2562,7 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("📝 write {} — refused", clip(path, 50)),
+                format!("write {} — refused", clip(path, 50)),
                 format!("Error: {e}"),
             )
         }
@@ -2569,7 +2573,7 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return outcome(
                     &call.id,
-                    format!("📝 write {} — failed", clip(path, 50)),
+                    format!("write {} — failed", clip(path, 50)),
                     format!("Error: could not create the directory for {path}: {e}"),
                 );
             }
@@ -2599,9 +2603,9 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
                 .map(|before| crate::diff::diff(&before, &args.content))
                 .map(|d| d.clipped(TRANSCRIPT_DIFF_LINES));
             let headline = match &changes {
-                Some(d) if !d.is_empty() => format!("📝 write {} — {}", clip(path, 50), d.tally()),
-                Some(_) => format!("📝 write {} — unchanged", clip(path, 50)),
-                None => format!("📝 write {} — {} bytes", clip(path, 50), args.content.len()),
+                Some(d) if !d.is_empty() => format!("write {} — {}", clip(path, 50), d.tally()),
+                Some(_) => format!("write {} — unchanged", clip(path, 50)),
+                None => format!("write {} — {} bytes", clip(path, 50), args.content.len()),
             };
             let mut result = outcome(
                 &call.id,
@@ -2613,7 +2617,7 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
         }
         Err(e) => outcome(
             &call.id,
-            format!("📝 write {} — failed", clip(path, 50)),
+            format!("write {} — failed", clip(path, 50)),
             format!("Error: could not write {path}: {e}"),
         ),
     }
@@ -2728,7 +2732,7 @@ const DESIGN_STARTER_CSS: &str = include_str!("../assets/design-starter.css");
 fn execute_get_design_starter(call: &ToolCall) -> ToolOutcome {
     outcome(
         &call.id,
-        "🎨 design starter".to_string(),
+        "design starter".to_string(),
         format!(
             "{DESIGN_STARTER_CSS}\n\nWrite this into the project (design-tokens.css or similar), \
              then replace --accent, --accent-hover, --font-display and --font-body before \
@@ -2753,7 +2757,7 @@ fn execute_check_contrast(call: &ToolCall) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<Args>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "🎨 contrast — unusable arguments".to_string(),
+            "contrast — unusable arguments".to_string(),
             format!(
                 r##"Error: could not read the arguments. Expected {{"pairs": [{{"label": "...", \
                  "foreground": "#000", "background": "#fff"}}]}}, got: {}"##,
@@ -2764,7 +2768,7 @@ fn execute_check_contrast(call: &ToolCall) -> ToolOutcome {
     if args.pairs.is_empty() {
         return outcome(
             &call.id,
-            "🎨 contrast — no pairs".to_string(),
+            "contrast — no pairs".to_string(),
             "Error: pairs must not be empty.".to_string(),
         );
     }
@@ -2794,7 +2798,7 @@ fn execute_check_contrast(call: &ToolCall) -> ToolOutcome {
         }
     }
     let summary = format!(
-        "🎨 contrast — {} pair{}{}",
+        "contrast — {} pair{}{}",
         args.pairs.len(),
         if args.pairs.len() == 1 { "" } else { "s" },
         if any_failed { ", 1+ failing" } else { ", all pass" }
@@ -2806,7 +2810,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
     let Ok(args) = serde_json::from_str::<WebSearchArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "🔎 web_search — unusable arguments".to_string(),
+            "web_search — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"query": "..."}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -2817,7 +2821,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
     if query.is_empty() {
         return outcome(
             &call.id,
-            "🔎 web_search — empty query".to_string(),
+            "web_search — empty query".to_string(),
             "Error: the query was empty. Nothing was searched.".to_string(),
         );
     }
@@ -2853,7 +2857,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
                     None => {
                         return outcome(
                             &call.id,
-                            format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
+                            format!("search \"{}\" — could not start", clip(&query, 50)),
                             format!(
                                 "Error: '{}' resolved to Windows' \"App Execution Alias\" stub, not \
                                  a real Python install. web_search needs Python 3 with the `ddgs` \
@@ -2899,7 +2903,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
                     None => {
                         return outcome(
                             &call.id,
-                            format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
+                            format!("search \"{}\" — could not start", clip(&query, 50)),
                             format!(
                                 "Error: could not run '{}': {e}. web_search needs Python 3 with the \
                                  `ddgs` package installed (pip install ddgs). If Python is installed \
@@ -2914,7 +2918,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
             Ok(Err(e)) => {
                 return outcome(
                     &call.id,
-                    format!("🔎 search \"{}\" — could not start", clip(&query, 50)),
+                    format!("search \"{}\" — could not start", clip(&query, 50)),
                     format!(
                         "Error: could not run '{}': {e}. web_search needs Python 3 with the `ddgs` \
                          package installed (pip install ddgs). If Python is installed under a \
@@ -2926,7 +2930,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
             Err(_) => {
                 return outcome(
                     &call.id,
-                    format!("🔎 search \"{}\" — timed out", clip(&query, 50)),
+                    format!("search \"{}\" — timed out", clip(&query, 50)),
                     format!(
                         "Error: killed after {}s waiting for search results. Try again, or a \
                          narrower query.",
@@ -2941,7 +2945,7 @@ async fn execute_web_search(call: &ToolCall, config: &ToolsConfig) -> ToolOutcom
         let stderr = String::from_utf8_lossy(&output.stderr);
         return outcome(
             &call.id,
-            format!("🔎 search \"{}\" — failed", clip(&query, 50)),
+            format!("search \"{}\" — failed", clip(&query, 50)),
             format!(
                 "Error: the search process exited with {:?}: {}",
                 output.status.code(),
@@ -2967,7 +2971,7 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) else {
         return outcome(
             call_id,
-            format!("🔎 search \"{}\" — unreadable response", clip(query, 50)),
+            format!("search \"{}\" — unreadable response", clip(query, 50)),
             format!(
                 "Error: could not parse the search driver's output: {}",
                 clip(trimmed, 300)
@@ -2979,7 +2983,7 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
         return if reason == "ddgs_not_installed" {
             outcome(
                 call_id,
-                format!("🔎 search \"{}\" — ddgs not installed", clip(query, 50)),
+                format!("search \"{}\" — ddgs not installed", clip(query, 50)),
                 "Error: the `ddgs` Python package is not installed. Install it with: \
                  pip install ddgs"
                     .to_string(),
@@ -2987,7 +2991,7 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
         } else {
             outcome(
                 call_id,
-                format!("🔎 search \"{}\" — failed", clip(query, 50)),
+                format!("search \"{}\" — failed", clip(query, 50)),
                 format!("Error: web search failed: {reason}"),
             )
         };
@@ -3001,7 +3005,7 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
     if results.is_empty() {
         return outcome(
             call_id,
-            format!("🔎 search \"{}\" — 0 results", clip(query, 50)),
+            format!("search \"{}\" — 0 results", clip(query, 50)),
             format!("No results found for '{query}'."),
         );
     }
@@ -3018,7 +3022,7 @@ fn format_search_result(call_id: &str, query: &str, stdout: &str, budget: usize)
     outcome(
         call_id,
         format!(
-            "🔎 search \"{}\" — {count} result{}",
+            "search \"{}\" — {count} result{}",
             clip(query, 50),
             if count == 1 { "" } else { "s" }
         ),
@@ -3320,7 +3324,7 @@ async fn execute_deploy_project(call: &ToolCall, workspace: &Workspace) -> ToolO
     let Some(Action::Deploy { provider, .. }) = describe_action(call) else {
         return outcome(
             &call.id,
-            "🚀 deploy — unusable arguments".to_string(),
+            "deploy — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"provider": "vercel"}} or {{"provider": "netlify"}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -3332,14 +3336,14 @@ async fn execute_deploy_project(call: &ToolCall, workspace: &Workspace) -> ToolO
     if let Err(e) = crate::deploy::detect::detect(workspace.root()) {
         return outcome(
             &call.id,
-            format!("🚀 deploy → {provider} — nothing to deploy"),
+            format!("deploy → {provider} — nothing to deploy"),
             format!("Error: {e}"),
         );
     }
 
     outcome(
         &call.id,
-        format!("🚀 deploy → {provider} — not started"),
+        format!("deploy → {provider} — not started"),
         "Error: a deployment could not be started this turn. It has to be the only tool call in \
          the turn, because it takes over the screen until it finishes. Ask for it on its own."
             .to_string(),
@@ -3358,7 +3362,7 @@ fn execute_list_dir(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
 
     let dir = match resolve_in_workspace(workspace, &requested) {
         Ok(p) => p,
-        Err(e) => return outcome(&call.id, format!("📁 list {requested} — {e}"), format!("Error: {e}")),
+        Err(e) => return outcome(&call.id, format!("list {requested} — {e}"), format!("Error: {e}")),
     };
 
     let entries = match std::fs::read_dir(&dir) {
@@ -3366,7 +3370,7 @@ fn execute_list_dir(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("📁 list {requested} — {e}"),
+                format!("list {requested} — {e}"),
                 format!("Error: could not list '{requested}': {e}"),
             )
         }
@@ -3405,7 +3409,7 @@ fn execute_list_dir(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
 
     outcome(
         &call.id,
-        format!("📁 list {requested} — {total} entries"),
+        format!("list {requested} — {total} entries"),
         clip(&body, 32_000),
     )
 }
@@ -3415,7 +3419,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<GlobArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "🔎 glob — unusable arguments".to_string(),
+            "glob — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"pattern": "src/**/*.rs"}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -3426,7 +3430,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     if pattern.is_empty() {
         return outcome(
             &call.id,
-            "🔎 glob — empty pattern".to_string(),
+            "glob — empty pattern".to_string(),
             "Error: pattern must not be empty.".to_string(),
         );
     }
@@ -3435,7 +3439,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let Some(joined) = joined.to_str() else {
         return outcome(
             &call.id,
-            "🔎 glob — invalid pattern".to_string(),
+            "glob — invalid pattern".to_string(),
             "Error: pattern is not valid UTF-8.".to_string(),
         );
     };
@@ -3445,7 +3449,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("🔎 glob {pattern} — invalid"),
+                format!("glob {pattern} — invalid"),
                 format!("Error: '{pattern}' is not a valid glob: {e}"),
             )
         }
@@ -3470,7 +3474,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         // model toward retrying instead of concluding.
         return outcome(
             &call.id,
-            format!("🔎 glob {pattern} — no matches"),
+            format!("glob {pattern} — no matches"),
             format!("No files match '{pattern}'."),
         );
     }
@@ -3487,7 +3491,7 @@ fn execute_glob(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
 
     outcome(
         &call.id,
-        format!("🔎 glob {pattern} — {total} match(es)"),
+        format!("glob {pattern} — {total} match(es)"),
         clip(&body, 32_000),
     )
 }
@@ -3526,7 +3530,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<GrepSearchArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "🔎 grep — unusable arguments".to_string(),
+            "grep — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"pattern": "fn main"}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -3537,7 +3541,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     if pattern.is_empty() {
         return outcome(
             &call.id,
-            "🔎 grep — empty pattern".to_string(),
+            "grep — empty pattern".to_string(),
             "Error: pattern must not be empty.".to_string(),
         );
     }
@@ -3546,7 +3550,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         Err(e) => {
             return outcome(
                 &call.id,
-                format!("🔎 grep {pattern} — invalid"),
+                format!("grep {pattern} — invalid"),
                 format!("Error: '{pattern}' is not a valid regular expression: {e}"),
             )
         }
@@ -3561,13 +3565,13 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let root = match resolve_in_workspace(workspace, &requested) {
         Ok(p) => p,
         Err(e) => {
-            return outcome(&call.id, format!("🔎 grep {pattern} — {e}"), format!("Error: {e}"))
+            return outcome(&call.id, format!("grep {pattern} — {e}"), format!("Error: {e}"))
         }
     };
     if !root.exists() {
         return outcome(
             &call.id,
-            format!("🔎 grep {pattern} — no such path"),
+            format!("grep {pattern} — no such path"),
             format!("Error: '{requested}' does not exist."),
         );
     }
@@ -3656,7 +3660,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         };
         return outcome(
             &call.id,
-            format!("🔎 grep {pattern} — no matches"),
+            format!("grep {pattern} — no matches"),
             format!("No lines match '{pattern}'{scope}."),
         );
     }
@@ -3671,7 +3675,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
 
     outcome(
         &call.id,
-        format!("🔎 grep {pattern} — {matched_lines} match(es) in {files_with_matches} file(s)"),
+        format!("grep {pattern} — {matched_lines} match(es) in {files_with_matches} file(s)"),
         clip(&body, 32_000),
     )
 }
@@ -3681,7 +3685,7 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<EditFileArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
-            "✏️ edit_file — unusable arguments".to_string(),
+            "edit_file — unusable arguments".to_string(),
             format!(
                 r#"Error: could not read the arguments. Expected {{"path": "src/main.rs", "old_string": "...", "new_string": "..."}}, got: {}"#,
                 clip(&call.function.arguments, 200)
@@ -3690,7 +3694,7 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     };
 
     let requested = args.path.trim().to_string();
-    let fail = |msg: String| outcome(&call.id, format!("✏️ edit {requested} — failed"), msg);
+    let fail = |msg: String| outcome(&call.id, format!("edit {requested} — failed"), msg);
 
     if requested.is_empty() {
         return fail("Error: path must not be empty.".to_string());
@@ -3740,7 +3744,7 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     // "1 replacement" describes the mechanism and leaves the size of it out.
     let mut result = outcome(
         &call.id,
-        format!("✏️ edit {requested} — {}", changes.tally()),
+        format!("edit {requested} — {}", changes.tally()),
         summary,
     );
     if !changes.is_empty() {
@@ -3773,7 +3777,7 @@ pub fn refused_as_dangerous(call: &ToolCall, reason: &str) -> ToolOutcome {
         .unwrap_or_else(|| call.function.name.clone());
     outcome(
         &call.id,
-        format!("⛔ {} — blocked", clip(&label, 60)),
+        format!("✗ {} — blocked", clip(&label, 60)),
         format!(
             "Blocked by the safety guardrails and never run: {reason}.\n\
              This was refused by the tool itself, not by the user, and no setting can permit \
@@ -3795,7 +3799,7 @@ pub fn refused_in_plan_mode(call: &ToolCall, reason: &str) -> ToolOutcome {
         .unwrap_or_else(|| call.function.name.clone());
     outcome(
         &call.id,
-        format!("📋 {} — not in plan mode", clip(&label, 60)),
+        format!("{} — not in plan mode", clip(&label, 60)),
         reason.to_string(),
     )
 }
@@ -3806,7 +3810,7 @@ pub fn refused_in_plan_mode(call: &ToolCall, reason: &str) -> ToolOutcome {
 pub fn plan_approved(call: &ToolCall, saved_to: &str, steps: usize) -> ToolOutcome {
     outcome(
         &call.id,
-        format!("📋 plan approved — saved to {saved_to}"),
+        format!("plan approved — saved to {saved_to}"),
         format!(
             "The user approved the plan, and it is now saved at {saved_to}. Plan mode is over: \
              {WRITE_FILE}, {EDIT_FILE} and the full {RUN_COMMAND} are available again, each \
@@ -3883,7 +3887,7 @@ pub fn progress_failed(call: &ToolCall, reason: &str) -> ToolOutcome {
 pub fn plan_declined(call: &ToolCall) -> ToolOutcome {
     outcome(
         &call.id,
-        "📋 plan declined — still planning".to_string(),
+        "plan declined — still planning".to_string(),
         format!(
             "The user did not approve this plan. You are still in plan mode and still cannot \
              change anything. They will usually say what was wrong with it: read that, \
@@ -4223,6 +4227,125 @@ mod tests {
             .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
             .collect();
         assert!(names.contains(&GREP_SEARCH.to_string()), "{names:?}");
+    }
+
+    /// A pictograph: an emoji, or a symbol a terminal is liable to render as
+    /// one. Deliberately wider than "emoji" -- the problem is not the Unicode
+    /// category, it is a glyph whose width or availability the app cannot
+    /// predict, and `⛭`/`⛔`/anything carrying U+FE0F all failed that way too.
+    fn pictograph(s: &str) -> Option<char> {
+        s.chars().find(|c| {
+            matches!(*c as u32,
+                0x1F000..=0x1FAFF   // emoji blocks
+                | 0x2600..=0x27BF   // misc symbols and dingbats
+                | 0xFE0F            // the variation selector that forces emoji presentation
+                | 0x2B00..=0x2BFF)  // misc symbols and arrows
+                // The typographic marks the app does use, all text-presentation
+                // and all decades old: `theme.rs` explains the rule.
+                && !matches!(*c, '✓' | '✔' | '✖' | '✗' | '✂' | '⚠' | '⚿' | '☐' | '☑' | '❯' | '↑')
+        })
+    }
+
+    /// The rule, enforced rather than remembered. Every one of these labels is
+    /// drawn in a column with the others, and a glyph whose width the terminal
+    /// decides for itself is what made that column ragged.
+    #[test]
+    fn no_label_carries_a_pictograph() {
+        let labels = [
+            Action::Command { command: "ls".into(), purpose: None },
+            Action::Read { path: "a.rs".into() },
+            Action::Write { path: "a.rs".into(), content: String::new() },
+            Action::List { path: ".".into() },
+            Action::Glob { pattern: "*.rs".into() },
+            Action::Grep { pattern: "x".into(), path: Some("src".into()) },
+            Action::Grep { pattern: "x".into(), path: None },
+            Action::Edit { path: "a.rs".into(), edits: Vec::new() },
+            Action::Search { query: "q".into(), max_results: 3 },
+            Action::DesignStarter,
+            Action::CheckContrast { pairs: Vec::new() },
+            Action::Deploy { provider: "vercel".into(), production: true, summary: None },
+            Action::Publish { path: ".".into() },
+            Action::EnableAuth { path: ".".into() },
+            Action::DbQuery { path: ".".into(), sql: "select 1".into() },
+            Action::ListChangeRequests { path: ".".into() },
+            Action::ResolveChangeRequest { path: ".".into(), id: "1".into() },
+            Action::Agent { task: "look".into(), agent_type: "explore".into() },
+            Action::Plan(Proposal {
+                title: "t".into(),
+                summary: String::new(),
+                steps: Vec::new(),
+                not_doing: Vec::new(),
+            }),
+            Action::Progress { step: 1, done: true, note: None },
+        ];
+        for action in labels {
+            let label = action.label();
+            assert!(
+                pictograph(&label).is_none(),
+                "{label:?} carries {:?}",
+                pictograph(&label)
+            );
+            assert!(!label.is_empty(), "{action:?} labelled itself with nothing");
+        }
+    }
+
+    /// The same rule for what the transcript actually shows, which is the
+    /// runner's `display` rather than the label -- they are built separately
+    /// and only one of them was ever checked by eye.
+    #[tokio::test]
+    async fn no_tool_result_carries_a_pictograph() {
+        let (_d, ws, cfg) = tree();
+        std::fs::write(ws.root().join("src/app.rs"), "a\nb\n").unwrap();
+
+        let calls = [
+            tool_call(READ_FILE, json!({"path": "src/app.rs"})),
+            tool_call(WRITE_FILE, json!({"path": "src/new.rs", "content": "x\n"})),
+            tool_call(EDIT_FILE, json!({"path": "src/app.rs", "old_string": "a", "new_string": "A"})),
+            tool_call(LIST_DIR, json!({"path": "."})),
+            tool_call(GLOB, json!({"pattern": "*.rs"})),
+            tool_call(GREP_SEARCH, json!({"pattern": "A"})),
+            tool_call(GET_DESIGN_STARTER, json!({})),
+            tool_call(CHECK_CONTRAST, json!({"pairs": [["#000000", "#ffffff", "text"]]})),
+            tool_call(PLAN_PROGRESS, json!({"step": 1, "done": true})),
+            tool_call("no_such_tool", json!({})),
+            // Malformed arguments take a different path to a different
+            // display string, and that path had its own icons.
+            tool_call(READ_FILE, json!({"nonsense": true})),
+            tool_call(EDIT_FILE, json!({"path": "src/app.rs"})),
+        ];
+        for call in calls {
+            let out = execute(&call, &ws, &cfg).await;
+            assert!(
+                pictograph(&out.display).is_none(),
+                "{:?} → {:?} carries {:?}",
+                call.function.name,
+                out.display,
+                pictograph(&out.display)
+            );
+        }
+    }
+
+    /// The refusal and bookkeeping paths build their own display strings, and
+    /// are the ones least likely to be looked at again.
+    #[test]
+    fn no_refusal_carries_a_pictograph() {
+        let call = tool_call(WRITE_FILE, json!({"path": "a.rs", "content": "x"}));
+        for out in [
+            declined(&call),
+            refused_as_dangerous(&call, "because"),
+            refused_in_plan_mode(&call, "because"),
+            plan_approved(&call, "plan.md", 3),
+            plan_declined(&call),
+            progress_failed(&call, "because"),
+            unanswered(&call, "because"),
+        ] {
+            assert!(
+                pictograph(&out.display).is_none(),
+                "{:?} carries {:?}",
+                out.display,
+                pictograph(&out.display)
+            );
+        }
     }
 
     /// The preview and the runner have to agree, and the only way to make that
@@ -5049,7 +5172,7 @@ mod tests {
     }
 
     /// Regression: without this, a model that only emits tool calls leaves the
-    /// transcript as a bare log of "$ ..."/"📝 ..." lines with nothing said
+    /// transcript as a bare log of "$ ..."/"..." lines with nothing said
     /// about them -- what a user pointed at directly when comparing this to
     /// Claude Code's narrated "I'll just run it." / "Ran it — output: ...".
     #[test]

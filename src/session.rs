@@ -202,7 +202,7 @@ mod tests {
         let path = dir.path().join("old.jsonl");
         std::fs::write(
             &path,
-            "{\"role\":\"tool\",\"content\":\"Wrote 12 bytes\",\"display\":\"📝 write a.rs\"}\n",
+            "{\"role\":\"tool\",\"content\":\"Wrote 12 bytes\",\"display\":\"write a.rs\"}\n",
         )
         .expect("write");
 

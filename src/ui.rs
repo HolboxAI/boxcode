@@ -458,15 +458,19 @@ fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
             lines.extend(message_lines(msg, width));
         }
         if app.state == AppState::ExecutingTools {
+            // A tool that is still running gets the spinner where a finished
+            // one gets `TOOL_MARK`, in the accent rather than the faint tone.
+            // This is what tells a slow `cargo test` apart from one that has
+            // already come back: both print the same label, and before this
+            // the only thing moving on screen was the one summary line at the
+            // bottom, which says how many are running but not which.
+            let frame = theme::spinner(app.busy_started.map(|t| t.elapsed()).unwrap_or_default());
             for call in &app.running_tools {
                 let label = crate::tools::describe_action(call)
                     .map(|a| a.label())
                     .unwrap_or_else(|| call.function.name.clone());
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{} ", theme::TOOL_MARK),
-                        Style::default().fg(theme::p().faint),
-                    ),
+                    Span::styled(format!("{frame} "), theme::accent()),
                     Span::styled(label, role_style(Role::Tool)),
                 ]));
                 // A running subagent gets one live sub-line: which round it
@@ -476,7 +480,11 @@ fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
                 if let Some(trail) = app.running_subagent_trail(&call.id) {
                     if let Some(step) = trail.steps.last() {
                         lines.push(Line::from(Span::styled(
-                            format!("  └ round {} · {step}", trail.rounds.max(1)),
+                            format!(
+                                "  {} round {} · {step}",
+                                theme::BRANCH_MARK,
+                                trail.rounds.max(1)
+                            ),
                             theme::faint(),
                         )));
                     }
@@ -1303,7 +1311,7 @@ fn tool_approval_parts(
         }
         Action::Read { path } => {
             lines.push(Line::from(Span::styled(
-                format!("📄 {path}"),
+                path.clone(),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1312,7 +1320,7 @@ fn tool_approval_parts(
         }
         Action::Write { path, content } => {
             lines.push(Line::from(Span::styled(
-                format!("📝 {path}"),
+                path.clone(),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1357,7 +1365,7 @@ fn tool_approval_parts(
         }
         Action::List { path } => {
             lines.push(Line::from(Span::styled(
-                format!("📁 {path}"),
+                path.clone(),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1366,7 +1374,7 @@ fn tool_approval_parts(
         }
         Action::Glob { pattern } => {
             lines.push(Line::from(Span::styled(
-                format!("🔎 {pattern}"),
+                pattern.clone(),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1376,7 +1384,7 @@ fn tool_approval_parts(
         Action::Grep { pattern, path } => {
             let scope = path.as_deref().map(|p| format!(" in {p}")).unwrap_or_default();
             lines.push(Line::from(Span::styled(
-                format!("🔎 {pattern}{scope}"),
+                format!("{pattern}{scope}"),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1419,7 +1427,7 @@ fn tool_approval_parts(
                 String::new()
             };
             lines.push(Line::from(Span::styled(
-                format!("✏️ {path}{suffix}"),
+                format!("{path}{suffix}"),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1450,7 +1458,7 @@ fn tool_approval_parts(
         Action::Deploy { provider, production, summary } => {
             lines.push(Line::from(Span::styled(
                 format!(
-                    "🚀 {provider} · {}",
+                    "{provider} · {}",
                     if *production { "Production" } else { "Preview" }
                 ),
                 Style::default()
@@ -1468,7 +1476,7 @@ fn tool_approval_parts(
         }
         Action::Search { query, max_results } => {
             lines.push(Line::from(Span::styled(
-                format!("🔎 {query}"),
+                query.clone(),
                 Style::default()
                     .fg(theme::p().text)
                     .add_modifier(Modifier::BOLD),
@@ -1961,7 +1969,7 @@ fn deployment_parts(
                     )));
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        format!("🌐 {} URL", session.target.label()),
+                        format!("{} URL", session.target.label()),
                         theme::faint(),
                     )));
                     // Never wrapped: a URL broken across two rows cannot be
@@ -3125,6 +3133,76 @@ mod tests {
             .collect()
     }
 
+    // ---- state marks, not pictographs ------------------------------------
+
+    /// A running tool must look different from a finished one. The count at
+    /// the bottom says how many are running; only the mark says *which*.
+    #[test]
+    fn a_running_tool_spins_where_a_finished_one_sits_still() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::ExecutingTools;
+        app.busy_started = Some(std::time::Instant::now());
+        app.running_tools = vec![command_call("call_1", "cargo test")];
+
+        let running = rendered_rows(&mut app, 60, 12)
+            .into_iter()
+            .find(|r| r.contains("cargo test"))
+            .expect("the running tool is on screen");
+        assert!(
+            !running.trim_start().starts_with(theme::TOOL_MARK),
+            "a running tool should not wear the settled mark: {running}"
+        );
+        assert!(
+            running.contains('⠋')
+                || running.contains('⠙')
+                || running.contains('⠹')
+                || running.contains('⠸')
+                || running.contains('⠼')
+                || running.contains('⠴')
+                || running.contains('⠦')
+                || running.contains('⠧')
+                || running.contains('⠇')
+                || running.contains('⠏'),
+            "expected a spinner frame: {running}"
+        );
+
+        // The same call, finished, is drawn with the settled mark instead.
+        let done = Message {
+            role: Role::Tool,
+            content: "ok".into(),
+            display: Some("$ cargo test — 805 passed".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call_1".into()),
+            diff: None,
+        };
+        let line = &message_lines(&done, 60)[0];
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with(theme::TOOL_MARK), "{text}");
+    }
+
+    /// The approval box is the other place icons lived. Its title already says
+    /// what is being asked, so the body is the path and nothing else.
+    #[test]
+    fn an_approval_header_is_the_path_alone() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.workspace_root = "/tmp/project".into();
+        app.overlay = Some(Overlay::ToolApproval(crate::approval::ApprovalRequest {
+            call: Default::default(),
+            action: Action::Read { path: "src/config.rs".into() },
+            remaining: 0,
+            preview: None,
+        }));
+
+        let header = rendered_rows(&mut app, 60, 12)
+            .into_iter()
+            .find(|r| r.contains("src/config.rs"))
+            .expect("the path is on screen");
+        let body = header.trim_matches(|c| c == '│' || c == ' ');
+        assert_eq!(body, "src/config.rs", "expected a bare path, got {header:?}");
+    }
+
     // ---- file-change diffs -----------------------------------------------
 
     mod diffs {
@@ -3310,7 +3388,7 @@ mod tests {
             let msg = Message {
                 role: Role::Tool,
                 content: "Replaced 1 occurrence(s)".into(),
-                display: Some("✏️ edit lib.rs — 1 addition and 1 removal".into()),
+                display: Some("edit lib.rs — 1 addition and 1 removal".into()),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 diff: Some(d),
@@ -3327,12 +3405,12 @@ mod tests {
             let msg = Message {
                 role: Role::Tool,
                 content: "total 4".into(),
-                display: Some("📁 list .".into()),
+                display: Some("list .".into()),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 diff: None,
             };
-            assert_eq!(text_of(&message_lines(&msg, 60)), vec!["· 📁 list ."]);
+            assert_eq!(text_of(&message_lines(&msg, 60)), vec!["· list ."]);
         }
 
         /// Colour is how a removal is told from an addition at a glance, so it
@@ -3397,6 +3475,7 @@ mod tests {
                 "{rendered:?}"
             );
         }
+
 
 
         /// Nothing to draw is nothing to draw -- not a stray blank gutter.

@@ -132,7 +132,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn Error>> {
 }
 
 async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
-    println!("🔎 Checking {} for a newer version...", base_url());
+    println!("Checking {} for a newer version...", base_url());
 
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
@@ -142,7 +142,7 @@ async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
 
     match fetch_latest_version(&client).await {
         Ok(latest) if version_is_newer(&latest, CURRENT) => {
-            println!("⬆️  {CURRENT} → {latest}");
+            println!("↑ {CURRENT} → {latest}");
         }
         Ok(latest) if force => {
             println!("✓ Already on {latest}. Reinstalling anyway (--force).");
@@ -159,11 +159,11 @@ async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
             // An unreachable network or a moved file shouldn't block an
             // explicit upgrade request — go ahead and let the installer itself
             // fail loudly if it genuinely can't run.
-            eprintln!("⚠️  Could not determine the latest version ({e}). Installing anyway.");
+            eprintln!("⚠  Could not determine the latest version ({e}). Installing anyway.");
         }
     }
 
-    println!("📥 Fetching the installer...");
+    println!("Fetching the installer...");
     let script = fetch_installer(&client, windows).await?;
 
     let script_path = std::env::temp_dir().join(format!(
