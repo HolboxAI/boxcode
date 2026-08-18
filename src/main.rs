@@ -260,6 +260,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await;
 
+    // Erase the inline viewport before the terminal goes back to normal.
+    //
+    // The viewport is a strip ratatui owns at the bottom of the real
+    // terminal; leaving raw mode does not remove what was drawn there. So
+    // "Goodbye!" and then the shell prompt were printed straight over the
+    // still-visible input box, producing the overlapped mess of a half prompt
+    // box with text through it. Clearing first, then leaving one blank line,
+    // means the shell comes back to a clean row.
+    let _ = terminal.clear();
+    if !alternate_screen {
+        println!();
+    }
     restore_terminal(enhanced, alternate_screen)?;
     // `/pull` set this instead of just exiting -- checked only after the
     // terminal is back to normal (raw mode and the alternate screen both
@@ -448,7 +460,15 @@ async fn run_app<B: ratatui::backend::Backend>(
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     match key.code {
-                        KeyCode::Char('c') | KeyCode::Char('d') if ctrl => break,
+                        // Ctrl-C asks first. Ctrl-D is left as an immediate
+                        // exit: it is the deliberate "I am done" key and is
+                        // not pressed by reflex the way Ctrl-C is.
+                        KeyCode::Char('c') if ctrl => {
+                            if app.request_quit() {
+                                break;
+                            }
+                        }
+                        KeyCode::Char('d') if ctrl => break,
                         _ => app.handle_key(key),
                     }
                 }
