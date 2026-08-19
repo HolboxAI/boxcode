@@ -14,8 +14,7 @@
 //!
 //! Nothing in here weakens or reroutes the safety decisions themselves:
 //! blocked commands are refused before a request is ever built, plan mode
-//! filters before it, and `require_approval`/`auto_approve_read_only` are
-//! judged before it. A request existing means "the user must answer this",
+//! filters before it, and `[tools] approval` is judged before it. A request existing means "the user must answer this",
 //! and there is no constructor that skips the queue.
 
 use crate::llm::ToolCall;

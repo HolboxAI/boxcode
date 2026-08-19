@@ -240,6 +240,48 @@ fn default_theme() -> String {
     "auto".to_string()
 }
 
+/// Which actions stop and wait for a yes/no.
+///
+/// This is the posture of the whole tool layer, and it is deliberately two
+/// values rather than a dial. The question a person actually has is "does it
+/// interrupt me for ordinary work, or only for the things I would want to
+/// catch" -- and every finer gradation between those was, in practice, a way
+/// to be asked about reading a file.
+///
+/// **Neither value reaches the blocklist.** `rm -rf /`, disk formatting, fork
+/// bombs and `curl | sh` are refused outright in both, and there is no
+/// setting, key or flag that changes that -- see `danger.rs`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    /// Ask only about actions that destroy something or put something on the
+    /// public internet -- the `Risk::Dangerous` tier in `danger.rs`, plus a
+    /// plan, which is what hands the writing tools back.
+    ///
+    /// The default, and the reason is what the alternative did to a real
+    /// session. Building anything -- a web app, a service, a migration -- is
+    /// dozens of ordinary steps: `mkdir`, `npm install`, `npm run build`,
+    /// `cargo test`, and a file written for each one. Asking about every one
+    /// of those does not make the destructive ones safer; it buries them.
+    /// Twenty identical prompts in a row are answered `y` by reflex, and the
+    /// twenty-first, the one that mattered, is answered the same way.
+    ///
+    /// Writes and edits are included in "ordinary" on purpose. Both are
+    /// confined to the workspace by `tools::resolve_in_workspace`, neither can
+    /// invoke a shell, and a file this tool wrote is a file `git diff` shows
+    /// and `git checkout` undoes. Deleting is the irreversible half, and
+    /// deleting is still in the tier that asks.
+    #[default]
+    Destructive,
+    /// Ask about every write and every command, sparing only the reads.
+    ///
+    /// What the default used to be. Reading, listing, globbing, grepping and
+    /// the read-only command allowlist stay silent -- being asked whether a
+    /// file may be *read* was never protecting anything -- and everything else
+    /// waits for a decision.
+    Always,
+}
+
 /// Settings for the shell command tool.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolsConfig {
@@ -251,20 +293,44 @@ pub struct ToolsConfig {
     /// launched from. Not a sandbox -- a command can `cd` out of it.
     #[serde(default = "dot")]
     pub workspace: String,
-    /// Ask before every command. This is the only real control over what the
-    /// model does to the machine, so turning it off is a deliberate act: the
-    /// model can then delete files with no prompt at all.
-    #[serde(default = "yes")]
-    pub require_approval: bool,
-    /// Skip the approval prompt for a short allowlist of read-only commands
-    /// (`ls`, `cat`, `grep`, `git status`/`diff`/`log`/`show`, ...) so the
-    /// prompt stays meaningful for the commands that can actually change
-    /// something. See `tools::is_read_only` for exactly what qualifies --
-    /// anything not obviously read-only still asks, `require_approval` still
-    /// governs everything else, and `false` here just means "ask about those
-    /// too."
-    #[serde(default = "yes")]
-    pub auto_approve_read_only: bool,
+    /// Which actions stop for a yes/no.
+    ///
+    /// See [`ApprovalMode`]. The default asks only about the things that
+    /// cannot be undone; the blocklist in `danger.rs` is unaffected by this
+    /// setting in either direction and refuses the catastrophic tier outright.
+    #[serde(default)]
+    pub approval: ApprovalMode,
+    /// Retired in favour of `approval`. Read so an old config still loads,
+    /// then discarded.
+    ///
+    /// Deliberately **not** carried over, and the reason is that it cannot be
+    /// read as a choice. `ToolsConfig` used to serialize every field, so every
+    /// `save` -- `/provider`, `/model`, the first-run setup -- wrote
+    /// `require_approval = true` into the file. Its presence says the app
+    /// saved a config once, not that anyone asked for anything: `true` was
+    /// already the default, so writing it by hand and leaving it out were
+    /// indistinguishable, and the only deliberate act the old setting could
+    /// express was `false`.
+    ///
+    /// An earlier revision of this migration mapped `true` to
+    /// [`ApprovalMode::Always`], on the theory that it should never loosen a
+    /// posture someone chose on purpose. That was the right instinct applied
+    /// to the wrong signal: since the app wrote the key itself, it made *every*
+    /// existing install migrate to the old behaviour, so the new default
+    /// reached nobody who had ever run the program.
+    ///
+    /// `false` needs no carrying over either -- it already meant "only the
+    /// dangerous tier asks", which is exactly what `approval` now defaults to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_approval: Option<bool>,
+    /// Superseded by `approval`, with no replacement.
+    ///
+    /// It only ever had one non-default use -- `false`, meaning "prompt me
+    /// before reading a file too" -- and prompting for a read is what trains
+    /// people to stop reading the prompts that matter. Read and discarded so
+    /// an old config still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve_read_only: Option<bool>,
     /// How long a single command may run before it is killed.
     #[serde(default = "default_command_timeout")]
     pub command_timeout_secs: u64,
@@ -408,8 +474,9 @@ impl Default for ToolsConfig {
         Self {
             enabled: yes(),
             workspace: dot(),
-            require_approval: yes(),
-            auto_approve_read_only: yes(),
+            approval: ApprovalMode::default(),
+            require_approval: None,
+            auto_approve_read_only: None,
             command_timeout_secs: default_command_timeout(),
             max_output_bytes: default_max_output_bytes(),
             max_steps: default_max_steps(),
@@ -483,7 +550,17 @@ impl Config {
             }
         }
         if let Some(v) = env_var("BOXCODE_TOOLS_APPROVAL") {
-            config.tools.require_approval = truthy(&v);
+            // The mode names, plus the truthy spellings this variable always
+            // took. `=1` is unambiguous here in a way the config key is not:
+            // nothing ever wrote this variable on a user's behalf, so setting
+            // it is always a deliberate act and can be honoured as one.
+            config.tools.approval = match v.trim().to_ascii_lowercase().as_str() {
+                "always" => ApprovalMode::Always,
+                "destructive" => ApprovalMode::Destructive,
+                other if truthy(other) => ApprovalMode::Always,
+                _ => ApprovalMode::Destructive,
+            };
+            config.tools.require_approval = None;
         }
 
         config.normalize();
@@ -493,7 +570,12 @@ impl Config {
 
     /// Trim stray whitespace. A trailing newline in an API key (very easy to get
     /// from `export KEY=$(cat file)`) produces an invalid Authorization header.
-    fn normalize(&mut self) {
+    /// `pub(crate)` so tests elsewhere can put a real `config.toml` through
+    /// the same path `load` does. Loading a file and parsing one are not the
+    /// same thing -- the retired-key handling lives here, not in serde -- and
+    /// a test that skipped it would be checking a config no running program
+    /// ever sees.
+    pub(crate) fn normalize(&mut self) {
         self.llm.endpoint = self.llm.endpoint.trim().trim_end_matches('/').to_string();
         self.llm.model = self.llm.model.trim().to_string();
         self.llm.api_key = self.llm.api_key.trim().to_string();
@@ -521,6 +603,12 @@ impl Config {
         if self.tools.workspace.is_empty() {
             self.tools.workspace = dot();
         }
+        // Both retired keys are dropped rather than translated -- see
+        // `require_approval`'s own comment for why neither one can be read as
+        // a choice its owner made. `approval` is the only thing that decides,
+        // and an absent `approval` means the default.
+        self.tools.require_approval = None;
+        self.tools.auto_approve_read_only = None;
         // A hand-edited `max_output_bytes = 0` would make every command look
         // like it printed nothing, which reads as a broken tool rather than a
         // bad setting.
@@ -919,9 +1007,11 @@ mod tests {
             assert!(loaded.tools.enabled);
             assert_eq!(loaded.tools.workspace, ".");
             assert_eq!(loaded.tools.max_steps, default_max_steps());
-            // The safe default has to survive an absent table, or upgrading
-            // silently hands existing users an unattended shell.
-            assert!(loaded.tools.require_approval);
+            // The posture has to survive an absent table. Destructive is the
+            // default, and the destructive tier still asks in it -- what must
+            // not happen is an absent table deserializing into something with
+            // no approval at all.
+            assert_eq!(loaded.tools.approval, ApprovalMode::Destructive);
             assert_eq!(loaded.tools.python_bin, "python3");
             assert_eq!(loaded.tools.search_timeout_secs, 20);
             // ...and the same again for `[deploy]`, added later still.
@@ -967,26 +1057,104 @@ mod tests {
         assert_eq!(parsed.tools.search_timeout_secs, 20);
     }
 
-    /// Same again for a config that has a `[tools]` table but no
-    /// `require_approval` key -- anyone who edited the table by hand.
+    /// A `[tools]` table with no `approval` key -- anyone who edited it by
+    /// hand, and every config written before the key existed.
     #[test]
-    fn a_tools_table_without_require_approval_still_defaults_to_asking() {
+    fn a_tools_table_without_approval_defaults_to_destructive() {
         let parsed: Config = toml::from_str(
             "[llm]\nendpoint = \"http://x\"\n\n[tools]\nenabled = true\nmax_steps = 3\n",
         )
         .expect("should parse");
-        assert!(parsed.tools.require_approval);
+        assert_eq!(parsed.tools.approval, ApprovalMode::Destructive);
     }
 
-    /// Same again for `auto_approve_read_only` -- an old table or a hand-edited
-    /// one without the key must still get the safe (and useful) default.
+    /// The regression that made the whole feature a no-op in practice.
+    ///
+    /// This is a real `config.toml` off a machine that had simply run the
+    /// program and picked a provider. `require_approval = true` is in it
+    /// because `save` wrote every field, not because anyone asked -- `true`
+    /// was the default, so it says nothing about intent. Reading it as a
+    /// deliberate "ask me about everything" sent every existing install
+    /// straight back to the old behaviour, which is every install there is.
     #[test]
-    fn a_tools_table_without_auto_approve_read_only_still_defaults_to_true() {
-        let parsed: Config = toml::from_str(
-            "[llm]\nendpoint = \"http://x\"\n\n[tools]\nenabled = true\nmax_steps = 3\n",
+    fn a_config_the_app_wrote_itself_still_gets_the_new_default() {
+        let mut parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"https://api.deepseek.com\"\nmodel = \"deepseek-v4-pro\"\n\n             [tools]\nenabled = true\nworkspace = \".\"\nrequire_approval = true\n             auto_approve_read_only = true\ncommand_timeout_secs = 60\nmax_steps = 40\n",
         )
         .expect("should parse");
-        assert!(parsed.tools.auto_approve_read_only);
+        parsed.normalize();
+        assert_eq!(parsed.tools.approval, ApprovalMode::Destructive);
+        // ...and neither retired key is written back out.
+        assert!(parsed.tools.require_approval.is_none());
+        assert!(parsed.tools.auto_approve_read_only.is_none());
+        let written = toml::to_string_pretty(&parsed).unwrap();
+        assert!(!written.contains("require_approval"), "{written}");
+        assert!(!written.contains("auto_approve_read_only"), "{written}");
+    }
+
+    /// `require_approval = false` already meant "only the dangerous tier
+    /// asks", which is exactly the new default -- so those installs see no
+    /// change at all, and must not be pushed the other way.
+    #[test]
+    fn the_old_unattended_setting_maps_to_the_new_default() {
+        let mut parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"http://x\"\n\n[tools]\nrequire_approval = false\nauto_approve_read_only = false\n",
+        )
+        .expect("should parse");
+        parsed.normalize();
+        assert_eq!(parsed.tools.approval, ApprovalMode::Destructive);
+        assert!(parsed.tools.auto_approve_read_only.is_none());
+    }
+
+    /// The new key, spelled the way the docs spell it.
+    #[test]
+    fn the_approval_mode_round_trips_through_toml() {
+        for (text, expected) in [
+            ("always", ApprovalMode::Always),
+            ("destructive", ApprovalMode::Destructive),
+        ] {
+            let parsed: Config = toml::from_str(&format!(
+                "[llm]\nendpoint = \"http://x\"\n\n[tools]\napproval = \"{text}\"\n"
+            ))
+            .expect("should parse");
+            assert_eq!(parsed.tools.approval, expected);
+            assert!(toml::to_string_pretty(&parsed).unwrap().contains(text));
+        }
+    }
+
+    /// `approval` is the only key that decides, whatever else is left in the
+    /// table beside it -- in both directions.
+    #[test]
+    fn the_new_key_is_the_only_one_that_decides() {
+        for (extra, expected) in [
+            ("approval = \"always\"\nrequire_approval = false\n", ApprovalMode::Always),
+            ("approval = \"destructive\"\nrequire_approval = true\n", ApprovalMode::Destructive),
+        ] {
+            let mut parsed: Config =
+                toml::from_str(&format!("[llm]\nendpoint = \"http://x\"\n\n[tools]\n{extra}"))
+                    .expect("should parse");
+            parsed.normalize();
+            assert_eq!(parsed.tools.approval, expected);
+        }
+    }
+
+    /// The env var is different: nothing ever set it on a user's behalf, so
+    /// setting it is always deliberate and is honoured as one.
+    #[test]
+    fn the_env_var_can_still_ask_for_the_strict_mode() {
+        with_isolated_home(|| {
+            for (value, expected) in [
+                ("always", ApprovalMode::Always),
+                ("1", ApprovalMode::Always),
+                ("destructive", ApprovalMode::Destructive),
+                ("0", ApprovalMode::Destructive),
+            ] {
+                std::env::set_var("BOXCODE_TOOLS_APPROVAL", value);
+                let loaded = Config::load().expect("loads");
+                assert_eq!(loaded.tools.approval, expected, "for {value:?}");
+            }
+            std::env::remove_var("BOXCODE_TOOLS_APPROVAL");
+        });
     }
 
     /// The reply cap is the difference between a whole generated file and one
