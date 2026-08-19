@@ -41,6 +41,12 @@ const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// promised.
 pub const EXPIRY_HOURS: u32 = 48;
 
+/// How many of the page's own assets the post-publish check will fetch before
+/// it stops. A publish must not get slower in proportion to how many files it
+/// has: the first few references are what break together when they break at
+/// all, since they share one wrong base path.
+const MAX_VERIFIED_ASSETS: usize = 10;
+
 #[derive(Debug)]
 pub struct Published {
     pub url: String,
@@ -359,6 +365,72 @@ fn inject_live_reload(bytes: Vec<u8>) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// The path an artifact is served under, taken from the URL the signer
+/// returned -- `/artifacts/k9depef6` for `https://boxcode.sh/artifacts/k9depef6`.
+///
+/// Read off the response rather than built from the id, so a fork or a
+/// self-hosted signer that lays its prefixes out differently keeps working
+/// without this having to know its scheme.
+fn served_under(url: &str) -> String {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    match after_scheme.find('/') {
+        Some(i) => after_scheme[i..].trim_end_matches('/').to_string(),
+        None => String::new(),
+    }
+}
+
+/// Rewrites root-absolute URLs in HTML so they resolve under the artifact's
+/// own prefix: `src="/assets/app.js"` becomes
+/// `src="/artifacts/k9depef6/assets/app.js"`.
+///
+/// Without this a perfectly good publish serves a blank page. Every build
+/// tool defaults to assuming it owns the domain root -- Vite's `base`, CRA's
+/// `homepage`, Next's `basePath` all default to `/` -- so a built `index.html`
+/// asks the browser for `/assets/app.js`. An artifact is served from a
+/// sub-path, where that resolves to the domain root and 404s. The upload
+/// succeeded, S3 holds every byte, and the page is empty: the single most
+/// confusing way this can fail, because nothing anywhere reports an error.
+///
+/// Rewriting to an absolute prefix rather than a relative `./` is deliberate.
+/// The artifact URL carries no trailing slash and is not redirected to one,
+/// so a browser resolving `./assets/app.js` from `/artifacts/k9depef6` asks
+/// for `/artifacts/assets/app.js` -- still wrong, just differently. An
+/// absolute prefix does not depend on how the URL was written.
+///
+/// Only `="/x` and `='/x` are touched. `//host/path` is protocol-relative and
+/// already points at another origin, so it is left alone; so is everything
+/// with a scheme, which cannot match this pattern in the first place.
+fn rebase_absolute_urls(html: &[u8], prefix: &str) -> Vec<u8> {
+    if prefix.is_empty() {
+        return html.to_vec();
+    }
+    let prefix = prefix.as_bytes();
+    let mut out = Vec::with_capacity(html.len() + 128);
+    let mut i = 0;
+    // Byte-wise rather than over `String`: the surrounding markup may be any
+    // encoding at all, and copying bytes through untouched is what keeps a
+    // page this cannot parse from being corrupted by trying.
+    while i < html.len() {
+        if html[i] == b'='
+            && i + 3 < html.len()
+            && (html[i + 1] == b'"' || html[i + 1] == b'\'')
+            && html[i + 2] == b'/'
+            && html[i + 3] != b'/'
+        {
+            out.push(b'=');
+            out.push(html[i + 1]);
+            out.extend_from_slice(prefix);
+            // The `/` at i+2 is copied by the next turn of the loop, so the
+            // prefix joins the path without either doubling or losing it.
+            i += 2;
+            continue;
+        }
+        out.push(html[i]);
+        i += 1;
+    }
+    out
+}
+
 fn extension(name: &str) -> Option<String> {
     name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase())
 }
@@ -465,6 +537,7 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
     // fresh to verify against and `verify_live` degrades to a reachability
     // check.
     let mut index_len = None;
+    let prefix = served_under(&signed.url);
     for upload in &signed.uploads {
         let candidate = files
             .iter()
@@ -472,7 +545,13 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
             .ok_or_else(|| format!("the service asked for a file that was not offered: {}", upload.path))?;
         let bytes = std::fs::read(&candidate.source)
             .map_err(|e| format!("could not read {}: {e}", candidate.source.display()))?;
-        let bytes = if is_html(&candidate.key) { inject_live_reload(bytes) } else { bytes };
+        let bytes = if is_html(&candidate.key) {
+            // Rebase before injecting, so the reload script is never itself a
+            // candidate for rewriting.
+            inject_live_reload(rebase_absolute_urls(&bytes, &prefix))
+        } else {
+            bytes
+        };
         if candidate.key == "index.html" {
             index_len = Some(bytes.len());
         }
@@ -529,12 +608,105 @@ async fn verify_live(client: &reqwest::Client, url: &str, expected_index_len: Op
     if !response.status().is_success() {
         return false;
     }
-    match expected_index_len {
-        Some(expected) => response.bytes().await.map(|b| b.len() == expected).unwrap_or(false),
-        // Nothing fresh to compare against this call -- reachability is all
-        // that can honestly be claimed.
-        None => true,
+    let Ok(body) = response.bytes().await else {
+        return false;
+    };
+    if expected_index_len.is_some_and(|expected| body.len() != expected) {
+        return false;
     }
+    // Not text: there is nothing to read references out of, and the fetch
+    // above is all that can honestly be claimed.
+    let Ok(html) = std::str::from_utf8(&body) else {
+        return true;
+    };
+
+    // The page loading is not the page working. A build that assumes it owns
+    // the domain root serves a perfectly good index.html whose every asset
+    // 404s -- a blank screen that reported as confirmed, which is the exact
+    // failure this walk exists to catch. Asking for what the served markup
+    // asks for is the only way to know.
+    for asset in referenced_assets(html, url).into_iter().take(MAX_VERIFIED_ASSETS) {
+        let ok = client
+            .get(&asset)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// The asset URLs a browser would fetch for `html` served at `page_url`,
+/// resolved the way a browser resolves them.
+///
+/// `src` is always an asset. `href` is usually a link, so it counts only when
+/// it names a stylesheet -- checking every `<a href>` would turn the app's own
+/// routes into evidence about this publish, and a single-page app's routes do
+/// not exist as files at all.
+///
+/// Relative references are resolved against the page's *directory*, dropping
+/// the last segment exactly as a browser does. That is not a detail: the
+/// artifact URL carries no trailing slash, so `./assets/app.js` on
+/// `/artifacts/k9depef6` really does resolve to `/artifacts/assets/app.js`,
+/// and a check that quietly resolved it the convenient way would confirm a
+/// page that does not work.
+fn referenced_assets(html: &str, page_url: &str) -> Vec<String> {
+    let (origin, dir) = split_origin_and_dir(page_url);
+    let mut out = Vec::new();
+    for (attr, quote, stylesheets_only) in [
+        ("src=\"", '"', false),
+        ("src='", '\'', false),
+        ("href=\"", '"', true),
+        ("href='", '\'', true),
+    ] {
+        for piece in html.split(attr).skip(1) {
+            let Some(raw) = piece.split(quote).next().map(str::trim) else {
+                continue;
+            };
+            if stylesheets_only && !raw.split('?').next().unwrap_or(raw).ends_with(".css") {
+                continue;
+            }
+            // Another origin, an inline payload, or an in-page anchor: none of
+            // them say anything about whether this publish is serving.
+            if raw.is_empty()
+                || raw.starts_with("//")
+                || raw.starts_with('#')
+                || raw.contains("://")
+                || raw.starts_with("data:")
+                || raw.starts_with("mailto:")
+            {
+                continue;
+            }
+            let resolved = if let Some(path) = raw.strip_prefix('/') {
+                format!("{origin}/{path}")
+            } else {
+                format!("{origin}{dir}{}", raw.trim_start_matches("./"))
+            };
+            if !out.contains(&resolved) {
+                out.push(resolved);
+            }
+        }
+    }
+    out
+}
+
+/// Splits `https://host/artifacts/id` into `("https://host", "/artifacts/")`
+/// -- the origin, and the directory relative references resolve against.
+fn split_origin_and_dir(url: &str) -> (String, String) {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
+    let (host, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let dir = match path.rfind('/') {
+        Some(i) => &path[..=i],
+        None => "/",
+    };
+    (format!("{scheme}://{host}"), dir.to_string())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -547,6 +719,320 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole fix, end to end, against the real service: publish a dist
+    /// shaped exactly like a default `vite build` and confirm a browser
+    /// opening the returned URL can actually fetch the assets the served HTML
+    /// asks for. This is the check that would have caught the blank page --
+    /// `verify_live` fetches index.html and stops there, so a publish whose
+    /// every asset 404s still reports as confirmed.
+    ///
+    /// Ignored by default: it needs the network and publishes a real (tiny,
+    /// 48h) artifact, neither of which belongs in an ordinary `cargo test`.
+    /// Run it deliberately with
+    /// `cargo test --bin boxcode publishing_a_vite_dist -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn publishing_a_vite_dist_serves_assets_a_browser_can_actually_fetch() {
+        let dir = temp("vite-e2e");
+        write(
+            &dir,
+            "index.html",
+            r#"<!doctype html><html><head>
+<script type="module" crossorigin src="/assets/app.js"></script>
+<link rel="stylesheet" crossorigin href="/assets/app.css">
+</head><body><div id="root"></div></body></html>"#,
+        );
+        write(&dir, "assets/app.js", "console.log('hello from the bundle');\n");
+        write(&dir, "assets/app.css", "body{background:#fff;color:#111}\n");
+
+        let published = publish(&dir, "https://boxcode.sh/api/artifact")
+            .await
+            .expect("publish should succeed");
+        println!("published to {}", published.url);
+        assert_eq!(published.files, 3);
+
+        let client = reqwest::Client::new();
+        let html = client
+            .get(&published.url)
+            .send()
+            .await
+            .expect("fetch index")
+            .text()
+            .await
+            .expect("body");
+
+        // Whatever the served HTML asks for, ask for it the same way a browser
+        // would -- resolved against the origin, not against our own idea of
+        // where the files went.
+        let mut checked = 0;
+        for attr in ["src=\"", "href=\""] {
+            for piece in html.split(attr).skip(1) {
+                let Some(url) = piece.split('"').next() else { continue };
+                if !url.starts_with('/') || url.starts_with("//") {
+                    continue;
+                }
+                let absolute = format!("https://boxcode.sh{url}");
+                let status = client
+                    .get(&absolute)
+                    .send()
+                    .await
+                    .expect("fetch asset")
+                    .status();
+                println!("  {status}  {absolute}");
+                assert!(
+                    status.is_success(),
+                    "the served page asks for {absolute}, which does not resolve -- \
+                     this is the blank page"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 2, "both the script and the stylesheet were checked");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The check, against the two real pages this bug produced: one published
+    /// before the rebase existed (blank, every asset 404s) and one published
+    /// after it (working). The first must come back unverified -- it reported
+    /// as "confirmed live" under the old check, which is what let a blank page
+    /// ship looking like a success.
+    ///
+    /// Ignored by default: it needs the network and two fixed artifact ids.
+    /// Both expire 48h after they were published, so a failure here long after
+    /// the fact means "the links aged out", not "the code regressed".
+    /// `cargo test --bin boxcode verify_live_against_the_real -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn verify_live_against_the_real_broken_and_fixed_pages() {
+        let client = reqwest::Client::new();
+
+        let broken = "https://boxcode.sh/artifacts/k9depef6";
+        let fixed = "https://boxcode.sh/artifacts/25menr6r";
+
+        let broken_ok = verify_live(&client, broken, None).await;
+        let fixed_ok = verify_live(&client, fixed, None).await;
+        println!("  broken page {broken} -> verified={broken_ok}");
+        println!("  fixed  page {fixed} -> verified={fixed_ok}");
+
+        assert!(
+            !broken_ok,
+            "the page whose assets all 404 must not report as confirmed live"
+        );
+        assert!(fixed_ok, "the rebased page serves its assets and must confirm");
+    }
+
+    // ---- what the post-publish check actually looks at -----------------------
+
+    #[test]
+    fn the_origin_and_directory_come_apart_the_way_a_browser_splits_them() {
+        assert_eq!(
+            split_origin_and_dir("https://boxcode.sh/artifacts/k9depef6"),
+            ("https://boxcode.sh".to_string(), "/artifacts/".to_string())
+        );
+        assert_eq!(
+            split_origin_and_dir("https://boxcode.sh/artifacts/k9depef6/"),
+            ("https://boxcode.sh".to_string(), "/artifacts/k9depef6/".to_string())
+        );
+        assert_eq!(
+            split_origin_and_dir("https://example.test"),
+            ("https://example.test".to_string(), "/".to_string())
+        );
+    }
+
+    /// The rebased page: every asset sits under the artifact prefix, and that
+    /// is what the check goes and asks for.
+    #[test]
+    fn a_rebased_page_is_checked_at_its_real_locations() {
+        let html = r#"<script src="/artifacts/k9depef6/assets/app.js"></script>
+<link rel="stylesheet" href="/artifacts/k9depef6/assets/app.css">"#;
+
+        assert_eq!(
+            referenced_assets(html, "https://boxcode.sh/artifacts/k9depef6"),
+            vec![
+                "https://boxcode.sh/artifacts/k9depef6/assets/app.js".to_string(),
+                "https://boxcode.sh/artifacts/k9depef6/assets/app.css".to_string(),
+            ]
+        );
+    }
+
+    /// The bug this exists to catch: an unrebased Vite build. The check must
+    /// ask for the domain-root path the browser would ask for -- the one that
+    /// 404s -- not the path where the file happens to live.
+    #[test]
+    fn an_unrebased_page_is_checked_where_the_browser_would_actually_look() {
+        let html = r#"<script src="/assets/index-BvuHFN-e.js"></script>"#;
+        assert_eq!(
+            referenced_assets(html, "https://boxcode.sh/artifacts/k9depef6"),
+            vec!["https://boxcode.sh/assets/index-BvuHFN-e.js".to_string()],
+            "resolving this to where the file really is would confirm a blank page"
+        );
+    }
+
+    /// A relative reference on a URL with no trailing slash resolves one
+    /// directory too high. Resolving it the convenient way instead would hide
+    /// exactly the failure worth reporting.
+    #[test]
+    fn relative_references_resolve_against_the_directory_not_the_page() {
+        let html = r#"<script src="./assets/app.js"></script><img src="logo.png">"#;
+        assert_eq!(
+            referenced_assets(html, "https://boxcode.sh/artifacts/k9depef6"),
+            vec![
+                "https://boxcode.sh/artifacts/assets/app.js".to_string(),
+                "https://boxcode.sh/artifacts/logo.png".to_string(),
+            ]
+        );
+    }
+
+    /// Other origins, inline data and in-page anchors say nothing about
+    /// whether this publish is serving, so none of them are fetched.
+    #[test]
+    fn other_origins_and_non_files_are_not_checked() {
+        let html = r##"<link href="//fonts.googleapis.com/css2?family=Figtree" rel="stylesheet">
+<link href="https://cdn.test/x.css" rel="stylesheet">
+<img src="data:image/png;base64,AAAA">
+<a href="#top">top</a>"##;
+        assert!(referenced_assets(html, "https://boxcode.sh/artifacts/abc").is_empty());
+    }
+
+    /// A single-page app's routes are not files. Treating `<a href="/admin">`
+    /// as an asset would report every SPA as broken.
+    #[test]
+    fn app_routes_are_not_mistaken_for_assets() {
+        let html = r#"<a href="/admin/orders">Orders</a><a href="/">Home</a>
+<link rel="stylesheet" href="/artifacts/abc/assets/app.css">"#;
+        assert_eq!(
+            referenced_assets(html, "https://boxcode.sh/artifacts/abc"),
+            vec!["https://boxcode.sh/artifacts/abc/assets/app.css".to_string()],
+            "only the stylesheet is a file; the routes are the app's business"
+        );
+    }
+
+    /// Single quotes are as valid as double, and the same asset named twice
+    /// is fetched once.
+    #[test]
+    fn quoting_styles_are_both_read_and_duplicates_collapse() {
+        let html = r#"<script src='/artifacts/abc/a.js'></script>
+<script src="/artifacts/abc/a.js"></script>"#;
+        assert_eq!(
+            referenced_assets(html, "https://boxcode.sh/artifacts/abc"),
+            vec!["https://boxcode.sh/artifacts/abc/a.js".to_string()]
+        );
+    }
+
+    /// A cache-busting query must not stop a stylesheet being recognised.
+    #[test]
+    fn a_stylesheet_with_a_query_string_is_still_a_stylesheet() {
+        let html = r#"<link rel="stylesheet" href="/artifacts/abc/a.css?v=2">"#;
+        assert_eq!(
+            referenced_assets(html, "https://boxcode.sh/artifacts/abc"),
+            vec!["https://boxcode.sh/artifacts/abc/a.css?v=2".to_string()]
+        );
+    }
+
+    // ---- serving under a sub-path ------------------------------------------
+
+    #[test]
+    fn the_served_path_is_read_off_the_signed_url() {
+        assert_eq!(served_under("https://boxcode.sh/artifacts/k9depef6"), "/artifacts/k9depef6");
+        assert_eq!(served_under("https://boxcode.sh/artifacts/k9depef6/"), "/artifacts/k9depef6");
+        assert_eq!(served_under("https://example.test/a/b/c"), "/a/b/c");
+        // A signer serving from the domain root has no prefix to add, and
+        // rebasing must then be a no-op rather than inventing one.
+        assert_eq!(served_under("https://example.test"), "");
+    }
+
+    /// The exact failure a real publish hit: Vite's default `base: "/"` emits
+    /// root-absolute asset URLs, the artifact is served from a sub-path, and
+    /// every asset 404s into a blank page while the upload reports success.
+    #[test]
+    fn a_vite_build_serves_its_assets_from_the_artifact_prefix() {
+        let html = br#"<!doctype html>
+<html><head>
+<script type="module" crossorigin src="/assets/index-BvuHFN-e.js"></script>
+<link rel="stylesheet" crossorigin href="/assets/index-8NRPCoXr.css">
+</head><body><div id="root"></div></body></html>"#;
+
+        let out = rebase_absolute_urls(html, "/artifacts/k9depef6");
+        let text = String::from_utf8(out).expect("still valid utf-8");
+
+        assert!(
+            text.contains(r#"src="/artifacts/k9depef6/assets/index-BvuHFN-e.js""#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"href="/artifacts/k9depef6/assets/index-8NRPCoXr.css""#),
+            "{text}"
+        );
+        assert!(!text.contains(r#"src="/assets/"#), "the broken form must be gone: {text}");
+    }
+
+    /// Another origin's URL is not ours to rewrite. Protocol-relative `//host`
+    /// is the one that looks like a root-absolute path and is not one --
+    /// getting this wrong would break every CDN font and script on the page.
+    #[test]
+    fn other_origins_are_left_alone() {
+        let html = br#"<link href="//fonts.googleapis.com/css2?family=Figtree" rel="stylesheet">
+<link href="https://fonts.gstatic.com/x.woff2" rel="preconnect">
+<script src="http://example.test/a.js"></script>"#;
+
+        let out = rebase_absolute_urls(html, "/artifacts/abc");
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.contains(r#"href="//fonts.googleapis.com"#), "{text}");
+        assert!(text.contains(r#"href="https://fonts.gstatic.com"#), "{text}");
+        assert!(text.contains(r#"src="http://example.test"#), "{text}");
+        assert!(!text.contains("/artifacts/abc"), "nothing should have been rewritten: {text}");
+    }
+
+    /// Relative URLs already resolve correctly and must not be touched --
+    /// rewriting them would double the prefix on a republish.
+    #[test]
+    fn relative_urls_are_untouched() {
+        let html = br#"<img src="logo.png"><img src="./a/b.png"><a href="../up.html">"#;
+        let out = rebase_absolute_urls(html, "/artifacts/abc");
+        assert_eq!(out, html.to_vec());
+    }
+
+    /// Single quotes are as valid as double in HTML, and a bare `href="/"`
+    /// (a home link) is a root-absolute URL like any other.
+    #[test]
+    fn single_quotes_and_bare_roots_are_handled() {
+        let html = br#"<script src='/a.js'></script><a href="/">home</a>"#;
+        let out = rebase_absolute_urls(html, "/artifacts/abc");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#"src='/artifacts/abc/a.js'"#), "{text}");
+        assert!(text.contains(r#"href="/artifacts/abc/""#), "{text}");
+    }
+
+    /// A root-served signer adds no prefix, so the bytes come back identical.
+    #[test]
+    fn an_empty_prefix_changes_nothing() {
+        let html = br#"<script src="/assets/a.js"></script>"#;
+        assert_eq!(rebase_absolute_urls(html, ""), html.to_vec());
+    }
+
+    /// Bytes that are not text pass through untouched rather than being
+    /// corrupted, the same guarantee `inject_live_reload` makes.
+    #[test]
+    fn non_utf8_bytes_survive_rebasing() {
+        let bytes = [0xff, 0xfe, b'=', b'"', b'/', b'a', 0x00];
+        let out = rebase_absolute_urls(&bytes, "/p");
+        // The rewrite still applies (it is byte-wise), and nothing else moved.
+        assert_eq!(out, vec![0xff, 0xfe, b'=', b'"', b'/', b'p', b'/', b'a', 0x00]);
+    }
+
+    /// The two transforms compose: assets are rebased and the reload script is
+    /// still injected, and the script itself is not rewritten by the rebase.
+    #[test]
+    fn rebasing_and_live_reload_compose() {
+        let html = br#"<html><body><script src="/assets/a.js"></script></body></html>"#;
+        let out = inject_live_reload(rebase_absolute_urls(html, "/artifacts/abc"));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#"src="/artifacts/abc/assets/a.js""#), "{text}");
+        assert!(text.contains("location.reload"), "the reload script survived: {text}");
+    }
 
     fn write(dir: &Path, name: &str, contents: &str) {
         let path = dir.join(name);
