@@ -43,10 +43,11 @@ log — comes back to the model, so it can read the error, fix it, and try again
   Deployed. It's live at https://my-app-x1.vercel.app
 ```
 
-A deployment **always stops for an explicit decision**, even with
-`require_approval = false` — it is classified `Dangerous`, the same tier as
-`rm -rf build`, because it sends your project to a third party and puts it on
-the public internet. Previews are the default; the model has to be told
+A deployment **always stops for an explicit decision**, in every `approval`
+mode — it is classified `Dangerous`, the same tier as `rm -rf build`, because
+it sends your project to a third party and puts it on the public internet.
+This is one of the things the default posture still asks about even though it
+destroys nothing locally. Previews are the default; the model has to be told
 "production" to get it.
 
 Once you press `y`, the deployment runs **interactively** rather than in a

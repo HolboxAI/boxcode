@@ -5,8 +5,8 @@
 //! Two levels sit above the existing approval flow:
 //!
 //! - [`Risk::Blocked`] — never runs, and is never offered for approval. Not
-//!   reachable by pressing `a`, by `require_approval = false`, or by any config
-//!   at all. This is for actions with no plausible legitimate use from inside a
+//!   reachable by pressing `a`, by any `[tools] approval` mode, or by any
+//!   config at all. This is for actions with no plausible legitimate use from inside a
 //!   project directory and no way back afterwards: erasing the filesystem root,
 //!   formatting a disk, piping a downloaded script into a shell.
 //! - [`Risk::Dangerous`] — always stops for an explicit decision, even in
@@ -81,8 +81,7 @@ impl Risk {
 /// change: widening the door on reads means naming the writes that must never
 /// go through it quietly.
 ///
-/// These land in the always-ask tier -- the one `require_approval = false`
-/// does not reach -- because their blast radius is not on this machine. A
+/// These land in the always-ask tier -- the one no `approval` mode reaches -- because their blast radius is not on this machine. A
 /// deleted local file is a mistake; a deleted repository, a merged pull
 /// request or a published release is a mistake other people already saw, and
 /// `git` cannot undo any of them.
@@ -524,8 +523,16 @@ fn write_target_risk(program: &str, args: &[&str], root: &Path) -> Risk {
     if is_device(destination) {
         return blocked(format!("`{program}` writing to a raw device destroys the disk"));
     }
+    if is_temp_path(destination) {
+        return Risk::Normal;
+    }
     match classify_target(destination, root) {
-        Target::Catastrophic => blocked(format!(
+        // Asked about rather than refused, for the same reason the redirect
+        // above is: the destination is right there in the command, and
+        // `cp dist/app /usr/local/bin/` is a thing people legitimately do.
+        // Recursive *deletion* outside the project stays blocked -- that is
+        // the class with no way back, and it is what this tier is for.
+        Target::Catastrophic => dangerous(format!(
             "`{program}` writing to `{destination}`, outside the project directory"
         )),
         Target::WipesProject if program == "mv" || program == "rsync" => blocked(format!(
@@ -611,7 +618,19 @@ fn package_risk(args: &[&str]) -> Risk {
     let removing = args
         .iter()
         .any(|a| matches!(*a, "uninstall" | "remove" | "rm" | "purge" | "autoremove"));
-    if removing {
+    // `npm publish`, `cargo publish`, `gem push`: a version number, once it is
+    // on a public registry, is there for good -- npm's unpublish window is 72
+    // hours and crates.io has none at all. That makes this the same kind of
+    // irreversible-and-visible-to-others act as `pr merge` or a deployment,
+    // which is why it belongs in the tier that asks whatever the settings say.
+    //
+    // It sat at `Normal` for as long as every command needed approval anyway.
+    // With ordinary commands now running unattended, `Normal` would mean a
+    // package published without anyone being asked.
+    let publishing = args.iter().any(|a| matches!(*a, "publish")) || args.first() == Some(&"push");
+    if publishing {
+        dangerous("publishes a package to a public registry, which cannot be taken back")
+    } else if removing {
         dangerous("uninstalls packages")
     } else if global {
         dangerous("installs globally, outside the project")
@@ -648,12 +667,26 @@ fn redirect_risk(segment: &str, root: &Path) -> Risk {
                 .trim_matches(|c| c == '\'' || c == '"')
                 .to_string();
 
-            if !target.is_empty() && target != "/dev/null" {
+            if !target.is_empty() && target != "/dev/null" && !is_temp_path(&target) {
                 if is_device(&target) {
                     return blocked("redirects output onto a raw device, destroying the disk");
                 }
+                // Asked about, not refused. This used to be `blocked`, and
+                // measured against this module's own rule for that tier -- "no
+                // plausible legitimate use ... and no way back afterwards" --
+                // it failed both halves. A shell redirect creates or truncates
+                // exactly one file, always named in the command the user is
+                // looking at, and `> /tmp/dev.log` to read a background
+                // server's output back is not only plausible, it is the
+                // ordinary way to do it. It was reported as a bug the first
+                // time anyone tried to start a dev server.
+                //
+                // `> ~/.zshrc` is still worth stopping for, which is why this
+                // is `dangerous` rather than `Normal`: the user sees the exact
+                // destination and decides. Only the scratch directory above is
+                // waved through.
                 risk = risk.max(match classify_target(&target, root) {
-                    Target::Catastrophic => blocked(format!(
+                    Target::Catastrophic => dangerous(format!(
                         "writes to `{target}`, outside the project directory"
                     )),
                     _ => Risk::Normal,
@@ -786,6 +819,33 @@ fn expand_home(target: &str) -> String {
         return format!("{home}/{rest}");
     }
     target.replace("${HOME}", &home).replace("$HOME", &home)
+}
+
+/// The system scratch directory.
+///
+/// Writing a file here is not a decision anyone needs to make: it is
+/// world-writable by design, the OS clears it, and it is where every shell
+/// one-liner has always put a log it is about to read back. Recognised so the
+/// tier below can be about *unexpected* destinations rather than about every
+/// destination that happens not to be the project.
+///
+/// Prefix matching is on a path boundary, so `/tmpfoo` is not `/tmp`.
+fn is_temp_path(target: &str) -> bool {
+    let normalized = target.replace('\\', "/").to_ascii_lowercase();
+    let mut roots: Vec<String> = ["/tmp", "/private/tmp", "/var/tmp", "/var/folders"]
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    // Whatever this OS actually says, which is the only way to catch a
+    // per-user `TMPDIR` and Windows' `AppData\Local\Temp`.
+    if let Some(dir) = std::env::temp_dir().to_str() {
+        roots.push(dir.replace('\\', "/").to_ascii_lowercase());
+    }
+    roots.iter().any(|root| {
+        let root = root.trim_end_matches('/');
+        !root.is_empty()
+            && (normalized == root || normalized.starts_with(&format!("{root}/")))
+    })
 }
 
 fn is_device(target: &str) -> bool {
@@ -1060,13 +1120,62 @@ mod tests {
         }
     }
 
+    /// Writing somewhere unexpected is a decision, not a refusal.
+    ///
+    /// These were `Blocked` -- never offered as a question at all -- and
+    /// measured against this module's own rule for that tier ("no plausible
+    /// legitimate use ... and no way back") they failed both halves. Each one
+    /// writes a single, named file, and the user can read the destination in
+    /// the command they are being asked about.
     #[test]
-    fn writing_outside_the_project_is_blocked() {
+    fn writing_outside_the_project_asks_first() {
         for command in [
             "echo x > /etc/passwd",
+            "echo x >> ~/.zshrc",
             "mv secrets.txt /etc/",
             "cp payload /usr/local/bin/tool",
             "tee /etc/hosts",
+        ] {
+            assert_dangerous(command);
+        }
+    }
+
+    /// The regression that prompted this: starting a dev server in the
+    /// background and reading its log back is the ordinary way to do it, and
+    /// it was refused outright.
+    #[test]
+    fn writing_to_the_scratch_directory_is_ordinary() {
+        for command in [
+            "cd todo-app && nohup npm run dev >/tmp/todo-dev.log 2>&1 &",
+            "npm run build > /tmp/build.log",
+            "cat /tmp/todo-dev.log",
+            "tee /tmp/out.txt",
+            "cp dist/app.js /var/tmp/app.js",
+        ] {
+            assert_normal(command);
+        }
+    }
+
+    /// The exemption is a path boundary, not a prefix match: a directory that
+    /// merely starts with the same letters is not the scratch directory.
+    #[test]
+    fn the_scratch_exemption_does_not_leak_to_neighbouring_paths() {
+        assert_dangerous("echo x > /tmpfoo/thing");
+        assert_dangerous("echo x > /var/tmpfoo/thing");
+    }
+
+    /// What the blocked tier is actually for, and still is: destruction with
+    /// no way back. Downgrading the writes above must not have touched it.
+    #[test]
+    fn deleting_outside_the_project_is_still_refused_outright() {
+        for command in [
+            "rm -rf /etc",
+            "rm -rf ~/Documents",
+            "find / -name '*.log' -delete",
+            "chmod -R 777 /usr",
+            "echo x > /dev/sda",
+            // Even in the scratch directory: this is the disk, not a file.
+            "dd of=/dev/disk0",
         ] {
             assert_blocked(command);
         }
@@ -1222,7 +1331,7 @@ mod tests {
     /// The other half of auto-approving `gh` reads. These reach past this
     /// machine -- a deleted repo or a merged PR is something other people have
     /// already seen, and `git` undoes none of it -- so they belong in the tier
-    /// `require_approval = false` cannot switch off.
+    /// no `approval` mode can switch off.
     #[test]
     fn irreversible_gh_operations_always_stop_for_a_decision() {
         for command in [

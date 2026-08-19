@@ -2152,7 +2152,10 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
 ];
 
 /// Whether `command` is read-only and reversible enough to skip the approval
-/// prompt for -- see `[tools] auto_approve_read_only` in `config.rs`.
+/// prompt for under `ApprovalMode::Always` -- see `[tools] approval` in
+/// `config.rs`. Under the default mode an ordinary command runs without a
+/// prompt regardless, and this list only still matters for what a *subagent*
+/// may run, where it is the fence rather than a convenience.
 ///
 /// `find` and general `git` are deliberately excluded: both have common,
 /// easy-to-type destructive forms (`find . -delete`, `git reset --hard`) that
@@ -3759,7 +3762,7 @@ pub fn declined(call: &ToolCall) -> ToolOutcome {
         .unwrap_or_else(|| call.function.name.clone());
     outcome(
         &call.id,
-        format!("{} — declined", clip(&label, 60)),
+        format!("{} — declined", clip_label(&label, 60)),
         "The user declined to let this happen. Do not try it again; take a different \
          approach or answer without it."
             .to_string(),
@@ -3777,7 +3780,7 @@ pub fn refused_as_dangerous(call: &ToolCall, reason: &str) -> ToolOutcome {
         .unwrap_or_else(|| call.function.name.clone());
     outcome(
         &call.id,
-        format!("✗ {} — blocked", clip(&label, 60)),
+        format!("✗ {} — blocked", clip_label(&label, 60)),
         format!(
             "Blocked by the safety guardrails and never run: {reason}.\n\
              This was refused by the tool itself, not by the user, and no setting can permit \
@@ -3799,7 +3802,7 @@ pub fn refused_in_plan_mode(call: &ToolCall, reason: &str) -> ToolOutcome {
         .unwrap_or_else(|| call.function.name.clone());
     outcome(
         &call.id,
-        format!("{} — not in plan mode", clip(&label, 60)),
+        format!("{} — not in plan mode", clip_label(&label, 60)),
         reason.to_string(),
     )
 }
@@ -3905,7 +3908,7 @@ pub fn unanswered(call: &ToolCall, reason: &str) -> ToolOutcome {
         .unwrap_or_else(|| call.function.name.clone());
     outcome(
         &call.id,
-        format!("{} — not run", clip(&label, 60)),
+        format!("{} — not run", clip_label(&label, 60)),
         reason.to_string(),
     )
 }
@@ -3917,6 +3920,22 @@ fn outcome(call_id: &str, display: String, content: String) -> ToolOutcome {
         content,
         diff: None,
     }
+}
+
+/// Truncate for a transcript label: one line, ending in an ellipsis.
+///
+/// Not `clip`. That one appends a `[… truncated at N characters]` note on its
+/// own line, which is right for content going to the model -- it needs to know
+/// it is reading a fragment -- and wrong for a label, which is drawn as a
+/// single line beside a state mark. A refused long command came out as two
+/// rows, the second of them a bracketed note about truncation, which reads as
+/// a second thing having gone wrong.
+fn clip_label(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end())
 }
 
 /// Truncate to `max` characters (not bytes -- this must never split a char).
@@ -4227,6 +4246,19 @@ mod tests {
             .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
             .collect();
         assert!(names.contains(&GREP_SEARCH.to_string()), "{names:?}");
+    }
+
+    /// A refused long command is one transcript row, not two. `clip`'s
+    /// truncation note is addressed to the model and belongs in content.
+    #[test]
+    fn a_refused_long_command_stays_on_one_line() {
+        let long = format!("cd todo-app && nohup npm run dev {}", "x".repeat(200));
+        let out = refused_as_dangerous(&tool_call(RUN_COMMAND, json!({"command": long})), "why");
+        assert!(!out.display.contains('\n'), "{:?}", out.display);
+        assert!(out.display.contains('…'), "{:?}", out.display);
+        assert!(!out.display.contains("truncated at"), "{:?}", out.display);
+        // The model still gets told plainly what happened.
+        assert!(out.content.contains("why"), "{}", out.content);
     }
 
     /// A pictograph: an emoji, or a symbol a terminal is liable to render as
@@ -5605,7 +5637,7 @@ mod tests {
 
         // Same reasoning as publish_artifact/deploy_project: it stands up a
         // real service on the public internet, so it must stay `Dangerous`
-        // (always approved) regardless of `require_approval`.
+        // (always approved) regardless of the approval mode.
         let risk = action_risk(&action, Path::new("/tmp"));
         assert!(matches!(risk, danger::Risk::Dangerous(_)), "{risk:?}");
 

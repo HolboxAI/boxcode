@@ -124,6 +124,22 @@ pub struct Choice {
 pub struct Delta {
     #[serde(default)]
     pub content: Option<String>,
+    /// A reasoning model's chain of thought, which arrives *before* any
+    /// `content` and on its own field.
+    ///
+    /// Absent from every OpenAI-reference response and present on DeepSeek's
+    /// reasoning models, Alibaba's, and several gateways that proxy them. It
+    /// was previously not declared here at all, so serde dropped it: on a long
+    /// think the endpoint was streaming continuously, every byte was
+    /// discarded, and the UI showed a spinner over a blank screen with a
+    /// frozen token counter. That is indistinguishable from a hang, and it was
+    /// reported as one.
+    ///
+    /// `reasoning` is the same field under the name some gateways use, aliased
+    /// rather than given a second field so everything downstream sees one
+    /// stream regardless of which spelling arrived.
+    #[serde(default, alias = "reasoning")]
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<ToolCallDelta>,
 }
@@ -158,6 +174,14 @@ pub struct FunctionDelta {
 #[derive(Debug)]
 pub enum StreamEvent {
     Token(String),
+    /// A fragment of the model's reasoning, on its way to the live area but
+    /// never to the transcript and never back onto the wire.
+    ///
+    /// Kept separate from `Token` rather than folded into it because the two
+    /// have different lifetimes: `Token` is the answer and is persisted,
+    /// replayed and resent, while this is scaffolding that exists to prove the
+    /// model is working and is dropped the moment it stops.
+    Reasoning(String),
     ToolCalls(Vec<ToolCall>),
     /// Not from the endpoint: the local command runner reports back on the same
     /// channel, so the event loop has one place to drain and one stale-id guard
@@ -470,6 +494,15 @@ async fn apply_delta(
     request_id: u64,
     tx: &mpsc::Sender<(u64, StreamEvent)>,
 ) -> bool {
+    if let Some(text) = delta.reasoning_content.filter(|s| !s.is_empty()) {
+        if tx
+            .send((request_id, StreamEvent::Reasoning(text)))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
     if let Some(text) = delta.content.filter(|s| !s.is_empty()) {
         if tx.send((request_id, StreamEvent::Token(text))).await.is_err() {
             return false;
@@ -577,6 +610,60 @@ mod tests {
             SseLine::Delta(delta, _) => delta.content.filter(|s| !s.is_empty()),
             _ => None,
         }
+    }
+
+    /// The field that was being dropped. A reasoning model streams its chain
+    /// of thought here, ahead of any `content`, and serde discarded it because
+    /// `Delta` never declared it -- so a minute of continuous streaming looked
+    /// exactly like a hung connection.
+    #[test]
+    fn reasoning_content_is_read_rather_than_discarded() {
+        let reasoning = |line: &str| match parse_sse_line(line) {
+            SseLine::Delta(delta, _) => delta.reasoning_content,
+            _ => None,
+        };
+        assert_eq!(
+            reasoning(r#"data: {"choices":[{"delta":{"reasoning_content":"Let me check"}}]}"#)
+                .as_deref(),
+            Some("Let me check")
+        );
+        // The spelling some gateways use for the same field.
+        assert_eq!(
+            reasoning(r#"data: {"choices":[{"delta":{"reasoning":"Let me check"}}]}"#).as_deref(),
+            Some("Let me check")
+        );
+        // And it must not be confused with the answer.
+        assert!(token(r#"data: {"choices":[{"delta":{"reasoning_content":"Let me check"}}]}"#).is_none());
+    }
+
+    /// Reasoning and content on the same chunk: both come through, and the
+    /// thinking precedes the answer it produced.
+    #[tokio::test]
+    async fn reasoning_arrives_before_the_answer_it_produced() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut pending = Vec::new();
+        apply_delta(
+            Delta {
+                content: Some("Hello".to_string()),
+                reasoning_content: Some("thinking".to_string()),
+                tool_calls: Vec::new(),
+            },
+            &mut pending,
+            1,
+            &tx,
+        )
+        .await;
+        drop(tx);
+
+        let mut seen = Vec::new();
+        while let Some((_, event)) = rx.recv().await {
+            seen.push(match event {
+                StreamEvent::Reasoning(t) => format!("reasoning:{t}"),
+                StreamEvent::Token(t) => format!("token:{t}"),
+                _ => "other".to_string(),
+            });
+        }
+        assert_eq!(seen, vec!["reasoning:thinking", "token:Hello"]);
     }
 
     #[test]
@@ -871,6 +958,7 @@ mod tests {
             .iter()
             .map(|e| match e {
                 StreamEvent::Token(_) => "token",
+                StreamEvent::Reasoning(_) => "reasoning",
                 StreamEvent::ToolCalls(_) => "tools",
                 StreamEvent::ToolsFinished(_) => "finished",
                 StreamEvent::AgentActivity { .. } => "activity",

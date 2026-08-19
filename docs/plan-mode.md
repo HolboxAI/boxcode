@@ -141,8 +141,9 @@ plan is never written.
   · ☑ Wrap the router in src/app.py
 ```
 
-Each write and command still asks for approval individually. Approving a plan
-approves the *approach*, not a blank cheque.
+Approving a plan approves the *approach*, not a blank cheque: each step still
+runs under the ordinary posture, so a destructive one asks individually. With
+`approval = "always"` every write and command asks again.
 
 The footer tracks where you are for as long as the plan is live:
 
@@ -251,7 +252,7 @@ since you are entitled to assume a file by that name is being used.
 | | In plan mode |
 |---|---|
 | `read_file`, `list_dir`, `glob` | Yes — and without an approval prompt |
-| `web_search` | Yes (still asks, since the query leaves your machine) |
+| `web_search` | Yes |
 | `run_command`, read-only | Yes — `ls`, `cat`, `grep`, `git status`/`diff`/`log`/`show` |
 | `run_command`, anything else | **Refused** — including builds and test runs |
 | `write_file`, `edit_file` | **Refused**, and not even offered to the model |
@@ -274,7 +275,8 @@ unconditional — a command boxcode cannot vouch for is refused rather than
 guessed about. If a build or test run is part of the work, it becomes a step in
 the plan and runs after you approve.
 
-The same allowlist governs `auto_approve_read_only`; see `tools::is_read_only`.
+The same allowlist governs `approval = "always"` and the fence around a
+subagent; see `tools::is_read_only`.
 
 ### What plan mode is not
 
@@ -306,10 +308,11 @@ A few invariants worth knowing, because they are what make the file trustworthy:
 
 ## Interactions with everything else
 
-- **`require_approval = false`** does not reach plan mode. That setting hands
-  the model an unattended shell; plan mode is the statement that nothing changes
+- **No `approval` mode reaches plan mode.** The setting decides which
+  ordinary actions stop to ask; plan mode is the statement that nothing changes
   until you approve a plan, and a statement with an exception is not worth
-  making. The plan prompt appears even there.
+  making. The plan prompt appears in every mode, and the writing tools are not
+  merely refused there — they are never offered.
 - **The hard blocklist outranks plan mode.** `rm -rf /` while planning is
   reported as *blocked*, not merely out of scope — the louder reason wins.
 - **Conversation is kept** when plan mode ends. Everything read while planning

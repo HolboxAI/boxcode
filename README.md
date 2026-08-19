@@ -15,7 +15,7 @@ OpenAI-compatible LLM endpoint.
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v1.7.1
+  ▟█▙       ▟█▙    boxcode  v1.8.0
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -31,7 +31,8 @@ OpenAI-compatible LLM endpoint.
   /model    switch model
 
   Ask about this project — it can read files and run commands.
-  Every command and every write waits for your approval.
+  Destructive commands wait for your approval — deleting, force-pushing,
+  publishing.
 
 ╭──────────────────────────────────────────────────────────────────────╮
 │❯ add a health check endpoint                                         │
@@ -78,10 +79,24 @@ details in one message, where a flag-heavy command would need several screens
 to ask for the same thing.
 
 - **Reads, writes and edits your files, and runs commands** in the directory
-  you launched from — every write and every command waits for your `y`/`n`
-  first, shown in full (a file's real new content, not a shell string).
-  Genuinely catastrophic commands (`rm -rf /`, disk formatting, fork bombs,
-  `curl | sh`, ...) are never even offered as a yes/no — see `danger.rs`.
+  you launched from. **Only destructive actions stop to ask.** Building
+  something is dozens of ordinary steps — `mkdir`, `npm install`, `npm run
+  build`, a file written for each one — and prompting for every one of those
+  never made the dangerous ones safer, it buried them: twenty identical
+  prompts get answered `y` by reflex, and so does the twenty-first. So
+  deleting, force-pushing, discarding uncommitted work, killing processes,
+  uninstalling, running as root, publishing a package and putting anything on
+  the internet all still wait for your `y`/`n`, shown in full — and everything
+  else just runs. Genuinely catastrophic commands (`rm -rf /`, disk
+  formatting, fork bombs, `curl | sh`, ...) are never even offered as a yes/no
+  — see `danger.rs`; that tier is deliberately narrow, and covers destruction
+  with no way back rather than anything merely unexpected, so writing a log to
+  `/tmp` and reading it back works the way it does in any shell. Set
+  `approval = "always"` under `[tools]` to be asked
+  about every write and command instead. **Upgrading from an earlier version
+  loosens your existing install**: the retired `require_approval` key is
+  dropped rather than translated, because the app used to write it into every
+  config itself, so its presence never meant anyone had chosen it.
 - **Every file change is a diff, before and after** — a write or an edit is
   approved by looking at red `-` and green `+` lines with real line numbers,
   against the file as it is on disk right now, not by reading a whole new file
@@ -115,6 +130,13 @@ to ask for the same thing.
 
 ## Usage
 
+- **You can see it thinking** — a reasoning model streams its chain of thought
+  on a separate field before a word of the answer appears. That field is now
+  read: the spinner says `Thinking…` and the latest line of it sits underneath,
+  where before there was a blank screen and a frozen counter for minutes at a
+  time. The spinner also separates the round in flight from the whole turn
+  (`Responding… (12s · 152s this turn)`), because a turn that ran `npm install`
+  and four round trips was reporting all of it as time spent responding.
 - **The transcript is marks, not emoji** — a tool line that is still running
   wears a spinner and a finished one wears a `·`, so you can see *which* of
   four commands is the slow one rather than only that four are running. No
@@ -149,10 +171,12 @@ immediately, no restart needed.
 
 ```toml
 [tools]
-enabled = true                # false sends no tool schema at all
-workspace = "."                # "." = the directory you launched from
-require_approval = true        # false = the model runs commands unattended (UNATTENDED banner shown)
-auto_approve_read_only = true  # skip the prompt for a narrow read-only allowlist (ls, cat, grep, git status/diff/log)
+enabled = true          # false sends no tool schema at all
+workspace = "."         # "." = the directory you launched from
+approval = "destructive"  # what stops to ask:
+                          #   "destructive" (default) — only actions that destroy
+                          #     something or put something on the public internet
+                          #   "always" — every write and every command, sparing reads
 
 [deploy]
 enabled = true            # false removes the deploy_project tool entirely
@@ -164,11 +188,12 @@ check_on_start = true
 theme = "auto"   # auto | dark | light — auto-detects your terminal, falls back to a palette legible on both
 ```
 
-Everything above the two deliberately-uncapped tiers (destructive-but-legit
-actions always stop for a decision, even with `require_approval = false`; the
-catastrophic tier can't be configured off at all) — see `danger.rs` for the
+Neither `approval` value reaches the two deliberately-uncapped tiers:
+destructive-but-legitimate actions always stop for a decision in both, and the
+catastrophic tier can't be configured off at all — see `danger.rs` for the
 exact rules. Nothing here is a sandbox: these prompts are the only thing
-limiting what the model can do with your own permissions.
+limiting what the model can do with your own permissions, and a looser default
+means the destructive tier is now carrying more of that weight on its own.
 
 ## Privacy
 

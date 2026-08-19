@@ -26,7 +26,7 @@ mod usage;
 mod workspace;
 
 use app::App;
-use config::Config;
+use config::{ApprovalMode, Config};
 use workspace::Workspace;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -419,13 +419,17 @@ fn open_workspace(config: &Config, override_root: Option<&str>) -> (Option<Works
     match Workspace::new(root) {
         Ok(workspace) => {
             let root = workspace.root().display().to_string();
-            // Every one of these is worth seeing before typing the first prompt:
-            // a shell tool can change anything, and unattended mode means it can
-            // do so without asking.
+            // Every one of these is worth seeing before typing the first
+            // prompt: a shell tool can change anything, so which actions stop
+            // to ask is stated outright rather than discovered. It is said in
+            // both modes now, not only the loose one -- the default *is* the
+            // loose one, and a posture nobody was told about is one nobody
+            // chose.
             let mut status = format!("commands run in {root}");
-            if !config.tools.require_approval {
-                status.push_str(" — UNATTENDED, no approval prompt");
-            }
+            status.push_str(match config.tools.approval {
+                ApprovalMode::Destructive => " — destructive actions ask first",
+                ApprovalMode::Always => " — every write and command asks first",
+            });
             if workspace.is_broad() {
                 status.push_str(" — this is a very broad directory");
             }

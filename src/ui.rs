@@ -504,6 +504,28 @@ fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
         }
         if let Some(status) = activity_line(app) {
             lines.push(status);
+            // One line of what the model is actually thinking about, under the
+            // spinner. One line, not the stream: this redraws every frame, and
+            // a chain of thought scrolling past at streaming speed is not
+            // something anyone reads -- it is something that proves the thing
+            // is alive, which one line does just as well.
+            if let Some(thought) = app.thinking_line() {
+                let room = width.saturating_sub(2).max(8);
+                // The *end* of the line when it does not fit, not the start:
+                // what the model is working through right now is the part that
+                // shows it is still moving, and the head of a long thought
+                // would sit frozen while the tail scrolled on invisibly.
+                let shown = if thought.chars().count() > room {
+                    let skip = thought.chars().count() - (room - 1);
+                    format!("…{}", thought.chars().skip(skip).collect::<String>())
+                } else {
+                    thought.to_string()
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(shown, theme::faint()),
+                ]));
+            }
         }
     }
 
@@ -531,9 +553,17 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
     if app.overlay == Some(Overlay::Deploy) {
         return None;
     }
-    let elapsed = app.busy_started.map(|t| t.elapsed());
-    let secs = elapsed.map(|e| e.as_secs()).unwrap_or(0);
-    let frame = theme::spinner(elapsed.unwrap_or_default());
+    // Two clocks, and they are not the same number. `request` is how long the
+    // round in flight has taken, which is what the verb beside it describes.
+    // `turn` is everything since Enter -- tool runs, npm downloads, every
+    // completed round trip -- and is named as the turn so it cannot be read as
+    // the other. Only shown once they have visibly diverged: on a plain
+    // question they are the same figure, and printing it twice would be noise.
+    let turn = app.busy_started.map(|t| t.elapsed());
+    let request = app.request_started.map(|t| t.elapsed()).or(turn);
+    let secs = request.map(|e| e.as_secs()).unwrap_or(0);
+    let turn_secs = turn.map(|e| e.as_secs()).unwrap_or(0);
+    let frame = theme::spinner(request.unwrap_or_default());
 
     let (verb, detail) = match app.state {
         AppState::AwaitingInput => return None,
@@ -546,7 +576,7 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
             "Compacting".to_string(),
             format!(" · summarising {} messages", app.context_size().messages),
         ),
-        AppState::Sending => ("Thinking".to_string(), String::new()),
+        AppState::Sending => ("Waiting".to_string(), String::new()),
         AppState::Streaming => {
             // See App::approx_tokens_this_turn -- the same estimate the
             // persisted usage log uses, always labelled "~" since it is one.
@@ -556,7 +586,17 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
             } else {
                 String::new()
             };
-            ("Responding".to_string(), detail)
+            // "Thinking" while reasoning is arriving and no answer has started
+            // -- which is the truth, and is the difference between a screen
+            // that looks hung and one that looks busy. A reasoning model can
+            // spend minutes here, and every byte of it used to be discarded
+            // with nothing on screen to show for it.
+            let verb = if app.thinking_line().is_some() {
+                "Thinking"
+            } else {
+                "Responding"
+            };
+            (verb.to_string(), detail)
         }
         AppState::ExecutingTools => {
             let n = app.running_tools.len();
@@ -576,11 +616,18 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
         }
     };
 
+    // A second or more apart is where the two clocks start telling different
+    // stories; below that the difference is rounding.
+    let turn_note = if turn_secs > secs {
+        format!(" · {turn_secs}s this turn")
+    } else {
+        String::new()
+    };
     Some(Line::from(vec![
         Span::styled(format!("{frame} "), theme::accent()),
         Span::styled(format!("{verb}… "), Style::default().fg(theme::p().accent_soft)),
         Span::styled(
-            format!("({secs}s{detail} · esc to interrupt)"),
+            format!("({secs}s{detail}{turn_note} · esc to interrupt)"),
             theme::faint(),
         ),
     ]))
@@ -755,9 +802,21 @@ pub fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::from(""));
+    // The second line is a promise about what this program will do to your
+    // machine, read before the first prompt is typed, so it has to track the
+    // setting rather than state the stricter of the two and be wrong for
+    // whoever is not in it.
+    let approval_tip = match app.config.tools.approval {
+        crate::config::ApprovalMode::Destructive => {
+            "Destructive commands wait for your approval — deleting, force-pushing, publishing."
+        }
+        crate::config::ApprovalMode::Always => {
+            "Every command and every write waits for your approval."
+        }
+    };
     for tip in [
         "Ask about this project — it can read files and run commands.",
-        "Every command and every write waits for your approval.",
+        approval_tip,
     ] {
         for part in wrap(tip, width) {
             lines.push(Line::from(Span::styled(part, theme::faint())));
@@ -1391,9 +1450,11 @@ fn tool_approval_parts(
             )));
             (" Search file contents? ", "search", "skip")
         }
-        // Only ever shown with `auto_approve_read_only = false` -- a subagent
-        // is auto-approved alongside the reads it is made of. The task is the
-        // whole decision, so it is the whole popup.
+        // Not reachable today: a subagent is read-only by construction, so it
+        // is auto-approved in both modes. Kept because the match is exhaustive
+        // by intent rather than by a catch-all arm -- the same reasoning
+        // `plan_mode_block` gives -- and because the task is the whole decision
+        // if a mode that asks about it ever exists again.
         Action::Agent { task, .. } => {
             for wrapped in wrap(task, inner) {
                 lines.push(Line::from(Span::styled(
@@ -3676,9 +3737,17 @@ mod tests {
         assert!(shown.contains(env!("CARGO_PKG_VERSION")), "{shown}");
         assert!(shown.contains("deepseek-chat"), "{shown}");
         assert!(shown.contains("/srv/project"), "{shown}");
-        assert!(shown.contains("waits for your approval"), "{shown}");
         assert!(shown.contains(theme::MASCOT[2]), "{shown}");
+
+        // The promise about what this will do to the machine has to match the
+        // setting. Stating the stricter one to whoever is not in it would be a
+        // safety claim that is simply untrue.
+        assert!(shown.contains("Destructive commands wait for your approval"), "{shown}");
+        app.config.tools.approval = crate::config::ApprovalMode::Always;
+        let strict = welcome_text(&app, 96);
+        assert!(strict.contains("Every command and every write waits"), "{strict}");
     }
+
 
 
     /// It is a launch screen, not furniture: the first prompt must replace it
@@ -3951,8 +4020,11 @@ mod tests {
         app.state = AppState::Sending;
         app.busy_started = Some(std::time::Instant::now());
 
+        // The request is out and nothing has come back: waiting is all that
+        // can honestly be claimed. "Thinking" is reserved for the state where
+        // reasoning is actually arriving.
         let rendered = rendered_text(&mut app, 80, 24);
-        assert!(rendered.contains("Thinking…"), "{rendered}");
+        assert!(rendered.contains("Waiting…"), "{rendered}");
         assert!(rendered.contains("esc to interrupt"), "{rendered}");
 
         // Idle shows none of it.
@@ -3961,6 +4033,56 @@ mod tests {
         let idle = rendered_text(&mut app, 80, 24);
         assert!(!idle.contains("esc to interrupt"), "{idle}");
     }
+
+    /// The bug this whole change exists for: a reasoning model streams its
+    /// chain of thought before a word of the answer, and with nothing on
+    /// screen the app was indistinguishable from hung.
+    #[test]
+    fn reasoning_shows_as_thinking_with_the_thought_underneath() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::Streaming;
+        app.busy_started = Some(std::time::Instant::now());
+        app.append_reasoning("First I need to check what the scaffold generated.\nThe entry point is main.jsx");
+
+        let rendered = rendered_text(&mut app, 80, 24);
+        assert!(rendered.contains("Thinking…"), "{rendered}");
+        assert!(
+            rendered.contains("The entry point is main.jsx"),
+            "the latest thought should be on screen: {rendered}"
+        );
+
+        // The answer starting is what ends it: a thought left standing under a
+        // reply that has moved on reads as still deliberating.
+        app.append_token("Here is the app.");
+        let answering = rendered_text(&mut app, 80, 24);
+        assert!(answering.contains("Responding…"), "{answering}");
+        assert!(!answering.contains("The entry point"), "{answering}");
+    }
+
+    /// Two clocks, because they answer different questions. The turn total is
+    /// shown only once it has diverged from the round in flight -- on a plain
+    /// question the two are the same number, and printing it twice is noise.
+    #[test]
+    fn the_turn_total_is_shown_separately_from_the_round_in_flight() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = AppState::Streaming;
+        app.busy_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(152));
+        app.request_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+
+        let rendered = rendered_text(&mut app, 100, 24);
+        assert!(rendered.contains("(12s"), "the round in flight: {rendered}");
+        assert!(rendered.contains("152s this turn"), "the turn total: {rendered}");
+
+        // A first round, where they agree, says it once.
+        app.busy_started = app.request_started;
+        let single = rendered_text(&mut app, 100, 24);
+        assert!(!single.contains("this turn"), "{single}");
+    }
+
 
     /// The end of the same bug: rendering an overlay into a zero-cell frame.
     #[test]

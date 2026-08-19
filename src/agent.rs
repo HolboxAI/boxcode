@@ -42,6 +42,9 @@ pub fn fire_request(
         return;
     }
     app.request_id += 1;
+    // The one place a request actually goes out, so the one place the
+    // per-request clock can be honest about when it started.
+    app.request_started = Some(std::time::Instant::now());
     let id = app.request_id;
     let endpoint = app.config.llm.endpoint.clone();
     let model = app.config.llm.model.clone();
@@ -127,6 +130,7 @@ pub fn handle_event(app: &mut App, id: u64, event: StreamEvent) {
     }
     match event {
         StreamEvent::Token(token) => app.append_token(&token),
+        StreamEvent::Reasoning(text) => app.append_reasoning(&text),
         StreamEvent::ToolCalls(calls) => app.request_tools(calls),
         StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
         StreamEvent::AgentActivity { call_id, label, rounds } => {
@@ -305,9 +309,14 @@ pub async fn run_subagent(
                     // user, and this loop has none; ToolsFinished and
                     // AgentActivity never arrive here -- the child runs its
                     // tools inline below, and only *sends* activity, upward.
+                    // A child's reasoning is dropped along with the rest:
+                    // the parent sees only the child's final report, so
+                    // surfacing its thinking would put a second, competing
+                    // narration on a screen that already has one.
                     Some((
                         _,
                         StreamEvent::Notice(_)
+                        | StreamEvent::Reasoning(_)
                         | StreamEvent::ToolsFinished(_)
                         | StreamEvent::AgentActivity { .. },
                     )) => {}
