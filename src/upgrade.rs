@@ -55,34 +55,54 @@ const NO_CHECK_ENV: &str = "BOXCODE_NO_UPDATE_CHECK";
 /// dead one is not felt.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn last_check_path() -> Option<std::path::PathBuf> {
-    Some(crate::config::Config::config_dir().join("last_update_check"))
+/// Where the newest release this install has ever heard of is remembered.
+///
+/// A different filename from the `last_update_check` day-stamp it replaces,
+/// and deliberately: that file holds a date, and a date read as a version
+/// would sail through `version_is_newer`'s "unparseable means different means
+/// newer" fallback and offer an upgrade to `2026-08-13` on every launch. A new
+/// name means an old file is simply never read.
+fn latest_known_path() -> Option<std::path::PathBuf> {
+    Some(crate::config::Config::config_dir().join("latest_known_version"))
 }
 
-/// Whether the once-a-day gate has already been spent.
+/// The newest release remembered from an earlier launch, if it is still newer
+/// than what is installed.
 ///
-/// Split out so the gate can be tested against a plain file, rather than by
-/// standing up an isolated `$HOME` around an async call. A missing or
-/// unreadable stamp reads as "not yet today", which is the right way round:
-/// the cost of an extra check is one request, the cost of skipping one is a
-/// user sitting on a stale build.
-fn already_checked_today(path: &std::path::Path, today: &str) -> bool {
-    std::fs::read_to_string(path)
-        .map(|stamp| stamp.trim() == today)
-        .unwrap_or(false)
+/// Self-correcting on both sides: a cache naming a version the user has since
+/// installed fails the comparison and says nothing, and a cache that is merely
+/// out of date is overwritten by the next check that reaches the network.
+fn cached_update(path: &std::path::Path) -> Option<String> {
+    let cached = std::fs::read_to_string(path).ok()?.trim().to_string();
+    (!cached.is_empty() && version_is_newer(&cached, CURRENT)).then_some(cached)
 }
 
-/// Whether a newer release exists, when that can be answered cheaply.
+fn remember_latest(path: &std::path::Path, latest: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, latest);
+    // The day-stamp this replaced, swept up on the way past so an upgraded
+    // install does not keep a file nothing reads.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_file(parent.join("last_update_check"));
+    }
+}
+
+/// Whether a newer release exists.
 ///
-/// `None` for every reason other than "there is a newer version": checked
-/// already today, turned off, offline, timed out, a malformed manifest. None
-/// of those are worth a word on screen -- someone starting a coding assistant
-/// wants the assistant, not a report on an update check that failed.
+/// `None` for every reason other than "there is a newer version": turned off,
+/// offline, timed out, a malformed manifest. None of those are worth a word on
+/// screen -- someone starting a coding assistant wants the assistant, not a
+/// report on an update check that failed.
 ///
-/// Once a day rather than every launch, on the same reasoning (and with the
-/// same file-stamp trick) as `telemetry::ping_active_if_new_day`: a prompt
-/// that appears every single time is one people learn to dismiss without
-/// reading, which is worse than not asking.
+/// **Every launch, while an update is pending.** This used to be once a day,
+/// stamped in a file, on the reasoning that a prompt appearing every time is
+/// one people learn to dismiss without reading. That reasoning is sound in
+/// general and wrong for this: the answer defaults to no and costs one
+/// keystroke, while the thing it was rationing is the only way most people
+/// ever hear that a fix they are hitting has already shipped. Being asked
+/// twice is cheap; running a fortnight-old build without knowing is not.
 pub async fn check_on_start(enabled: bool) -> Option<String> {
     if !enabled {
         return None;
@@ -91,22 +111,25 @@ pub async fn check_on_start(enabled: bool) -> Option<String> {
         return None;
     }
 
-    let path = last_check_path()?;
-    check_against(&base_url(), &path, &crate::dateutil::today_string()).await
+    let path = latest_known_path()?;
+    check_against(&base_url(), &path).await
 }
 
 /// The check itself, with everything it depends on passed in.
 ///
-/// Where it looks, where it stamps and what day it is are all arguments
-/// rather than globals, so the tests drive it against a local server and a
-/// temporary file. The alternative -- reaching for `$HOME` and
-/// `BOXCODE_UPGRADE_URL_BASE` from inside a test -- mutates process-wide state
-/// that every other test in this file shares, and duly broke two of them.
-async fn check_against(base: &str, stamp: &std::path::Path, today: &str) -> Option<String> {
-    if already_checked_today(stamp, today) {
-        return None;
-    }
-
+/// Where it looks and where it remembers are arguments rather than globals, so
+/// the tests drive it against a local server and a temporary file. The
+/// alternative -- reaching for `$HOME` and `BOXCODE_UPGRADE_URL_BASE` from
+/// inside a test -- mutates process-wide state that every other test in this
+/// file shares, and duly broke two of them.
+///
+/// The network is asked on every launch, because a release published this
+/// morning is worth hearing about this afternoon. The cache is not a rate
+/// limit -- it is the answer for the launch where the network cannot be
+/// reached at all, which on a laptop that has just woken up is a common one.
+/// Without it, going offline would silently stop mentioning an update the
+/// previous launch already knew about.
+async fn check_against(base: &str, cache: &std::path::Path) -> Option<String> {
     let client = reqwest::Client::builder()
         .connect_timeout(CHECK_TIMEOUT)
         .timeout(CHECK_TIMEOUT)
@@ -114,17 +137,19 @@ async fn check_against(base: &str, stamp: &std::path::Path, today: &str) -> Opti
         .build()
         .ok()?;
 
-    let latest = fetch_version_from(&client, base).await.ok()?;
-
-    // Stamped only after a request that actually answered. A failed check
-    // must not count as today's, or one flaky morning silently skips the
-    // whole day.
-    if let Some(parent) = stamp.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    match fetch_version_from(&client, base).await {
+        // Remembered whatever it says, including "you are up to date": that
+        // overwrites a stale entry, which is what stops the cache below from
+        // offering an upgrade the user has already installed.
+        Ok(latest) => {
+            remember_latest(cache, &latest);
+            version_is_newer(&latest, CURRENT).then_some(latest)
+        }
+        // Offline, timed out, or a manifest that would not parse. Fall back to
+        // what the last successful check found, and stay silent if there was
+        // none -- a failed check is never worth a word on screen.
+        Err(_) => cached_update(cache),
     }
-    let _ = std::fs::write(stamp, today);
-
-    version_is_newer(&latest, CURRENT).then_some(latest)
 }
 
 pub async fn run(force: bool) -> Result<(), Box<dyn Error>> {
@@ -353,86 +378,158 @@ mod tests {
         assert_eq!(verdict, None);
     }
 
-    /// The check, end to end, against a server that says a newer release
-    /// exists. Serves the same `Cargo.toml` the real one reads, so this
-    /// exercises the fetch, the parse and the comparison rather than mocking
-    /// past them. Nothing process-global is touched: the base URL and the
-    /// stamp are arguments, so this cannot race the other tests here.
-    #[tokio::test]
-    async fn a_newer_release_is_reported_and_the_day_is_stamped() {
-        let base = serve_repo("[package]\nversion = \"99.9.9\"\n".to_string(), String::new()).await;
-        let dir = std::env::temp_dir().join("boxcode-upd-newer");
+    /// A scratch directory of this test's own, so the cases here cannot see
+    /// each other's cache file.
+    fn cache_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("boxcode-upd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let stamp = dir.join("last_update_check");
-        let _ = std::fs::remove_file(&stamp);
+        dir
+    }
 
-        let first = check_against(&base, &stamp, "2026-08-13").await;
-        // Second call, same day: the stamp the first one wrote must close the
-        // gate, or the prompt appears on every single launch.
-        let second = check_against(&base, &stamp, "2026-08-13").await;
-        // Tomorrow it opens again.
-        let tomorrow = check_against(&base, &stamp, "2026-08-14").await;
+    /// The change this exists for: a pending update is mentioned on *every*
+    /// launch, not once and then not again until tomorrow.
+    #[tokio::test]
+    async fn a_pending_update_is_offered_on_every_launch() {
+        let base = serve_repo("[package]\nversion = \"99.9.9\"\n".to_string(), String::new()).await;
+        let dir = cache_dir("every");
+        let cache = dir.join("latest_known_version");
+
+        let first = check_against(&base, &cache).await;
+        let second = check_against(&base, &cache).await;
+        let third = check_against(&base, &cache).await;
 
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(first.as_deref(), Some("99.9.9"));
-        assert_eq!(second, None, "the once-a-day gate did not close");
-        assert_eq!(tomorrow.as_deref(), Some("99.9.9"), "the gate never reopened");
+        assert_eq!(second.as_deref(), Some("99.9.9"), "the second launch went quiet");
+        assert_eq!(third.as_deref(), Some("99.9.9"), "the third launch went quiet");
     }
 
     /// The version the user already has must not be offered to them.
     #[tokio::test]
     async fn the_current_version_is_not_offered_as_an_update() {
         let base = serve_repo(format!("[package]\nversion = \"{CURRENT}\"\n"), String::new()).await;
-        let dir = std::env::temp_dir().join("boxcode-upd-same");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let stamp = dir.join("last_update_check");
-        let _ = std::fs::remove_file(&stamp);
+        let dir = cache_dir("same");
+        let cache = dir.join("latest_known_version");
 
-        let verdict = check_against(&base, &stamp, "2026-08-13").await;
+        let verdict = check_against(&base, &cache).await;
 
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(verdict, None);
     }
 
-    /// An unreachable server is the common case on a laptop that just woke up,
-    /// and it must be silent -- and must NOT stamp the day, or one flaky
-    /// morning skips the check until tomorrow.
+    /// An unreachable server is the common case on a laptop that just woke up.
+    /// With nothing remembered it must be silent -- a failed check is never
+    /// worth a word on screen.
     #[tokio::test]
-    async fn an_unreachable_server_is_silent_and_does_not_stamp_the_day() {
-        let dir = std::env::temp_dir().join("boxcode-upd-offline");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let stamp = dir.join("last_update_check");
-        let _ = std::fs::remove_file(&stamp);
+    async fn an_unreachable_server_with_no_cache_is_silent() {
+        let dir = cache_dir("offline");
+        let cache = dir.join("latest_known_version");
 
         // Port 1 refuses immediately; no waiting on the timeout.
-        let verdict = check_against("http://127.0.0.1:1", &stamp, "2026-08-13").await;
+        let verdict = check_against("http://127.0.0.1:1", &cache).await;
 
-        let stamped = stamp.exists();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(verdict, None);
-        assert!(!stamped, "a failed check must not count as today's");
     }
 
-    /// A prompt on every single launch is one people learn to dismiss without
-    /// reading, so a stamp from today closes the gate.
-    #[test]
-    fn a_check_already_made_today_closes_the_gate() {
-        let dir = std::env::temp_dir().join(format!("boxcode-check-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join("last_update_check");
+    /// ...but an update the last successful check found is still worth
+    /// mentioning while offline. Without this, closing the laptop lid would
+    /// silently stop reporting an update the previous launch already knew of.
+    #[tokio::test]
+    async fn an_update_already_found_survives_going_offline() {
+        let base = serve_repo("[package]\nversion = \"99.9.9\"\n".to_string(), String::new()).await;
+        let dir = cache_dir("cached");
+        let cache = dir.join("latest_known_version");
 
-        std::fs::write(&path, "2026-08-13\n").expect("stamp");
-        assert!(already_checked_today(&path, "2026-08-13"));
-        // Yesterday's stamp must not suppress today's check, or the feature
-        // silently stops working the day after it is first used.
-        assert!(!already_checked_today(&path, "2026-08-14"));
+        let online = check_against(&base, &cache).await;
+        let offline = check_against("http://127.0.0.1:1", &cache).await;
 
-        // A stamp that was never written, or cannot be read, means "not yet":
-        // an extra request costs one request, a skipped one leaves someone on
-        // a stale build indefinitely.
-        std::fs::remove_file(&path).expect("rm");
-        assert!(!already_checked_today(&path, "2026-08-13"));
         let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(online.as_deref(), Some("99.9.9"));
+        assert_eq!(offline.as_deref(), Some("99.9.9"), "the cache did not answer");
+    }
+
+    /// The cache must not outlive its usefulness: once the endpoint says the
+    /// installed build is current, a stale entry has to stop being offered.
+    #[tokio::test]
+    async fn a_successful_check_overwrites_a_stale_cache() {
+        let dir = cache_dir("stale");
+        let cache = dir.join("latest_known_version");
+        std::fs::write(&cache, "99.9.9").expect("seed");
+
+        let base = serve_repo(format!("[package]\nversion = \"{CURRENT}\"\n"), String::new()).await;
+        let verdict = check_against(&base, &cache).await;
+        // And the next offline launch is quiet too, not just this one.
+        let offline = check_against("http://127.0.0.1:1", &cache).await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(verdict, None, "a version the user has must not be offered");
+        assert_eq!(offline, None, "the stale entry outlived the check that disproved it");
+    }
+
+    /// A cache naming a version already installed answers nothing, however it
+    /// got there -- including a downgrade, where the file is newer than the
+    /// binary in the wrong direction.
+    #[test]
+    fn the_cache_only_answers_when_it_is_genuinely_newer() {
+        let dir = cache_dir("compare");
+        let cache = dir.join("latest_known_version");
+
+        std::fs::write(&cache, "99.9.9\n").expect("write");
+        assert_eq!(cached_update(&cache).as_deref(), Some("99.9.9"));
+
+        std::fs::write(&cache, CURRENT).expect("write");
+        assert_eq!(cached_update(&cache), None, "the installed version is not an update");
+
+        std::fs::write(&cache, "0.0.1").expect("write");
+        assert_eq!(cached_update(&cache), None, "an older version is not an update");
+
+        std::fs::write(&cache, "   \n").expect("write");
+        assert_eq!(cached_update(&cache), None, "a blank cache says nothing");
+
+        std::fs::remove_file(&cache).expect("rm");
+        assert_eq!(cached_update(&cache), None, "a missing cache says nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The day-stamp this replaced holds a date, and a date read as a version
+    /// passes `version_is_newer`'s unparseable-means-newer fallback -- so it
+    /// would offer an upgrade to `2026-08-13` forever. The new file has its
+    /// own name, and the old one is swept up rather than left to rot.
+    #[test]
+    fn the_old_day_stamp_is_never_read_as_a_version() {
+        let dir = cache_dir("legacy");
+        let legacy = dir.join("last_update_check");
+        std::fs::write(&legacy, "2026-08-13\n").expect("write");
+
+        // The trap, stated: this is exactly what reading it would have done.
+        assert!(version_is_newer("2026-08-13", CURRENT));
+
+        let cache = dir.join("latest_known_version");
+        assert_eq!(cached_update(&cache), None, "the day-stamp must not be read");
+
+        remember_latest(&cache, "99.9.9");
+        let swept = !legacy.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(swept, "the retired day-stamp should have been cleaned up");
+    }
+
+    /// 1.10.0 is newer than 1.6.2, and the only reason to say so out loud is
+    /// that a string comparison says the opposite -- "1.10.0" sorts *below*
+    /// "1.6.2". This release is the first with a double-digit minor, so it is
+    /// the first where getting that wrong would mean nobody is ever offered an
+    /// update again, silently, with the check still running and still
+    /// reporting success.
+    #[test]
+    fn a_double_digit_minor_is_newer_than_a_single_digit_one() {
+        assert!(version_is_newer("1.10.0", "1.6.2"));
+        assert!(version_is_newer("1.10.0", "1.9.0"));
+        assert!(version_is_newer("2.0.0", "1.99.99"));
+        assert!(!version_is_newer("1.9.0", "1.10.0"));
+        assert!(!version_is_newer("1.10.0", "1.10.0"));
+        // The string comparison this guards against, stated.
+        assert!("1.10.0" < "1.6.2", "the trap is real, and it is why this test exists");
     }
 
     #[test]
