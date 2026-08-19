@@ -3120,10 +3120,12 @@ async fn execute_publish_artifact(
                 "Confirmed live: the URL was fetched right after upload and served what was \
                  just written."
             } else {
-                "Could not confirm the URL is actually serving this yet (the read-back after \
-                 upload failed or found a mismatch) -- the upload itself succeeded, but say so \
-                 as unconfirmed rather than as done, and check the URL yourself before telling \
-                 the user it works."
+                "NOT confirmed: the page was fetched back after upload and either it did not \
+                 match, or something it asks the browser for did not resolve. The upload itself \
+                 succeeded, so the files are there -- what is in doubt is whether the page \
+                 works. The usual cause is a build that assumes it owns the domain root while \
+                 the link serves from a sub-path, which renders blank. Say this is unconfirmed \
+                 rather than done, and check the URL before telling the user it works."
             };
             outcome(
                 &call.id,
