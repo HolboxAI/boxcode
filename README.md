@@ -167,9 +167,20 @@ to ask for the same thing.
 | `/new` | Start a fresh conversation (old one stays on disk for `/resume`) |
 | `/compact` | Summarize the conversation now, freeing context |
 | `/usage` | Local token usage — today, last 7 days, all time |
+| `/rollback` | Undo every file the model wrote this session (asks first) |
 
 `/provider` and `/model` write to `~/.boxcode/config.toml` and apply
 immediately, no restart needed.
+
+`/rollback` undoes files, not history. Every `write_file` and `edit_file`
+records what the file held first, and `/rollback` puts those states back —
+files the model created are deleted, files it changed are restored to what it
+found, and files you edited yourself are never touched. It shows the full list
+and waits for a yes. What it cannot undo, it says so about: shell commands
+(a build, an `npm install`, an `rm`) change the disk in ways no snapshot
+covers, so the confirmation names the commands that ran instead of pretending.
+The window opens when boxcode starts, survives `/compact`, and closes on
+`/new`.
 
 ## Configuration
 
@@ -227,6 +238,8 @@ chat-completions endpoint.
 - `src/plan.rs` — `plan.md`'s format and progress tracking
 - `src/diff.rs` — the line diff behind every file-change preview and transcript
   entry
+- `src/rollback.rs` — the undo journal behind `/rollback`: what each write
+  replaced, and what putting it back means
 - `src/artifacts.rs`, `src/auth.rs`, `src/db.rs`, `src/requests.rs` —
   publishing, hosted auth, hosted per-project SQLite, the change-request
   mailbox; `infra/` holds the control-planes these talk to

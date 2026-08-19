@@ -185,6 +185,14 @@ pub struct ToolOutcome {
     /// Not sent to the model: it already knows what it asked for, and
     /// `content` reports the result.
     pub diff: Option<crate::diff::FileDiff>,
+    /// What `/rollback` needs to undo this call, when it is the kind of call
+    /// that can be undone.
+    ///
+    /// Rides back on the outcome rather than being written to a journal here
+    /// for the same reason `diff` does: the runner is a spawned task holding
+    /// no app state, and results already have a way home. `App` records it in
+    /// `push_tool_outcome`; see `rollback.rs` for what is and is not covered.
+    pub rollback: Option<crate::rollback::Record>,
 }
 
 /// The shell used to run a command, per platform.
@@ -2431,11 +2439,23 @@ async fn execute_run_command(call: &ToolCall, workspace: &Workspace, config: &To
         None => "killed".to_string(),
     };
 
-    outcome(
+    let mut result = outcome(
         &call.id,
         format!("$ {} — {status}", clip(&command, 60)),
         content,
-    )
+    );
+    // Not an undo entry -- there is none to be had for a shell command, which
+    // is exactly the point. `/rollback` names these so its file count is never
+    // read as "and nothing else happened"; a build, an `npm install` or an
+    // `rm` leaves the disk changed in ways no snapshot here covers.
+    //
+    // Recorded whatever the exit code: a command that failed halfway still
+    // ran halfway, and "it exited nonzero so it changed nothing" is precisely
+    // the assumption worth not making.
+    if !is_read_only(&command) {
+        result.rollback = Some(crate::rollback::Record::Shell { command });
+    }
+    result
 }
 
 async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
@@ -2594,11 +2614,18 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
     // additions against nothing, which is exactly the kind of confident-looking
     // wrong picture a diff exists to prevent. That case gets the byte count it
     // always got and no diff at all.
-    let before = match tokio::fs::read_to_string(&resolved).await {
-        Ok(text) => Some(text),
+    //
+    // Read once and used twice: the diff wants "missing counts as empty", and
+    // `/rollback` wants missing kept *as* missing, since undoing a file into
+    // existence is a delete and not a write of "". Two questions, one read --
+    // reading again after the write would answer neither.
+    let read = tokio::fs::read_to_string(&resolved).await;
+    let before = match &read {
+        Ok(text) => Some(text.clone()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
         Err(_) => None,
     };
+    let snapshot = crate::rollback::snapshot(read);
 
     match tokio::fs::write(&resolved, &args.content).await {
         Ok(()) => {
@@ -2616,6 +2643,14 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
                 format!("Wrote {} bytes to {path}", args.content.len()),
             );
             result.diff = changes.filter(|d| !d.is_empty());
+            // Only on success: a write that failed changed nothing, and an
+            // undo entry for it would offer to restore a file to what it
+            // already holds.
+            result.rollback = Some(crate::rollback::Record::File {
+                display: path.to_string(),
+                path: resolved.clone(),
+                before: snapshot,
+            });
             result
         }
         Err(e) => outcome(
@@ -3729,6 +3764,10 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     if let Err(e) = std::fs::write(&path, &working) {
         return fail(format!("Error: could not write '{requested}': {e}"));
     }
+    // `contents` is what was on disk a moment ago, already read and already
+    // proved to be text by the read above -- so the snapshot costs one clone
+    // and can never be `Absent`: `edit_file` refuses a file that is not there.
+    let snapshot = crate::rollback::snapshot(Ok(contents));
 
     let summary = if batch {
         format!(
@@ -3753,6 +3792,11 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
     if !changes.is_empty() {
         result.diff = Some(changes);
     }
+    result.rollback = Some(crate::rollback::Record::File {
+        display: requested.clone(),
+        path,
+        before: snapshot,
+    });
     result
 }
 
@@ -3919,6 +3963,7 @@ fn outcome(call_id: &str, display: String, content: String) -> ToolOutcome {
         display,
         content,
         diff: None,
+        rollback: None,
     }
 }
 
@@ -4020,6 +4065,202 @@ mod tests {
         std::fs::write(root.join("node_modules/pkg/index.rs"), "// dep\n").unwrap();
         let ws = Workspace::new(root).expect("workspace");
         (dir, ws, ToolsConfig::default())
+    }
+
+    // ---- what /rollback is handed -----------------------------------------
+
+    /// End to end, through the real tools: create a file, edit an existing one
+    /// twice, then undo the lot. The one test that would catch a break
+    /// anywhere along the chain -- snapshot capture, first-touch-wins, and the
+    /// restore itself.
+    #[tokio::test]
+    async fn a_session_of_writes_and_edits_undoes_completely() {
+        let (_d, ws, cfg) = tree();
+        let original = std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap();
+
+        let mut journal = crate::rollback::Journal::default();
+        let mut run = |out: ToolOutcome| {
+            if let Some(record) = out.rollback {
+                journal.record(record);
+            }
+        };
+
+        run(execute(
+            &tool_call(WRITE_FILE, json!({"path": "src/brand_new.rs", "content": "fn a() {}\n"})),
+            &ws,
+            &cfg,
+        )
+        .await);
+        run(execute(
+            &tool_call(
+                EDIT_FILE,
+                json!({"path": "src/app.rs", "old_string": "needle", "new_string": "haystack"}),
+            ),
+            &ws,
+            &cfg,
+        )
+        .await);
+        run(execute(
+            &tool_call(
+                EDIT_FILE,
+                json!({"path": "src/app.rs", "old_string": "haystack", "new_string": "thread"}),
+            ),
+            &ws,
+            &cfg,
+        )
+        .await);
+
+        // The disk really did change.
+        assert!(ws.root().join("src/brand_new.rs").exists());
+        assert!(std::fs::read_to_string(ws.root().join("src/app.rs"))
+            .unwrap()
+            .contains("thread"));
+
+        let steps = journal.plan();
+        assert_eq!(steps.len(), 2, "two files, three calls");
+        let report = crate::rollback::apply(&steps);
+
+        assert!(
+            !ws.root().join("src/brand_new.rs").exists(),
+            "the created file should be gone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.root().join("src/app.rs")).unwrap(),
+            original,
+            "the edited file should be byte-identical to what the session found"
+        );
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.restored.len(), 1);
+
+        // And a file the session never touched is untouched by the undo.
+        assert_eq!(
+            std::fs::read_to_string(ws.root().join("src/ui/render.rs")).unwrap(),
+            "// ui\n"
+        );
+    }
+
+
+    /// A write to a file that did not exist records `Absent`, which is what
+    /// makes undoing it a delete rather than a write of "".
+    #[tokio::test]
+    async fn writing_a_new_file_records_it_as_absent_beforehand() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(
+            &tool_call(WRITE_FILE, json!({"path": "src/new.rs", "content": "fn main() {}\n"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        match out.rollback.expect("a write must be undoable") {
+            crate::rollback::Record::File { display, before, .. } => {
+                assert_eq!(display, "src/new.rs");
+                assert_eq!(before, crate::rollback::Before::Absent);
+            }
+            other => panic!("expected a file record, got {other:?}"),
+        }
+    }
+
+    /// Overwriting an existing file keeps what it held, not an empty string --
+    /// the diff treats missing as empty and `/rollback` must not.
+    #[tokio::test]
+    async fn overwriting_a_file_keeps_the_previous_content() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(
+            &tool_call(WRITE_FILE, json!({"path": "src/app.rs", "content": "replaced\n"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        match out.rollback.expect("a write must be undoable") {
+            crate::rollback::Record::File { before, .. } => assert_eq!(
+                before,
+                crate::rollback::Before::Text("let needle = 1;\n".to_string())
+            ),
+            other => panic!("expected a file record, got {other:?}"),
+        }
+    }
+
+    /// Same for an edit, and the record points at the file that was written
+    /// so the undo lands in the right place.
+    #[tokio::test]
+    async fn an_edit_records_the_file_as_it_was() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(
+            &tool_call(
+                EDIT_FILE,
+                json!({"path": "src/app.rs", "old_string": "needle", "new_string": "haystack"}),
+            ),
+            &ws,
+            &cfg,
+        )
+        .await;
+
+        match out.rollback.expect("an edit must be undoable") {
+            crate::rollback::Record::File {
+                display,
+                path,
+                before,
+            } => {
+                assert_eq!(display, "src/app.rs");
+                assert_eq!(path, ws.root().join("src/app.rs"));
+                assert_eq!(
+                    before,
+                    crate::rollback::Before::Text("let needle = 1;\n".to_string())
+                );
+            }
+            other => panic!("expected a file record, got {other:?}"),
+        }
+    }
+
+    /// A write that never happened must leave no undo entry: restoring a file
+    /// to what it already holds is noise at best and a lie at worst.
+    #[tokio::test]
+    async fn a_refused_write_records_nothing() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(
+            &tool_call(WRITE_FILE, json!({"path": "", "content": "x"})),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.rollback.is_none());
+    }
+
+    /// A failed edit likewise. `old_string` not matching means nothing was
+    /// written, so there is nothing to put back.
+    #[tokio::test]
+    async fn a_failed_edit_records_nothing() {
+        let (_d, ws, cfg) = tree();
+        let out = execute(
+            &tool_call(
+                EDIT_FILE,
+                json!({"path": "src/app.rs", "old_string": "not here", "new_string": "x"}),
+            ),
+            &ws,
+            &cfg,
+        )
+        .await;
+        assert!(out.rollback.is_none());
+    }
+
+    /// A command that can change things is recorded so `/rollback` can say so.
+    /// A read-only one is not: warning about `ls` would train the user to
+    /// ignore the warning that matters.
+    #[tokio::test]
+    async fn only_commands_that_can_change_things_are_recorded() {
+        let (_d, ws, cfg) = tree();
+
+        let out = execute(&call("echo hi > out.txt"), &ws, &cfg).await;
+        assert!(
+            matches!(out.rollback, Some(crate::rollback::Record::Shell { .. })),
+            "a redirect can write anywhere and must be flagged"
+        );
+
+        let out = execute(&call("ls"), &ws, &cfg).await;
+        assert!(out.rollback.is_none(), "`ls` changes nothing");
     }
 
     #[tokio::test]
