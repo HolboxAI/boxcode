@@ -15,7 +15,7 @@ OpenAI-compatible LLM endpoint.
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v1.8.0
+  ▟█▙       ▟█▙    boxcode  v1.9.0
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -145,8 +145,12 @@ to ask for the same thing.
   says `read`/`write`/`grep` more precisely than a picture of a page did.
 - **Type prompt, Enter to send** — Alt/Shift-Enter for a newline, Esc to
   cancel, ↑/↓ to recall previous prompts, Ctrl-A/E/W/U/K for line editing,
-  Ctrl-C to exit. Paste works; your terminal's own scrollback, search and
-  selection all work on the transcript too.
+  Ctrl-C twice to exit (the first press arms it, any other key disarms).
+  Paste works, and while the session is running your terminal's own scrollback,
+  search and selection all work on the transcript. **Quitting then clears it
+  off the terminal**, leaving the shell as you found it — the conversation is
+  still on disk for `--resume`, and `clear_on_exit = false` under `[ui]` keeps
+  it on screen instead.
 - `endpoint` accepts `https://host`, `https://host/v1`, or the full chat-
   completions URL — all three resolve. Env vars override `config.toml`.
 
@@ -185,7 +189,12 @@ enabled = true            # false removes the deploy_project tool entirely
 check_on_start = true
 
 [ui]
-theme = "auto"   # auto | dark | light — auto-detects your terminal, falls back to a palette legible on both
+theme = "auto"        # auto | dark | light — auto-detects your terminal, falls back to a palette legible on both
+clear_on_exit = true  # wipe the conversation off the terminal when you quit.
+                      # Clears the scrollback, not just the visible screen — the
+                      # same thing `clear` does, with the same consequence:
+                      # anything there before boxcode started goes too. The
+                      # session is still on disk for `--resume` either way.
 ```
 
 Neither `approval` value reaches the two deliberately-uncapped tiers:

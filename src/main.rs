@@ -274,6 +274,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!();
     }
     restore_terminal(enhanced, alternate_screen)?;
+
+    // Then, on a clean exit, take the conversation off the terminal entirely.
+    //
+    // Three conditions, and each one is a case where wiping the screen would
+    // destroy something worth more than the tidiness:
+    //
+    //   * `result.is_ok()` -- an error is printed just below, and an error
+    //     that erased itself is worse than no error at all.
+    //   * `!alternate_screen` -- that fallback has already restored whatever
+    //     was on screen before boxcode started. Clearing on top of it would
+    //     wipe the user's own terminal rather than ours.
+    //   * the setting -- see `UiConfig::clear_on_exit` for the trade.
+    //
+    // Nothing is lost that was not already on screen: the session is on disk
+    // either way, and `--resume` picks it up.
+    let wiped = should_clear_on_exit(&app.config.ui, alternate_screen, result.is_ok());
+    if wiped {
+        clear_scrollback();
+    }
     // `/pull` set this instead of just exiting -- checked only after the
     // terminal is back to normal (raw mode and the alternate screen both
     // released), since the relaunched process needs the real terminal to set
@@ -289,8 +308,60 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Err(e) = &result {
         eprintln!("Error: {e}");
     }
-    println!("Goodbye!");
+    // Skipped when the screen was wiped: "Goodbye!" alone at the top of a
+    // blank terminal is the one thing left of a session that was supposed to
+    // leave nothing. The shell prompt coming back says it exited.
+    if !wiped {
+        println!("Goodbye!");
+    }
     result
+}
+
+/// Clear the screen *and* the scrollback, leaving the terminal as it was
+/// found.
+///
+/// `\x1b[3J` is the part that matters and the part that is easy to leave out:
+/// `[2J` alone clears what is visible, so the whole conversation is still
+/// there one scroll up, which is not what "close it" means to anyone. This is
+/// byte for byte what `clear(1)` emits on a terminal that supports it.
+///
+/// Written straight to stdout rather than through crossterm: `Clear` has no
+/// variant for the saved-lines buffer, and a terminal that does not understand
+/// the sequence ignores it, which is the correct outcome anyway.
+fn clear_scrollback() {
+    use std::io::Write;
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(CLEAR_SCROLLBACK);
+    let _ = stdout.flush();
+}
+
+/// Erase saved lines, home the cursor, erase the screen -- byte for byte what
+/// `clear(1)` emits.
+///
+/// A named constant so the `[3J` cannot be quietly dropped: without it this
+/// clears only what is visible and the conversation is one scroll away, which
+/// is the bug rather than the fix. There is a test.
+const CLEAR_SCROLLBACK: &[u8] = b"\x1b[3J\x1b[H\x1b[2J";
+
+/// Whether quitting should take the conversation off the terminal.
+///
+/// Split out of `main` because each `false` here is a case where tidiness
+/// would destroy something worth more, and a condition like that is worth
+/// being able to test rather than read.
+fn should_clear_on_exit(ui: &config::UiConfig, alternate_screen: bool, ok: bool) -> bool {
+    // An error is printed immediately after this, and one that erased itself
+    // would be worse than none -- at least a missing message leaves an exit
+    // code to go on.
+    if !ok {
+        return false;
+    }
+    // The alternate-screen fallback has already put back whatever was on
+    // screen before boxcode started. Clearing on top of that would wipe the
+    // user's own terminal rather than ours.
+    if alternate_screen {
+        return false;
+    }
+    ui.clear_on_exit
 }
 
 /// Re-launches the boxcode binary rooted at `dir`, in place of this process
@@ -825,6 +896,45 @@ fn install_panic_hook(enhanced: bool, alternate_screen: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The conversation has to be gone, not one scroll away. `[2J` alone
+    /// clears the visible screen and leaves the whole session in the
+    /// scrollback, which is the complaint this exists to answer.
+    #[test]
+    fn clearing_erases_the_scrollback_not_just_the_screen() {
+        let sequence = String::from_utf8(CLEAR_SCROLLBACK.to_vec()).expect("ascii");
+        assert!(sequence.contains("\u{1b}[3J"), "missing the saved-lines erase: {sequence:?}");
+        assert!(sequence.contains("\u{1b}[2J"), "missing the screen erase: {sequence:?}");
+        assert!(sequence.contains("\u{1b}[H"), "missing the cursor home: {sequence:?}");
+    }
+
+    /// Every case where wiping the screen would cost more than it is worth.
+    #[test]
+    fn nothing_is_wiped_when_something_is_worth_keeping() {
+        let on = config::UiConfig::default();
+        let off = config::UiConfig { clear_on_exit: false, ..Default::default() };
+
+        // The ordinary quit.
+        assert!(should_clear_on_exit(&on, false, true));
+
+        // A failure: the error is printed right after, and must survive.
+        assert!(!should_clear_on_exit(&on, false, false));
+
+        // The alternate-screen fallback already restored the terminal; this
+        // would wipe what was there before boxcode started.
+        assert!(!should_clear_on_exit(&on, true, true));
+
+        // And the setting is the last word.
+        assert!(!should_clear_on_exit(&off, false, true));
+    }
+
+    /// The default is on, which is the whole point -- and it is the kind of
+    /// default that is easy to flip by accident when the struct grows.
+    #[test]
+    fn clearing_on_exit_is_the_default() {
+        assert!(config::UiConfig::default().clear_on_exit);
+        assert!(config::Config::default().ui.clear_on_exit);
+    }
 
     /// `restore_cooked_mode` runs on the failure path, where something has
     /// already gone wrong, and it runs in CI and under `cargo test` where

@@ -228,11 +228,34 @@ pub struct UiConfig {
     /// is safe but less vivid than saying outright which one you use.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Wipe the terminal on the way out, so quitting leaves it as it was
+    /// found rather than with the whole conversation still sitting there.
+    ///
+    /// On by default: a session is a working scratchpad, and the state most
+    /// people want after closing one is the shell they started from. It is a
+    /// setting rather than a fixed behaviour because it is genuinely a
+    /// trade -- see the caveat below.
+    ///
+    /// **This clears the scrollback, not only the visible screen**, which is
+    /// what makes the difference between "the conversation is gone" and "the
+    /// conversation is one scroll away". That is the same thing `clear` does
+    /// on most terminals, and it has the same consequence: anything that was
+    /// in the scrollback *before* boxcode started goes with it. Set this to
+    /// `false` on a terminal whose history you rely on.
+    ///
+    /// Never applied on the way out of a failure. An error message that
+    /// erased itself would be worse than no error message, since at least a
+    /// missing one leaves the exit code.
+    #[serde(default = "yes")]
+    pub clear_on_exit: bool,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
-        Self { theme: default_theme() }
+        Self {
+            theme: default_theme(),
+            clear_on_exit: yes(),
+        }
     }
 }
 
@@ -1055,6 +1078,31 @@ mod tests {
         .expect("should parse");
         assert_eq!(parsed.tools.python_bin, "python3");
         assert_eq!(parsed.tools.search_timeout_secs, 20);
+    }
+
+    /// A config written before `clear_on_exit` existed must still load, and
+    /// must get the new default rather than failing to parse.
+    #[test]
+    fn a_ui_table_without_clear_on_exit_still_loads() {
+        let parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"http://x\"\n\n[ui]\ntheme = \"dark\"\n",
+        )
+        .expect("should parse");
+        assert_eq!(parsed.ui.theme, "dark");
+        assert!(parsed.ui.clear_on_exit);
+    }
+
+    /// And someone who turns it off keeps it off across a save.
+    #[test]
+    fn clear_on_exit_survives_a_round_trip() {
+        let mut parsed: Config = toml::from_str(
+            "[llm]\nendpoint = \"http://x\"\n\n[ui]\nclear_on_exit = false\n",
+        )
+        .expect("should parse");
+        parsed.normalize();
+        assert!(!parsed.ui.clear_on_exit);
+        let written = toml::to_string_pretty(&parsed).unwrap();
+        assert!(written.contains("clear_on_exit = false"), "{written}");
     }
 
     /// A `[tools]` table with no `approval` key -- anyone who edited it by
