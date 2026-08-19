@@ -35,6 +35,17 @@ pub enum Role {
     System,
     /// The result of one tool call, sent back to the model as `role: "tool"`.
     Tool,
+    /// Local news the model has to be told about: right now, a `/rollback`
+    /// naming the files it just put back.
+    ///
+    /// Its own role because neither neighbour fits. `System` is commentary
+    /// `history` drops, and dropping this one would leave the model editing
+    /// against a disk that no longer matches anything it was told. `Summary`
+    /// does reach the wire, but it means "this replaces the messages above",
+    /// and borrowing it would make a rollback look like a compaction in both
+    /// the transcript and the session file. So: shown like a `System` notice,
+    /// sent like a `Summary`.
+    Context,
     /// A `/compact` summary standing in for everything that came before it.
     ///
     /// Deliberately its own role rather than `System`: a System message is
@@ -104,6 +115,7 @@ impl Role {
             Role::System => "System",
             Role::Tool => "Tool",
             Role::Summary => "Summary",
+            Role::Context => "Rollback",
         }
     }
 }
@@ -151,6 +163,19 @@ pub enum Overlay {
     /// its state lives in `App::deploy` rather than in this variant. Every
     /// other overlay is one question with one answer and carries its own data.
     Deploy,
+    /// `/rollback`, before it does anything. Carries the whole plan rather
+    /// than recomputing it on confirm, so what runs is exactly what was read
+    /// on screen -- a journal that grew between the question and the answer
+    /// cannot widen the undo past what was agreed to.
+    RollbackConfirm {
+        steps: Vec<crate::rollback::Step>,
+        /// The shell-command caveat, when any ran. Rendered above the keys
+        /// because it is the reason to say no.
+        warning: Option<String>,
+        /// Which of yes/no is highlighted. Starts on no: this throws work
+        /// away, so a reflexive Enter must be the harmless answer.
+        confirmed: bool,
+    },
 }
 
 /// Sequential manual entry used when the user picks "Custom endpoint..." instead
@@ -180,6 +205,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/usage", "what today cost, and the history"),
     ("/quota", "what is left today, and your own limits"),
     ("/subagents", "what each subagent did, step by step"),
+    ("/rollback", "undo every file the model wrote this session"),
 ];
 
 /// Roughly how many characters one token is worth.
@@ -549,6 +575,14 @@ pub struct App {
     /// model asked for it rather than the user typing `/deploy`. `Some` means
     /// a turn is waiting on this flow to finish.
     pub deploy_tool_call: Option<ToolCall>,
+    /// Every file this run has written, and what it held first -- what
+    /// `/rollback` undoes. Filled by `push_tool_outcome` from the outcomes the
+    /// runner sends back; see `rollback.rs`.
+    pub rollback: crate::rollback::Journal,
+    /// An approved rollback plan waiting for the event loop to perform it.
+    /// Drained by `main.rs` exactly like `plan_dirty` and for the same reason:
+    /// `App` does no I/O, so its tests never touch a real disk.
+    pub rollback_request: Option<Vec<crate::rollback::Step>>,
 }
 
 impl App {
@@ -609,6 +643,8 @@ impl App {
             deploy_action: None,
             deploy_abort: None,
             deploy_tool_call: None,
+            rollback: crate::rollback::Journal::default(),
+            rollback_request: None,
         }
     }
 
@@ -731,6 +767,7 @@ impl App {
                         "/usage" => self.show_usage(),
                         "/quota" => self.show_quota(),
                         "/subagents" => self.show_subagents(),
+                        "/rollback" => self.start_rollback(),
                         other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
                     }
                 } else {
@@ -1293,6 +1330,12 @@ impl App {
         self.follow_tail = true;
         self.greeted = true;
         self.last_prompt_tokens = None;
+        // "Forget what we discussed" reasonably includes "and stop offering to
+        // undo it": the transcript naming those writes is about to go, and an
+        // undo the user can no longer see the reason for is a trap. `/compact`
+        // deliberately does *not* do this -- it shortens the context, not the
+        // session, and the files on disk are untouched either way.
+        self.rollback.clear();
         // The flush cursor counts into `messages`, which just got shorter.
         // Left where it was it would sit past the end of the new list, and
         // `drainable` would hand back nothing -- so this notice, and every
@@ -1320,6 +1363,8 @@ impl App {
         let mut chars = 0usize;
         let mut messages = 0usize;
         for message in &self.messages {
+            // Error and System never reach `history`, so they are free. Context
+            // and Summary do, so they are not.
             if matches!(message.role, Role::Error | Role::System) {
                 continue;
             }
@@ -1827,6 +1872,128 @@ impl App {
         self.print_readout(Self::usage_readout);
     }
 
+    /// `/rollback` -- offer to put every file the model wrote back the way it
+    /// found it, and do nothing until that offer is accepted.
+    ///
+    /// Refused mid-turn. Tools run in a spawned task, so a rollback started
+    /// while one is in flight would race a write it cannot see: the journal
+    /// would learn about that file only after this had already restored the
+    /// others, leaving the disk in a state no one asked for and the summary
+    /// wrong about it. Waiting costs a keystroke; getting it wrong costs the
+    /// thing the command exists to protect.
+    fn start_rollback(&mut self) {
+        self.follow_tail = true;
+
+        if self.state != AppState::AwaitingInput {
+            self.messages.push(Message::new(
+                Role::System,
+                "Not while a turn is running — a rollback started now would race the writes \
+                 still in flight. Press Esc to stop the turn first, then /rollback.",
+            ));
+            return;
+        }
+
+        if self.rollback.is_empty() {
+            // Said in terms of what would be undone, not of an empty list: a
+            // session that only ran commands has an empty journal *and* a
+            // changed disk, and "nothing to roll back" alone would read as a
+            // promise this cannot make.
+            let mut text =
+                "Nothing to roll back — no file has been written or edited this session."
+                    .to_string();
+            if let Some(warning) = self.rollback.shell_warning() {
+                text.push_str(&format!("\n\n{warning}"));
+            }
+            self.messages.push(Message::new(Role::System, text));
+            return;
+        }
+
+        let steps = self.rollback.plan();
+        let warning = self.rollback.shell_warning();
+        self.overlay = Some(Overlay::RollbackConfirm {
+            steps,
+            warning,
+            confirmed: false,
+        });
+    }
+
+    /// Answer the rollback confirmation. Left/Right move between no and yes,
+    /// `y`/`n` answer outright, Esc is no -- the same vocabulary the tool
+    /// approval popup already taught, since this asks the same shape of
+    /// question about a bigger blast radius.
+    fn handle_rollback_key(
+        &mut self,
+        key: KeyEvent,
+        steps: Vec<crate::rollback::Step>,
+        warning: Option<String>,
+        confirmed: bool,
+    ) {
+        let decided = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => true,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => false,
+            KeyCode::Enter => confirmed,
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                self.overlay = Some(Overlay::RollbackConfirm {
+                    steps,
+                    warning,
+                    confirmed: !confirmed,
+                });
+                return;
+            }
+            // An unrecognised key leaves the question standing rather than
+            // silently dismissing it -- `handle_overlay_key` already took the
+            // overlay, so putting it back is what "nothing happened" means.
+            _ => {
+                self.overlay = Some(Overlay::RollbackConfirm {
+                    steps,
+                    warning,
+                    confirmed,
+                });
+                return;
+            }
+        };
+
+        self.follow_tail = true;
+        if !decided {
+            self.messages.push(Message::new(
+                Role::System,
+                "Rollback cancelled — nothing was changed.",
+            ));
+            return;
+        }
+
+        // Handed to the event loop rather than performed here: `App` writes
+        // nothing to disk, so that its tests never can either. `main.rs` calls
+        // `rollback::apply` and brings the result back to `finish_rollback`.
+        self.rollback_request = Some(steps);
+    }
+
+    /// What the event loop found when it ran the plan.
+    ///
+    /// The journal is cleared either way. Every entry in it has now been acted
+    /// on, and a second `/rollback` offering to undo the same writes again
+    /// would be undoing work done *since*, which is the opposite of what it
+    /// says. A file that failed is named in the report and stays the user's to
+    /// deal with; keeping the whole journal alive for its sake would make the
+    /// next rollback wider than the user believes.
+    pub fn finish_rollback(&mut self, report: crate::rollback::Report) {
+        self.rollback.clear();
+        self.follow_tail = true;
+
+        let failed = !report.failed.is_empty();
+        self.messages.push(Message::new(
+            if failed { Role::Error } else { Role::System },
+            report.summary(),
+        ));
+
+        // And the same news on the wire. The model has been told across
+        // several tool results that these files hold what it wrote; leaving
+        // that uncorrected means its next edit is reasoning about a disk that
+        // no longer exists. `Role::Context` is the only local role `history`
+        // forwards, and this is what it is for.
+        self.messages.push(Message::new(Role::Context, report.notice()));
+    }
+
     /// Whether `call` needs a human decision before it runs.
     ///
     /// Two things always ask, before the mode is even consulted, because they
@@ -2264,7 +2431,14 @@ impl App {
         self.follow_tail = true;
     }
 
-    pub fn push_tool_outcome(&mut self, outcome: ToolOutcome) {
+    pub fn push_tool_outcome(&mut self, mut outcome: ToolOutcome) {
+        // Before the outcome is taken apart into a Message, which has no field
+        // for this and no reason to grow one -- the journal is state about the
+        // disk, not about the conversation, and unlike the transcript it is
+        // not something `/compact` may throw away.
+        if let Some(record) = outcome.rollback.take() {
+            self.rollback.record(record);
+        }
         self.messages.push(Message {
             role: Role::Tool,
             content: outcome.content,
@@ -2582,7 +2756,9 @@ impl App {
                 // Sent as `system`, not `assistant`: it is context the model
                 // already has, not something it said, and framing it as a
                 // reply invites it to be continued rather than consulted.
-                Role::Summary => out.push(ChatMessage::text("system", message.content.clone())),
+                Role::Summary | Role::Context => {
+                    out.push(ChatMessage::text("system", message.content.clone()))
+                }
                 Role::Error | Role::System => {}
             }
         }
@@ -3055,6 +3231,7 @@ impl App {
                 display,
                 content: session.report(),
                 diff: None,
+                rollback: None,
             });
             self.overlay = None;
             self.follow_tail = true;
@@ -3111,6 +3288,11 @@ impl App {
                 self.overlay = Some(approval);
                 self.handle_command_approval_key(key);
             }
+            Overlay::RollbackConfirm {
+                steps,
+                warning,
+                confirmed,
+            } => self.handle_rollback_key(key, steps, warning, confirmed),
             // Put back for the same reason: the flow decides for itself when
             // it is over, and it is `close_deploy` that clears this.
             Overlay::Deploy => {
@@ -3661,6 +3843,255 @@ mod tests {
     }
 
     // ---- /deploy ---------------------------------------------------------
+
+    // ---- /rollback -------------------------------------------------------
+
+    fn write_outcome(
+        id: &str,
+        display: &str,
+        path: &std::path::Path,
+        before: crate::rollback::Before,
+    ) -> ToolOutcome {
+        ToolOutcome {
+            call_id: id.to_string(),
+            display: format!("write {display}"),
+            content: "Wrote it".to_string(),
+            diff: None,
+            rollback: Some(crate::rollback::Record::File {
+                display: display.to_string(),
+                path: path.to_path_buf(),
+                before,
+            }),
+        }
+    }
+
+    fn wrote_new(a: &mut App, id: &str, display: &str, path: &str) {
+        a.push_tool_outcome(write_outcome(
+            id,
+            display,
+            std::path::Path::new(path),
+            crate::rollback::Before::Absent,
+        ));
+    }
+
+    /// The command is only offered when it has something to offer. With an
+    /// empty journal it says so and opens no popup, rather than asking a
+    /// question with no answers.
+    #[test]
+    fn rollback_with_nothing_written_explains_instead_of_asking() {
+        let mut a = app();
+        a.start_rollback();
+        assert!(a.overlay.is_none(), "no popup for an empty journal");
+        assert!(a
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("no file has been written"));
+    }
+
+    /// A session that only ran commands has an empty journal and a changed
+    /// disk. Saying "nothing to roll back" alone would be a promise this
+    /// cannot keep, so the commands are named.
+    #[test]
+    fn rollback_with_only_commands_still_mentions_them() {
+        let mut a = app();
+        a.rollback.record(crate::rollback::Record::Shell {
+            command: "npm install".to_string(),
+        });
+        a.start_rollback();
+        assert!(a.overlay.is_none());
+        assert!(a.messages.last().unwrap().content.contains("npm install"));
+    }
+
+    /// Refused mid-turn: a rollback started while the runner is writing would
+    /// race a file it has not been told about yet.
+    #[test]
+    fn rollback_is_refused_while_a_turn_is_running() {
+        let mut a = app();
+        wrote_new(&mut a, "1", "a.rs", "/tmp/a.rs");
+        a.state = AppState::ExecutingTools;
+        a.start_rollback();
+        assert!(a.overlay.is_none(), "must not ask mid-turn");
+        assert!(a.rollback_request.is_none(), "and must not act");
+        assert!(a
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("Not while a turn is running"));
+    }
+
+    /// The popup starts on "no": this throws work away, so a reflexive Enter
+    /// must be the harmless answer.
+    #[test]
+    fn the_confirmation_defaults_to_no_and_enter_cancels() {
+        let mut a = app();
+        wrote_new(&mut a, "1", "src/a.rs", "/tmp/a.rs");
+        a.start_rollback();
+
+        match &a.overlay {
+            Some(Overlay::RollbackConfirm {
+                steps, confirmed, ..
+            }) => {
+                assert_eq!(steps.len(), 1);
+                assert!(!confirmed, "the default answer must be no");
+            }
+            other => panic!("expected the confirmation, got {other:?}"),
+        }
+
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.rollback_request.is_none(), "Enter on no must not act");
+        assert!(a.messages.last().unwrap().content.contains("cancelled"));
+    }
+
+    /// Esc leaves everything alone, and the journal survives so the user can
+    /// think again.
+    #[test]
+    fn escaping_the_confirmation_keeps_the_journal() {
+        let mut a = app();
+        wrote_new(&mut a, "1", "src/a.rs", "/tmp/a.rs");
+        a.start_rollback();
+        a.handle_key(key(KeyCode::Esc));
+
+        assert!(a.overlay.is_none());
+        assert!(a.rollback_request.is_none());
+        assert!(!a.rollback.is_empty(), "the offer must still stand");
+    }
+
+    /// Saying yes hands the plan to the event loop rather than doing the
+    /// writes here -- `App` performs no I/O.
+    #[test]
+    fn saying_yes_queues_the_plan_for_the_event_loop() {
+        let mut a = app();
+        a.push_tool_outcome(write_outcome(
+            "1",
+            "src/a.rs",
+            std::path::Path::new("/tmp/a.rs"),
+            crate::rollback::Before::Text("before\n".to_string()),
+        ));
+        a.start_rollback();
+        a.handle_key(key(KeyCode::Char('y')));
+
+        let queued = a.rollback_request.take().expect("the plan was queued");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].action,
+            crate::rollback::Action::Restore("before\n".to_string())
+        );
+    }
+
+    /// What runs is what was on screen. A write that lands between the
+    /// question and the answer must not widen the undo past what was agreed.
+    #[test]
+    fn the_plan_that_runs_is_the_plan_that_was_shown() {
+        let mut a = app();
+        wrote_new(&mut a, "1", "src/a.rs", "/tmp/a.rs");
+        a.start_rollback();
+
+        // A second file arrives while the popup is up.
+        wrote_new(&mut a, "2", "src/b.rs", "/tmp/b.rs");
+        a.handle_key(key(KeyCode::Char('y')));
+
+        let queued = a.rollback_request.take().expect("queued");
+        assert_eq!(queued.len(), 1, "only what the user saw and agreed to");
+        assert_eq!(queued[0].display, "src/a.rs");
+    }
+
+    /// Left/Right move the highlight, so Enter can still say yes.
+    #[test]
+    fn arrows_move_the_highlight_and_enter_then_confirms() {
+        let mut a = app();
+        wrote_new(&mut a, "1", "src/a.rs", "/tmp/a.rs");
+        a.start_rollback();
+        a.handle_key(key(KeyCode::Right));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.rollback_request.is_some());
+    }
+
+    /// An unrecognised key leaves the question standing rather than silently
+    /// dismissing it.
+    #[test]
+    fn an_unrecognised_key_leaves_the_confirmation_up() {
+        let mut a = app();
+        wrote_new(&mut a, "1", "src/a.rs", "/tmp/a.rs");
+        a.start_rollback();
+        a.handle_key(key(KeyCode::Char('q')));
+        assert!(matches!(a.overlay, Some(Overlay::RollbackConfirm { .. })));
+    }
+
+    /// The model is told, on the wire, which files moved under it. Without
+    /// this its next edit reasons about a disk that no longer exists.
+    #[test]
+    fn the_model_is_told_what_was_rolled_back() {
+        let mut a = app();
+        a.finish_rollback(crate::rollback::Report {
+            restored: vec!["src/main.rs".to_string()],
+            deleted: vec!["src/api.rs".to_string()],
+            ..Default::default()
+        });
+
+        let told = a.history(None).iter().any(|m| {
+            let c = m.content.clone().unwrap_or_default();
+            m.role == "system" && c.contains("src/main.rs") && c.contains("src/api.rs")
+        });
+        assert!(told, "the rollback must reach the model, not just the screen");
+    }
+
+    /// Every entry has now been acted on, so a second /rollback must not
+    /// offer to undo the same writes again -- by then it would be undoing
+    /// work done since.
+    #[test]
+    fn the_journal_is_spent_once_the_rollback_has_run() {
+        let mut a = app();
+        wrote_new(&mut a, "1", "src/a.rs", "/tmp/a.rs");
+        a.finish_rollback(crate::rollback::Report::default());
+        assert!(a.rollback.is_empty());
+    }
+
+    /// A failed file is reported as an error, not as a quiet line inside a
+    /// success message.
+    #[test]
+    fn a_failed_restore_is_reported_as_an_error() {
+        let mut a = app();
+        a.finish_rollback(crate::rollback::Report {
+            failed: vec![("src/a.rs".to_string(), "permission denied".to_string())],
+            ..Default::default()
+        });
+        let shown = a
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Error)
+            .expect("an error");
+        assert!(shown.content.contains("src/a.rs"));
+        assert!(shown.content.contains("permission denied"));
+    }
+
+    /// `/new` closes the window; `/compact` does not. Compaction shortens the
+    /// context, not the session, and the files on disk are untouched by it.
+    #[test]
+    fn new_clears_the_journal_and_compaction_does_not() {
+        let mut a = app();
+        wrote_new(&mut a, "1", "src/a.rs", "/tmp/a.rs");
+
+        a.start_compaction();
+        assert!(!a.rollback.is_empty(), "/compact must not close the window");
+
+        a.start_new_conversation();
+        assert!(a.rollback.is_empty(), "/new must");
+    }
+
+    /// The command is reachable the way every other one is: typed, matched by
+    /// prefix, run on Enter.
+    #[test]
+    fn rollback_is_dispatched_from_the_command_menu() {
+        let mut a = app();
+        assert!(COMMANDS.iter().any(|(name, _)| *name == "/rollback"));
+        type_str(&mut a, "/rollb");
+        assert_eq!(a.selected_command(), Some("/rollback"));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.input_buffer.is_empty(), "the command ran");
+    }
 
     /// An app whose workspace is a real, deployable project directory.
     fn app_in_project() -> (tempfile::TempDir, App) {
@@ -5353,6 +5784,7 @@ mod tests {
             display: format!("$ … — {content}"),
             content: content.to_string(),
             diff: None,
+            rollback: None,
         }
     }
 
@@ -6104,6 +6536,7 @@ mod tests {
                 .to_string(),
             content: "It loads from ~/.boxcode/config.toml.".to_string(),
             diff: None,
+            rollback: None,
         }]);
 
         assert_eq!(a.running_subagent_trail("call_1"), None, "no longer live");
@@ -6140,6 +6573,7 @@ mod tests {
             display: "agent \"map the config loading\" — done (1 tool round)".to_string(),
             content: "report".to_string(),
             diff: None,
+            rollback: None,
         }]);
 
         a.show_subagents();
@@ -6175,6 +6609,7 @@ mod tests {
                 display: "agent — done".to_string(),
                 content: "r".to_string(),
                 diff: None,
+                rollback: None,
             }]);
         }
         assert_eq!(a.subagent_trails.len(), MAX_SUBAGENT_TRAILS);
@@ -6311,6 +6746,7 @@ mod tests {
             display: "$ cat a.rs — 3 lines".to_string(),
             content: "exit code: 0\n--- stdout ---\nfn main() {}\n".to_string(),
             diff: None,
+            rollback: None,
         }]);
 
         assert_eq!(a.state, AppState::Sending);

@@ -233,6 +233,7 @@ pub async fn run_subagent(
                       non-empty task describing what to research."
                 .to_string(),
             diff: None,
+            rollback: None,
         };
     };
     if agent_type != "explore" {
@@ -244,6 +245,7 @@ pub async fn run_subagent(
                  research) exists; omit agent_type to get it, and do any writing yourself."
             ),
             diff: None,
+            rollback: None,
         };
     }
 
@@ -335,6 +337,7 @@ pub async fn run_subagent(
                      with read_file/grep_search/glob, or try the agent again."
                 ),
                 diff: None,
+                rollback: None,
             };
         }
 
@@ -364,6 +367,7 @@ pub async fn run_subagent(
                     report
                 },
                 diff: None,
+                rollback: None,
             };
         }
 
@@ -384,6 +388,7 @@ pub async fn run_subagent(
                     content: "The subagent spent its whole budget without writing a report."
                         .to_string(),
                     diff: None,
+                    rollback: None,
                 };
             }
         }

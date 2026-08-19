@@ -270,7 +270,7 @@ pub fn message_lines(msg: &Message, width: usize) -> Vec<Line<'static>> {
         // prose: it is labelled, so it is never mistaken for a reply the model
         // gave to something, and its own body is shown in full -- what the
         // model will be working from next is worth being able to read.
-        Role::System | Role::Summary => {
+        Role::System | Role::Summary | Role::Context => {
             lines.push(Line::from(vec![Span::styled(
                 format!("{}: ", msg.role.label()),
                 role_style(msg.role),
@@ -879,6 +879,11 @@ fn role_style(role: Role) -> Style {
         Role::Summary => Style::default()
             .fg(theme::p().accent)
             .add_modifier(Modifier::BOLD),
+        // Warning-toned: it is always reporting that something on disk is no
+        // longer what the messages above it say it is.
+        Role::Context => Style::default()
+            .fg(theme::p().warning)
+            .add_modifier(Modifier::BOLD),
     }
 }
 
@@ -1194,10 +1199,121 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
             let labels: Vec<String> = items.iter().map(|(_, id)| id.clone()).collect();
             render_picker(f, area, " Pull a project (last 48h) ", &labels, *selected);
         }
+        Some(Overlay::RollbackConfirm {
+            steps,
+            warning,
+            confirmed,
+        }) => render_rollback_confirm(f, area, steps, warning.as_deref(), *confirmed),
         // Drawn inline at the bottom of the frame by `render`, not as a
         // floating overlay -- see the comment there.
         Some(Overlay::ToolApproval { .. }) | Some(Overlay::Deploy) => {}
     }
+}
+
+/// How many files the rollback confirmation lists before it stops naming them
+/// and just counts the rest. A popup that grows past the terminal would push
+/// the yes/no line off screen, which is the one line that must always be
+/// visible.
+const ROLLBACK_LIST_LINES: usize = 12;
+
+/// The `/rollback` confirmation: what will happen, why it might not be enough,
+/// and a yes/no that starts on no.
+///
+/// Every entry is spelled out rather than summarised into a count. "12 files"
+/// is not something anyone can agree to; `delete src/api.rs` is.
+fn render_rollback_confirm(
+    f: &mut Frame,
+    area: Rect,
+    steps: &[crate::rollback::Step],
+    warning: Option<&str>,
+    confirmed: bool,
+) {
+    let width = area.width.saturating_sub(8).clamp(MIN_POPUP_WIDTH, 76);
+    let body_width = width.saturating_sub(4) as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    for step in steps.iter().take(ROLLBACK_LIST_LINES) {
+        let style = match step.action {
+            crate::rollback::Action::Blocked(_) => theme::faint(),
+            _ => theme::text(),
+        };
+        lines.push(Line::from(Span::styled(
+            shorten(&step.label(), body_width),
+            style,
+        )));
+    }
+    if let Some(rest) = steps.len().checked_sub(ROLLBACK_LIST_LINES).filter(|n| *n > 0) {
+        lines.push(Line::from(Span::styled(
+            format!("… and {rest} more file(s)"),
+            theme::faint(),
+        )));
+    }
+
+    let blocked = steps.iter().filter(|s| !s.is_actionable()).count();
+    if blocked > 0 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{blocked} file(s) cannot be undone and will be left as they are."),
+            Style::default().fg(theme::p().warning),
+        )));
+    }
+
+    if let Some(warning) = warning {
+        lines.push(Line::from(""));
+        for wrapped in wrap(warning, body_width) {
+            lines.push(Line::from(Span::styled(
+                wrapped,
+                Style::default().fg(theme::p().warning),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("Undo these changes?  ", theme::text()),
+        Span::styled(
+            "  no  ",
+            if confirmed {
+                theme::faint()
+            } else {
+                Style::default()
+                    .fg(theme::p().accent)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            },
+        ),
+        Span::styled("  ", theme::text()),
+        Span::styled(
+            "  yes  ",
+            if confirmed {
+                Style::default()
+                    .fg(theme::p().danger)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                theme::faint()
+            },
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "y / n · ←→ to move · Enter to pick · Esc cancels",
+        theme::faint(),
+    )));
+
+    let popup = centered_rect(width, lines.len() as u16 + 2, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::p().warning))
+        .title(Span::styled(
+            format!(" Roll back {} file(s) ", steps.len()),
+            Style::default()
+                .fg(theme::p().warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(
+        Paragraph::new(lines).block(block).style(theme::text()),
+        popup,
+    );
 }
 
 /// How many lines of a `write_file` preview to show before eliding the rest.
@@ -3150,6 +3266,75 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buffer.get(x, y).symbol()).collect())
             .collect()
+    }
+
+    // ---- the /rollback confirmation ----------------------------------------
+
+    fn rollback_overlay(files: usize, warning: Option<&str>) -> App {
+        let mut app = App::new(crate::config::Config::default());
+        let steps = (0..files)
+            .map(|i| crate::rollback::Step {
+                display: format!("src/module_{i}.rs"),
+                path: std::path::PathBuf::from(format!("/tmp/module_{i}.rs")),
+                touches: 1,
+                action: if i % 2 == 0 {
+                    crate::rollback::Action::Delete
+                } else {
+                    crate::rollback::Action::Restore("before\n".to_string())
+                },
+            })
+            .collect();
+        app.overlay = Some(Overlay::RollbackConfirm {
+            steps,
+            warning: warning.map(str::to_string),
+            confirmed: false,
+        });
+        app
+    }
+
+    /// Every file is named, and both verbs are visible: "12 files" is not
+    /// something anyone can agree to, `delete src/api.rs` is.
+    #[test]
+    fn the_rollback_popup_names_each_file_and_what_happens_to_it() {
+        let mut app = rollback_overlay(2, None);
+        let rows = rendered_rows(&mut app, 100, 30);
+        let all = rows.join("\n");
+        assert!(all.contains("module_0.rs"), "{all}");
+        assert!(all.contains("module_1.rs"), "{all}");
+        assert!(all.contains("delete"), "{all}");
+        assert!(all.contains("restore"), "{all}");
+        assert!(all.contains("Undo these changes?"), "{all}");
+    }
+
+    /// The shell caveat is the reason to say no, so it has to be on screen
+    /// next to the question rather than buried in the transcript.
+    #[test]
+    fn the_rollback_popup_shows_the_shell_warning() {
+        let mut app = rollback_overlay(1, Some("1 shell command(s) also ran: npm install"));
+        let rows = rendered_rows(&mut app, 100, 30);
+        assert!(rows.join("\n").contains("npm install"));
+    }
+
+    /// A long list is capped rather than growing the popup off the bottom of
+    /// the terminal -- the yes/no line is the one that must always be visible.
+    #[test]
+    fn a_long_rollback_list_is_capped_and_says_how_many_it_hid() {
+        let mut app = rollback_overlay(ROLLBACK_LIST_LINES + 5, None);
+        let rows = rendered_rows(&mut app, 100, 40);
+        let all = rows.join("\n");
+        assert!(all.contains("and 5 more"), "{all}");
+        assert!(all.contains("Undo these changes?"), "{all}");
+    }
+
+    /// Small terminals must not panic. `Clear` indexes the buffer without
+    /// checking, so a popup wider or taller than the frame is a crash, not a
+    /// clipped draw.
+    #[test]
+    fn the_rollback_popup_survives_a_tiny_terminal() {
+        for (w, h) in [(20u16, 6u16), (40, 8), (1, 1), (80, 3)] {
+            let mut app = rollback_overlay(6, Some("a warning that is quite long indeed"));
+            let _ = rendered_rows(&mut app, w, h);
+        }
     }
 
     /// The one row (as rendered text) that contains `needle`. Panics if none

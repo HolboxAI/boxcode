@@ -16,6 +16,7 @@ mod plan;
 mod providers;
 mod quota;
 mod requests;
+mod rollback;
 mod session;
 mod telemetry;
 mod tools;
@@ -645,6 +646,17 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.note_plan_save_failure(&e);
                 }
             }
+        }
+
+        // `/rollback`, once the user has said yes to it. Here rather than in
+        // `App` for the same reason the plan file and the usage log are:
+        // `App` performs no I/O, which is what lets its tests run without a
+        // disk. Inline rather than spawned -- this is a handful of small
+        // writes to files that were open moments ago, not a build -- and
+        // before the agent steps below, so a rollback always lands before
+        // whatever the next turn does.
+        if let Some(steps) = app.rollback_request.take() {
+            app.finish_rollback(rollback::apply(&steps));
         }
 
         // The agent loop's two active steps: fire the request `App` queued,
