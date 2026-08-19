@@ -15,7 +15,7 @@ OpenAI-compatible LLM endpoint.
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v1.9.0
+  ▟█▙       ▟█▙    boxcode  v1.10.0
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -65,8 +65,9 @@ picker and edit `~/.boxcode/config.toml` / set `BOXCODE_ENDPOINT`,
 
 **Run** — `boxcode`
 
-**Update** — it checks once a day on startup and asks before installing
-anything (default answer is no). Reinstall by hand any time with
+**Update** — it checks on every startup and asks before installing anything
+(default answer is no), so a pending update is mentioned every time rather than
+once and then not again until tomorrow. Reinstall by hand any time with
 `boxcode --upgrade` (always a force-install, so it also fixes a broken
 install). Turn the automatic check off with `BOXCODE_NO_UPDATE_CHECK=1` or
 `check_on_start = false` under `[update]`.

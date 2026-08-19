@@ -71,8 +71,8 @@ pub struct UpdateConfig {
     ///
     /// Defaults to on, because the failure it prevents is silent: a user
     /// stays on a build with a fixed bug still in it, and nothing ever tells
-    /// them. It is a single request, at most once a day, with a short
-    /// timeout, and every failure is ignored -- see `upgrade::check_on_start`.
+    /// them. It is a single small request with a short timeout, and every
+    /// failure is ignored -- see `upgrade::check_on_start`.
     ///
     /// Worth turning off on a machine with no route to github.com, where the
     /// check can only ever fail, and in CI, where nothing should be prompting.

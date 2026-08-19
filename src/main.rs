@@ -811,7 +811,7 @@ TOOLS (read_file, write_file, run_command; writes and commands need your
                               max_output_bytes, max_steps.
 
 UPGRADE:
-    Starting boxcode checks for a newer release at most once a day and offers
+    Starting boxcode checks for a newer release on every launch and offers
     to install it. It answers no by default, gives up after two seconds, and
     says nothing at all when it cannot reach the network.
 
