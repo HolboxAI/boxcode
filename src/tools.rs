@@ -3127,17 +3127,25 @@ async fn execute_publish_artifact(
             };
             outcome(
                 &call.id,
+                // The URL leads, because the URL is the entire point of the
+                // call and this line is the only part of it guaranteed to be
+                // on screen. The counts used to lead and the link appeared
+                // nowhere, which left it to the model to remember to repeat
+                // it in prose -- so "where is the url" was a fair question
+                // about a tool that had already produced one.
                 format!(
-                    "\u{1F310} preview \u{2014} {} file{}, expires in {}h{}",
+                    "\u{1F310} preview {} \u{2014} {} file{}, expires in {}h{}",
+                    published.url,
                     published.files,
                     if published.files == 1 { "" } else { "s" },
                     published.expires_in_hours,
                     if published.verified { "" } else { ", unconfirmed" }
                 ),
                 format!(
-                    "Published {} file{} ({:.0} KB).\n\nURL: {}\n\n{confirmation}\n\nTell the \
-                     user this link is public to anyone who has it and stops working in {} \
-                     hours.",
+                    "Published {} file{} ({:.0} KB).\n\nURL: {}\n\n{confirmation}\n\nGive the \
+                     user this URL in your reply, written out in full -- it is what they asked \
+                     for and they cannot act on a publish they cannot open. Tell them the link \
+                     is public to anyone who has it and stops working in {} hours.",
                     published.files,
                     if published.files == 1 { "" } else { "s" },
                     published.bytes as f64 / 1024.0,
