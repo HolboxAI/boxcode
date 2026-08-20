@@ -9,6 +9,16 @@
 //! base URL it answers on. What runs behind that URL, and why it is a
 //! separate box rather than a Lambda, is `infra/auth/README.md`'s story;
 //! this module only has to know the one request/response shape.
+//!
+//! The request carries nothing but the id, deliberately. Provisioning starts
+//! a container and a database on a shared box, so it does need protecting --
+//! but not by a credential: the only thing a caller can influence is the id,
+//! and every other value is reused from what that project already has, so
+//! re-provisioning someone else's restarts their container with identical
+//! config and changes nothing. What bounds it instead is a cap on live
+//! projects, a global rate limit, and a requirement that the artifact really
+//! exists, none of which need to know who is asking. See
+//! docs/ddos-and-abuse.md.
 
 use std::path::Path;
 use std::time::Duration;

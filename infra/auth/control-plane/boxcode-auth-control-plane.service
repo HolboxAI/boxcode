@@ -11,6 +11,22 @@ Environment=REGISTRY_PATH=/opt/boxcode-auth/registry.json
 Environment=NGINX_CONF_DIR=/etc/nginx/conf.d/auth-projects
 Environment=SITE_BASE=https://boxcode.sh
 Environment=PORT=8080
+# The ceiling on live projects. Every one is a container holding 30-50MB
+# and a Postgres database, on a 2GB box -- so this is the number past which
+# the machine stops working, not a policy preference. See
+# docs/ddos-and-abuse.md.
+Environment=MAX_PROJECTS=50
+# Provisions this host will perform per hour from everyone combined. The
+# limit that actually holds: per-source limiting assumes addresses are
+# scarce, and against IPv6 or rented cloud IPs they are not.
+Environment=GLOBAL_RATE=20
+# Provisions one source may ask for per hour, so one noisy client cannot
+# spend the whole global budget. An IPv6 /64 counts as one source.
+Environment=RATE_LIMIT=5
+# How long after its artifact stops serving a project's container, database
+# and route are torn down. Longer than the artifact's own 48h because
+# republishing to the same id is ordinary.
+Environment=REAP_AFTER_HOURS=72
 # AUTH_BASE is deliberately not set here: index.mjs already defaults to
 # https://auth.boxcode.sh. Override only if this box is ever reachable
 # under a different domain.

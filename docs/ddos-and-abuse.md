@@ -1,6 +1,6 @@
 # DDoS and abuse: what we can absorb, and what we cannot
 
-**Status:** assessment + plan. Nothing in §4 is built yet.
+**Status:** P0 shipped. P1–P4 planned, not built.
 **Scope:** `boxcode.sh` (CloudFront), `auth.boxcode.sh` (one EC2 box), and the planned
 full-stack hosting on Lambda.
 **Verified against account `992382417943`, us-east-1.**
@@ -13,19 +13,19 @@ The static half of boxcode is in good shape. The dynamic half is one small box w
 and no protection of any kind, and it holds a **resource-creation endpoint that needs no
 authentication**.
 
-The most urgent problem is not a DDoS. **`POST /provision` spawns a Docker container and a
-Postgres database per request, unauthenticated.** Roughly **40 requests from a single laptop**
-exhaust the box's memory and take down auth, database, change-requests and uploads together. No
-flood, no botnet, no volume — forty `curl` commands.
+The most urgent problem was not a DDoS. **`POST /provision` spawned a Docker container and a
+Postgres database per request, unauthenticated** — roughly **40 requests from a single laptop**
+exhausted the box's memory and took auth, database, change-requests and uploads down together. No
+flood, no botnet, no volume. **That is now fixed** (P0 below); §3.1 keeps the analysis because the
+shape of it is worth remembering.
 
-Fixing that is worth more than every anti-DDoS control in this document combined, and it is
-cheap. Everything else here is layered defence for the day someone actually points volume at us.
+Everything else here is layered defence for the day someone actually points volume at us.
 
 | | Today | After §4 |
 |---|---|---|
 | `boxcode.sh` static | Shield Standard via CloudFront | + WAF rate rules |
 | `auth.boxcode.sh` | **Nothing** — direct A record to a t3.small | Behind CloudFront + WAF, origin cloaked |
-| `/provision` | **Unauthenticated container spawn** | Authenticated, rate-limited, quota-capped |
+| `/provision` | ~~Unbounded container spawn~~ **FIXED** | Globally rate-limited, quota-capped, artifact-bound, reaped |
 | Lambda concurrency | Shared with 42 production functions | Reserved caps, blast radius bounded |
 | Detection | None | Alarms on the four signals in §6 |
 
@@ -69,11 +69,15 @@ by IP. Moving it behind CloudFront is the single highest-leverage structural cha
 
 ## 3. Threats, in order of how easy they are
 
-### 3.1 CRITICAL — `/provision` is an unauthenticated resource-creation endpoint
+### 3.1 ~~CRITICAL~~ **FIXED** — `/provision` was an unbounded resource-creation endpoint
 
-`infra/auth/control-plane/index.mjs:226` accepts `POST /provision {"project_id": "abcd"}` with
+*Closed by P0. Kept here because the shape of the failure is worth remembering, and because the
+same pattern — an unauthenticated endpoint that creates durable resources — is the one to check
+for whenever a new control-plane route is added.*
+
+`infra/auth/control-plane/index.mjs` accepted `POST /provision {"project_id": "abcd"}` with
 **no authentication**, validated only by the shape regex `/^[a-z2-9]{4,16}$/`. Each accepted
-request performs:
+request performed:
 
 1. `CREATE DATABASE proj_<id>` on the shared Postgres
 2. `docker run -d --network host ... supabase/gotrue:v2.189.0` — **a new container**, port from 9000 up
@@ -99,8 +103,8 @@ megabytes of RAM held indefinitely, and permanent disk.** Call it 10,000:1. This
 vector — it is a single-attacker DoS that needs no volume at all, and it is by a wide margin the
 most serious thing in this document.
 
-It also self-heals badly: the code deliberately does not roll back partial failures (documented at
-`index.mjs:251`), so a half-finished provision leaves a database with no container behind.
+It also self-healed badly: the code deliberately does not roll back partial failures, so a
+half-finished provision left a database with no container behind. The reaper now clears those.
 
 ### 3.2 HIGH — a flood at `/api/artifact` can starve production Lambdas
 
@@ -158,9 +162,31 @@ only lever.
 
 Ordered by value per unit of effort. **P0 is not optional and is not really about DDoS.**
 
-### P0 — Close `/provision` (hours, ~$0)
+### P0 — Close `/provision` — **DONE**
 
 Nothing else on this list matters while forty curl commands can take the platform down.
+
+Shipped: four checks run before anything is created — **global** rate limit → per-source rate
+limit → project cap → the artifact must actually exist — plus an hourly reaper. Each has a test
+that proves it *blocks*, not that it exists. Details in
+[infra/auth/README.md](../infra/auth/README.md#what-guards-provision).
+
+**Deliberately no credential.** The only caller-controlled input is the id; port, database name,
+container name and JWT secret are all reused from what the project already has, so re-provisioning
+someone else's restarts their container with identical config and changes nothing. A key would
+have guarded a takeover the endpoint's shape already makes impossible, while adding a secret to
+distribute and a way to lock a real user out of their own project.
+
+**The global limit is what does the work.** Per-source limiting assumes addresses are scarce and
+they are not — cloud IPs are rentable by the thousand, and one IPv6 allocation is 18 quintillion
+addresses, so against a distributed attacker it is theatre. A limit on what the *host* will do per
+hour cannot be escaped by having more addresses. The accepted cost is that a flood can consume the
+budget and delay legitimate provisions for the rest of the window; a real user waits, where the
+alternative was the box running out of memory.
+
+The one item deferred from the original list is item 5 below — the per-provision `nginx -s reload`
+is still there. With `MAX_PROJECTS` capping the config count at 50, `nginx -t` cost is bounded and
+the O(N²) term cannot be reached, so the map-file rewrite is no longer urgent.
 
 1. **Require the deploy token.** The same trust-on-first-use secret already designed for the
    hosting plan and already shipped in pattern by `src/db.rs::key_for()`. A caller who cannot
@@ -308,5 +334,5 @@ Stated plainly so nobody assumes otherwise.
 - CloudFront's current behaviours and whether a WAF is already attached could not be read either
   (`cloudfront:GetDistribution*` denied). **Confirm in the console before building P1.**
 
-**Recommendation: do P0 this week.** It is a few hours of work against the one problem on this list
-that a single person with `curl` can trigger today.
+**P0 is done.** Next is P1 — putting `auth.boxcode.sh` behind CloudFront and cloaking the origin,
+which is the one structural change that a t3.small on a public IP cannot do without.
