@@ -140,18 +140,49 @@ returns `{rows, truncated}` (capped at 500 rows — `web_search`'s row cap
 is the same idea); everything else runs as a write and returns
 `{changes, last_insert_rowid}`.
 
-## Known limitations
+## The worker pool
 
-- No query timeout. `node:sqlite`'s `DatabaseSync` is synchronous —
-  blocking the whole process for the duration of a query — so a
-  JS-level timeout can't actually interrupt one already running. Not
-  expected to matter for the workloads this is built for (simple
-  CRUD against small per-project files), but worth knowing rather than
-  assuming away.
+Every statement runs on a thread from a small pool (`control-plane/worker.mjs`),
+never on the main thread. This is not an optimisation — it is the difference
+between one project's slow query costing that project and costing everyone.
+
+`DatabaseSync` blocks the thread it runs on. When that was the process's only
+thread, a slow query stopped the event loop, so other projects' requests were
+not merely delayed — they were never read off the socket. Measured on the code
+this replaced: while one project ran an ~8s query, an unrelated project's
+`SELECT 1` waited 7.8s and then got a connection reset. With the pool, the same
+unrelated query is answered in 12ms.
+
+`QUERY_TIMEOUT_MS` (default 5000) bounds **the answer, not the query**. There is
+no way to cancel a running statement: `DatabaseSync` exposes no interrupt, no
+progress handler and no busy timeout, and SQLite's own `sqlite3_interrupt` is
+not reachable from Node. On timeout the caller gets a 504 immediately and the
+worker is terminated — but a native `sqlite3_step` already in flight runs to
+completion before that thread actually dies. The pool spawns a replacement, so
+capacity recovers either way.
+
+`MAX_DB_BYTES` (default 50 MB) caps one project's file. Reads, `DELETE`, `DROP`
+and `VACUUM` still work at the cap, deliberately: refusing them would leave a
+full project with no statement it could run to get back under the limit.
+`UPDATE` is treated as growth, since it can shrink or grow a row and there is no
+way to know which beforehand.
+
+## Backups
+
+`backup.sh`, run nightly by `boxcode-db-backup.timer`, snapshots every project
+file to `s3://boxcode-artifacts/backups/db/db-YYYY-MM-DD.tar.gz`. It uses
+sqlite3's `.backup`, not `cp`: a byte copy of a database with a live journal
+restores corrupt, and this runs against a live service. Restore instructions are
+in the script's own footer.
+
+## Known limitations
 - No security hardening beyond the key check: the control-plane runs as
   root, and a valid key grants unrestricted SQL (including `DROP TABLE`)
   against that one project's file. Same "prove it works first" tradeoff
   auth's README documents.
+- No backup existed at all before `backup.sh`; durability was "the EBS
+  volume is still there". The nightly snapshot closes that, but there is
+  still no point-in-time recovery — the most that can be lost is a day.
 - SQLite's own concurrency limits (single-writer file locking) apply.
   Fine for the traffic this was built to prove out; a real concern if a
   project's data workload ever gets genuinely concurrent.
