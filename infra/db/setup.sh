@@ -64,11 +64,48 @@ sudo systemctl reload nginx
 echo "== db control-plane service =="
 sudo mkdir -p "$INSTALL_DIR/control-plane" "$INSTALL_DIR/data"
 sudo cp "$SCRIPT_DIR/control-plane/index.mjs" "$INSTALL_DIR/control-plane/index.mjs"
+# worker.mjs is not optional: index.mjs spawns it by path on startup, and a
+# deploy that copied only index.mjs would leave the service crash-looping on
+# a missing module. Copied in the same step for exactly that reason.
+sudo cp "$SCRIPT_DIR/control-plane/worker.mjs" "$INSTALL_DIR/control-plane/worker.mjs"
 sudo cp "$SCRIPT_DIR/control-plane/boxcode-db-control-plane.service" \
     /etc/systemd/system/boxcode-db-control-plane.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now boxcode-db-control-plane
 sudo systemctl restart boxcode-db-control-plane
+
+echo "== nightly backup =="
+# sqlite3's own .backup takes a consistent snapshot of a database that is
+# being written to; a plain file copy of one with a live journal restores
+# corrupt. See backup.sh.
+if ! command -v sqlite3 >/dev/null 2>&1; then
+    sudo dnf install -y sqlite >/dev/null
+fi
+sudo install -m 0755 "$SCRIPT_DIR/backup.sh" "$INSTALL_DIR/backup.sh"
+sudo tee /etc/systemd/system/boxcode-db-backup.service >/dev/null <<EOF
+[Unit]
+Description=boxcode db nightly backup to S3
+
+[Service]
+Type=oneshot
+Environment=DATA_DIR=$INSTALL_DIR/data
+ExecStart=$INSTALL_DIR/backup.sh
+EOF
+sudo tee /etc/systemd/system/boxcode-db-backup.timer >/dev/null <<'EOF'
+[Unit]
+Description=Run the boxcode db backup nightly
+
+[Timer]
+OnCalendar=daily
+# The box may be asleep or the unit may have been added after today's run;
+# without this the first backup would wait until tomorrow.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now boxcode-db-backup.timer
 
 echo "== done =="
 sleep 1

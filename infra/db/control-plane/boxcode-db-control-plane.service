@@ -14,6 +14,21 @@ RestartSec=2
 Environment=REGISTRY_PATH=/opt/boxcode-db/registry.json
 Environment=DATA_DIR=/opt/boxcode-db/data
 Environment=PORT=8081
+# Loopback by default -- unchanged from before the worker pool existed, so
+# re-running setup.sh never widens what can reach this service. Set to
+# 0.0.0.0 (and open :8081 in the instance's security group to the Lambda's
+# security group only) when boxcode-hosted backends need it: they run with
+# no route to the public internet, so they cannot reach this the way the
+# agent does, through https://auth.boxcode.sh.
+Environment=HOST=127.0.0.1
+# Threads that may sit blocked inside SQLite at once. See worker.mjs.
+Environment=POOL_SIZE=4
+# How long a caller waits before being told a query did not finish. Bounds
+# the answer, not the query -- SQLite cannot be interrupted from Node.
+Environment=QUERY_TIMEOUT_MS=5000
+# Ceiling on one project's file. Reads, DELETE, DROP and VACUUM still work
+# at the cap so a full project can always get back under it.
+Environment=MAX_DB_BYTES=52428800
 # Root only because /opt/boxcode-db needs creating on first run, same as
 # the auth control-plane's own reasoning -- this service shells out to
 # nothing and touches no other system state, so root is a wider grant

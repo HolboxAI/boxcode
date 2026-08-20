@@ -35,10 +35,38 @@ import { createServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
 import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
 import path from "node:path";
+import { Worker } from "node:worker_threads";
+import { availableParallelism } from "node:os";
+import { fileURLToPath } from "node:url";
 
 const REGISTRY_PATH = process.env.REGISTRY_PATH || "/opt/boxcode-db/registry.json";
 const DATA_DIR = process.env.DATA_DIR || "/opt/boxcode-db/data";
 const PORT = Number(process.env.PORT || 8081);
+// Loopback by default, exactly as this service has always bound: nginx on
+// this same box is the only thing that has ever needed to reach it, and a
+// service that starts listening on every interface because it was upgraded
+// would be a security change nobody asked for.
+//
+// Set HOST=0.0.0.0 to also accept connections from inside the VPC. That is
+// what boxcode-hosted backends need -- they run with no route to the public
+// internet by design, so they cannot reach this service the way the agent
+// does, via https://auth.boxcode.sh. Whatever can reach the port is then
+// decided by the instance's security group, which is the right place for it.
+const HOST = process.env.HOST || "127.0.0.1";
+
+// How many statements may be in flight at once. Each occupies one OS thread
+// blocked inside SQLite, so this is a thread count, not a request ceiling.
+const POOL_SIZE = Number(process.env.POOL_SIZE || Math.max(2, Math.min(4, availableParallelism() - 1)));
+// How long a caller waits before being told the query did not finish. Not a
+// cancellation -- see worker.mjs on why SQLite cannot be interrupted from
+// here. It bounds the *answer*, not the query.
+const QUERY_TIMEOUT_MS = Number(process.env.QUERY_TIMEOUT_MS || 5000);
+// Jobs waiting for a free worker. Past this the service says so rather than
+// growing a queue nobody is still waiting on.
+const MAX_QUEUE = Number(process.env.MAX_QUEUE || 64);
+// Ceiling on one project's file. 0 disables. Reads and DELETEs still work at
+// the cap; only statements that could grow it are refused.
+const MAX_DB_BYTES = Number(process.env.MAX_DB_BYTES || 50 * 1024 * 1024);
 // Same default as the auth control-plane's own AUTH_BASE (see
 // infra/auth/control-plane/index.mjs) -- both run on the same box behind
 // the same domain, and a project's auth is always reachable at
@@ -162,27 +190,115 @@ function referencesCurrentUserId(sql) {
   return /[:@$]current_user_id\b/.test(sql);
 }
 
-// `namedParams` is only ever `{ current_user_id }`, and only ever passed
-// at all when the caller sent a verified access_token -- omitting it
-// entirely for every other request (rather than passing `{}`) keeps
-// today's access-token-less queries running through node:sqlite exactly
-// as they did before this existed.
-function runQuery(projectId, sql, params, namedParams) {
-  const dbPath = path.join(DATA_DIR, `${projectId}.sqlite`);
-  const db = new DatabaseSync(dbPath);
-  try {
-    const stmt = db.prepare(sql);
-    const args = namedParams ? [namedParams, ...params] : params;
-    if (isReadStatement(sql)) {
-      const rows = stmt.all(...args);
-      const truncated = rows.length > MAX_ROWS;
-      return { rows: truncated ? rows.slice(0, MAX_ROWS) : rows, truncated };
-    }
-    const result = stmt.run(...args);
-    return { changes: result.changes, last_insert_rowid: Number(result.lastInsertRowid) };
-  } finally {
-    db.close();
+// ---- the SQLite pool -------------------------------------------------------
+//
+// Every statement this service runs goes through here, and the main thread
+// never opens a database again. See worker.mjs for why: DatabaseSync blocks
+// the thread it runs on, so doing this work inline meant one project's slow
+// query stopped every other project from being served at all.
+
+const WORKER_PATH = fileURLToPath(new URL("./worker.mjs", import.meta.url));
+
+let nextJobId = 1;
+const idle = [];
+const queue = [];
+// id -> { resolve, reject, timer, worker }
+const inFlight = new Map();
+
+function spawnWorker() {
+  const worker = new Worker(WORKER_PATH, {
+    workerData: {
+      dataDir: DATA_DIR,
+      maxRows: MAX_ROWS,
+      namedQueriesTable: NAMED_QUERIES_TABLE,
+      maxDbBytes: MAX_DB_BYTES,
+    },
+  });
+  worker.on("message", (msg) => settle(worker, msg));
+  // A worker that dies for any other reason (an OOM, a native crash) must not
+  // strand the caller waiting on it, and must not shrink the pool.
+  worker.on("error", (e) => settle(worker, { id: worker.jobId, ok: false, message: e.message }));
+  worker.on("exit", () => {
+    const i = idle.indexOf(worker);
+    if (i !== -1) idle.splice(i, 1);
+    if (!shuttingDown && pool.length < POOL_SIZE) replace(worker);
+  });
+  worker.unref();
+  return worker;
+}
+
+let shuttingDown = false;
+const pool = [];
+
+function replace(dead) {
+  const i = pool.indexOf(dead);
+  if (i !== -1) pool.splice(i, 1);
+  const fresh = spawnWorker();
+  pool.push(fresh);
+  idle.push(fresh);
+  pump();
+}
+
+function settle(worker, msg) {
+  if (!msg || msg.id === undefined) return;
+  const entry = inFlight.get(msg.id);
+  if (!entry) return; // already timed out; its answer is no longer wanted
+  inFlight.delete(msg.id);
+  clearTimeout(entry.timer);
+  worker.jobId = undefined;
+  idle.push(worker);
+  if (msg.ok) {
+    entry.resolve(msg.value);
+  } else {
+    entry.reject(
+      msg.overCapacity ? new HttpError(413, msg.message) : new Error(msg.message)
+    );
   }
+  pump();
+}
+
+function pump() {
+  while (queue.length > 0 && idle.length > 0) {
+    const worker = idle.pop();
+    const { job, resolve, reject } = queue.shift();
+    worker.jobId = job.id;
+    const timer = setTimeout(() => {
+      // Give up on the answer and on the thread. Terminating cannot preempt a
+      // native sqlite call already running -- worker.mjs explains why -- but
+      // it does stop the thread the moment that call returns, and it frees the
+      // caller now rather than whenever SQLite finishes.
+      inFlight.delete(job.id);
+      reject(new HttpError(504, `query exceeded ${QUERY_TIMEOUT_MS}ms and was abandoned`));
+      worker.terminate();
+    }, QUERY_TIMEOUT_MS);
+    inFlight.set(job.id, { resolve, reject, timer, worker });
+    worker.postMessage(job);
+  }
+}
+
+function runOnPool(job) {
+  return new Promise((resolve, reject) => {
+    if (queue.length >= MAX_QUEUE) {
+      return reject(new HttpError(503, "too many queries in flight; try again shortly"));
+    }
+    queue.push({ job: { ...job, id: nextJobId++ }, resolve, reject });
+    pump();
+  });
+}
+
+for (let i = 0; i < POOL_SIZE; i++) {
+  const w = spawnWorker();
+  pool.push(w);
+  idle.push(w);
+}
+
+// `namedParams` is only ever `{ current_user_id }`, and only ever passed at
+// all when the caller sent a verified access_token -- omitting it entirely for
+// every other request (rather than passing `{}`) keeps today's
+// access-token-less queries running through node:sqlite exactly as they did
+// before this existed.
+function runQuery(projectId, sql, params, namedParams) {
+  return runOnPool({ op: "query", projectId, sql, params, namedParams });
 }
 
 async function readJsonBody(req) {
@@ -233,7 +349,7 @@ async function handleQuery(req, res) {
     }
 
     await mkdir(DATA_DIR, { recursive: true });
-    const result = runQuery(projectId, sql, params, namedParams);
+    const result = await runQuery(projectId, sql, params, namedParams);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(result));
   } catch (e) {
@@ -250,20 +366,11 @@ async function handleQuery(req, res) {
 }
 
 // Looks up the SQL text registered under `name` for `projectId`. A missing
-// table (nothing registered yet) and a missing row (wrong name) both
-// resolve to `null` -- a public caller does not need to know which, only
-// that there is nothing to run under that name.
+// table (nothing registered yet) and a missing row (wrong name) both resolve
+// to `null` -- a public caller does not need to know which, only that there is
+// nothing to run under that name.
 function lookupNamedQuery(projectId, name) {
-  const dbPath = path.join(DATA_DIR, `${projectId}.sqlite`);
-  const db = new DatabaseSync(dbPath);
-  try {
-    const row = db.prepare(`SELECT sql FROM ${NAMED_QUERIES_TABLE} WHERE name = ?`).get(name);
-    return row ? row.sql : null;
-  } catch {
-    return null;
-  } finally {
-    db.close();
-  }
+  return runOnPool({ op: "lookup", projectId, name });
 }
 
 // The client-facing counterpart to /query: reachable with nothing but a
@@ -303,7 +410,7 @@ async function handleNamedQuery(req, res) {
   try {
     const userId = await verifyUser(projectId, accessToken);
 
-    const sql = lookupNamedQuery(projectId, name);
+    const sql = await lookupNamedQuery(projectId, name);
     if (sql === null) {
       return fail(res, 404, `no named query "${name}" is registered for this project`);
     }
@@ -314,7 +421,7 @@ async function handleNamedQuery(req, res) {
     // every row anyway. The developer who wrote and registered it still
     // has to get the WHERE clause right.
     const namedParams = referencesCurrentUserId(sql) ? { current_user_id: userId } : undefined;
-    const result = runQuery(projectId, sql, params, namedParams);
+    const result = await runQuery(projectId, sql, params, namedParams);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(result));
   } catch (e) {
@@ -338,6 +445,9 @@ const server = createServer(async (req, res) => {
   return fail(res, 404, "POST /query or /named-query only");
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`boxcode db control-plane listening on 127.0.0.1:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(
+    `boxcode db control-plane listening on ${HOST}:${PORT} ` +
+      `(pool ${POOL_SIZE}, timeout ${QUERY_TIMEOUT_MS}ms, cap ${Math.round(MAX_DB_BYTES / 1048576)}MB)`
+  );
 });
