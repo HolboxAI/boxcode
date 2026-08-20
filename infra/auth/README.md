@@ -71,15 +71,89 @@ git pull && bash infra/auth/setup.sh
   here is reachable except through nginx.
 - `auth_url` in every response is `https://auth.boxcode.sh/<id>`.
 
+## What guards `/provision`
+
+Provisioning starts a Docker container and a Postgres database on a shared
+2 GB box, and a GoTrue container holds 30–50 MB. An endpoint that took nothing
+but an id was therefore one that anyone could exhaust the machine with — around
+forty `curl` commands, no volume required, taking auth, db, requests and uploads
+down together, plus a Postgres database and container layer left behind
+permanently for each one.
+
+**There is deliberately no credential.** The only thing a caller can influence
+is the id: port, database name, container name and JWT secret are all reused
+from what that project already has, so re-provisioning someone else's restarts
+their container with identical config and changes *nothing*. A key would have
+been guarding a takeover the endpoint's own shape already makes impossible,
+while adding a secret to distribute and a way for a real user to get locked out
+of their own project.
+
+What bounds the damage instead needs no idea who is asking. Four checks run
+**before anything is created**, cheapest first:
+
+1. **Global rate limit** — `GLOBAL_RATE` (default 20) provisions per hour
+   across the whole host, from everyone combined. **This is the one that
+   actually holds.** A per-source limit assumes the source is scarce, and it is
+   not: cloud IPs are rentable by the thousand and a single IPv6 allocation
+   hands one attacker 18 quintillion addresses, so against anyone distributing
+   requests, per-source limiting is theatre. A global limit cannot be escaped
+   by having more addresses because it does not care where a request came from.
+2. **Per-source rate limit** — `RATE_LIMIT` (default 5) per hour, so one noisy
+   client cannot spend everyone's global budget. A whole IPv6 **/64** counts as
+   one source, not one address, for the reason above.
+3. **The project cap** — `MAX_PROJECTS` (default 50). Not a policy limit: it is
+   the number past which this box stops working, and it is the hard ceiling no
+   volume of requests can push past. An *existing* project still re-provisions
+   at the cap, because that is how a crash-looped container gets healed.
+4. **The artifact must exist** — one `HEAD` against
+   `https://boxcode.sh/artifacts/<id>`. This is what makes an id cost
+   something: you cannot provision a project that was never published, so an
+   attacker has to publish first, which is itself rate-limited, attributable
+   and expiring. Fails closed — a network error means "cannot confirm".
+
+Then `provision()` runs. Re-provisioning a healthy project is now genuinely
+free: `startGoTrue` already returned early when the container was running, and
+`writeNginxConf` now compares before writing, so the reload — the most
+expensive thing on the path and the only part that gets worse as projects
+accumulate — is skipped when nothing changed.
+
+**The accepted cost:** a flood can consume the global budget and stop
+legitimate provisions for the rest of the window. That is deliberate. A real
+user waits; the alternative was the box running out of memory and taking four
+services down with it.
+
+## The reaper
+
+An artifact expires after 48 hours, but until now its container, database and
+nginx route stayed on this box forever — so container count only ever went up
+and the box's memory was a countdown with no way to add time back.
+
+An hourly sweep tears down projects whose artifact has stopped serving for
+`REAP_AFTER_HOURS` (default 72 — deliberately longer than the artifact's own
+48h, because republishing to the same id is ordinary and dropping auth the
+moment a link lapsed would kill sessions on a project still being worked on).
+
+A sweep, not a timer per project: idempotent, self-healing if a teardown half
+fails, and one timer regardless of project count. One nginx reload for the
+whole sweep, never on the request path.
+
 ## Known limitations (explicitly deferred, matching the "prove the flow
 works first" goal this was built for)
 
-- No security hardening: the control-plane service and every GoTrue
-  container run as root, Postgres has no password, and `/provision` itself
-  has no auth of its own beyond "the id looks like a real artifact id".
+- The control-plane service and every GoTrue container still run as root, and
+  Postgres still has no password. `/provision` is no longer unauthenticated,
+  but nothing else on this box has been hardened.
 - No horizontal scaling story: everything is one box. A GoTrue container
   per project is cheap (tens of MB each), but this has not been load-
-  tested past a handful of projects.
+  tested past a handful of projects — which is why `MAX_PROJECTS` exists.
+- The rate limiter is per-process and in memory, so a restart clears it and it
+  does not span instances. Adequate while there is one box; `MAX_PROJECTS` and
+  the artifact requirement are the durable controls, and neither is affected by
+  a restart.
+- Nothing stops someone publishing 50 artifacts and provisioning all of them to
+  fill the cap. A credential would not have helped — they would use their own —
+  and the damage is bounded to "no new projects until the reaper runs", not to
+  the box falling over. Worth revisiting if it ever actually happens.
 - No rollback on a partially-failed `/provision` call (e.g. the database
   gets created but the container fails to start) — `provision()` in
   `control-plane/index.mjs` says why, and a failure is logged with enough
