@@ -289,6 +289,93 @@ detect_arch() {
   esac
 }
 
+# The startup file this user's shell re-reads on every new terminal.
+#
+# Empty for a shell we do not recognise, which the caller reports as "add it
+# to your shell's startup file" rather than guessing: naming the wrong file is
+# worse than naming none, because the user follows the instruction exactly,
+# nothing changes, and there is nothing on screen to suggest why.
+shell_rc_file() {
+  case "$(basename "${SHELL:-}")" in
+    zsh) echo "$HOME/.zshrc" ;;
+    # macOS terminals open *login* shells, which read .bash_profile and never
+    # .bashrc. Linux terminals open interactive non-login shells, which do
+    # exactly the opposite. Picking the wrong one of that pair is the classic
+    # way a PATH fix appears to do nothing at all.
+    bash)
+      if [ "$(detect_os)" = "macos" ]; then
+        echo "$HOME/.bash_profile"
+      else
+        echo "$HOME/.bashrc"
+      fi
+      ;;
+    *) echo "" ;;
+  esac
+}
+
+# Whether `rc` already puts `dir` on PATH.
+#
+# Checks the `$HOME`-relative and `~` spellings as well as the expanded path,
+# because a startup file written by a person (or by another installer) almost
+# always says `$HOME/.local/bin` rather than `/Users/someone/.local/bin`.
+# Matching only the expanded form would tell people to append a line they can
+# see is already in the file, which is how a correct instruction gets ignored.
+rc_already_has_dir() {
+  local rc="$1" dir="$2" relative
+  [ -f "$rc" ] || return 1
+  grep -qF -- "$dir" "$rc" && return 0
+  case "$dir" in
+    "$HOME"/*)
+      relative="${dir#"$HOME"/}"
+      grep -qF -- "\$HOME/$relative" "$rc" && return 0
+      grep -qF -- "~/$relative" "$rc" && return 0
+      ;;
+  esac
+  return 1
+}
+
+# Print the command that puts `dir` on PATH permanently.
+#
+# This replaces a bare `export PATH="$HOME/.local/bin:$PATH"`, which was the
+# right line and the wrong advice: with no file named, people paste it into
+# the terminal they are standing in. `export` sets a variable in one process,
+# so it dies with that window -- boxcode works until the terminal is closed
+# and is then "command not found" again, which reads as the install having
+# silently broken rather than as a PATH that was never persisted.
+#
+# Appending to a startup file is what makes it survive, because that file is
+# re-read by every new shell. It is the same mechanism every other tool on a
+# developer's machine already uses.
+print_path_setup_hint() {
+  local dir="$1"
+  local rc line
+
+  # fish cannot run the line below at all -- `export FOO=bar` is a syntax
+  # error there -- and it has a builtin that persists on its own, so there is
+  # no file to edit.
+  if [ "$(basename "${SHELL:-}")" = "fish" ]; then
+    echo "      fish_add_path $dir"
+    return 0
+  fi
+
+  rc="$(shell_rc_file)"
+  line="export PATH=\"$dir:\$PATH\""
+
+  if [ -z "$rc" ]; then
+    echo "      $line"
+    echo ""
+    echo "   Add that to your shell's startup file so it survives a new terminal."
+    return 0
+  fi
+
+  if rc_already_has_dir "$rc" "$dir"; then
+    echo "   $rc already adds it, so just open a new terminal."
+    return 0
+  fi
+
+  echo "      echo '$line' >> $rc"
+}
+
 # Pulls the download URL for one named asset out of a GitHub "get the latest
 # release" API response. No `jq` dependency, on purpose -- this has to run on
 # a bare-minimum machine that may have nothing but bash and curl. Relies on
@@ -468,8 +555,12 @@ else
   if [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
     echo "✓ Installed to ~/.local/bin (already in PATH)"
   else
-    echo "⚠️  Installed to ~/.local/bin"
-    echo "Add to your PATH: export PATH=\"\$HOME/.local/bin:\$PATH\""
+    echo "⚠️  Installed to ~/.local/bin, which is not on your PATH."
+    echo "   Your shell cannot find boxcode until it is. Run this once, then"
+    echo "   open a new terminal:"
+    echo ""
+    print_path_setup_hint "$HOME/.local/bin"
+    echo ""
   fi
 fi
 
@@ -493,7 +584,14 @@ sweep_path_for_stale_copies "$INSTALLED_AT"
 hash -r 2>/dev/null || true
 RESOLVED=$(command -v boxcode || true)
 if [ -z "$RESOLVED" ]; then
-  echo "⚠️  boxcode is not on your PATH yet. Open a new shell and retry."
+  # "Open a new shell and retry" was true and useless: a new shell changes
+  # nothing when the line was never written to a file. Say what to write.
+  echo ""
+  echo "⚠️  boxcode is installed at $INSTALLED_AT, but your shell cannot find it."
+  echo "   Run this once, then open a new terminal:"
+  echo ""
+  print_path_setup_hint "$(dirname "$INSTALLED_AT")"
+  echo ""
 elif [ "$RESOLVED" != "$INSTALLED_AT" ]; then
   echo ""
   echo "⚠️  WARNING: 'boxcode' resolves to $RESOLVED,"

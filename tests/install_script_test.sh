@@ -465,3 +465,90 @@ if command -v python3 &> /dev/null; then
 else
   echo "SKIP: ensure_ddgs_available real-Python test (no python3 on this machine)"
 fi
+
+# --- the PATH hint ----------------------------------------------------------
+# The whole point of the hint is that the command it prints, run verbatim,
+# leaves boxcode findable in a *new* terminal. The old hint printed a bare
+# `export ...` with no file named, which people paste into the shell they are
+# standing in -- where it works until that window closes and is then "command
+# not found" again.
+
+hint_home=$(mktemp -d)
+
+# Every branch of the shell -> startup file mapping. Naming the wrong file is
+# silent: the user follows the instruction exactly and nothing changes.
+uname() { echo "Darwin"; }   # shadowed so detect_os is driven, not the machine
+out=$(HOME="$hint_home" SHELL=/bin/zsh print_path_setup_hint "$hint_home/.local/bin")
+echo "$out" | grep -qF ">> $hint_home/.zshrc" ||
+  fail "zsh should be pointed at .zshrc, got: $out"
+
+out=$(HOME="$hint_home" SHELL=/bin/bash print_path_setup_hint "$hint_home/.local/bin")
+echo "$out" | grep -qF ">> $hint_home/.bash_profile" ||
+  fail "bash on macOS opens login shells, so .bash_profile is the file, got: $out"
+
+uname() { echo "Linux"; }
+out=$(HOME="$hint_home" SHELL=/bin/bash print_path_setup_hint "$hint_home/.local/bin")
+echo "$out" | grep -qF ">> $hint_home/.bashrc" ||
+  fail "bash on Linux opens interactive non-login shells, so .bashrc is the file, got: $out"
+unset -f uname
+
+# `export FOO=bar` is a syntax error in fish, so the generic line would be
+# actively wrong there rather than merely unhelpful.
+out=$(HOME="$hint_home" SHELL=/opt/homebrew/bin/fish print_path_setup_hint "$hint_home/.local/bin")
+echo "$out" | grep -qF "fish_add_path" ||
+  fail "fish needs its own builtin, not an export line, got: $out"
+echo "$out" | grep -qF "export" &&
+  fail "fish must not be handed an export line: $out"
+
+# An unrecognised shell still gets the correct line -- we just cannot say
+# which file it belongs in, and guessing would be worse than admitting it.
+out=$(HOME="$hint_home" SHELL=/bin/nosuchshell print_path_setup_hint "$hint_home/.local/bin")
+echo "$out" | grep -qF "export PATH=" ||
+  fail "an unknown shell should still get the export line, got: $out"
+echo "$out" | grep -qF "startup file" ||
+  fail "an unknown shell should be told to persist it somewhere, got: $out"
+
+echo "PASS: print_path_setup_hint names the right startup file for each shell"
+
+# Someone who already has the directory on PATH must not be told to append a
+# duplicate -- they can see the line in the file, so being told to add it is
+# how a correct instruction gets dismissed. A startup file written by a person
+# says `$HOME/.local/bin` or `~/.local/bin`, almost never the expanded path,
+# so matching only the expanded form would miss essentially every real case.
+for spelling in '$HOME/.local/bin' '~/.local/bin' "$hint_home/.local/bin"; do
+  printf 'export PATH="%s:$PATH"\n' "$spelling" > "$hint_home/.zshrc"
+  out=$(HOME="$hint_home" SHELL=/bin/zsh print_path_setup_hint "$hint_home/.local/bin")
+  echo "$out" | grep -qF "already adds it" ||
+    fail "the $spelling spelling should have been recognised, got: $out"
+done
+
+# ...but an unrelated startup file must still get the instruction.
+echo 'alias ll="ls -la"' > "$hint_home/.zshrc"
+out=$(HOME="$hint_home" SHELL=/bin/zsh print_path_setup_hint "$hint_home/.local/bin")
+echo "$out" | grep -qF ">> $hint_home/.zshrc" ||
+  fail "an unrelated .zshrc should still get the append command, got: $out"
+
+echo "PASS: an existing PATH line is recognised in every spelling people actually write"
+
+# The test that matters: run the printed command exactly as a user would, then
+# open a genuinely new shell and see whether boxcode is found.
+if command -v zsh &> /dev/null; then
+  e2e_home=$(mktemp -d)
+  mkdir -p "$e2e_home/.local/bin"
+  printf '#!/bin/bash\necho ran\n' > "$e2e_home/.local/bin/boxcode"
+  chmod +x "$e2e_home/.local/bin/boxcode"
+
+  printed=$(HOME="$e2e_home" SHELL=/bin/zsh print_path_setup_hint "$e2e_home/.local/bin")
+  # Exactly what a user copies: the command, without the display indent.
+  HOME="$e2e_home" eval "$(echo "$printed" | sed 's/^ *//')"
+
+  found=$(HOME="$e2e_home" zsh -i -c 'command -v boxcode' 2>/dev/null || true)
+  rm -rf "$e2e_home"
+  [ -n "$found" ] ||
+    fail "the printed command did not actually put boxcode on PATH in a new shell"
+  echo "PASS: the printed command really does make boxcode findable in a new terminal"
+else
+  echo "SKIP: PATH hint end-to-end test (no zsh on this machine)"
+fi
+
+rm -rf "$hint_home"
