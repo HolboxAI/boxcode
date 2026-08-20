@@ -244,6 +244,9 @@ chat-completions endpoint.
 - `src/artifacts.rs`, `src/auth.rs`, `src/db.rs`, `src/requests.rs` —
   publishing, hosted auth, hosted per-project SQLite, the change-request
   mailbox; `infra/` holds the control-planes these talk to
+- `infra/` — the hosted control-planes (auth, db, requests, uploads). Their
+  exposure and what happens under attack:
+  [docs/ddos-and-abuse.md](docs/ddos-and-abuse.md)
 - `src/deploy/` — one file per hosting provider behind a shared
   `DeploymentProvider` trait (see [docs/deploying.md](docs/deploying.md) for
   how to add one)
