@@ -1,0 +1,8 @@
+# Terraform working files -- state, provider binaries, and the lockfile's
+# platform-specific hashes are not something a repo should carry.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+kill-switch.zip
