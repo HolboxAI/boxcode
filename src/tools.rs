@@ -3834,7 +3834,11 @@ pub fn refused_as_dangerous(call: &ToolCall, reason: &str) -> ToolOutcome {
         .unwrap_or_else(|| call.function.name.clone());
     outcome(
         &call.id,
-        format!("✗ {} — blocked", clip_label(&label, 60)),
+        // The reason rides on the display line rather than in a separate
+        // message. It used to be carried by a `Role::Error` entry drawn above
+        // this one, which said the same thing under a red "Error" headline --
+        // twice over, and mislabelled both times.
+        format!("✗ {} — blocked\n{reason}", clip_label(&label, 60)),
         format!(
             "Blocked by the safety guardrails and never run: {reason}.\n\
              This was refused by the tool itself, not by the user, and no setting can permit \
@@ -4499,17 +4503,26 @@ mod tests {
         assert!(names.contains(&GREP_SEARCH.to_string()), "{names:?}");
     }
 
-    /// A refused long command is one transcript row, not two. `clip`'s
-    /// truncation note is addressed to the model and belongs in content.
+    /// A refused long command puts its label on one row and its reason on the
+    /// next -- never a bracketed `[… truncated at 60 characters]`, which is
+    /// addressed to the model and belongs in content.
     #[test]
-    fn a_refused_long_command_stays_on_one_line() {
+    fn a_refused_long_command_labels_cleanly() {
         let long = format!("cd todo-app && nohup npm run dev {}", "x".repeat(200));
-        let out = refused_as_dangerous(&tool_call(RUN_COMMAND, json!({"command": long})), "why");
-        assert!(!out.display.contains('\n'), "{:?}", out.display);
-        assert!(out.display.contains('…'), "{:?}", out.display);
+        let out = refused_as_dangerous(
+            &tool_call(RUN_COMMAND, json!({"command": long})),
+            "writes outside the project directory",
+        );
+        let mut rows = out.display.lines();
+        let label = rows.next().expect("a label row");
+        assert!(label.ends_with("— blocked"), "{label:?}");
+        assert!(label.contains('…'), "{label:?}");
         assert!(!out.display.contains("truncated at"), "{:?}", out.display);
+        // The reason is shown, and shown here rather than in a separate
+        // `Role::Error` message drawn above it.
+        assert_eq!(rows.next(), Some("writes outside the project directory"));
         // The model still gets told plainly what happened.
-        assert!(out.content.contains("why"), "{}", out.content);
+        assert!(out.content.contains("writes outside"), "{}", out.content);
     }
 
     /// A pictograph: an emoji, or a symbol a terminal is liable to render as

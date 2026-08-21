@@ -1014,8 +1014,11 @@ impl App {
                 format!("{partial}\n[cancelled]"),
             ));
         } else {
+            // Esc, not a failure. Reporting the user's own deliberate act
+            // back to them under a red "Error" is the transcript arguing with
+            // something they just did on purpose.
             self.messages
-                .push(Message::new(Role::Error, "Request cancelled."));
+                .push(Message::new(Role::System, "Request cancelled."));
         }
         // Whatever streamed before the cancel was still real usage.
         let tokens = self.record_quota();
@@ -1100,13 +1103,19 @@ impl App {
             // deliberately no key, flag, or config value that reaches this.
             if let danger::Risk::Blocked(reason) = self.risk_of(call) {
                 let call = self.pending_tools.pop_front().expect("front just matched");
-                let label = tools::describe_action(&call)
-                    .map(|a| a.label())
-                    .unwrap_or_else(|| call.function.name.clone());
-                self.messages.push(Message::new(
-                    Role::Error,
-                    format!("Blocked: {label}\n{reason}"),
-                ));
+                // No `Role::Error` message to go with this. A guardrail
+                // refusing something is not an error: nothing failed, and the
+                // program did exactly what it is for. Drawn under a red
+                // "Error" headline it read as boxcode having broken, which is
+                // the opposite of the truth and is alarming in a way the
+                // event does not deserve.
+                //
+                // It was also the same event twice -- the tool line below
+                // says it too -- so what is left is one line, in the same
+                // place every other tool result appears, carrying its reason.
+                // Plan mode's refusal has always been rendered this calmly;
+                // this is the harder refusal, but it is the same kind of
+                // thing.
                 self.push_tool_outcome(tools::refused_as_dangerous(&call, &reason));
                 self.follow_tail = true;
                 continue;
@@ -1398,7 +1407,7 @@ impl App {
         // not this command's.
         if self.context_size().messages > 0 {
             self.messages.push(Message::new(
-                Role::Error,
+                Role::System,
                 "There is already a conversation here. /resume picks a past session up only \
                  from a fresh start -- /new first if you mean to switch.",
             ));
@@ -1766,8 +1775,11 @@ impl App {
         let (metric, value) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
 
         if metric.is_empty() || value.is_empty() {
+            // Help text. It was being drawn under a red "Error" headline,
+            // which is the transcript reporting a failure because someone
+            // asked how to use a command.
             self.messages.push(Message::new(
-                Role::Error,
+                Role::System,
                 "Usage: /quota set <requests|tokens|usd> <number>\n\
                  e.g. /quota set requests 200   ·   /quota set usd 0.10\n\
                  Use /quota clear to remove your limits.",
@@ -1799,7 +1811,7 @@ impl App {
             },
             other => {
                 self.messages.push(Message::new(
-                    Role::Error,
+                    Role::System,
                     format!("'{other}' is not a metric. Use requests, tokens or usd."),
                 ));
                 return;
@@ -1830,7 +1842,7 @@ impl App {
 
     fn bad_limit_value(&mut self, value: &str, expected: &str) {
         self.messages.push(Message::new(
-            Role::Error,
+            Role::System,
             format!("'{value}' is not {expected}."),
         ));
     }
@@ -2969,8 +2981,9 @@ impl App {
                 });
             }
             None => {
+                // A first run, answered with the command that fixes it.
                 self.messages.push(Message::new(
-                    Role::Error,
+                    Role::System,
                     "No provider configured yet. Run /provider first.",
                 ));
             }
@@ -3393,7 +3406,7 @@ impl App {
                 self.overlay_cursor = 0;
                 if api_key.is_empty() {
                     self.messages
-                        .push(Message::new(Role::Error, "No API key entered; cancelled."));
+                        .push(Message::new(Role::System, "No API key entered; cancelled."));
                     return;
                 }
                 self.apply_llm_config(
@@ -4391,9 +4404,15 @@ mod tests {
                 let mut a = app();
                 type_str(&mut a, cmd);
                 a.handle_key(key(KeyCode::Enter));
+                // Explained, and explained calmly: a typo in a slash
+                // command is not a failure of anything.
                 assert!(
-                    a.messages.iter().any(|m| m.role == Role::Error),
+                    a.messages.iter().any(|m| m.role == Role::System),
                     "{cmd} should explain itself"
+                );
+                assert!(
+                    !a.messages.iter().any(|m| m.role == Role::Error),
+                    "{cmd} is a typo, not an error"
                 );
                 assert_eq!(a.config.quota.max_requests_per_day, 0, "{cmd} must change nothing");
                 assert!(!a.messages.iter().any(|m| m.role == Role::User), "{cmd}");
@@ -4883,7 +4902,9 @@ mod tests {
         type_str(&mut a, "/resume");
         a.handle_key(key(KeyCode::Enter));
         let last = a.messages.last().expect("a refusal");
-        assert!(last.role == Role::Error);
+        // Using a command in the wrong order is not a failure -- it is
+        // answered with the command that puts it right.
+        assert!(last.role == Role::System, "got {}", last.role.label());
         assert!(last.content.contains("/new first"), "{}", last.content);
     }
 
@@ -6193,6 +6214,64 @@ mod tests {
         }
     }
 
+    /// The line this whole change draws: "Error" is for something that went
+    /// wrong, not for anything the transcript merely wants to say.
+    ///
+    /// Cancelling is the user's own deliberate act, and it was being reported
+    /// back to them in red as though it had failed.
+    #[test]
+    fn cancelling_your_own_request_is_not_an_error() {
+        let mut a = streaming_app();
+        a.cancel();
+
+        let last = a.messages.last().expect("a note");
+        assert!(last.role == Role::System, "got {}", last.role.label());
+        assert!(last.content.contains("cancelled"), "{}", last.content);
+        assert!(!a.messages.iter().any(|m| m.role == Role::Error));
+    }
+
+    /// ...and the other half, which is what keeps the label meaning
+    /// anything: a request that genuinely failed still says so.
+    #[test]
+    fn a_failed_request_is_still_an_error() {
+        let mut a = streaming_app();
+        a.fail_stream("the endpoint is unreachable".to_string());
+
+        assert!(
+            a.messages.iter().any(|m| m.role == Role::Error),
+            "a real failure must keep the label"
+        );
+    }
+
+    /// A guardrail refusing something is not an error.
+    ///
+    /// Nothing failed and the program did exactly what it is for, but a block
+    /// was drawn under a red "Error" headline -- which reads as boxcode
+    /// having broken, and is alarming in a way the event does not deserve. It
+    /// was also the same event twice, since the tool line says it too.
+    #[test]
+    fn a_blocked_command_is_not_reported_as_an_error() {
+        let mut a = streaming_app();
+        a.request_tools(vec![command_call("call_1", "rm -rf /")]);
+
+        assert!(
+            !a.messages.iter().any(|m| m.role == Role::Error),
+            "a block must not be drawn as an error: {:?}",
+            a.messages.iter().map(|m| m.body()).collect::<Vec<_>>()
+        );
+
+        // One line, in the same place every other tool result appears,
+        // carrying the reason it used to duplicate.
+        let told = a.messages.last().expect("a result");
+        assert!(told.role == Role::Tool);
+        let shown = told.display.as_deref().expect("a display line");
+        assert!(shown.contains("— blocked"), "{shown}");
+        assert!(shown.contains("outside the project directory"), "{shown}");
+
+        // And the model is still told plainly, in the words it acts on.
+        assert!(told.content.contains("Blocked by the safety guardrails"), "{}", told.content);
+    }
+
     /// The catastrophic tier is unchanged and unreachable from any mode --
     /// this is the property the whole loosening rests on.
     #[test]
@@ -7263,16 +7342,18 @@ mod tests {
     }
 
     #[test]
-    fn standalone_model_without_a_provider_configured_shows_an_inline_error() {
+    fn standalone_model_without_a_provider_configured_says_what_to_run() {
         let mut a = app();
         type_str(&mut a, "/model");
         a.handle_key(key(KeyCode::Enter));
 
         assert_eq!(a.overlay, None);
+        // A first run, not a fault: answered with the command that fixes it.
         assert!(a
             .messages
             .iter()
-            .any(|m| m.role == Role::Error && m.content.contains("/provider")));
+            .any(|m| m.role == Role::System && m.content.contains("/provider")));
+        assert!(!a.messages.iter().any(|m| m.role == Role::Error));
     }
 
     #[test]
@@ -7844,10 +7925,17 @@ mod tests {
         let mut a = planning_app();
         a.request_tools(vec![command_call("call_1", "rm -rf /")]);
 
-        assert!(a
-            .messages
-            .iter()
-            .any(|m| m.role == Role::Error && m.content.contains("Blocked")));
+        // Reported as *blocked*, not as merely out of scope for plan mode --
+        // the louder reason wins. Asserted against the tool result rather
+        // than a `Role::Error` message, because a guardrail refusing
+        // something is not an error and no longer produces one.
+        let told = a.messages.last().expect("a result");
+        assert!(told.role == Role::Tool, "expected a tool result, got {}", told.role.label());
+        assert!(told.content.contains("Blocked by the safety guardrails"), "{}", told.content);
+        assert!(
+            !a.messages.iter().any(|m| m.role == Role::Error),
+            "a blocked command must not be drawn as an error"
+        );
     }
 
     // ---- the plan already in the project ------------------------------------
