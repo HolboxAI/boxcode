@@ -325,13 +325,7 @@ async fn run(
         req = req.bearer_auth(api_key);
     }
 
-    let response = req.send().await.map_err(|e| {
-        if e.is_connect() || e.is_timeout() {
-            format!("Could not reach {url}: {e}\nCheck BOXCODE_ENDPOINT / config.toml.")
-        } else {
-            format!("Request to {url} failed: {e}")
-        }
-    })?;
+    let response = req.send().await.map_err(|e| network_failure(&url, &e))?;
 
     // Surface HTTP failures (401 bad key, 404 wrong path, 400 bad model) as text
     // in the transcript instead of silently ending the stream.
@@ -414,8 +408,32 @@ async fn run(
     let mut finish_reason: Option<String> = None;
     let mut reported_usage: Option<ApiUsage> = None;
 
-    'read: while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Stream interrupted: {e}"))?;
+    'read: loop {
+        // A stall, not a total time limit. A long generation legitimately runs
+        // for minutes, so capping the whole request would kill the answers
+        // people most want; what never happens on a healthy stream is a long
+        // *gap between chunks*, since bytes arrive continuously once the model
+        // starts -- reasoning included. Without this the read simply waits
+        // forever: a dropped Wi-Fi link or a server that accepted the request
+        // and then went quiet left the spinner turning with nothing behind it
+        // and no way to tell that from a slow answer.
+        let next = match tokio::time::timeout(STREAM_STALL_TIMEOUT, stream.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                return Err(format!(
+                    "Lost the connection to {}: nothing received for {}s.",
+                    host_of(&url),
+                    STREAM_STALL_TIMEOUT.as_secs()
+                ))
+            }
+        };
+        let Some(chunk) = next else { break 'read };
+        // Mid-stream, so the connection was fine a moment ago -- said in those
+        // terms rather than as reqwest's chain, for the same reason
+        // `network_failure` exists.
+        let chunk = chunk.map_err(|_| {
+            format!("Lost the connection to {} mid-reply.", host_of(&url))
+        })?;
         buf.extend_from_slice(&chunk);
 
         while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
@@ -591,6 +609,89 @@ pub fn parse_sse_line(line: &str) -> SseLine {
     }
 }
 
+/// How long the stream may go silent before it is treated as dead.
+///
+/// Deliberately a gap between chunks rather than a limit on the whole request:
+/// a long generation is supposed to take minutes, and a total timeout would
+/// abandon exactly the answers that took the most work. Two minutes is far
+/// longer than any real pause between chunks -- including the wait for the
+/// first one on a large prompt -- and short enough that a connection which
+/// died silently does not leave the spinner turning indefinitely.
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The host part of an endpoint URL, for a message a person has to read.
+///
+/// `https://api.deepseek.com/v1/chat/completions` is the URL the request went
+/// to, and repeating all of it -- three times, as the old message did -- says
+/// nothing the host does not.
+fn host_of(url: &str) -> &str {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+}
+
+/// Whether any layer of `e`'s source chain mentions `needle`.
+///
+/// reqwest does not expose "this was a DNS failure" as a predicate, and the
+/// only place that fact exists is the wrapped `hyper`/`std::io` error several
+/// levels down.
+fn chain_mentions(e: &reqwest::Error, needle: &str) -> bool {
+    use std::error::Error;
+    let mut source: Option<&(dyn Error + 'static)> = Some(e);
+    while let Some(err) = source {
+        if err.to_string().to_ascii_lowercase().contains(needle) {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+/// One short sentence for a network failure.
+///
+/// Printing `{e}` gave the whole of reqwest's nested chain, which is written
+/// for whoever is debugging reqwest and repeats the URL at every layer:
+///
+/// ```text
+/// Could not reach https://api.deepseek.com/v1/chat/completions: error sending
+/// request for url (https://api.deepseek.com/v1/chat/completions): error trying
+/// to connect: dns error: failed to lookup address information: nodename nor
+/// servname provided, or not known
+/// Check BOXCODE_ENDPOINT / config.toml.
+/// ```
+///
+/// Four lines, one fact: the name did not resolve. Every layer above that is
+/// the library narrating its own call stack, and the trailing advice is said
+/// again by `notice.rs`'s hint for this kind of error.
+///
+/// The `Could not reach` prefix is load-bearing -- `notice::markers::UNREACHABLE`
+/// keys on it to pick the "Endpoint unreachable" headline and its hint, so a
+/// rewording here silently downgrades the whole class to a plain "Error".
+fn network_failure(url: &str, e: &reqwest::Error) -> String {
+    let host = host_of(url);
+    // Ordered by specificity: a DNS failure is also a connect failure, and
+    // "no such host" is the more useful of the two things to be told.
+    if chain_mentions(e, "dns error") || chain_mentions(e, "failed to lookup") {
+        format!("Could not reach {host}: no such host.")
+    } else if e.is_timeout() {
+        format!("Could not reach {host}: timed out.")
+    } else if chain_mentions(e, "connection refused") {
+        format!("Could not reach {host}: connection refused.")
+    } else if chain_mentions(e, "certificate") || chain_mentions(e, "tls") {
+        format!("Could not reach {host}: TLS handshake failed.")
+    } else if e.is_connect() {
+        format!("Could not reach {host}.")
+    } else {
+        // Not a connection problem at all -- a malformed request, a body that
+        // would not encode. Still one line, but it must not claim the network
+        // is at fault.
+        format!("Request to {host} failed.")
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -664,6 +765,107 @@ mod tests {
             });
         }
         assert_eq!(seen, vec!["reasoning:thinking", "token:Hello"]);
+    }
+
+    /// A network failure is one short line, not reqwest's call stack.
+    ///
+    /// The message this replaced ran to four lines and repeated the URL three
+    /// times, to say one thing: the name did not resolve. Everything above
+    /// that was the library narrating its own layers.
+    #[tokio::test]
+    async fn a_network_failure_is_one_short_line() {
+        let (tx, mut rx) = mpsc::channel(8);
+        // Port 1 refuses immediately, so this is hermetic and fast -- no DNS,
+        // no waiting on a timeout.
+        stream_chat(
+            Target {
+                endpoint: "http://127.0.0.1:1",
+                model: "m",
+                api_key: "",
+                max_tokens: 100,
+                include_usage: false,
+            },
+            vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }],
+            Vec::new(),
+            1,
+            tx,
+        )
+        .await;
+
+        let mut error = None;
+        while let Ok((_, ev)) = rx.try_recv() {
+            if let StreamEvent::Error(e) = ev {
+                error = Some(e);
+            }
+        }
+        let error = error.expect("an unreachable endpoint must report something");
+
+        assert_eq!(error.lines().count(), 1, "should be one line: {error:?}");
+        assert!(error.contains("127.0.0.1:1"), "should name the host: {error:?}");
+        // The layers that made the old message unreadable.
+        for noise in ["error sending request", "error trying to connect", "hyper", "os error"] {
+            assert!(!error.contains(noise), "{noise:?} leaked through: {error:?}");
+        }
+        // And the URL is named once, not at every layer.
+        assert_eq!(error.matches("127.0.0.1").count(), 1, "{error:?}");
+    }
+
+    /// Every one of these has to keep reaching `notice`'s "Endpoint
+    /// unreachable" headline and its hint. That classification keys on the
+    /// wording, so a rewording silently demotes the whole class to a bare
+    /// "Error" with no hint -- which is exactly the sort of thing that is
+    /// noticed months later, by a user, offline.
+    #[test]
+    fn every_network_message_still_classifies_as_offline() {
+        let e = |m: &str| crate::notice::classify(m);
+        for message in [
+            "Could not reach api.deepseek.com: no such host.",
+            "Could not reach api.deepseek.com: timed out.",
+            "Could not reach api.deepseek.com: connection refused.",
+            "Could not reach api.deepseek.com: TLS handshake failed.",
+            "Could not reach api.deepseek.com.",
+            "Lost the connection to api.deepseek.com mid-reply.",
+            "Lost the connection to api.deepseek.com: nothing received for 120s.",
+        ] {
+            assert_eq!(
+                e(message),
+                crate::notice::Kind::Offline,
+                "{message:?} lost its headline"
+            );
+        }
+        // ...but a failure that is not the network's fault must not claim to
+        // be one, or "check your connection" is advice about the wrong thing.
+        assert_ne!(
+            e("Request to api.deepseek.com failed."),
+            crate::notice::Kind::Offline
+        );
+    }
+
+    #[test]
+    fn the_host_is_taken_from_whatever_shape_of_url_arrives() {
+        assert_eq!(host_of("https://api.deepseek.com/v1/chat/completions"), "api.deepseek.com");
+        assert_eq!(host_of("http://127.0.0.1:1/v1/chat/completions"), "127.0.0.1:1");
+        assert_eq!(host_of("https://llm.internal:8443"), "llm.internal:8443");
+        // Not a URL at all: better to echo it than to produce an empty message.
+        assert_eq!(host_of("nonsense"), "nonsense");
+    }
+
+    /// The stall guard has to be long enough that it never fires on a real
+    /// answer. It is a gap between chunks, not a limit on the request, because
+    /// a total timeout would abandon exactly the long generations people most
+    /// want -- if this is ever "simplified" into `Client::timeout`, that is
+    /// the bug it introduces.
+    #[test]
+    fn the_stall_guard_is_a_generous_gap_not_a_request_limit() {
+        assert!(
+            STREAM_STALL_TIMEOUT >= Duration::from_secs(60),
+            "too tight to survive a slow first chunk on a large prompt"
+        );
     }
 
     #[test]
