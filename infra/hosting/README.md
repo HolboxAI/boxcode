@@ -98,6 +98,75 @@ origin directly gets nothing, so WAF and the rate limits below cannot be skipped
 Port 80 is open to the world only because Let's Encrypt validates from its own
 addresses, not CloudFront's.
 
+## What runs on the box
+
+`setup.sh` provisions it, and is idempotent because it is also the recovery
+path — it runs unattended from user-data on every spot replacement, not just
+once by hand.
+
+| | |
+|---|---|
+| Docker + **gVisor** (`runsc`) | Registered as a runtime, **not** as the default. Apps and builds ask for it; Postgres deliberately does not — it is our own trusted image, and gVisor's overhead falls hardest on exactly the I/O a database does most of. |
+| **Postgres 16** | The reason this box exists rather than a Lambda: a real wire protocol, so every ORM works untouched. Password auth, on the data volume. |
+| nginx | `apps.boxcode.sh`, per-app routes in `conf.d/app-projects/`, WebSocket upgrade — three lines here, impossible on API Gateway. |
+| `boxcode-egress-backstop` | See below. |
+
+### The Docker address pool is not cosmetic
+
+Docker's default pools are `172.17.0.0/16` through `172.31.0.0/16`. **This
+account's VPC is `172.31.0.0/16`.** Left alone, Docker eventually hands a
+container network the same range as the VPC and the box silently loses its route
+to the auth box at `172.31.22.160` — an outage that appears at container number
+N for no visible reason. `setup.sh` moves the pool to `10.200.0.0/16`.
+
+### How apps are confined
+
+**One `--internal` network per app**, containing exactly that app and Postgres.
+App-to-app is impossible *by construction* rather than by a flag — two apps are
+never on the same network, so there is nothing to misconfigure. An earlier draft
+used one shared network with `icc=false`, which also works but depends on a
+single option staying set.
+
+`--internal` is what blocks egress: no default route on the bridge at all, so
+external DNS returns SERVFAIL and there is nowhere for a miner, a bot or an
+exfiltrator to go.
+
+The **backstop** is a `DOCKER-USER` rule dropping anything forwarded from the app
+pool to outside it. Docker owns its iptables rules and rewrites them on daemon
+restart, and a control that `systemctl restart docker` can silently remove is not
+a control — `DOCKER-USER` is the one chain Docker never flushes.
+
+Every containment flag lives in `runtime/container.mjs` as pure functions rather
+than as a shell string in the control-plane, because this is the file where
+forgetting one line removes a security property and nothing looks wrong
+afterwards. **20 tests** assert each flag is present.
+
+### Proving it blocks, not that it is configured
+
+`docker inspect` showing `--cap-drop ALL` proves a flag was passed. It does not
+prove a container cannot mount a filesystem. Every check in
+`runtime/verify-containment.sh` **tries the thing and fails the run if it
+succeeds**:
+
+```bash
+# on the box, exercising gVisor for real
+bash infra/hosting/runtime/verify-containment.sh
+
+# anywhere with Docker; gVisor is Linux-only
+RUNTIME=runc bash infra/hosting/runtime/verify-containment.sh
+```
+
+15 checks: no egress by IP, by name, by DNS, or to the metadata service; reaches
+its own database but not another app's subnet; not root, cannot mount, cannot
+write outside its tmpfs, cannot execute from it; unbounded allocation is
+OOM-killed and a fork bomb hits the pid ceiling.
+
+The last two run in throwaway containers. An earlier version ran the fork bomb
+inside the shared one, which left it pinned at its PID ceiling for thirty seconds
+— the next `docker exec` could not fork, and the following check failed for a
+reason that had nothing to do with what it tested. A destructive test needs its
+own blast radius, same as a destructive tenant does.
+
 ## Still Lambda-shaped
 
 Not yet rewritten for EC2, and wrong in the meantime:
@@ -262,9 +331,13 @@ Not applied yet. `runner.tf` additionally needs `runner_subnet_id`,
 `runner_vpc_id` and `runner_bootstrap_bucket`, and the bundle at
 `s3://<bucket>/hosting/bundle.zip` that `user-data.sh.tftpl` fetches on boot.
 
-**`setup.sh` does not exist yet.** Boot mounts the data volume and stops with a
-clear message rather than failing, so the box comes up reachable and unprovisioned
-instead of stuck in a replace loop.
+`setup.sh` stops with a clear message, rather than failing, when the bundle has
+no `control-plane/` — the box comes up provisioned and reachable but unable to
+accept deploys, instead of putting the ASG into a replace loop that no amount of
+retrying fixes. The control-plane is the next piece.
+
+`apps.boxcode.sh` must point at the **Elastic IP**, not at an instance address,
+or every spot replacement breaks TLS.
 
  `terraform apply` needs credentials with permission to create
 IAM roles, a Lambda, an SNS topic, a budget and a WAF ACL.
