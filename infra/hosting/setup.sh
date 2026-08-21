@@ -1,181 +1,88 @@
 #!/usr/bin/env bash
-# Provisions the runner box: Docker with gVisor, the container networking that
-# confines hosted apps, Postgres, and nginx for apps.boxcode.sh.
+# Provisions the runner box: nginx, Postgres, and the per-app plumbing that
+# hosted backends run under.
 #
-# Runs unattended from user-data on every launch -- including the 3am spot
-# replacement nobody is awake for -- and by hand after any infra/hosting change.
-# Idempotent throughout, which is not a nicety here: it is the recovery path.
+# One dedicated t3.medium. No Docker, no container runtime, no orchestrator --
+# apps run as ordinary systemd services, which is both the simplest thing that
+# works and, because of what systemd can lock a service out of, the thing that
+# gives each tenant a real sandbox. See runtime/unit.mjs.
 #
 # THIS BOX RUNS CODE STRANGERS UPLOADED. It shares nothing with boxcode-auth,
-# which runs its control-plane as root with Postgres on `trust` -- defensible
-# there because everything on it is a trusted third-party image, and not
-# defensible for a minute here. Do not copy that box's privilege posture over.
+# which runs its control-plane as root with Postgres on `trust`. That is fine
+# there, where every process is a trusted third-party image, and would be
+# indefensible here. Do not carry that box's posture across.
 #
-# SKIP_TLS=1 sets up everything except the DNS check and certbot, so the rest
-# can be proven over plain HTTP before apps.boxcode.sh has an A record. Same
-# escape hatch infra/auth/setup.sh has, for the same reason.
+# Idempotent -- meant to be re-run after any infra/hosting change.
+#
+# SKIP_TLS=1 does everything except the DNS check and certbot, so the rest can
+# be proven over plain HTTP before apps.boxcode.sh has an A record.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_TLS="${SKIP_TLS:-0}"
-DATA="${BOXCODE_DATA_DIR:-/opt/boxcode-hosting}"
+APPS_DIR=/opt/boxcode-apps
 DOMAIN=apps.boxcode.sh
 
-# Docker's default address pools are 172.17.0.0/16 through 172.31.0.0/16, and
-# this account's VPC is 172.31.0.0/16. Left alone, Docker will eventually hand a
-# container network the same range as the VPC and the box silently loses its
-# route to the auth box at 172.31.22.160 -- an outage that appears at container
-# number N for no visible reason. Moving the pool out of the way costs nothing.
-DOCKER_POOL=10.200.0.0/16
-PG_NETWORK=boxcode-pg
-PG_CONTAINER=boxcode-postgres
-PG_IMAGE=postgres:16-alpine
-
-echo "== data volume =="
-if ! mountpoint -q "$DATA"; then
-    echo "$DATA is not a mount point -- user-data attaches and mounts the data" >&2
-    echo "volume before running this. Refusing to write project state to the" >&2
-    echo "root volume, which is destroyed on every instance replacement." >&2
-    exit 1
-fi
-sudo mkdir -p "$DATA"/{pgdata,apps,zips,builds,secrets}
-sudo chmod 700 "$DATA/secrets"
-
 echo "== packages =="
-sudo dnf install -y docker nginx certbot python3-certbot-nginx bind-utils \
-    jq unzip iptables-services >/dev/null
+sudo dnf install -y nginx postgresql15-server postgresql15 certbot \
+    python3-certbot-nginx bind-utils jq unzip git tar xz >/dev/null
 
-echo "== gvisor =="
-# The replacement for the per-tenant Firecracker microVM that Lambda gave for
-# free. Containers share the host kernel; runsc puts a user-space kernel in
-# front of it so an exploit has to get through the Sentry first. Costs ~10-15%
-# CPU, which is the price of the substrate change.
-if ! command -v runsc >/dev/null 2>&1; then
-    ARCH="$(uname -m)"
-    URL="https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}"
-    TMP="$(mktemp -d)"
-    (
-        cd "$TMP"
-        # Checksums are verified, not decorated: this binary is the thing
-        # standing between a hostile container and the host kernel, and it is
-        # fetched over the internet on every fresh instance.
-        curl -fsSLO "${URL}/runsc" -O "${URL}/runsc.sha512" \
-            -O "${URL}/containerd-shim-runsc-v1" -O "${URL}/containerd-shim-runsc-v1.sha512"
-        sha512sum -c runsc.sha512 containerd-shim-runsc-v1.sha512
-        chmod a+rx runsc containerd-shim-runsc-v1
-        sudo mv runsc containerd-shim-runsc-v1 /usr/local/bin/
-    )
-    rm -rf "$TMP"
+echo "== node =="
+# AL2023's default nodejs is v18, and this platform hosts apps written against
+# current Node. Same approach infra/db/setup.sh takes: a real tarball in its own
+# directory rather than fighting the distro's module streams.
+NODE_VERSION=v22.20.0
+NODE_DIR=/opt/node22
+if [ ! -x "$NODE_DIR/bin/node" ] || [ "$("$NODE_DIR/bin/node" --version)" != "$NODE_VERSION" ]; then
+    TARBALL="node-$NODE_VERSION-linux-x64.tar.xz"
+    curl -fsSLO "https://nodejs.org/dist/$NODE_VERSION/$TARBALL"
+    sudo rm -rf "$NODE_DIR" && sudo mkdir -p "$NODE_DIR"
+    sudo tar -xJf "$TARBALL" -C "$NODE_DIR" --strip-components=1
+    rm -f "$TARBALL"
 fi
-runsc --version | head -1
+"$NODE_DIR/bin/node" --version
 
-echo "== docker daemon =="
-sudo mkdir -p /etc/docker
-# runsc is registered as an available runtime, NOT as the default. Hosted app
-# containers and the build sandbox ask for it explicitly; Postgres deliberately
-# does not -- it is our own trusted image, and gVisor's overhead falls hardest
-# on exactly the I/O a database does most of.
-#
-# live-restore keeps containers running across a daemon restart, so `systemctl
-# restart docker` during maintenance does not take ten live demos down with it.
-#
-# Log rotation is not housekeeping either. A full disk is the outage this box
-# will actually have -- it takes out all ten apps and Postgres at once, and it
-# is caused by ordinary use rather than by anything going wrong.
-sudo tee /etc/docker/daemon.json >/dev/null <<EOF
-{
-  "default-address-pools": [{"base": "${DOCKER_POOL}", "size": 24}],
-  "runtimes": {"runsc": {"path": "/usr/local/bin/runsc"}},
-  "live-restore": true,
-  "log-driver": "json-file",
-  "log-opts": {"max-size": "10m", "max-file": "3"}
-}
-EOF
-sudo systemctl enable --now docker
-sudo systemctl restart docker
-sudo docker info --format '{{.ServerVersion}} runtimes={{range $k,$v := .Runtimes}}{{$k}} {{end}}'
-
-echo "== egress backstop =="
-# Belt and braces on the container networks below.
-#
-# Each app network is created --internal, which is what actually blocks egress.
-# But Docker owns its iptables rules and rewrites them on daemon restart, and a
-# control that a `systemctl restart docker` can silently remove is not a
-# control. DOCKER-USER is the one chain Docker never flushes, so the rule goes
-# there: anything forwarded FROM the app pool TO outside the app pool is
-# dropped, whatever Docker's own rules happen to say at the time.
-sudo tee /usr/local/sbin/boxcode-egress-backstop >/dev/null <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-# -C tests for the rule and fails if absent, which is the idempotency check.
-iptables -C DOCKER-USER -s ${DOCKER_POOL} '!' -d ${DOCKER_POOL} -j DROP 2>/dev/null || \\
-    iptables -I DOCKER-USER 1 -s ${DOCKER_POOL} '!' -d ${DOCKER_POOL} -j DROP
-EOF
-sudo chmod +x /usr/local/sbin/boxcode-egress-backstop
-sudo tee /etc/systemd/system/boxcode-egress-backstop.service >/dev/null <<'EOF'
-[Unit]
-Description=Drop egress from boxcode app networks, whatever Docker rewrote
-After=docker.service
-Requires=docker.service
-PartOf=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/boxcode-egress-backstop
-
-[Install]
-WantedBy=multi-user.target
-EOF
-sudo systemctl daemon-reload
-sudo systemctl enable --now boxcode-egress-backstop
-sudo systemctl restart boxcode-egress-backstop
+echo "== app directories and the shared group =="
+# Every app's unix user is in this group; nothing else is. It exists so nginx
+# can be granted what it needs without any app being able to reach another's
+# files -- the directories below are 0750 and owned per-app.
+getent group bcapp >/dev/null || sudo groupadd --system bcapp
+sudo mkdir -p "$APPS_DIR"
+sudo chmod 0755 "$APPS_DIR"
 
 echo "== postgres =="
 # The reason this box exists rather than a Lambda: a real wire protocol, so
-# Prisma, SQLAlchemy, the Django ORM and every other ORM work untouched.
-#
-# Runs on the default runtime, not runsc -- see the daemon.json comment.
-if ! sudo docker network inspect "$PG_NETWORK" >/dev/null 2>&1; then
-    sudo docker network create --internal "$PG_NETWORK" >/dev/null
+# Prisma, SQLAlchemy and the Django ORM work untouched.
+if [ ! -f /var/lib/pgsql/data/PG_VERSION ]; then
+    sudo postgresql-setup --initdb
 fi
 
-PW_FILE="$DATA/secrets/postgres-super.pw"
-if [ ! -f "$PW_FILE" ]; then
-    # Generated once and kept on the data volume, so an instance replacement
-    # comes back to a database it can still open.
-    openssl rand -hex 32 | sudo tee "$PW_FILE" >/dev/null
-    sudo chmod 600 "$PW_FILE"
-fi
+# scram-sha-256 on loopback, NOT trust. Every app reaches Postgres over
+# 127.0.0.1 with its own role and its own generated password, and CONNECT is
+# revoked on every database but its own. `trust` here would mean any app could
+# open any other app's database by name.
+sudo tee /var/lib/pgsql/data/pg_hba.conf >/dev/null <<'EOF'
+local   all   postgres              peer
+host    all   all      127.0.0.1/32 scram-sha-256
+host    all   all      ::1/128      scram-sha-256
+EOF
+# Sized for a 4 GiB box that also has to hold ten apps.
+sudo tee -a /var/lib/pgsql/data/postgresql.conf >/dev/null <<'EOF'
 
-if ! sudo docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
-    sudo docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
-    sudo docker run -d --name "$PG_CONTAINER" \
-        --network "$PG_NETWORK" \
-        --restart unless-stopped \
-        -e POSTGRES_PASSWORD_FILE=/run/secrets/pw \
-        -v "$PW_FILE":/run/secrets/pw:ro \
-        -v "$DATA/pgdata":/var/lib/postgresql/data \
-        --memory 768m --memory-swap 768m \
-        "$PG_IMAGE" \
-        -c shared_buffers=192MB \
-        -c max_connections=100 \
-        -c statement_timeout=10000 \
-        -c idle_in_transaction_session_timeout=60000 >/dev/null
-fi
-# Wait for it rather than racing whatever runs next.
-for _ in $(seq 1 30); do
-    sudo docker exec "$PG_CONTAINER" pg_isready -q && break
-    sleep 2
-done
-sudo docker exec "$PG_CONTAINER" pg_isready
+# --- boxcode hosting ---
+listen_addresses = '127.0.0.1'
+shared_buffers = 128MB
+max_connections = 60
+password_encryption = scram-sha-256
+statement_timeout = 10000
+idle_in_transaction_session_timeout = 60000
+EOF
+sudo systemctl enable --now postgresql
+sudo systemctl restart postgresql
+sudo -u postgres psql -qtc 'select version()' | head -1
 
 echo "== nginx =="
 sudo mkdir -p /etc/nginx/conf.d/app-projects
-sudo cp "$SCRIPT_DIR/nginx/upgrade-map.conf" /etc/nginx/conf.d/upgrade-map.conf
-# Only write the base vhost if it is not already there: once certbot has run it
-# has edited this file in place, and copying the template over the top would
-# silently destroy the TLS server block. Same trap infra/db/setup.sh documents.
 if [ ! -f /etc/nginx/conf.d/apps.conf ]; then
     sudo cp "$SCRIPT_DIR/nginx/apps.conf.template" /etc/nginx/conf.d/apps.conf
 fi
@@ -183,12 +90,22 @@ sudo nginx -t
 sudo systemctl enable --now nginx
 sudo systemctl reload nginx
 
+echo "== journald size cap =="
+# A full disk is the outage this box will actually have: it takes out every app
+# and Postgres at once, and ordinary use causes it. Ten apps logging into the
+# journal unbounded is the most likely way to get there.
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/boxcode.conf >/dev/null <<'EOF'
+[Journal]
+SystemMaxUse=2G
+MaxRetentionSec=3day
+EOF
+sudo systemctl restart systemd-journald
+
 if [ "$SKIP_TLS" = "1" ]; then
     echo "== SKIP_TLS=1: plain HTTP, no DNS check, no certbot =="
 else
     echo "== dns check =="
-    # certbot's HTTP-01 challenge fails opaquely without this, so say the useful
-    # thing here rather than letting certbot's error be the first anyone sees.
     TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token \
         -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
     THIS_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 \
@@ -196,13 +113,10 @@ else
     RESOLVED=$(dig +short "$DOMAIN" | tail -1)
     if [ "$RESOLVED" != "$THIS_IP" ]; then
         echo "$DOMAIN resolves to '$RESOLVED', not this box ($THIS_IP)." >&2
-        echo "" >&2
-        echo "On a spot replacement this is expected until the Elastic IP is" >&2
-        echo "reassociated. Point $DOMAIN at the Elastic IP, not at an" >&2
-        echo "instance address, or every replacement breaks TLS." >&2
+        echo "Point it at this instance's Elastic IP, then re-run; or re-run" >&2
+        echo "with SKIP_TLS=1 to prove everything else over plain HTTP first." >&2
         exit 1
     fi
-
     echo "== tls =="
     sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos \
         --register-unsafely-without-email --redirect
@@ -210,20 +124,19 @@ fi
 
 echo "== hosting control-plane =="
 if [ -f "$SCRIPT_DIR/control-plane/index.mjs" ]; then
-    sudo mkdir -p /opt/boxcode-hosting-cp
-    sudo cp "$SCRIPT_DIR"/control-plane/*.mjs /opt/boxcode-hosting-cp/
+    sudo mkdir -p /opt/boxcode-hosting/control-plane
+    sudo cp "$SCRIPT_DIR"/control-plane/*.mjs /opt/boxcode-hosting/control-plane/
+    sudo cp "$SCRIPT_DIR"/runtime/*.mjs /opt/boxcode-hosting/control-plane/
     sudo cp "$SCRIPT_DIR/control-plane/boxcode-hosting-control-plane.service" \
-        /etc/systemd/system/boxcode-hosting-control-plane.service
+        /etc/systemd/system/
     sudo systemctl daemon-reload
     sudo systemctl enable --now boxcode-hosting-control-plane
     sudo systemctl restart boxcode-hosting-control-plane
     sudo systemctl --no-pager status boxcode-hosting-control-plane
 else
-    # Not an error. The box is provisioned and reachable; it just has nothing
-    # to deploy into yet. Failing here would put the ASG into a replace loop
-    # that no amount of retrying fixes.
-    echo "no control-plane/ in this bundle -- box is provisioned but cannot"
-    echo "accept deploys yet. This is expected until it ships."
+    # Not a failure. The box is provisioned and reachable; it has nothing to
+    # deploy into yet.
+    echo "no control-plane/ yet -- box is provisioned but cannot accept deploys."
 fi
 
 echo "== done: $(date -Is) =="

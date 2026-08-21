@@ -1,32 +1,42 @@
 # Base vhost for apps.boxcode.sh -- the origin CloudFront sends /api/* to.
 #
-# Like auth.boxcode.sh, this needs a real owned domain: Let's Encrypt refuses
+# Needs a real owned domain, same as auth.boxcode.sh: Let's Encrypt refuses
 # *.compute.amazonaws.com outright ("forbidden by policy") because anyone can
-# get one for free, and an ACM cert cannot be handed to plain nginx at all.
-# See infra/auth/nginx/auth.conf.template, which learned this the hard way.
+# get one free, and an ACM cert cannot be handed to plain nginx at all. See
+# infra/auth/nginx/auth.conf.template, which learned that the hard way.
 #
-# Listens on 80 only; setup.sh runs `certbot --nginx` after this file is in
-# place and certbot adds the 443 server block and the redirect itself. Hand-
-# writing that block here would only give certbot's own edit something to
-# diverge from.
+# Listens on 80 only; setup.sh runs certbot afterwards and certbot adds the 443
+# block and the redirect itself.
 
-# Per-app routes are written into this directory by the hosting control-plane,
-# one file per live project, never into this file -- certbot edits this one in
-# place, and regenerating it from the template would destroy that edit.
+# WebSockets. Connection must say "upgrade" only when the client actually asked
+# to, or keep-alive breaks for every ordinary request. One of the things that
+# was simply not possible on Lambda.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
 server {
     listen 80;
     server_name apps.boxcode.sh;
 
-    # Hosted backends are demo apps, not CDNs. A small body cap costs nothing
-    # legitimate and takes an easy amplification lever off the table.
+    # Demo backends, not a CDN. A small cap costs nothing legitimate and takes
+    # an easy amplification lever away.
     client_max_body_size 10m;
 
-    # A request to an id nobody has deployed lands here rather than on nginx's
-    # welcome page -- a clearer signal that the id itself is the problem.
+    location = /healthz {
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+    }
+
+    # An id nobody has deployed lands here rather than on nginx's welcome page.
     location / {
         return 404 "no app deployed at this path\n";
         add_header Content-Type text/plain;
     }
 
+    # One file per live app, written by the control-plane. Never written into
+    # this file: certbot edits this one in place, and regenerating it from the
+    # template would destroy that edit.
     include /etc/nginx/conf.d/app-projects/*.conf;
 }
