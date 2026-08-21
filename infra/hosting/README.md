@@ -1,6 +1,14 @@
-# Hosting guards
+# Hosting
 
-Rate limiting and cost containment for boxcode's hosted backends.
+The runner box that hosted full-stack backends run on, plus the rate limiting
+and cost containment around them.
+
+> **Substrate changed on 2026-08-21: Lambda to EC2.** Lambda could not run what
+> people actually build — no WebSockets, a 30s request cap, and no database wire
+> protocol, so Prisma, SQLAlchemy and the Django ORM all fail. A dedicated EC2
+> runner removes all three. `runner.tf` and `spot-fallback/` are the new
+> substrate; `guards.tf` still describes reserved concurrency and a Lambda kill
+> switch and **has not been retargeted yet** — see "Still Lambda-shaped" below.
 
 **Constraint that shapes everything here:** this AWS account is shared. It runs
 **42 Lambda functions** and **8 EC2 instances** that have nothing to do with
@@ -11,6 +19,162 @@ outage. **That is a worse failure than the one it prevents.**
 
 So every control is scoped to boxcode's own resources, and none of it is
 account-wide.
+
+## The runner box
+
+One instance, on spot, with an on-demand fallback. **~$40/month against ~$87
+on-demand**, and that difference is why the design is shaped the way it is.
+
+Three things are load-bearing and none of them are obvious:
+
+**One availability zone.** The data volume holds the project registry and
+Postgres, and EBS cannot cross zones. An ASG spread across zones would happily
+launch a replacement that cannot reach any of the state it is replacing.
+
+**`min = max = desired = 1`.** The same single volume forbids two instances. That
+also rules out capacity rebalancing, which works by launching a replacement
+*before* terminating the instance at risk — so it is switched off rather than
+enabled as decoration.
+
+**Terraform does not own the on-demand percentage after creation.** The fallback
+function owns it at runtime. Without the `ignore_changes` on it, an unrelated
+`terraform apply` during a capacity shortage would reset the group to spot-only
+and take the platform back down — an outage caused by the thing meant to prevent
+one.
+
+### How the fallback works
+
+An ASG **does not fall back to on-demand on its own**. With the percentage at 0
+and no spot capacity in the pinned AZ, it retries spot forever and the platform
+stays down. That is the failure `spot-fallback/` exists to prevent, and the
+reason "spot with an on-demand fallback" needs code rather than a checkbox.
+
+```
+  spot launch fails ──> EventBridge ──> boxcode-spot-fallback
+                                          on-demand percentage 0 -> 100
+                                          tag boxcode:fallback-since = now
+                                                    │
+  hourly sweep ─────> EventBridge ──────────────────┤
+                                          healthy for 6h?  100 -> 0
+```
+
+**Returning to spot is free.** The percentage applies to the *next* launch, not
+the running instance, so going back costs nothing and interrupts nobody — the box
+simply becomes a spot box the next time it is replaced for any reason. That is
+why the return path needs no scheduling: there is no outage to schedule around.
+
+The six-hour wait is not a flapping guard, since flapping the policy is free. It
+is a signal guard: capacity shortages last hours, and switching back after ten
+minutes just means the next replacement fails and drops the platform again.
+
+### Uncertainty resolves in different directions on purpose
+
+`policy.mjs` is asymmetric, and this is the part to read before changing it:
+
+| Direction | On unreadable state | Why |
+|---|---|---|
+| Falling back to on-demand | **acts anyway** | Setting 100 when it is already 100 does nothing. Holding leaves the platform down. |
+| Returning to spot | **refuses** | This direction only ever saves money. It never restores service, so it requires certainty. |
+
+`Number()` is deliberately not used to validate: `Number(null)`, `Number("")`,
+`Number(false)` and `Number([])` are all `0`, which in this module reads as "we
+are on spot" — the single most consequential thing to be wrong about.
+
+```bash
+node --test infra/hosting/spot-fallback/policy.test.mjs   # 16 tests
+```
+
+### Why a container cannot read the instance role
+
+`http_put_response_hop_limit = 1` on the launch template. Docker adds a network
+hop, so a limit of 1 reaches the host and nothing else — a container on the
+bridge cannot reach `169.254.169.254` and read this instance's credentials.
+
+### Why the box only answers CloudFront
+
+Ingress on 443 comes from the `com.amazonaws.global.cloudfront.origin-facing`
+managed prefix list, not `0.0.0.0/0`. Resolving `apps.boxcode.sh` and hitting the
+origin directly gets nothing, so WAF and the rate limits below cannot be skipped.
+Port 80 is open to the world only because Let's Encrypt validates from its own
+addresses, not CloudFront's.
+
+## What runs on the box
+
+`setup.sh` provisions it, and is idempotent because it is also the recovery
+path — it runs unattended from user-data on every spot replacement, not just
+once by hand.
+
+| | |
+|---|---|
+| Docker + **gVisor** (`runsc`) | Registered as a runtime, **not** as the default. Apps and builds ask for it; Postgres deliberately does not — it is our own trusted image, and gVisor's overhead falls hardest on exactly the I/O a database does most of. |
+| **Postgres 16** | The reason this box exists rather than a Lambda: a real wire protocol, so every ORM works untouched. Password auth, on the data volume. |
+| nginx | `apps.boxcode.sh`, per-app routes in `conf.d/app-projects/`, WebSocket upgrade — three lines here, impossible on API Gateway. |
+| `boxcode-egress-backstop` | See below. |
+
+### The Docker address pool is not cosmetic
+
+Docker's default pools are `172.17.0.0/16` through `172.31.0.0/16`. **This
+account's VPC is `172.31.0.0/16`.** Left alone, Docker eventually hands a
+container network the same range as the VPC and the box silently loses its route
+to the auth box at `172.31.22.160` — an outage that appears at container number
+N for no visible reason. `setup.sh` moves the pool to `10.200.0.0/16`.
+
+### How apps are confined
+
+**One `--internal` network per app**, containing exactly that app and Postgres.
+App-to-app is impossible *by construction* rather than by a flag — two apps are
+never on the same network, so there is nothing to misconfigure. An earlier draft
+used one shared network with `icc=false`, which also works but depends on a
+single option staying set.
+
+`--internal` is what blocks egress: no default route on the bridge at all, so
+external DNS returns SERVFAIL and there is nowhere for a miner, a bot or an
+exfiltrator to go.
+
+The **backstop** is a `DOCKER-USER` rule dropping anything forwarded from the app
+pool to outside it. Docker owns its iptables rules and rewrites them on daemon
+restart, and a control that `systemctl restart docker` can silently remove is not
+a control — `DOCKER-USER` is the one chain Docker never flushes.
+
+Every containment flag lives in `runtime/container.mjs` as pure functions rather
+than as a shell string in the control-plane, because this is the file where
+forgetting one line removes a security property and nothing looks wrong
+afterwards. **20 tests** assert each flag is present.
+
+### Proving it blocks, not that it is configured
+
+`docker inspect` showing `--cap-drop ALL` proves a flag was passed. It does not
+prove a container cannot mount a filesystem. Every check in
+`runtime/verify-containment.sh` **tries the thing and fails the run if it
+succeeds**:
+
+```bash
+# on the box, exercising gVisor for real
+bash infra/hosting/runtime/verify-containment.sh
+
+# anywhere with Docker; gVisor is Linux-only
+RUNTIME=runc bash infra/hosting/runtime/verify-containment.sh
+```
+
+15 checks: no egress by IP, by name, by DNS, or to the metadata service; reaches
+its own database but not another app's subnet; not root, cannot mount, cannot
+write outside its tmpfs, cannot execute from it; unbounded allocation is
+OOM-killed and a fork bomb hits the pid ceiling.
+
+The last two run in throwaway containers. An earlier version ran the fork bomb
+inside the shared one, which left it pinned at its PID ceiling for thirty seconds
+— the next `docker exec` could not fork, and the following check failed for a
+reason that had nothing to do with what it tested. A destructive test needs its
+own blast radius, same as a destructive tenant does.
+
+## Still Lambda-shaped
+
+Not yet rewritten for EC2, and wrong in the meantime:
+
+- `guards.tf`'s L3 (reserved concurrency) → container cgroup limits
+- the kill switch's `PutFunctionConcurrency` → SSM `SendCommand` to the box
+- `kill-switch/scope.mjs` **is fine as-is** — it contains no Lambda references at
+  all, and its name+tag+never-touch rule applies to container names unchanged
 
 ## The strategy: four layers, cheapest first
 
@@ -163,7 +327,19 @@ terraform init -backend=false && terraform validate && terraform fmt -check
 
 ## Applying
 
-Not applied yet. `terraform apply` needs credentials with permission to create
+Not applied yet. `runner.tf` additionally needs `runner_subnet_id`,
+`runner_vpc_id` and `runner_bootstrap_bucket`, and the bundle at
+`s3://<bucket>/hosting/bundle.zip` that `user-data.sh.tftpl` fetches on boot.
+
+`setup.sh` stops with a clear message, rather than failing, when the bundle has
+no `control-plane/` — the box comes up provisioned and reachable but unable to
+accept deploys, instead of putting the ASG into a replace loop that no amount of
+retrying fixes. The control-plane is the next piece.
+
+`apps.boxcode.sh` must point at the **Elastic IP**, not at an instance address,
+or every spot replacement breaks TLS.
+
+ `terraform apply` needs credentials with permission to create
 IAM roles, a Lambda, an SNS topic, a budget and a WAF ACL.
 
 Order matters: **activate the cost-allocation tag first**, or the budget
