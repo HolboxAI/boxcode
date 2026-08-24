@@ -40,9 +40,24 @@ variable "cost_tag_key" {
 }
 
 variable "budget_usd" {
-  description = "Monthly spend on tagged boxcode resources that trips the kill switch."
+  description = <<-EOT
+    Monthly spend on tagged boxcode resources that trips the kill switch.
+
+    Was 25 when hosted backends were Lambdas and the steady-state bill was
+    pennies. The Firecracker host is a dedicated m8i.large tagged
+    boxcode:hosting, so the baseline is now about $97/month and a threshold of
+    25 would fire on the first day and every day after -- exactly the
+    permanently-firing budget this file's header warns against, just scoped by
+    tag instead of by account.
+
+    110 is chosen to sit between the two numbers that matter: comfortably above
+    the $96.81 estimate, so an ordinary month is silent, and below the $112.71
+    worst realistic overshoot, so a month that combines ten times the expected
+    traffic with a badly-behaved log producer trips it. The point is to be told
+    before the invoice, not after.
+  EOT
   type        = string
-  default     = "25"
+  default     = "110"
 }
 
 variable "app_concurrency" {
