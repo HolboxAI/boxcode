@@ -270,6 +270,64 @@ that is intact, drops the rest **with a reason**, and lets reconciliation deal w
 the consequences. A control plane that refuses to start over one malformed entry
 takes the whole platform down to protect one project.
 
+## The control plane
+
+One always-running process. Everything it decides lives in `runtime/` as pure,
+tested modules; `control-plane/index.mjs` is orchestration, I/O and the HTTP
+surface, and is deliberately thin because it is the part with no tests.
+
+**Deploys are asynchronous.** A build takes minutes and CloudFront gives an
+origin 60 seconds to respond, so `POST /api/deploy` accepts the work and returns
+immediately; the client polls `GET /api/deploy/status/<id>`. A synchronous deploy
+would have worked in testing and timed out in production.
+
+```
+POST /api/deploy   ->  gate -> capacity -> slot -> registry written
+                       then, in the background:
+                       database.sh provision  ->  DATABASE_URL
+                       rootfs/assemble.sh     ->  ext4 image
+                       rootfs/install-deps.sh ->  build microVM
+                       lifecycle/vm.sh start  ->  running
+```
+
+The registry entry is written **before** the work starts, so a crash mid-deploy
+leaves an entry reconciliation will either start or reap — rather than a running
+VM nothing claims.
+
+Deploys are serialised, not queued: two builds each want 1 GiB, and the box is
+sized for ten projects plus one build.
+
+### The gate
+
+| | | |
+|---|---|---|
+| A1 | Token bound to the project on first use | An eight-character guess would otherwise replace a running server |
+| A2 | 2 live projects per token | |
+| A3 | 5 deploys/hour, 20/day per token | |
+| A4 | 3 new projects/day per address | |
+| A5 | 10 deploys/hour per address | Above A3, because a shared office NAT is one address with several honest people behind it |
+| A6 | Token and address blocklist | Refused first, and without explanation |
+| A7 | Every deploy recorded with token hash and source | |
+
+**A2 and A4 are a pair.** A cap of two projects per token is defeated by minting
+tokens; a cap on new tokens per address is defeated by one token taking every
+slot. Together, occupying the platform needs many addresses as well as patience.
+
+Tokens are stored **hashed** and compared in constant time — a registry readable
+by anyone who gets a copy of the disk should not hand them the ability to take
+over live projects. The gate **fails closed**: an unreadable clock refuses
+everything, because every limit is a window against that clock.
+
+### Capacity is measured, not counted
+
+A microVM's memory is spent the moment it boots — its own guest kernel, no page
+cache to evict, nothing shared, and deliberately no balloon device. So 256 MiB
+per project is 256 MiB of the box, always, idle or not. That is the price of the
+isolation, and it is why ten is the number rather than thirty.
+
+Admission reads `MemAvailable` and refuses when accepting would eat the reserves,
+so ten idle FastAPI services and six Next.js servers are both correct answers.
+
 ## Testing
 
 ```bash
@@ -280,6 +338,8 @@ node --test infra/hosting/runtime/build.test.mjs     # 22
 node --test infra/hosting/runtime/registry.test.mjs  # 17
 node --test infra/hosting/runtime/reconcile.test.mjs # 16
 node --test infra/hosting/runtime/database.test.mjs  # 21
+node --test infra/hosting/runtime/gate.test.mjs      # 26
+node --test infra/hosting/runtime/capacity.test.mjs  # 11
 node --test infra/hosting/kill-switch/scope.test.mjs # 10
 ```
 

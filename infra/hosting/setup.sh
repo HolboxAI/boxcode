@@ -394,9 +394,38 @@ fi
 
 echo "== hosting control-plane =="
 if [ -f "$SCRIPT_DIR/control-plane/index.mjs" ]; then
-    sudo mkdir -p /opt/boxcode-hosting/control-plane
+    # The directory layout is preserved, not flattened. index.mjs imports
+    # ../runtime/*.mjs by relative path and shells out to lifecycle/ and
+    # rootfs/, so copying every .mjs into one directory -- which an earlier
+    # version of this did -- breaks every import on the first start.
+    sudo mkdir -p /opt/boxcode-hosting/{control-plane,runtime,lifecycle,rootfs,nginx,state}
     sudo cp "$SCRIPT_DIR"/control-plane/*.mjs /opt/boxcode-hosting/control-plane/
-    sudo cp "$SCRIPT_DIR"/runtime/*.mjs /opt/boxcode-hosting/control-plane/
+    sudo cp "$SCRIPT_DIR"/runtime/*.mjs      /opt/boxcode-hosting/runtime/
+    sudo cp "$SCRIPT_DIR"/lifecycle/*.sh     /opt/boxcode-hosting/lifecycle/
+    sudo cp "$SCRIPT_DIR"/rootfs/*.sh        /opt/boxcode-hosting/rootfs/
+    sudo cp "$SCRIPT_DIR"/nginx/*            /opt/boxcode-hosting/nginx/ 2>/dev/null || true
+    sudo chmod 0755 /opt/boxcode-hosting/lifecycle/*.sh /opt/boxcode-hosting/rootfs/*.sh
+    # State is the registry and the deploy history: 0700, since the history
+    # holds token hashes and the registry holds every project's slot.
+    sudo chmod 0700 /opt/boxcode-hosting/state
+
+    # nginx has to reach the control plane for /api/deploy, and nothing else may.
+    sudo tee /etc/nginx/conf.d/app-projects/_deploy.conf >/dev/null <<'EOF'
+location = /api/deploy {
+    proxy_pass http://127.0.0.1:8085/deploy;
+    proxy_set_header Host $host;
+    # Without this every deploy appears to come from 127.0.0.1 and every
+    # per-address limit in the gate becomes a per-box limit.
+    proxy_set_header X-Forwarded-For $remote_addr;
+    client_max_body_size 1m;
+}
+location ~ ^/api/deploy/status/([a-z2-9]{4,16})$ {
+    proxy_pass http://127.0.0.1:8085/status/$1;
+    proxy_set_header Host $host;
+}
+EOF
+    sudo nginx -t && sudo systemctl reload nginx
+
     sudo cp "$SCRIPT_DIR/control-plane/boxcode-hosting-control-plane.service" \
         /etc/systemd/system/
     sudo systemctl daemon-reload
