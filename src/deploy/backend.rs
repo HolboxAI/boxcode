@@ -38,6 +38,16 @@ impl Runtime {
             Runtime::Python => "Python",
         }
     }
+
+    /// What the hosting service calls it. Deliberately separate from `label`:
+    /// that one is prose shown to a person and free to be reworded, and this one
+    /// is a wire value the server matches on.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Runtime::Node => "node",
+            Runtime::Python => "python",
+        }
+    }
 }
 
 /// Which server framework, so the right adapter can be used.
@@ -98,6 +108,66 @@ pub struct BackendProfile {
     /// Why this was identified as it was, shown so a wrong guess is obvious.
     pub markers: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// The port the hosted guest listens on. Fixed, because every microVM has an
+/// address of its own and there is nothing to collide with. Must agree with
+/// `GUEST_PORT` in `infra/hosting/runtime/registry.mjs`.
+pub const GUEST_PORT: u16 = 8080;
+
+impl BackendProfile {
+    /// The command that starts this server inside its microVM.
+    ///
+    /// `None` when the entrypoint is unknown -- there is no useful default, and
+    /// guessing produces a VM that boots, fails, and reports as a broken app
+    /// rather than as a question nobody answered.
+    ///
+    /// Everything binds `0.0.0.0`, which would be wrong on a shared host and is
+    /// right here: a guest has one interface, nginx reaches it across the point-
+    /// to-point link, and binding loopback inside the VM would make it
+    /// unreachable from anywhere at all.
+    pub fn start_command(&self) -> Option<Vec<String>> {
+        let entry = self.entrypoint.as_deref()?;
+        let argv = match self.framework {
+            // Node reads PORT from the environment, which assemble.sh always
+            // sets, so nothing needs passing on the command line.
+            BackendFramework::Express
+            | BackendFramework::Fastify
+            | BackendFramework::Koa
+            | BackendFramework::Nest => vec!["/usr/bin/node".to_string(), entry.to_string()],
+
+            // uvicorn needs the app object named, and takes host and port as
+            // flags rather than from the environment.
+            BackendFramework::FastApi => {
+                let module = entry.strip_suffix(".py")?.replace('/', ".");
+                vec![
+                    "/usr/bin/python3".to_string(),
+                    "-m".to_string(),
+                    "uvicorn".to_string(),
+                    format!("{module}:app"),
+                    "--host".to_string(),
+                    "0.0.0.0".to_string(),
+                    "--port".to_string(),
+                    GUEST_PORT.to_string(),
+                ]
+            }
+
+            // manage.py is deliberately never the detected entrypoint -- it is
+            // Django's CLI, not its app -- so it is named here instead.
+            BackendFramework::Django => vec![
+                "/usr/bin/python3".to_string(),
+                "manage.py".to_string(),
+                "runserver".to_string(),
+                format!("0.0.0.0:{GUEST_PORT}"),
+            ],
+
+            BackendFramework::Flask | BackendFramework::Plain => match self.runtime {
+                Runtime::Python => vec!["/usr/bin/python3".to_string(), entry.to_string()],
+                Runtime::Node => vec!["/usr/bin/node".to_string(), entry.to_string()],
+            },
+        };
+        Some(argv)
+    }
 }
 
 /// Files that make a directory Python regardless of what is in them.

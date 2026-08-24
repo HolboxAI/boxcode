@@ -1406,6 +1406,28 @@ fn tool_approval_parts(
             }
             (" Publish a preview? ", "publish", "skip")
         }
+        Action::DeployBackend { path } => {
+            for wrapped in wrap(path, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            // Three facts, chosen because they are the ones the answer turns
+            // on and the ones a person would otherwise find out afterwards:
+            // this runs their code rather than serving it, it is reachable by
+            // anyone, and it cannot call out to anything.
+            for wrapped in wrap(
+                "Uploads this project's source and RUNS it as a live server anyone with the \
+                 link can reach. It gets a database, has no outbound internet, and expires \
+                 after 48 hours.",
+                inner,
+            ) {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            (" Host this backend? ", "host", "skip")
+        }
         Action::EnableAuth { path } => {
             for wrapped in wrap(path, inner) {
                 lines.push(Line::from(Span::styled(
