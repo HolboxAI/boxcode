@@ -83,6 +83,49 @@ export function slotPlan(slot) {
   };
 }
 
+/// Where nginx sends a request for this slot.
+///
+/// Straight at the guest's own address. There is no host port to allocate and
+/// nothing to collide over, because every guest has an address of its own --
+/// which is only true because app TAPs live in the host network namespace. In a
+/// per-app namespace this address would be unreachable from nginx entirely.
+export function upstreamFor(slot, port = 8080) {
+  const n = slotSubnet(slot);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`refusing upstream port ${JSON.stringify(port)}`);
+  }
+  return `${n.guestIp}:${port}`;
+}
+
+/// The nginx location block for one project.
+export function renderNginxRoute(id, slot, port = 8080) {
+  if (typeof id !== "string" || !/^[a-z2-9]{4,16}$/.test(id)) {
+    throw new Error(`refusing to route invalid id ${JSON.stringify(id)}`);
+  }
+  const upstream = upstreamFor(slot, port);
+  return `# Generated for ${id} on slot ${slot}. Regenerated on every deploy.
+location ^~ /api/${id}/ {
+    # ^~ so a longer regex location elsewhere cannot steal this prefix, and the
+    # trailing slash on proxy_pass is what strips /api/<id>/ before the app sees
+    # the path -- without it every route inside the app would need to know its
+    # own project id.
+    proxy_pass http://${upstream}/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # WebSockets, which Lambda could not do at all.
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+
+    # A microVM boots in well under a second, but a cold app behind it may not.
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 60s;
+}
+`;
+}
+
 /// The kernel command line the guest boots with.
 ///
 /// `ip=` configures the guest's interface at boot without a DHCP client in the

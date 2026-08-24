@@ -39,7 +39,7 @@ read -r BUILD_SLOT BUILD_MEM BUILD_TIMEOUT STATUS_PATH STARTED_PATH <<<"$("$NODE
 ")"
 
 echo "== $id: build slot $BUILD_SLOT =="
-sudo /usr/local/sbin/boxcode-slot-net up "$BUILD_SLOT"
+sudo /usr/local/sbin/boxcode-slot-net up "$BUILD_SLOT" --netns
 sudo /usr/local/sbin/boxcode-build-net
 
 # The jailer derives the chroot from --id and will create
@@ -98,7 +98,7 @@ mapfile -t jailer_args < <("$NODE" -e "
   import('file://$REPO_RUNTIME/machine.mjs').then(async m => {
     const b = await import('file://$REPO_RUNTIME/build.mjs');
     console.log(m.jailerArgs({
-      id: process.argv[1], slot: b.BUILD_SLOT, configFile: 'vm.json',
+      id: process.argv[1], slot: b.BUILD_SLOT, configFile: 'vm.json', netns: true,
     }).join('\n'));
   });
 " "$id")
@@ -143,7 +143,7 @@ if [ "$ok" = "true" ]; then
 fi
 
 sudo rm -rf "$jail"
-sudo /usr/local/sbin/boxcode-slot-net down "$BUILD_SLOT" || true
+sudo /usr/local/sbin/boxcode-slot-net down "$BUILD_SLOT" --netns || true
 
 if [ "$ok" = "true" ]; then
     echo "== $id: $reason =="

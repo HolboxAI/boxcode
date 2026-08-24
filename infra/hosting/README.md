@@ -180,27 +180,73 @@ A failed build leaves the project exactly as it was. The image is only moved bac
 over the original on success, so a redeploy retries from a known state rather than
 from whatever the last attempt managed before it died.
 
-### The no-egress guarantee is topology, not a sysctl
+### Where app TAPs live, and what that costs
 
-An earlier version of `setup.sh` set `net.ipv4.ip_forward=0` and called that the
-guarantee. That was imprecise, and the correction matters:
+App TAPs are in the **host** network namespace. Only the build slot gets a
+namespace of its own.
 
-> An app microVM's network namespace contains **exactly one interface** — its own
-> TAP. No veth, no peer, no route. There is nowhere for a packet to go, whatever
-> `ip_forward` is set to anywhere on the box.
+The first version of this put every slot in a namespace, which is wrong in a way
+that is easy to miss: a namespace hides the TAP from the host, and it equally
+hides the guest from **nginx**, which runs in the host namespace and has to reach
+the app to serve it. There was no route in. **Nothing would ever have answered a
+request.**
 
-Which is just as well, because the build slot needs host forwarding for its NAT,
-so `ip_forward=0` was never going to survive. `setup.sh` now **asserts the
-invariant that actually holds**: every app namespace is checked to contain only
-its own TAP and loopback, and provisioning fails if one has grown anything else.
+So a guest's limits are two firewall facts rather than a topological one, and
+`setup.sh` asserts both rather than assuming them:
+
+| | |
+|---|---|
+| `ip_forward=0` | A guest reaching another guest, or the internet, would be the host forwarding between two interfaces. It does not. |
+| `INPUT` rules | A guest may reach Postgres on this box and nothing else — not sshd, not nginx's own port, not the control plane. |
+
+Each guest is still on a point-to-point /30, so it has no route to anything but
+the host end of its own link. This is a weaker *kind* of guarantee than topology
+— a rule can be removed where a missing interface cannot — which is precisely why
+provisioning fails if either check does not hold.
+
+The build slot keeps its namespace, because it genuinely needs forwarding and NAT
+that must not exist anywhere else on the box, and `ip_forward` is namespaced.
+
+## Starting and stopping
+
+The control plane is **not** what keeps a microVM alive — the jailer processes
+are, and they outlive it. So a control-plane restart finds a box with VMs already
+running and a registry describing what *should* be running, and those disagree in
+every interesting case:
+
+| Registry | Running | Action |
+|---|---|---|
+| yes | yes | **adopt** — do nothing |
+| yes | no | **start** |
+| no | yes | **stop** — it is leaked memory |
+| expired | either | **reap** |
+
+Getting the third case wrong is how a box slowly fills with 256 MiB allocations
+nobody can account for, until the eleventh deploy fails for no visible reason.
+Getting it *too* aggressive is worse: stopping something merely unrecognised takes
+a live tenant down. So `reconcile.mjs` only ever stops a VM whose **name** says it
+is ours — the same anchored rule the kill switch uses — and everything else is
+logged as ignored and left running.
+
+`vm.sh list` reads the process table rather than pid files: **a pid file written
+by something that then crashed is a lie**. The slot is recovered from the jailer's
+uid, which is `30000 + slot`.
+
+The registry survives being damaged. It will eventually be truncated by a power
+loss mid-write, or hand-edited during an incident, so `parse` keeps every entry
+that is intact, drops the rest **with a reason**, and lets reconciliation deal with
+the consequences. A control plane that refuses to start over one malformed entry
+takes the whole platform down to protect one project.
 
 ## Testing
 
 ```bash
-node --test infra/hosting/runtime/network.test.mjs   # 10
-node --test infra/hosting/runtime/machine.test.mjs   # 19
+node --test infra/hosting/runtime/network.test.mjs   # 15
+node --test infra/hosting/runtime/machine.test.mjs   # 21
 node --test infra/hosting/runtime/rootfs.test.mjs    # 21
 node --test infra/hosting/runtime/build.test.mjs     # 22
+node --test infra/hosting/runtime/registry.test.mjs  # 17
+node --test infra/hosting/runtime/reconcile.test.mjs # 16
 node --test infra/hosting/kill-switch/scope.test.mjs # 10
 ```
 

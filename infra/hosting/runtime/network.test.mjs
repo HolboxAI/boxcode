@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   SLOT_COUNT, SUBNET_PREFIX, HOST_VPC_CIDR,
   slotSubnet, tapName, netnsName, guestMac, slotPlan, bootArgs,
+  upstreamFor, renderNginxRoute,
 } from "./network.mjs";
 
 const ALL = Array.from({ length: SLOT_COUNT }, (_, i) => i);
@@ -98,4 +99,48 @@ test("boot args cannot be used to smuggle a second line", () => {
 test("there are more slots than the box is sized for", () => {
   // A reaper that is briefly behind must not block a deploy.
   assert.ok(SLOT_COUNT > 10, `${SLOT_COUNT} slots for 10 projects leaves no slack`);
+});
+
+// ---- routing -------------------------------------------------------------
+
+test("nginx is pointed straight at the guest, not at a host port", () => {
+  // Only possible because app TAPs live in the host namespace. In a per-app
+  // namespace this address is unreachable from nginx and nothing would serve.
+  for (const s of ALL) {
+    assert.equal(upstreamFor(s), `${slotSubnet(s).guestIp}:8080`);
+  }
+  const r = renderNginxRoute("k9depef6", 3);
+  assert.match(r, /proxy_pass http:\/\/10\.200\.3\.2:8080\/;/);
+});
+
+test("the route strips its own prefix", () => {
+  // Without the trailing slash on proxy_pass, every route inside the app would
+  // have to know its own project id.
+  assert.match(renderNginxRoute("k9depef6", 0), /proxy_pass http:\/\/[\d.]+:\d+\/;/);
+  assert.match(renderNginxRoute("k9depef6", 0), /location \^~ \/api\/k9depef6\//);
+});
+
+test("the route carries websockets", () => {
+  const r = renderNginxRoute("k9depef6", 0);
+  assert.match(r, /proxy_http_version 1\.1;/);
+  assert.match(r, /proxy_set_header Upgrade \$http_upgrade;/);
+  assert.match(r, /proxy_set_header Connection \$connection_upgrade;/);
+});
+
+test("two projects never share an upstream", () => {
+  const seen = new Set();
+  for (const s of ALL) {
+    const u = upstreamFor(s);
+    assert.ok(!seen.has(u), `${u} used twice`);
+    seen.add(u);
+  }
+});
+
+test("a hostile id or port is refused", () => {
+  for (const bad of ["../../etc", "a b", "", "A9depef6", "x".repeat(17), null, 42]) {
+    assert.throws(() => renderNginxRoute(bad, 0), /refusing to route invalid id/);
+  }
+  for (const bad of [0, 65536, -1, 1.5, "8080", null]) {
+    assert.throws(() => upstreamFor(0, bad), /refusing upstream port/);
+  }
 });

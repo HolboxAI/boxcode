@@ -96,12 +96,22 @@ test("every slot's VMM runs as a different user", () => {
   assert.equal(uids.size, SLOT_COUNT);
 });
 
-test("the VMM is chrooted and in its own network namespace", () => {
+test("the VMM is chrooted", () => {
+  assert.equal(val(jailerArgs({ id: "k9depef6", slot: 3 }), "--chroot-base-dir"), JAIL_ROOT);
+});
+
+test("an app VM is NOT put in a network namespace", () => {
+  // The first version of this put every VM in one, which hides the TAP from the
+  // host -- and hides the guest from nginx, which runs in the host namespace
+  // and has to reach the app to serve it. There was no route in; the design
+  // could not have served a single request.
   const a = jailerArgs({ id: "k9depef6", slot: 3 });
-  assert.equal(val(a, "--chroot-base-dir"), JAIL_ROOT);
-  // The TAP device lives in this namespace and nowhere else, so the VMM cannot
-  // see the host's interfaces even if it escapes the chroot.
-  assert.equal(val(a, "--netns"), `/var/run/netns/${slotPlan(3).netns}`);
+  assert.ok(!a.includes("--netns"), "an app VM must be reachable from the host namespace");
+});
+
+test("the build VM does get one, because it alone needs forwarding and NAT", () => {
+  const b = jailerArgs({ id: "k9depef6", slot: 3, netns: true });
+  assert.equal(val(b, "--netns"), `/var/run/netns/${slotPlan(3).netns}`);
 });
 
 test("there is no live API socket into the VMM", () => {

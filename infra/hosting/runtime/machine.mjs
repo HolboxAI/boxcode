@@ -129,7 +129,7 @@ export function jailerIds(slot) {
 /// argv for the jailer. It execs firecracker itself, so nothing here is ever
 /// handed to a shell -- and the id is validated regardless, because an id that
 /// is itself a flag would still arrive as its own argument.
-export function jailerArgs({ id, slot, firecracker = "/usr/bin/firecracker", configFile = "vm.json" }) {
+export function jailerArgs({ id, slot, firecracker = "/usr/bin/firecracker", configFile = "vm.json", netns = false }) {
   mustId(id);
   const net = slotPlan(slot);
   const { uid, gid } = jailerIds(slot);
@@ -139,22 +139,44 @@ export function jailerArgs({ id, slot, firecracker = "/usr/bin/firecracker", con
     throw new Error(`config file must be a plain name inside the jail, got ${JSON.stringify(configFile)}`);
   }
 
-  return [
+  const args = [
     "--id", id,
     "--exec-file", firecracker,
     "--uid", String(uid),
     "--gid", String(gid),
     "--chroot-base-dir", JAIL_ROOT,
-    // The TAP device lives in this namespace and nowhere else, so the VMM
-    // cannot see the host's interfaces even if it escapes the chroot.
-    "--netns", `/var/run/netns/${net.netns}`,
-    // Everything after -- is firecracker's own.
+  ];
+
+  // Only the build VM gets a network namespace, and the reason is worth
+  // recording because the first version of this gave one to every VM.
+  //
+  // A namespace hides the TAP device from the host, which sounds strictly
+  // better -- and it also hides the guest from nginx, which runs in the host
+  // namespace and has to reach the app to serve it. There is no route in. The
+  // design could not have served a single request.
+  //
+  // App TAPs therefore live in the host namespace, where nginx can reach the
+  // guest and the guest can reach Postgres. What the guest may do from there is
+  // controlled by ip_forward=0 (so it cannot reach another guest or the
+  // internet, both of which would be forwarding) and by INPUT rules limiting it
+  // to Postgres. That is a firewall guarantee rather than a topological one --
+  // weaker in kind, so setup.sh asserts both rather than assuming them.
+  //
+  // The build VM keeps its namespace, because it genuinely needs forwarding and
+  // NAT that must not exist anywhere else on the box.
+  if (netns) {
+    args.push("--netns", `/var/run/netns/${net.netns}`);
+  }
+
+  // Everything after -- is firecracker's own.
+  args.push(
     "--",
     "--config-file", configFile,
     // No API socket. The VM is fully described by its config file at boot, and
     // a live API socket is a control channel into the VMM that nothing needs.
     "--no-api",
-  ];
+  );
+  return args;
 }
 
 /// Where the jailer will place this VM's chroot. The control-plane copies the

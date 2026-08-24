@@ -186,119 +186,100 @@ fi
 echo "slots=$SLOT_COUNT prefix=$SUBNET_PREFIX naming=fc-tapN/fcnsN -- agreed"
 
 echo "== slot networking =="
-# One network namespace and one TAP device per slot, matching runtime/network.mjs.
-# Each guest sits on a point-to-point /30 with the host, so a guest has no route
-# to another guest -- that is structural rather than a firewall rule that could
-# be edited away.
+# One TAP per slot. App TAPs live in the HOST network namespace; only the build
+# slot gets a namespace of its own.
 #
-# The host deliberately does NOT enable ip_forward for these. With no forwarding
-# and no NAT there is no route off the box at all: no mining pool, no C2, no
-# spam relay, nowhere to exfiltrate to.
+# The first version of this put every slot in a namespace, which is wrong in a
+# way that is easy to miss: a namespace hides the TAP from the host, and it
+# equally hides the guest from nginx, which runs in the host namespace and has
+# to reach the app in order to serve it. There was no route in. Nothing would
+# ever have answered a request.
+#
+# So what stops a guest doing more than it should is not topology here, it is
+# two firewall facts, both asserted below rather than assumed:
+#
+#   ip_forward=0   a guest reaching another guest, or the internet, would be
+#                  the host forwarding between two interfaces. It does not.
+#   INPUT rules    a guest may reach Postgres on this box and nothing else.
+#
+# Each guest still sits on a point-to-point /30 with the host, so it has no
+# route to anything except the host end of its own link.
 sudo tee /usr/local/sbin/boxcode-slot-net >/dev/null <<SLOTEOF
 #!/usr/bin/env bash
-# Create or tear down one slot's namespace and TAP device. Idempotent.
+# Create or tear down one slot's TAP device. Idempotent.
+#
+#   boxcode-slot-net up|down <slot> [--netns]
+#
+# --netns puts the device in its own namespace, which only the build slot wants.
 set -euo pipefail
 action="\${1:?up or down}"
 slot="\${2:?slot number}"
+want_ns="\${3:-}"
 ns="fcns\${slot}"
 tap="fc-tap\${slot}"
 host_ip="${SUBNET_PREFIX}.\${slot}.1"
 
-# Test for the namespace by its file, not by parsing \`ip netns list\` -- that
-# prints "fcns0 (id: 0)", so an exact-line grep never matches and every re-run
-# would try to add a namespace that already exists and die under set -e. The
-# file is also exactly what jailer --netns is pointed at.
+in_ns() {
+    if [ "\$want_ns" = "--netns" ]; then ip netns exec "\$ns" "\$@"; else "\$@"; fi
+}
+
 if [ "\$action" = "up" ]; then
-    [ -e "/var/run/netns/\$ns" ] || ip netns add "\$ns"
-    ip netns exec "\$ns" ip link show "\$tap" >/dev/null 2>&1 || {
-        ip netns exec "\$ns" ip tuntap add dev "\$tap" mode tap
-        ip netns exec "\$ns" ip addr add "\$host_ip/30" dev "\$tap"
-        ip netns exec "\$ns" ip link set "\$tap" up
-        ip netns exec "\$ns" ip link set lo up
+    if [ "\$want_ns" = "--netns" ]; then
+        # Tested by the namespace file, not by parsing \`ip netns list\` -- that
+        # prints "fcns15 (id: 0)", so an exact-line grep never matches and every
+        # re-run would try to add a namespace that exists and die under set -e.
+        [ -e "/var/run/netns/\$ns" ] || ip netns add "\$ns"
+        in_ns ip link set lo up
+    fi
+    in_ns ip link show "\$tap" >/dev/null 2>&1 || {
+        in_ns ip tuntap add dev "\$tap" mode tap
+        in_ns ip addr add "\$host_ip/30" dev "\$tap"
+        in_ns ip link set "\$tap" up
     }
 elif [ "\$action" = "down" ]; then
-    [ -e "/var/run/netns/\$ns" ] && ip netns delete "\$ns" || true
+    if [ "\$want_ns" = "--netns" ]; then
+        [ -e "/var/run/netns/\$ns" ] && ip netns delete "\$ns" || true
+    else
+        ip link show "\$tap" >/dev/null 2>&1 && ip link delete "\$tap" || true
+    fi
 else
-    echo "usage: \$0 up|down <slot>" >&2; exit 2
+    echo "usage: \$0 up|down <slot> [--netns]" >&2; exit 2
 fi
 SLOTEOF
 sudo chmod 0755 /usr/local/sbin/boxcode-slot-net
 
-echo "== build slot network =="
-# The one slot with egress, because installing dependencies needs a package
-# registry and nothing else on this box may reach one.
-#
-# An earlier version of this script set net.ipv4.ip_forward=0 and called that
-# the no-egress guarantee. That was imprecise, and the correction matters:
-#
-#   The guarantee for an app microVM is TOPOLOGY, not a sysctl. Its network
-#   namespace contains exactly one interface -- its own TAP -- and no veth, no
-#   route, and no peer. There is nowhere for a packet to go, whatever
-#   ip_forward happens to be set to anywhere on the box.
-#
-# Which is just as well, because the build slot needs host forwarding, so
-# ip_forward=0 was never going to survive. The invariant that actually holds is
-# asserted below instead of that one.
-BUILD_SLOT=15   # must match BUILD_SLOT in runtime/build.mjs
-sudo sysctl -qw net.ipv4.ip_forward=1
-sudo tee /etc/sysctl.d/99-boxcode-forward.conf >/dev/null <<'EOF'
-# Required for the build slot's NAT. App microVMs are sealed by the topology of
-# their network namespace, not by this -- see infra/hosting/setup.sh.
-net.ipv4.ip_forward = 1
+echo "== no forwarding =="
+# The control that stops a guest reaching another guest or the internet. Both
+# would be the host forwarding between two of its interfaces, and it does not.
+sudo sysctl -qw net.ipv4.ip_forward=0
+sudo tee /etc/sysctl.d/99-boxcode-no-forward.conf >/dev/null <<'EOF'
+# A guest reaching anything but this host would be forwarding. Do not enable
+# this. The build slot needs forwarding and gets it inside its own network
+# namespace, where ip_forward is a separate, namespaced setting.
+net.ipv4.ip_forward = 0
 EOF
+[ "$(cat /proc/sys/net/ipv4/ip_forward)" = "0" ] || { echo "ip_forward is not 0" >&2; exit 1; }
+echo "ip_forward = 0"
 
-sudo tee /usr/local/sbin/boxcode-build-net >/dev/null <<BUILDEOF
-#!/usr/bin/env bash
-# Give the build slot's namespace a way out, and NAT it. Idempotent.
-set -euo pipefail
-slot="${BUILD_SLOT}"
-ns="fcns\${slot}"
-host_if="veth-bld-h"
-ns_if="veth-bld-n"
-host_ip="169.254.72.1"
-ns_ip="169.254.72.2"
+echo "== what a guest may reach on this host =="
+# Postgres, and nothing else. Without these a guest could reach sshd, nginx's
+# own port, the control plane, and anything else bound to a wildcard address.
+GUESTS="${SUBNET_PREFIX}.0.0/16"
+add_rule() { sudo iptables -C "$@" 2>/dev/null || sudo iptables -A "$@"; }
+add_rule INPUT -s "$GUESTS" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+add_rule INPUT -s "$GUESTS" -p tcp --dport 5432 -j ACCEPT
+add_rule INPUT -s "$GUESTS" -j DROP
+sudo iptables -S INPUT | grep -- "$GUESTS" | sed 's/^/   /'
 
-[ -e "/var/run/netns/\$ns" ] || { echo "namespace \$ns does not exist yet" >&2; exit 1; }
-
-if ! ip link show "\$host_if" >/dev/null 2>&1; then
-    ip link add "\$host_if" type veth peer name "\$ns_if"
-    ip link set "\$ns_if" netns "\$ns"
-    ip addr add "\$host_ip/30" dev "\$host_if"
-    ip link set "\$host_if" up
-    ip netns exec "\$ns" ip addr add "\$ns_ip/30" dev "\$ns_if"
-    ip netns exec "\$ns" ip link set "\$ns_if" up
-    # Forward inside the namespace, between the guest's TAP and this veth.
-    ip netns exec "\$ns" sysctl -qw net.ipv4.ip_forward=1
-    ip netns exec "\$ns" ip route add default via "\$host_ip"
-    # And NAT the guest's own /30, so the registry sees the box's address.
-    ip netns exec "\$ns" iptables -t nat -A POSTROUTING -o "\$ns_if" -j MASQUERADE
-fi
-
-# On the host: masquerade the build namespace out of the primary interface.
-UPLINK=\$(ip route show default | awk '/default/ {print \$5; exit}')
-iptables -t nat -C POSTROUTING -s "169.254.72.0/30" -o "\$UPLINK" -j MASQUERADE 2>/dev/null \\
-    || iptables -t nat -A POSTROUTING -s "169.254.72.0/30" -o "\$UPLINK" -j MASQUERADE
-BUILDEOF
-sudo chmod 0755 /usr/local/sbin/boxcode-build-net
-
-echo "== assert app namespaces are sealed =="
-# The invariant the whole design rests on, checked rather than assumed. An app
-# slot's namespace must contain exactly its own TAP and loopback. A veth, a
-# bridge, or a second address in there is a route off the box, and it would not
-# be visible anywhere else.
-for slot in $(seq 0 $((SLOT_COUNT - 1))); do
-    [ "$slot" = "$BUILD_SLOT" ] && continue
-    ns="fcns${slot}"
-    [ -e "/var/run/netns/$ns" ] || continue
-    ifaces=$(sudo ip netns exec "$ns" ip -o link show \
-        | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -v '^lo$' | sort)
-    if [ "$ifaces" != "fc-tap${slot}" ]; then
-        echo "namespace $ns is not sealed. Expected only fc-tap${slot}, found:" >&2
-        echo "$ifaces" >&2
-        exit 1
-    fi
-done
-echo "app namespaces contain only their own TAP -- no route off the box"
+echo "== assert a guest cannot reach a neighbour =="
+# The two facts above, checked rather than trusted. A DROP that is missing, or
+# an ip_forward someone turned on while debugging, would not be visible
+# anywhere else until a tenant found it.
+sudo iptables -C INPUT -s "$GUESTS" -j DROP 2>/dev/null || {
+    echo "the catch-all DROP for guest traffic is missing" >&2; exit 1; }
+[ "$(cat /proc/sys/net/ipv4/ip_forward)" = "0" ] || {
+    echo "ip_forward was turned back on" >&2; exit 1; }
+echo "guests can reach postgres on this host, and nothing else"
 
 ##############################################################################
 # Postgres
