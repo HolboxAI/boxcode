@@ -91,6 +91,38 @@ echo "== $id: init =="
 " "$@" | sudo tee "$staging/sbin/init" >/dev/null
 sudo chmod 0755 "$staging/sbin/init"
 
+echo "== $id: build-init =="
+# The same image carries both inits. The build boots it with
+# init=/sbin/build-init on the kernel command line, installs dependencies into
+# /app, and powers off; the app then boots the very same disk with the default
+# init and its node_modules are simply there. Nothing is copied out, nothing is
+# mounted, and there is no second block device.
+lockfile=false
+manifest=null
+case "$runtime" in
+    node)
+        [ -f "$src/package-lock.json" ] && lockfile=true
+        ;;
+    python)
+        for m in requirements.txt pyproject.toml setup.py; do
+            if [ -f "$src/$m" ]; then manifest="\"$m\""; break; fi
+        done
+        ;;
+esac
+"$NODE" -e "
+  import('file://$REPO_RUNTIME/build.mjs').then(m => {
+    const cmds = m.installCommands(process.argv[1], {
+      lockfile: process.argv[2] === 'true',
+      manifest: JSON.parse(process.argv[3]),
+    });
+    process.stdout.write(m.renderBuildInit({
+      commands: cmds,
+      env: JSON.parse(process.env.BOXCODE_BUILD_ENV || '{}'),
+    }));
+  });
+" "$runtime" "$lockfile" "$manifest" | sudo tee "$staging/sbin/build-init" >/dev/null
+sudo chmod 0755 "$staging/sbin/build-init"
+
 echo "== $id: mke2fs =="
 sudo rm -f "$image"
 mapfile -t args < <("$NODE" -e "

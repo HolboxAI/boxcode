@@ -148,12 +148,51 @@ exploit is easier from root and dropping costs nothing.
 There is no DHCP client. The kernel configures `eth0` from the `ip=` boot
 argument, which is most of why a microVM is serving in a fraction of a second.
 
-### Where dependencies are not installed
+### Dependencies are installed inside a microVM too
 
-`assemble.sh` expects a tree whose dependencies are already present, and
-installing them is deliberately **not** done there. `npm install` runs arbitrary
-`postinstall` code, and the right place for that is a throwaway microVM with
-network — not a script on the host. That is the next piece; see below.
+`npm install` runs arbitrary `postinstall` code. That is true of every CI system
+ever built and it is not preventable — containment is the only answer, and it has
+to be at least as strong as what the app itself gets, or **the build becomes the
+soft way into a platform whose entire premise is per-tenant hardware isolation**.
+
+So `install-deps.sh` boots the project's own image as a microVM, with
+`init=/sbin/build-init` on the kernel command line instead of the default. Same
+disk, different PID 1 — which is what makes it cheap: dependencies land in `/app`
+and are simply there when the app later boots the same disk normally. **Nothing
+is copied out, nothing is mounted, and there is no second block device.**
+
+Three differences from an app microVM, and only three:
+
+| | App VM | Build VM |
+|---|---|---|
+| Network | none | NAT'd, through the build slot |
+| Memory | 256 MiB | 1024 MiB — `npm install` peaks high |
+| Init | `/sbin/init` | `/sbin/build-init`, then powers itself off |
+
+The result is read back with `debugfs -R cat`, which reads an ext4 image
+**without mounting it** — the host must never mount a filesystem a stranger's
+build has just finished writing to. The guest writes a start marker before doing
+anything and its exit code afterwards, so a VM that never booted is
+distinguishable from one whose install failed; without the marker both look
+identical from outside, as a missing status file.
+
+A failed build leaves the project exactly as it was. The image is only moved back
+over the original on success, so a redeploy retries from a known state rather than
+from whatever the last attempt managed before it died.
+
+### The no-egress guarantee is topology, not a sysctl
+
+An earlier version of `setup.sh` set `net.ipv4.ip_forward=0` and called that the
+guarantee. That was imprecise, and the correction matters:
+
+> An app microVM's network namespace contains **exactly one interface** — its own
+> TAP. No veth, no peer, no route. There is nowhere for a packet to go, whatever
+> `ip_forward` is set to anywhere on the box.
+
+Which is just as well, because the build slot needs host forwarding for its NAT,
+so `ip_forward=0` was never going to survive. `setup.sh` now **asserts the
+invariant that actually holds**: every app namespace is checked to contain only
+its own TAP and loopback, and provisioning fails if one has grown anything else.
 
 ## Testing
 
@@ -161,6 +200,7 @@ network — not a script on the host. That is the next piece; see below.
 node --test infra/hosting/runtime/network.test.mjs   # 10
 node --test infra/hosting/runtime/machine.test.mjs   # 19
 node --test infra/hosting/runtime/rootfs.test.mjs    # 21
+node --test infra/hosting/runtime/build.test.mjs     # 22
 node --test infra/hosting/kill-switch/scope.test.mjs # 10
 ```
 

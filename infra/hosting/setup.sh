@@ -224,15 +224,81 @@ fi
 SLOTEOF
 sudo chmod 0755 /usr/local/sbin/boxcode-slot-net
 
-# Explicitly off, and asserted rather than assumed. A guest reaching the
-# internet would need this on; leaving it at whatever the AMI shipped is how a
-# no-egress guarantee quietly stops being true.
-sudo sysctl -qw net.ipv4.ip_forward=0
-sudo tee /etc/sysctl.d/99-boxcode-no-forward.conf >/dev/null <<'EOF'
-# Guests must have no route off this box. Nothing here forwards for them.
-net.ipv4.ip_forward = 0
+echo "== build slot network =="
+# The one slot with egress, because installing dependencies needs a package
+# registry and nothing else on this box may reach one.
+#
+# An earlier version of this script set net.ipv4.ip_forward=0 and called that
+# the no-egress guarantee. That was imprecise, and the correction matters:
+#
+#   The guarantee for an app microVM is TOPOLOGY, not a sysctl. Its network
+#   namespace contains exactly one interface -- its own TAP -- and no veth, no
+#   route, and no peer. There is nowhere for a packet to go, whatever
+#   ip_forward happens to be set to anywhere on the box.
+#
+# Which is just as well, because the build slot needs host forwarding, so
+# ip_forward=0 was never going to survive. The invariant that actually holds is
+# asserted below instead of that one.
+BUILD_SLOT=15   # must match BUILD_SLOT in runtime/build.mjs
+sudo sysctl -qw net.ipv4.ip_forward=1
+sudo tee /etc/sysctl.d/99-boxcode-forward.conf >/dev/null <<'EOF'
+# Required for the build slot's NAT. App microVMs are sealed by the topology of
+# their network namespace, not by this -- see infra/hosting/setup.sh.
+net.ipv4.ip_forward = 1
 EOF
-echo "ip_forward = $(cat /proc/sys/net/ipv4/ip_forward) (must be 0)"
+
+sudo tee /usr/local/sbin/boxcode-build-net >/dev/null <<BUILDEOF
+#!/usr/bin/env bash
+# Give the build slot's namespace a way out, and NAT it. Idempotent.
+set -euo pipefail
+slot="${BUILD_SLOT}"
+ns="fcns\${slot}"
+host_if="veth-bld-h"
+ns_if="veth-bld-n"
+host_ip="169.254.72.1"
+ns_ip="169.254.72.2"
+
+[ -e "/var/run/netns/\$ns" ] || { echo "namespace \$ns does not exist yet" >&2; exit 1; }
+
+if ! ip link show "\$host_if" >/dev/null 2>&1; then
+    ip link add "\$host_if" type veth peer name "\$ns_if"
+    ip link set "\$ns_if" netns "\$ns"
+    ip addr add "\$host_ip/30" dev "\$host_if"
+    ip link set "\$host_if" up
+    ip netns exec "\$ns" ip addr add "\$ns_ip/30" dev "\$ns_if"
+    ip netns exec "\$ns" ip link set "\$ns_if" up
+    # Forward inside the namespace, between the guest's TAP and this veth.
+    ip netns exec "\$ns" sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec "\$ns" ip route add default via "\$host_ip"
+    # And NAT the guest's own /30, so the registry sees the box's address.
+    ip netns exec "\$ns" iptables -t nat -A POSTROUTING -o "\$ns_if" -j MASQUERADE
+fi
+
+# On the host: masquerade the build namespace out of the primary interface.
+UPLINK=\$(ip route show default | awk '/default/ {print \$5; exit}')
+iptables -t nat -C POSTROUTING -s "169.254.72.0/30" -o "\$UPLINK" -j MASQUERADE 2>/dev/null \\
+    || iptables -t nat -A POSTROUTING -s "169.254.72.0/30" -o "\$UPLINK" -j MASQUERADE
+BUILDEOF
+sudo chmod 0755 /usr/local/sbin/boxcode-build-net
+
+echo "== assert app namespaces are sealed =="
+# The invariant the whole design rests on, checked rather than assumed. An app
+# slot's namespace must contain exactly its own TAP and loopback. A veth, a
+# bridge, or a second address in there is a route off the box, and it would not
+# be visible anywhere else.
+for slot in $(seq 0 $((SLOT_COUNT - 1))); do
+    [ "$slot" = "$BUILD_SLOT" ] && continue
+    ns="fcns${slot}"
+    [ -e "/var/run/netns/$ns" ] || continue
+    ifaces=$(sudo ip netns exec "$ns" ip -o link show \
+        | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -v '^lo$' | sort)
+    if [ "$ifaces" != "fc-tap${slot}" ]; then
+        echo "namespace $ns is not sealed. Expected only fc-tap${slot}, found:" >&2
+        echo "$ifaces" >&2
+        exit 1
+    fi
+done
+echo "app namespaces contain only their own TAP -- no route off the box"
 
 ##############################################################################
 # Postgres
