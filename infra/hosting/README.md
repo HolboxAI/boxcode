@@ -109,11 +109,58 @@ Two constraints are load-bearing and neither is obvious:
 
 Both have tests.
 
+## Turning a project into a bootable disk
+
+Firecracker boots a kernel and hands it a block device. Neither exists on its
+own — this is the part the Firecracker README means when it says image
+management is *"an external concern users must address separately"*.
+
+```
+base rootfs (one per runtime, built once at setup)
+  + the project's built tree
+  + a generated init
+  = one ext4 file per project
+```
+
+**Built with `mke2fs -d`**, which populates a filesystem image from a directory
+*without mounting it*. That matters more than it sounds: the obvious alternative
+is a loop device and a real mount, which needs `CAP_SYS_ADMIN` in the host mount
+namespace — on the one box where handing that out is least appealing. `mke2fs`
+needs neither.
+
+**Alpine, not Amazon Linux.** A minimal Alpine root is about 8 MiB against
+roughly 200 for a `dnf --installroot` of AL2023. Every megabyte is paid ten times
+over — once per project image on a 50 GiB disk — and again in the seconds a
+deploy spends copying it.
+
+### The init is the guest's PID 1
+
+Deliberately not an init system. There is one process to run, nothing to
+supervise, and no service ordering. If the app exits, PID 1 exits and the kernel
+panics — with `panic=1` in the boot arguments that stops the microVM dead instead
+of leaving it holding 256 MiB doing nothing, which is exactly right: the control
+plane sees a stopped VM and decides.
+
+It `exec`s rather than forks, so the app *is* PID 1, and drops to uid 1000 via
+`su-exec` first. The microVM is the boundary that matters, but a guest kernel
+exploit is easier from root and dropping costs nothing.
+
+There is no DHCP client. The kernel configures `eth0` from the `ip=` boot
+argument, which is most of why a microVM is serving in a fraction of a second.
+
+### Where dependencies are not installed
+
+`assemble.sh` expects a tree whose dependencies are already present, and
+installing them is deliberately **not** done there. `npm install` runs arbitrary
+`postinstall` code, and the right place for that is a throwaway microVM with
+network — not a script on the host. That is the next piece; see below.
+
 ## Testing
 
 ```bash
 node --test infra/hosting/runtime/network.test.mjs   # 10
 node --test infra/hosting/runtime/machine.test.mjs   # 19
+node --test infra/hosting/runtime/rootfs.test.mjs    # 21
 node --test infra/hosting/kill-switch/scope.test.mjs # 10
 ```
 

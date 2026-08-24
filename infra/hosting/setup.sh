@@ -137,6 +137,12 @@ if [ ! -f "$FC_DIR/vmlinux" ]; then
 fi
 ls -l "$FC_DIR/vmlinux"
 
+echo "== base root filesystems =="
+# One per runtime, built once and copied per project. Slow the first time (it
+# fetches packages), a no-op afterwards -- build-base.sh stamps each base with
+# the versions it was built from and skips one that is already current.
+NODE="$NODE_DIR/bin/node" FC_DIR="$FC_DIR" bash "$SCRIPT_DIR/rootfs/build-base.sh"
+
 echo "== jail root =="
 sudo mkdir -p "$JAIL_ROOT" "$APPS_DIR"
 sudo chmod 0700 "$JAIL_ROOT"
