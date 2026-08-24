@@ -207,6 +207,38 @@ provisioning fails if either check does not hold.
 The build slot keeps its namespace, because it genuinely needs forwarding and NAT
 that must not exist anywhere else on the box, and `ip_forward` is namespaced.
 
+## A database per project
+
+The reason this is not on Lambda: a real wire protocol, so Prisma, SQLAlchemy,
+the Django ORM and everything else work untouched against a plain
+`DATABASE_URL`.
+
+**The isolation rule is not the default, and getting it wrong is invisible:**
+
+> PostgreSQL grants `CONNECT` on **every** database to `PUBLIC`. A role per
+> project therefore buys nothing on its own — any project could open any other
+> project's database the moment it reached the port.
+
+So each database revokes `CONNECT` from `PUBLIC` and grants it back only to its
+own role, and `setup.sh` does the same to `postgres` and **`template1`** — without
+the latter, every database created afterwards starts with the hole reopened. The
+same default exists one level down on the `public` schema, and is closed the same
+way.
+
+Each role is `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`,
+capped at **5 connections** (ten projects cannot take all 60), with a 10s
+`statement_timeout` and a 60s `idle_in_transaction_session_timeout` — without the
+latter one project's abandoned transaction holds locks that block its own future
+migrations forever.
+
+**Passwords rotate on every deploy** rather than being stored and reused. A
+password that never changes outlives the project it belonged to, sitting in an
+image and a shell history for as long as anyone keeps either.
+
+SQL identifiers cannot be parameterised, so the anchored id pattern is not a tidy
+check — it is the only thing between a project id and arbitrary SQL. There is a
+test asserting that nothing but a valid id can reach the generated SQL.
+
 ## Starting and stopping
 
 The control plane is **not** what keeps a microVM alive — the jailer processes
@@ -247,6 +279,7 @@ node --test infra/hosting/runtime/rootfs.test.mjs    # 21
 node --test infra/hosting/runtime/build.test.mjs     # 22
 node --test infra/hosting/runtime/registry.test.mjs  # 17
 node --test infra/hosting/runtime/reconcile.test.mjs # 16
+node --test infra/hosting/runtime/database.test.mjs  # 21
 node --test infra/hosting/kill-switch/scope.test.mjs # 10
 ```
 
