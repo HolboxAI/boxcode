@@ -45,6 +45,23 @@ const SITE_BASE = process.env.SITE_BASE || "https://boxcode.sh";
 const REGISTRY_PATH = join(STATE_DIR, "registry.json");
 const GATE_PATH = join(STATE_DIR, "gate.json");
 
+/// Written by lifecycle/kill-switch.sh. While it exists, nothing is started.
+///
+/// Without this the switch would undo itself: it stops ten VMs, and within
+/// fifteen minutes reconciliation sees ten registry entries with nothing
+/// running and helpfully starts them all again. Stopping still happens, and so
+/// does reaping -- the switch is about not serving, not about not tidying up.
+const KILLED_PATH = join(STATE_DIR, "killed");
+
+async function isKilled() {
+  try {
+    await readFile(KILLED_PATH, "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const REAP_INTERVAL_MS = Number(process.env.REAP_INTERVAL_MS || 15 * 60_000);
 
 // A deploy holds a slot and the build slot while it runs. Serialised, because
@@ -154,7 +171,8 @@ async function sweep() {
   if (running === null) return; // see listRunning
 
   const plan = reconcile({ registry, running, now: Date.now() });
-  console.log(`reconcile: ${summarise(plan)}`);
+  const killed = await isKilled();
+  console.log(`reconcile: ${summarise(plan)}${killed ? " -- KILL SWITCH ON, starting nothing" : ""}`);
   for (const i of plan.ignored) console.log(`  ignoring ${i.name}: ${i.why}`);
 
   for (const s of plan.stop) {
@@ -164,6 +182,10 @@ async function sweep() {
     );
   }
   for (const s of plan.start) {
+    if (killed) {
+      console.log(`  not starting ${s.id}: the kill switch is on`);
+      continue;
+    }
     console.log(`  starting ${s.id} on slot ${s.slot}`);
     await sh(script("lifecycle", "vm.sh"), ["start", s.id, String(s.slot)]).catch(
       (e) => console.error(`  start ${s.id} failed: ${e.message}`),
@@ -236,6 +258,12 @@ async function acceptDeploy(body, address) {
   if (!runtime) return { status: 400, body: { error: "runtime must be node or python" } };
   if (!Array.isArray(body.entrypoint) || body.entrypoint.length === 0) {
     return { status: 400, body: { error: "an entrypoint command is required" } };
+  }
+
+  if (await isKilled()) {
+    // Accepting one would build an image and then refuse to start it, which
+    // reads as a broken deploy rather than a stopped platform.
+    return { status: 503, body: { error: "boxcode hosting is temporarily stopped" } };
   }
 
   if (deployInFlight) {
