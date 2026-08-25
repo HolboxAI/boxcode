@@ -134,13 +134,29 @@ resource "aws_iam_role_policy" "kill_switch" {
   policy = data.aws_iam_policy_document.kill_switch.json
 }
 
+# Built from the directory rather than referencing a zip somebody has to
+# remember to make. `filename = "kill-switch.zip"` was a file that did not exist
+# and never would have: terraform apply failed on it, at the end of a long plan,
+# on the one resource nobody wants to discover is missing during an incident.
+#
+# No bundling step. The nodejs22.x runtime ships AWS SDK v3, so
+# @aws-sdk/client-ssm resolves without node_modules -- which is also why the
+# kill switch has no dependencies to keep current.
+data "archive_file" "kill_switch" {
+  type        = "zip"
+  source_dir  = "${path.module}/kill-switch"
+  output_path = "${path.module}/.terraform-kill-switch.zip"
+  excludes    = ["scope.test.mjs"]
+}
+
 resource "aws_lambda_function" "kill_switch" {
-  function_name = "boxcode-kill-switch"
-  role          = aws_iam_role.kill_switch.arn
-  runtime       = "nodejs22.x"
-  handler       = "index.handler"
-  filename      = "kill-switch.zip"
-  timeout       = 60
+  function_name    = "boxcode-kill-switch"
+  role             = aws_iam_role.kill_switch.arn
+  runtime          = "nodejs22.x"
+  handler          = "index.handler"
+  filename         = data.archive_file.kill_switch.output_path
+  source_code_hash = data.archive_file.kill_switch.output_base64sha256
+  timeout          = 60
   # Never given reserved concurrency of its own: it must be able to run during
   # exactly the incident where everything else is throttled.
   environment {
