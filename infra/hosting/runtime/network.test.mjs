@@ -144,3 +144,16 @@ test("a hostile id or port is refused", () => {
     assert.throws(() => upstreamFor(0, bad), /refusing upstream port/);
   }
 });
+
+test("the guest is told which init to run", () => {
+  // The default is /sbin/init, which in an Alpine rootfs is a symlink to
+  // busybox -- the guest boots Alpine's init, reads /etc/inittab, and dies
+  // looking for openrc. That is exactly what the first real boot did.
+  assert.match(bootArgs(0), /\binit=\/sbin\/boxcode-init\b/);
+});
+
+test("a build can override the init, and the kernel takes the last one", () => {
+  const a = bootArgs(0, "init=/sbin/build-init");
+  assert.ok(a.lastIndexOf("init=/sbin/build-init") > a.indexOf("init=/sbin/boxcode-init"),
+    `the build's init must come last: ${a}`);
+});

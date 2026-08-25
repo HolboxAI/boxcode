@@ -142,6 +142,11 @@ export function bootArgs(slot, extra = "") {
     "reboot=k",
     "panic=1",
     "pci=off",
+    // Named explicitly. The default would be /sbin/init, which in an Alpine
+    // rootfs is a symlink to busybox -- the guest boots Alpine's init, reads
+    // /etc/inittab and dies looking for openrc. A build overrides this with its
+    // own init= in extraBootArgs; the kernel takes the last one given.
+    "init=/sbin/boxcode-init",
     // No hardware to probe and no init system to wait for: this is most of why
     // a microVM boots in about a tenth of a second.
     `ip=${n.guestIp}::${n.hostIp}:255.255.255.252::eth0:off`,

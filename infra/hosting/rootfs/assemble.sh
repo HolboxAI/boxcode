@@ -92,8 +92,8 @@ echo "== $id: init =="
     const env = { ...JSON.parse(process.env.BOXCODE_APP_ENV || '{}'), PORT: String(reg.GUEST_PORT) };
     process.stdout.write(m.renderInit({ startCommand: process.argv.slice(1), env }));
   });
-" "$@" | sudo tee "$staging/sbin/init" >/dev/null
-sudo chmod 0755 "$staging/sbin/init"
+" "$@" | sudo tee "$staging/sbin/boxcode-init" >/dev/null
+sudo chmod 0755 "$staging/sbin/boxcode-init"
 
 echo "== $id: build-init =="
 # The same image carries both inits. The build boots it with
@@ -126,6 +126,12 @@ esac
   });
 " "$runtime" "$lockfile" "$manifest" | sudo tee "$staging/sbin/build-init" >/dev/null
 sudo chmod 0755 "$staging/sbin/build-init"
+
+# Neither init is written to /sbin/init, and that is not an aesthetic choice:
+# alpine-baselayout ships /sbin/init as a symlink to busybox, and tee follows
+# symlinks -- writing there lands on busybox itself.
+[ -L "$staging/sbin/init" ] || [ ! -e "$staging/sbin/init" ] \
+    || { echo "warning: /sbin/init in the base is a regular file, not the expected symlink" >&2; }
 
 echo "== $id: mke2fs =="
 sudo rm -f "$image"

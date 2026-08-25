@@ -100,12 +100,21 @@ test("postgres never listens on a wildcard", () => {
   assert.match(a, /^localhost,/);
 });
 
-test("it listens on every slot's gateway and no more", () => {
+test("it listens on every app slot's gateway and no more", () => {
   const a = listenAddresses(SLOT_COUNT).split(",");
   assert.equal(a.length, SLOT_COUNT + 1, "one per slot, plus loopback");
   for (let s = 0; s < SLOT_COUNT; s++) {
     assert.ok(a.includes(slotSubnet(s).hostIp), `missing ${slotSubnet(s).hostIp}`);
   }
+});
+
+test("the build slot is excluded when asked", () => {
+  // Its gateway lives inside a network namespace, so the host cannot bind it --
+  // and a build VM has no business reaching a project's database.
+  const a = listenAddresses(SLOT_COUNT, "10.200", 15).split(",");
+  assert.ok(!a.includes("10.200.15.1"), a.join(","));
+  assert.ok(a.includes("10.200.0.1"));
+  assert.equal(a.length, SLOT_COUNT, "one fewer than with the build slot in");
 });
 
 test("an absurd slot count is refused", () => {

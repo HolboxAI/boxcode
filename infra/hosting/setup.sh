@@ -71,9 +71,14 @@ echo "/dev/kvm present, CPU reports virtualization extensions"
 ##############################################################################
 
 echo "== packages =="
+# curl is deliberately absent from this list. AL2023 ships curl-minimal, which
+# provides /usr/bin/curl, and asking for the full `curl` package makes dnf try
+# to replace it -- producing pages of "conflicts with curl provided by
+# curl-minimal" and failing the whole transaction. Same for `tar`, which is
+# already in the base image.
 sudo dnf install -y nginx postgresql15-server postgresql15 certbot \
-    python3-certbot-nginx bind-utils jq unzip git tar xz e2fsprogs \
-    iproute iptables-nft curl >/dev/null
+    python3-certbot-nginx bind-utils jq unzip git xz e2fsprogs \
+    iproute iptables-nft >/dev/null
 
 echo "== node =="
 # AL2023's default nodejs is v18 and the control-plane targets current Node.
@@ -95,34 +100,43 @@ fi
 ##############################################################################
 
 echo "== firecracker =="
-FC_VERSION="${FC_VERSION:-v1.13.1}"
+FC_VERSION="${FC_VERSION:-v1.16.1}"
 ARCH="$(uname -m)"
 sudo mkdir -p "$FC_DIR"
 
-if [ ! -x /usr/bin/firecracker ] || [ "$(/usr/bin/firecracker --version | head -1 | awk '{print $2}')" != "$FC_VERSION" ]; then
+if [ ! -x /usr/bin/firecracker ] || ! /usr/bin/firecracker --version 2>/dev/null | grep -q "$FC_VERSION"; then
     TMP="$(mktemp -d)"
     (
         cd "$TMP"
         REL="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}"
-        curl -fsSL "${REL}/firecracker-${FC_VERSION}-${ARCH}.tgz" -o fc.tgz
-        # The checksum is verified, not decorated: these two binaries are what
-        # stands between a hostile tenant and the host, and they are fetched
-        # over the internet on a box that hosts other people's code.
-        curl -fsSL "${REL}/firecracker-${FC_VERSION}-${ARCH}.tgz.sha256.txt" -o fc.sha256
-        sha256sum -c fc.sha256
-        tar -xzf fc.tgz
-        sudo install -m 0755 "release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" /usr/bin/firecracker
+        TGZ="firecracker-${FC_VERSION}-${ARCH}.tgz"
+        # Downloaded under its real name, not a short one. The checksum file
+        # lists the original filename, so `sha256sum -c` looks for exactly that
+        # -- renaming it to fc.tgz makes the check fail with "No such file",
+        # which reads as a download failure rather than a naming mistake.
+        curl -fsSL "${REL}/${TGZ}" -o "$TGZ"
+        curl -fsSL "${REL}/${TGZ}.sha256.txt" -o "${TGZ}.sha256.txt"
+        # Verified, not decorated: these two binaries are what stands between a
+        # hostile tenant and the host, fetched over the internet onto a box that
+        # runs other people's code.
+        sha256sum -c "${TGZ}.sha256.txt"
+        tar -xzf "$TGZ"
+        # The release lays out release-<version>-<arch>/, but find rather than
+        # assume: the layout has changed between releases before.
+        FC_BIN="$(find . -type f -name "firecracker-${FC_VERSION}-${ARCH}" | head -1)"
+        JAILER_BIN="$(find . -type f -name "jailer-${FC_VERSION}-${ARCH}" | head -1)"
+        [ -n "$FC_BIN" ] || { echo "no firecracker binary in $TGZ" >&2; ls -R . >&2; exit 1; }
+        [ -n "$JAILER_BIN" ] || { echo "no jailer binary in $TGZ" >&2; exit 1; }
+        sudo install -m 0755 "$FC_BIN" /usr/bin/firecracker
         # The jailer is not optional hardening. A microVM is a strong boundary,
         # but the VMM process sits on the HOST side of it -- running it as root
-        # would turn a Firecracker vulnerability into host root directly. The
-        # jailer chroots it, drops it to an unprivileged uid, puts it in a cgroup
-        # and a network namespace, and installs a seccomp filter.
-        sudo install -m 0755 "release-${FC_VERSION}-${ARCH}/jailer-${FC_VERSION}-${ARCH}" /usr/bin/jailer
-    )
+        # would turn a Firecracker vulnerability into host root directly.
+        sudo install -m 0755 "$JAILER_BIN" /usr/bin/jailer
+    ) || exit 1
     rm -rf "$TMP"
 fi
 /usr/bin/firecracker --version | head -1
-/usr/bin/jailer --version | head -1
+/usr/bin/jailer --version 2>&1 | head -1
 
 echo "== guest kernel =="
 # Firecracker boots an uncompressed kernel image directly -- no bootloader, no
@@ -248,6 +262,55 @@ fi
 SLOTEOF
 sudo chmod 0755 /usr/local/sbin/boxcode-slot-net
 
+echo "== build slot network =="
+# The one slot with a way out, because installing dependencies needs a package
+# registry and nothing else on this box may reach one.
+#
+# Its namespace gets a veth to the host and forwards between that and the TAP.
+# ip_forward is namespaced in Linux, so switching it on in there leaves the
+# host's own setting -- and every app slot's isolation -- untouched.
+#
+# This was lost once already: it lived inside the slot-networking section and
+# went with it during a rewrite, and the only symptom was install-deps.sh
+# failing with "boxcode-build-net: command not found" three stages into a
+# deploy. It is its own section now so that cannot happen the same way twice.
+BUILD_SLOT=15   # must match BUILD_SLOT in runtime/build.mjs
+sudo tee /usr/local/sbin/boxcode-build-net >/dev/null <<BUILDEOF
+#!/usr/bin/env bash
+# Give the build slot's namespace a way out, and NAT it. Idempotent.
+set -euo pipefail
+slot="${BUILD_SLOT}"
+ns="fcns\${slot}"
+host_if="veth-bld-h"
+ns_if="veth-bld-n"
+host_ip="169.254.72.1"
+ns_ip="169.254.72.2"
+
+[ -e "/var/run/netns/\$ns" ] || { echo "namespace \$ns does not exist yet" >&2; exit 1; }
+
+if ! ip link show "\$host_if" >/dev/null 2>&1; then
+    ip link add "\$host_if" type veth peer name "\$ns_if"
+    ip link set "\$ns_if" netns "\$ns"
+    ip addr add "\$host_ip/30" dev "\$host_if"
+    ip link set "\$host_if" up
+    ip netns exec "\$ns" ip addr add "\$ns_ip/30" dev "\$ns_if"
+    ip netns exec "\$ns" ip link set "\$ns_if" up
+    ip netns exec "\$ns" sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec "\$ns" ip route add default via "\$host_ip"
+    ip netns exec "\$ns" iptables -t nat -A POSTROUTING -o "\$ns_if" -j MASQUERADE
+fi
+
+UPLINK=\$(ip route show default | awk '/default/ {print \$5; exit}')
+iptables -t nat -C POSTROUTING -s "169.254.72.0/30" -o "\$UPLINK" -j MASQUERADE 2>/dev/null \\
+    || iptables -t nat -A POSTROUTING -s "169.254.72.0/30" -o "\$UPLINK" -j MASQUERADE
+# The build namespace forwards; the host must too, for that one path. App slots
+# are unaffected -- they have no veth and no route, so there is nothing for the
+# host to forward on their behalf.
+sysctl -qw net.ipv4.ip_forward=1
+BUILDEOF
+sudo chmod 0755 /usr/local/sbin/boxcode-build-net
+echo "boxcode-build-net installed"
+
 echo "== no forwarding =="
 # The control that stops a guest reaching another guest or the internet. Both
 # would be the host forwarding between two of its interfaces, and it does not.
@@ -258,8 +321,10 @@ sudo tee /etc/sysctl.d/99-boxcode-no-forward.conf >/dev/null <<'EOF'
 # namespace, where ip_forward is a separate, namespaced setting.
 net.ipv4.ip_forward = 0
 EOF
-[ "$(cat /proc/sys/net/ipv4/ip_forward)" = "0" ] || { echo "ip_forward is not 0" >&2; exit 1; }
-echo "ip_forward = 0"
+# Not asserted as an invariant any more: boxcode-build-net turns it on for the
+# build path, and it stays on. What actually keeps an app guest in is that its
+# namespace has one interface and no route -- checked below.
+echo "ip_forward = $(cat /proc/sys/net/ipv4/ip_forward) (build slot needs it on)"
 
 echo "== what a guest may reach on this host =="
 # Postgres, and nothing else. Without these a guest could reach sshd, nginx's
@@ -270,6 +335,22 @@ add_rule INPUT -s "$GUESTS" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 add_rule INPUT -s "$GUESTS" -p tcp --dport 5432 -j ACCEPT
 add_rule INPUT -s "$GUESTS" -j DROP
 sudo iptables -S INPUT | grep -- "$GUESTS" | sed 's/^/   /'
+
+echo "== bring every app slot's TAP up =="
+# Before Postgres starts, and that ordering is the whole point.
+#
+# Postgres binds its listen_addresses at startup and silently skips any it
+# cannot bind. Creating TAPs lazily per deploy meant none of these addresses
+# existed when it came up, so it bound 127.0.0.1 alone -- while
+# `show listen_addresses` still cheerfully reported all seventeen. The only
+# symptom was a guest that served HTTP fine and could not reach its database.
+#
+# They cost nothing idle, and vm.sh's own `slot-net up` stays idempotent.
+for slot in $(seq 0 $((SLOT_COUNT - 1))); do
+    [ "$slot" = "$BUILD_SLOT" ] && continue
+    sudo /usr/local/sbin/boxcode-slot-net up "$slot"
+done
+echo "app slot gateways: $(ip -4 -o addr show | grep -c '10\.200\.')"
 
 echo "== assert a guest cannot reach a neighbour =="
 # The two facts above, checked rather than trusted. A DROP that is missing, or
@@ -309,8 +390,8 @@ EOF
 # between the database and the internet.
 PG_LISTEN="$("$NODE_DIR/bin/node" -e "
   import('file://$SCRIPT_DIR/runtime/database.mjs').then(m =>
-    console.log(m.listenAddresses(Number(process.argv[1]))));
-" "$SLOT_COUNT")"
+    console.log(m.listenAddresses(Number(process.argv[1]), '10.200', Number(process.argv[2]))));
+" "$SLOT_COUNT" "$BUILD_SLOT")"
 
 # A dedicated file rather than appending to postgresql.conf. The first version
 # used `tee -a`, so every re-run of this script appended another copy of the
@@ -419,7 +500,11 @@ location = /api/deploy {
     proxy_set_header X-Forwarded-For $remote_addr;
     client_max_body_size 1m;
 }
-location ~ ^/api/deploy/status/([a-z2-9]{4,16})$ {
+# Quoted, and it has to be. nginx uses braces for blocks, so a regex
+# containing {4,16} is parsed as the end of the location block unless the
+# whole expression is in quotes -- it fails with "missing closing parenthesis",
+# which points at the wrong thing entirely.
+location ~ "^/api/deploy/status/([a-z2-9]{4,16})$" {
     proxy_pass http://127.0.0.1:8085/status/$1;
     proxy_set_header Host $host;
 }

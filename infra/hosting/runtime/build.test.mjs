@@ -189,3 +189,33 @@ test("a path that could escape is refused", () => {
     assert.throws(() => debugfsReadArgs("/i/x.ext4", bad), /refusing guest path/);
   }
 });
+
+test("the build init sets PATH too", () => {
+  // Same failure, same fix: su-exec is in /sbin and pid 1 has no PATH.
+  const c = code(renderBuildInit(OK));
+  const path = c.split("\n").find((l) => l.startsWith("export PATH="));
+  assert.ok(path, "build init must set PATH");
+  assert.ok(path.includes("/sbin"), path);
+  assert.ok(c.indexOf("export PATH=") < c.indexOf("su-exec"));
+});
+
+test("only the build init writes a resolver", () => {
+  // The base image ships an empty /etc/resolv.conf because an app microVM has
+  // no route off the box. The build VM is the one exception -- it has NAT and
+  // has to reach a package registry -- so it writes its own here. npm failing
+  // with EAI_AGAIN on a real box is what this is for.
+  const c = code(renderBuildInit(OK));
+  assert.match(c, /nameserver/, "the build init must provide a resolver");
+  assert.ok(c.indexOf("resolv.conf") < c.indexOf("cd /app"), "before the install runs");
+});
+
+test("the build has somewhere to cache, and does not ship it", () => {
+  // The app user is created with no home. npm fails outright with EACCES on
+  // mkdir /home/app rather than falling back, which is how this was found.
+  const c = code(renderBuildInit(OK));
+  assert.match(c, /export HOME=/);
+  assert.match(c, /npm_config_cache=/);
+  // And the cache is removed before the status is written, so it is gone
+  // whether the install succeeded or failed.
+  assert.ok(c.indexOf("rm -rf /tmp/.npm") < c.lastIndexOf(STATUS_PATH));
+});

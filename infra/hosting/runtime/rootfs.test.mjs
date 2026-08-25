@@ -186,3 +186,18 @@ test("a hostile id is refused", () => {
     assert.throws(() => paths(bad), /invalid id/, JSON.stringify(bad));
   }
 });
+
+test("init sets PATH, because pid 1 inherits none", () => {
+  // The kernel gives pid 1 no environment at all. Without an explicit PATH
+  // every unqualified command fails with "can't execute: No such file or
+  // directory", which reads as a missing binary rather than a missing PATH --
+  // su-exec, in /sbin, was exactly that failure on a real box.
+  const i = renderInit(OK);
+  const path = i.split("\n").find((l) => l.startsWith("export PATH="));
+  assert.ok(path, "init must set PATH");
+  for (const dir of ["/sbin", "/bin", "/usr/bin", "/usr/sbin"]) {
+    assert.ok(path.includes(dir), `PATH must include ${dir}: ${path}`);
+  }
+  // And before anything that relies on it.
+  assert.ok(i.indexOf("export PATH=") < i.indexOf("exec su-exec"));
+});

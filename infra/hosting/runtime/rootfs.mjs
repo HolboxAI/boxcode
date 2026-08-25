@@ -27,6 +27,16 @@ export const ID_RE = /^[a-z2-9]{4,16}$/;
 export const APP_UID = 1000;
 export const APP_GID = 1000;
 
+/// Where the app's init goes, and why it is not /sbin/init.
+///
+/// alpine-baselayout ships /sbin/init as a symlink to busybox. Writing there
+/// follows the symlink and lands on busybox itself, and the guest then boots
+/// Alpine's own init, reads /etc/inittab, and dies looking for openrc -- which
+/// is exactly what happened on the first real boot. Its own name has no symlink
+/// to follow, and makes the app path symmetric with the build path, which uses
+/// /sbin/build-init and worked first time for the same reason.
+export const APP_INIT_PATH = "/sbin/boxcode-init";
+
 /// Base rootfs per runtime, built once at setup and copied per project.
 export const BASES = {
   node: "node22",
@@ -130,6 +140,12 @@ export function renderInit({ startCommand, env = {} }) {
 # microVM rather than one holding memory and doing nothing.
 set -e
 
+# PID 1 gets no environment from the kernel -- not even PATH. Without this,
+# every unqualified command in this script fails with "can't execute: No such
+# file or directory", which reads as a missing binary rather than a missing
+# PATH. su-exec lives in /sbin and was exactly that failure.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 mount -t proc     none /proc
 mount -t sysfs    none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
@@ -139,6 +155,11 @@ mount -t devtmpfs none /dev 2>/dev/null || true
 ip link set lo up 2>/dev/null || true
 
 ${exports.join("\n")}
+
+# Set for the same reason the build init sets it: the app user has no home
+# directory, and a library that writes to HOME gets EACCES rather than a
+# fallback. /tmp is writable and empty at boot.
+export HOME=/tmp
 
 cd /app
 

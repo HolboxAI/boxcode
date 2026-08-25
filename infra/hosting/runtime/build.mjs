@@ -121,10 +121,35 @@ export function renderBuildInit({ commands, env = {}, timeoutSeconds = BUILD_TIM
 # No set -e: the exit code IS the product, and dying before recording it would
 # turn every failed install into an indistinguishable silent one.
 
+# PID 1 gets no environment from the kernel, PATH included. su-exec is in
+# /sbin, and without this the install fails with "timeout: can't execute
+# su-exec" -- which looks like a missing package and is not.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 mount -t proc     none /proc
 mount -t sysfs    none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
 ip link set lo up 2>/dev/null || true
+
+# A resolver, written here and nowhere else.
+#
+# The base image ships an empty /etc/resolv.conf on purpose: an app microVM has
+# no route off the box, and a resolver that cannot work only turns "no such
+# host" into a timeout. A build VM is the one exception -- it has NAT and it has
+# to reach a package registry -- so it writes its own, in the one init that is
+# allowed to. The app's init leaves the empty one alone, which is what makes the
+# no-egress guarantee visible from inside the guest as well as enforced outside.
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n' > /etc/resolv.conf
+
+# The app user has no home directory -- it is created with -H, because a hosted
+# app has no business having one. npm and pip both want somewhere to cache, and
+# npm fails outright with EACCES on mkdir /home/app rather than falling back.
+# /tmp is writable by everyone, and everything below is removed before the
+# status is written, so nothing from the build ships inside the image.
+export HOME=/tmp
+export npm_config_cache=/tmp/.npm
+export PIP_CACHE_DIR=/tmp/.pip
+export XDG_CACHE_HOME=/tmp/.cache
 
 # Written before anything else, so a VM that died during boot is
 # distinguishable from one whose install failed. Otherwise both look the same
@@ -137,6 +162,11 @@ ${exports.join("\n")}
 cd /app || { echo "no /app in the image"; echo 90 > ${STATUS_PATH}; sync; poweroff -f; }
 
 ${body}
+
+# Whatever the install cached is dead weight in an image that is copied on
+# every start. A large npm cache is easily bigger than the dependencies it
+# produced.
+rm -rf /tmp/.npm /tmp/.pip /tmp/.cache 2>/dev/null || true
 
 echo "$rc" > ${STATUS_PATH}
 

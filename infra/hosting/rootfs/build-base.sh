@@ -30,8 +30,10 @@ COMMUNITY="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/community"
 # guest kernel exploit is easier from uid 0 and dropping costs nothing.
 COMMON="alpine-baselayout busybox busybox-suid musl ca-certificates su-exec"
 
-need() { command -v "$1" >/dev/null 2>&1 || { echo "$1 is required" >&2; exit 1; }; }
-need apk || true
+# No check for a system apk. Amazon Linux has none, which is the whole reason
+# the static one is fetched below -- and `need apk || true` does not do what it
+# looks like it does: `exit` inside a function exits the script, so the `|| true`
+# never runs and provisioning stops on a tool it was about to install anyway.
 
 # Amazon Linux has no apk, so fetch the static one. It runs fine on glibc and is
 # the supported way to build an Alpine root from a non-Alpine host.
@@ -83,8 +85,27 @@ build_base() {
     sudo chroot "$root" /bin/busybox adduser -D -u 1000 -H -s /sbin/nologin app 2>/dev/null \
         || echo "app:x:1000:1000::/app:/sbin/nologin" | sudo tee -a "$root/etc/passwd" >/dev/null
 
+    # Verified before stamping, because a stamp is a claim that this base is
+    # complete and every later run trusts it without looking.
+    #
+    # This is not hypothetical. The first build here lost su-exec -- apk exited
+    # 0 with 20 of 26 packages -- and stamped itself done. Every subsequent run
+    # said "already built and unchanged", and the only symptom appeared three
+    # stages into a deploy, inside a microVM, as
+    # "timeout: can't execute su-exec". Checking costs a grep.
+    missing=""
+    for pkg in $COMMON $packages; do
+        grep -qx "P:${pkg}" "$root/lib/apk/db/installed" || missing="$missing $pkg"
+    done
+    if [ -n "$missing" ]; then
+        echo "base $name is incomplete, missing:$missing" >&2
+        echo "not writing the stamp -- the next run will rebuild rather than trust this" >&2
+        sudo rm -rf "$root"
+        exit 1
+    fi
+
     echo "$want" | sudo tee "$stamp" >/dev/null
-    echo "   $(sudo du -sh "$root" | cut -f1) at $root"
+    echo "   $(sudo du -sh "$root" | cut -f1) at $root, $(grep -c '^P:' "$root/lib/apk/db/installed") packages"
 }
 
 sudo mkdir -p "$BASE_DIR"

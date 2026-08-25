@@ -145,11 +145,17 @@ fi
 
 # The control that matters most. A pass here means a hosted project cannot
 # reach a mining pool, a C2 server, or anywhere to send what it collected.
-if [ "$(curl -sf -m 15 "http://$GUEST:8080/egress")" = "blocked" ]; then
-    ok "the guest has NO outbound internet"
-else
-    bad "THE GUEST REACHED THE INTERNET -- the no-egress guarantee is broken"
-fi
+#
+# Read carefully, because the obvious version of this test is wrong: a guest
+# that is not serving at all makes this curl fail, and treating any non-"blocked"
+# answer as "reached" turns a dead app into a reported security failure. Only
+# the literal string "REACHED" means egress worked.
+EGRESS="$(curl -sf -m 15 "http://$GUEST:8080/egress" || echo "no-answer")"
+case "$EGRESS" in
+    blocked)   ok "the guest has NO outbound internet" ;;
+    REACHED)   bad "THE GUEST REACHED THE INTERNET -- the no-egress guarantee is broken" ;;
+    *)         bad "could not test egress: the guest answered '$EGRESS'" ;;
+esac
 
 step "isolation"
 OTHER=$(( SLOT == 0 ? 1 : 0 ))

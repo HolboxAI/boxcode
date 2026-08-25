@@ -53,6 +53,12 @@ variable "runner_root_gb" {
   default     = 50
 }
 
+variable "bootstrap_bucket" {
+  description = "Bucket holding the infra/hosting bundle the box fetches to provision itself. One key, read-only -- see the instance role."
+  type        = string
+  default     = "boxcode-artifacts"
+}
+
 variable "admin_cidr" {
   description = "Source allowed to reach SSH. Empty closes port 22, which is right once Session Manager is proven."
   type        = list(string)
@@ -105,7 +111,7 @@ resource "aws_vpc_security_group_ingress_rule" "runner_acme" {
   ip_protocol       = "tcp"
   from_port         = 80
   to_port           = 80
-  description       = "HTTP for the Let's Encrypt HTTP-01 challenge"
+  description       = "HTTP for the Lets Encrypt HTTP-01 challenge"
 }
 
 resource "aws_vpc_security_group_ingress_rule" "runner_ssh" {
@@ -127,7 +133,7 @@ resource "aws_vpc_security_group_egress_rule" "runner_out" {
   security_group_id = aws_security_group.runner.id
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "-1"
-  description       = "Host egress. Guests are confined on the box, not here."
+  description       = "Host egress. Guests are confined on the box, not here"
 }
 
 ##############################################################################
@@ -163,6 +169,17 @@ resource "aws_iam_role_policy_attachment" "runner_ssm" {
 # escapes both its microVM and the jailer and reads these credentials off the
 # metadata service, there is nothing here worth having.
 data "aws_iam_policy_document" "runner" {
+  # One object, on one prefix. The box has to fetch infra/hosting/ from
+  # somewhere to provision itself, and this is the narrowest way to let it: not
+  # the bucket, not a prefix it could walk, one key it can GET. Everything the
+  # bundle contains is already in the repo, so this grants read access to
+  # nothing that is not public in intent.
+  statement {
+    sid       = "FetchItsOwnProvisioningBundle"
+    actions   = ["s3:GetObject"]
+    resources = ["arn:aws:s3:::${var.bootstrap_bucket}/hosting/hosting.tgz"]
+  }
+
   statement {
     sid       = "OwnLogsOnly"
     actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
@@ -222,9 +239,26 @@ resource "aws_instance" "runner" {
   tags = local.runner_tags
 }
 
-# A stable address is not optional: apps.boxcode.sh points at it, and a
-# certificate issued for a name that stops resolving here breaks every project.
+variable "allocate_eip" {
+  description = <<-EOT
+    Whether to give the runner a stable Elastic IP.
+
+    Required in production: apps.boxcode.sh points at it, and a certificate
+    issued for a name that stops resolving here breaks every project. Not
+    required to test, where the instance's auto-assigned address is enough and
+    SKIP_TLS=1 skips the certificate entirely.
+
+    Off by default because this account is at its Elastic IP limit, and the two
+    unassociated addresses sitting in it belong to other people's work.
+    Releasing an Elastic IP is irreversible -- the address does not come back --
+    so that is a decision for whoever owns them, not a step in this apply.
+  EOT
+  type        = bool
+  default     = false
+}
+
 resource "aws_eip" "runner" {
+  count    = var.allocate_eip ? 1 : 0
   instance = aws_instance.runner.id
   domain   = "vpc"
   tags     = local.runner_tags
@@ -324,6 +358,6 @@ output "runner_instance_id" {
 }
 
 output "runner_public_ip" {
-  description = "Point apps.boxcode.sh at this, and set it as the CloudFront origin for /api/*."
-  value       = aws_eip.runner.public_ip
+  description = "Point apps.boxcode.sh at this, and set it as the CloudFront origin for /api/*. The Elastic IP when there is one, otherwise the instance's own address -- which changes on stop/start, so it is fine for testing and not for DNS."
+  value       = var.allocate_eip ? one(aws_eip.runner[*].public_ip) : aws_instance.runner.public_ip
 }

@@ -170,14 +170,30 @@ export function dropSql(id) {
   ];
 }
 
-/// Addresses Postgres should listen on: the host end of every slot's link, plus
-/// loopback. Never `*` -- that binds the public interface too, and the only
+/// Addresses Postgres should listen on: the host end of every APP slot's link,
+/// plus loopback. Never `*` -- that binds the public interface too, and the only
 /// thing standing between that and the internet would be a security group.
-export function listenAddresses(slotCount, prefix = "10.200") {
+///
+/// Two things this gets right that the first version did not:
+///
+///   The build slot is excluded. Its gateway lives inside a network namespace,
+///   so the host cannot bind it at all -- and a build VM has no business
+///   reaching a project's database.
+///
+///   Every address here must EXIST before Postgres starts. It binds at startup
+///   and quietly skips what it cannot bind: the first version listed all
+///   sixteen, none of the TAPs existed yet because they are created per deploy,
+///   and Postgres came up bound to 127.0.0.1 alone while `show listen_addresses`
+///   still reported all seventeen. Nothing logged. setup.sh now brings every app
+///   TAP up before Postgres starts, which is what makes this list true.
+export function listenAddresses(slotCount, prefix = "10.200", buildSlot = null) {
   if (!Number.isInteger(slotCount) || slotCount < 1 || slotCount > 256) {
     throw new Error(`refusing slot count ${JSON.stringify(slotCount)}`);
   }
   const addrs = ["localhost"];
-  for (let s = 0; s < slotCount; s++) addrs.push(`${prefix}.${s}.1`);
+  for (let s = 0; s < slotCount; s++) {
+    if (s === buildSlot) continue;
+    addrs.push(`${prefix}.${s}.1`);
+  }
   return addrs.join(",");
 }
