@@ -1,17 +1,23 @@
 ##############################################################################
 # boxcode hosting guards
 #
-# Four layers, each catching what the one above it misses, each cheaper than
-# the next. Nothing here is account-wide: this account is shared with 42 other
+# Layered, each catching what the one above it misses, each cheaper than the
+# next. Nothing here is account-wide: this account is shared with 42 other
 # Lambda functions and 8 EC2 instances, so every control is scoped to boxcode's
-# own resources by name AND tag, and the IAM policy below is what makes that
-# binding rather than merely intended.
+# own resources, and the IAM policy below is what makes that binding rather than
+# merely intended.
 #
 #   L0  Shield Standard          free, automatic, absorbs L3/L4 at the edge
-#   L1  WAF rate-based rules     blocks an L7 flood before anything is invoked
-#   L2  API Gateway throttle     hard cap on invocations per second
-#   L3  Reserved concurrency     hard cap on compute per app
-#   L4  Budget alarm -> switch   last resort
+#   L1  WAF rate-based rules     blocks an L7 flood before it reaches the box
+#   L2  Per-VM ceilings          256 MiB, 1 vCPU, rate-limited disk and network,
+#                                enforced by Firecracker in runtime/machine.mjs
+#   L3  Budget alarm -> switch   last resort
+#
+# The old L2 (API Gateway throttling) and L3 (Lambda reserved concurrency) are
+# gone with the substrate they belonged to. Note what that changes about the
+# threat: on Lambda a flood converted directly into money, so the layers existed
+# largely to bound a bill. The runner box is a flat monthly cost, so a flood now
+# costs availability rather than spend -- these layers protect uptime.
 #
 # Deliberately NOT here, and never to be added:
 #   - an account-level Lambda concurrency limit. It would throttle all 42
@@ -27,11 +33,11 @@ variable "region" {
   default = "us-east-1"
 }
 
-variable "app_prefix" {
-  description = "Every hosted backend is named with this prefix. Must agree with APP_NAME_RE in kill-switch/scope.mjs."
-  type        = string
-  default     = "boxcode-app-"
-}
+# app_prefix used to live here, because the IAM policy built a resource ARN from
+# it. Nothing in Terraform names a hosted project any more -- the box does -- so
+# it went with the ARN rather than staying as a variable nothing reads. The
+# naming contract is APP_NAME_RE in kill-switch/scope.mjs, which is where it is
+# enforced and tested.
 
 variable "cost_tag_key" {
   description = "Cost-allocation tag the budget filters on. Must be activated in Billing > Cost allocation tags before the budget can see it."
@@ -40,15 +46,34 @@ variable "cost_tag_key" {
 }
 
 variable "budget_usd" {
-  description = "Monthly spend on tagged boxcode resources that trips the kill switch."
-  type        = string
-  default     = "25"
-}
+  description = <<-EOT
+    Monthly spend on tagged boxcode resources that trips the kill switch.
 
-variable "app_concurrency" {
-  description = "Reserved concurrency per hosted backend. Also what the kill switch restores to."
-  type        = number
-  default     = 2
+    Was 25 when hosted backends were Lambdas and the steady-state bill was
+    pennies. The Firecracker host is a dedicated m8i.large tagged
+    boxcode:hosting, so the baseline is now about $97/month and a threshold of
+    25 would fire on the first day and every day after -- exactly the
+    permanently-firing budget this file's header warns against, just scoped by
+    tag instead of by account.
+
+    Was 110 against a $96.81 estimate. Applying the guards moved the baseline:
+    WAF is $5 for the web ACL plus $1 per rule for three rules, the alarms are
+    $0.30, and seven daily snapshots of the runner volume land near $1.50 once
+    ten projects are actually on it. That is about $107, and 110 left roughly
+    three percent of headroom.
+
+    That matters more here than it would for an alert, because this budget does
+    not only warn -- it fires the kill switch, which stops every hosted project.
+    A threshold that trips in an ordinary month is not a noisy alarm, it is a
+    monthly self-inflicted outage that stays down until someone runs restore.
+
+    125 sits about seventeen percent above the baseline: silent in a normal
+    month, and still far below anything that could be called runaway. The point
+    is to be told before the invoice, not after -- and to be told only when
+    there is something to be told about.
+  EOT
+  type        = string
+  default     = "125"
 }
 
 variable "alert_email" {
@@ -59,36 +84,38 @@ variable "alert_email" {
 # L4 -- the kill switch, and the IAM policy that is the actual guarantee
 ##############################################################################
 
-# This is the important resource in the file.
-#
-# scope.mjs decides which functions the kill switch *intends* to touch. This
-# policy decides which ones it *can*. Code can have a bug; an IAM resource
-# constraint is enforced by AWS before the call runs, so even a kill switch
-# that tried to throttle gpurouter-agent would be refused by the API.
-#
-# If you change the naming scheme, change it in three places or the switch
-# silently stops working: here, APP_NAME_RE in scope.mjs, and whatever names
-# deploy-control creates.
 data "aws_iam_policy_document" "kill_switch" {
-  # Reading is unavoidably account-wide: ListFunctions has no resource-level
-  # permission in Lambda's IAM model. That is acceptable -- listing changes
-  # nothing, and scope.mjs filters what comes back.
+  # This is the important resource in the file.
+  #
+  # scope.mjs decides which microVMs the kill switch *intends* to stop, and runs
+  # on the box. This policy decides which box it can reach at all. Code can have
+  # a bug; an IAM resource constraint is enforced by AWS before the call runs, so
+  # a kill switch that tried to run a shell command on gpu-router-prod would be
+  # refused by the API.
+  #
+  # It used to grant lambda:PutFunctionConcurrency on `function:boxcode-app-*`,
+  # from when hosted backends were Lambda functions. Same shape of promise,
+  # different resource: now it is ssm:SendCommand on ONE instance id and ONE
+  # document.
   statement {
-    sid       = "ReadOnlyListing"
-    actions   = ["lambda:ListFunctions", "lambda:ListTags", "lambda:GetFunction"]
-    resources = ["*"]
+    sid     = "RunTheKillScriptOnTheRunnerOnly"
+    actions = ["ssm:SendCommand"]
+    resources = [
+      aws_instance.runner.arn,
+      # The document is named as well as the instance. Without this second arn
+      # the grant is "send this instance any command", and with it the grant is
+      # "send this instance a shell command" -- the shell script itself is what
+      # decides what that does, and it is in the repo.
+      "arn:aws:ssm:${var.region}::document/AWS-RunShellScript",
+    ]
   }
 
-  # Writing is not. This is the line that protects the other 42 functions.
+  # Reading back what happened. Scoped to this account's own invocations; there
+  # is no resource-level permission for these in SSM's IAM model.
   statement {
-    sid = "ThrottleOnlyBoxcodeApps"
-    actions = [
-      "lambda:PutFunctionConcurrency",
-      "lambda:DeleteFunctionConcurrency",
-    ]
-    resources = [
-      "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:${var.app_prefix}*",
-    ]
+    sid       = "ReadTheResult"
+    actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
+    resources = ["*"]
   }
 
   statement {
@@ -117,17 +144,35 @@ resource "aws_iam_role_policy" "kill_switch" {
   policy = data.aws_iam_policy_document.kill_switch.json
 }
 
+# Built from the directory rather than referencing a zip somebody has to
+# remember to make. `filename = "kill-switch.zip"` was a file that did not exist
+# and never would have: terraform apply failed on it, at the end of a long plan,
+# on the one resource nobody wants to discover is missing during an incident.
+#
+# No bundling step. The nodejs22.x runtime ships AWS SDK v3, so
+# @aws-sdk/client-ssm resolves without node_modules -- which is also why the
+# kill switch has no dependencies to keep current.
+data "archive_file" "kill_switch" {
+  type        = "zip"
+  source_dir  = "${path.module}/kill-switch"
+  output_path = "${path.module}/.terraform-kill-switch.zip"
+  excludes    = ["scope.test.mjs"]
+}
+
 resource "aws_lambda_function" "kill_switch" {
-  function_name = "boxcode-kill-switch"
-  role          = aws_iam_role.kill_switch.arn
-  runtime       = "nodejs22.x"
-  handler       = "index.handler"
-  filename      = "kill-switch.zip"
-  timeout       = 60
+  function_name    = "boxcode-kill-switch"
+  role             = aws_iam_role.kill_switch.arn
+  runtime          = "nodejs22.x"
+  handler          = "index.handler"
+  filename         = data.archive_file.kill_switch.output_path
+  source_code_hash = data.archive_file.kill_switch.output_base64sha256
+  timeout          = 60
   # Never given reserved concurrency of its own: it must be able to run during
   # exactly the incident where everything else is throttled.
   environment {
-    variables = { APP_CONCURRENCY = tostring(var.app_concurrency) }
+    variables = {
+      RUNNER_INSTANCE_ID = aws_instance.runner.id
+    }
   }
   tags = { (var.cost_tag_key) = "true" }
 }
@@ -213,18 +258,11 @@ resource "aws_cloudwatch_metric_alarm" "account_concurrency" {
   alarm_actions       = [aws_sns_topic.alerts.arn]
 }
 
-resource "aws_cloudwatch_metric_alarm" "app_throttles" {
-  alarm_name          = "boxcode-app-throttles"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Throttles"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 100
-  alarm_description   = "Hosted apps are being throttled -- reserved concurrency is doing its job, but something is pushing hard."
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-}
+# The Lambda `Throttles` alarm that used to sit here is gone. Hosted backends
+# are microVMs; there is no such metric, and an alarm that can never fire is
+# worse than no alarm -- it reads as coverage. The equivalent signal for this
+# substrate is boxcode-runner-status-check and boxcode-runner-disk, both in
+# runner.tf.
 
 ##############################################################################
 # L1 -- WAF. Blocks at the edge, before API Gateway or Lambda is reached, so a

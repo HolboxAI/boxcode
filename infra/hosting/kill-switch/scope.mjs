@@ -1,29 +1,33 @@
-// What the kill switch is allowed to touch, and nothing else.
+// What the kill switch is allowed to stop, and nothing else.
 //
-// This account is shared. It runs 42 Lambda functions and 8 EC2 instances that
-// have nothing to do with boxcode -- gpurouter-agent, fsi-genai-workshop-*,
-// mach11-registration-*, bedrock-gateway-UI-prod and the rest. A kill switch
-// that fired during an incident and throttled "every function" would turn a
-// boxcode cost problem into a company-wide outage. That is a worse failure
-// than the one it exists to prevent, so the scoping is the feature and the
-// killing is the easy part.
+// It now stops microVMs on the runner box rather than throttling Lambda
+// functions, and the shape of the guarantee changed with it. Worth reading
+// before editing, because the old reasoning is still half-visible in the tests.
 //
-// Three independent things have to agree before a function is touched:
+// **Then:** hosted backends were Lambda functions in an account shared with 42
+// others -- gpurouter-agent, fsi-genai-workshop-*, mach11-registration-*. A
+// kill switch that throttled "every function" would have turned a boxcode cost
+// problem into a company-wide outage, so three things had to agree: the name,
+// a boxcode:hosting tag, and a never-touch list.
+//
+// **Now:** the things being stopped are microVMs on a box that runs nothing
+// else. The tag check has no analogue there -- a VM has no AWS tags -- and
+// inventing one would be theatre. Two checks remain:
 //
 //   1. The name matches the boxcode-app prefix.
-//   2. The function carries the boxcode:hosting tag.
-//   3. The name is not on the never-touch list.
+//   2. The name is not on the never-touch list.
 //
-// Any one of them saying no is a no. They are independent on purpose: a name
-// collision alone is not enough, a stray tag alone is not enough, and the
-// denylist backstops both.
+// What replaced the tag is not in this file. The braces are now the IAM policy
+// on the kill switch's role, which grants ssm:SendCommand on **one instance
+// id** and one document -- so even a bug here cannot reach another box, because
+// AWS refuses the call before the code runs. Code you can get wrong; an IAM
+// resource constraint you cannot.
 //
-// And none of it is the real guarantee. The real guarantee is the IAM policy
-// on the kill switch's own role, which grants
-// PutFunctionConcurrency only on `function:boxcode-app-*` -- so even a bug in
-// this file cannot touch gpurouter-agent, because AWS itself refuses the call.
-// Code you can get wrong; IAM resource scoping you cannot. This module is the
-// belt; the policy is the braces.
+// The tag constant and its checks are kept below for the Lambda-era callers
+// that still pass tags, and ignored when none are supplied. The test suite
+// still asserts against the real names of the production functions in this
+// account, which stays worth doing: those names must never match, whatever
+// this switch is pointed at next.
 
 /// Every hosted backend is named `boxcode-app-<project id>`, and project ids
 /// are `[a-z2-9]{4,16}` -- the same shape the artifact signer mints and every
@@ -47,31 +51,43 @@ export const NEVER_TOUCH = new Set([
   "boxcode-kill-switch",
 ]);
 
-/// True only when all three checks agree. `tags` is the function's tag map as
-/// returned by ListTags.
+/// True only when every applicable check agrees.
 ///
-/// Deliberately takes already-fetched tags rather than fetching them itself:
-/// a function that does I/O is a function whose test needs a network, and this
-/// is the one piece of logic that has to be provably correct.
-export function mayTouch(functionName, tags) {
-  if (typeof functionName !== "string") return false;
-  if (NEVER_TOUCH.has(functionName)) return false;
-  if (!APP_NAME_RE.test(functionName)) return false;
-  if (!tags || tags[REQUIRED_TAG] === undefined) return false;
+/// `tags` is optional. Pass a tag map and it is required to carry
+/// [`REQUIRED_TAG`] -- that is the Lambda-era rule and it still holds for
+/// anything that has tags. Pass nothing, as the on-box caller does, and the
+/// name checks alone decide, because a microVM has no tags to check.
+///
+/// Deliberately takes already-fetched tags rather than fetching them itself: a
+/// function that does I/O is a function whose test needs a network, and this is
+/// the one piece of logic that has to be provably correct.
+export function mayTouch(name, tags) {
+  if (typeof name !== "string") return false;
+  if (NEVER_TOUCH.has(name)) return false;
+  if (!APP_NAME_RE.test(name)) return false;
+  // `undefined` means "this thing has no tags" -- a microVM. An empty object
+  // means "it has tags and none of them is ours" -- a Lambda that should be
+  // refused. Those are different answers and collapsing them would quietly
+  // drop the Lambda-era check.
+  if (tags !== undefined && (!tags || tags[REQUIRED_TAG] === undefined)) return false;
   return true;
 }
 
 /// Filter a listing down to what may be touched, and say what was skipped and
 /// why. The reason strings are logged during an incident, when "why did it not
 /// stop that one" is the question being asked at speed.
-export function partition(functions) {
+export function partition(items) {
   const allowed = [];
   const skipped = [];
-  for (const fn of functions) {
-    const name = fn.FunctionName;
-    if (NEVER_TOUCH.has(name)) skipped.push({ name, why: "on the never-touch list" });
+  for (const item of items) {
+    // Accepts both shapes: `{ FunctionName, Tags }` from Lambda's ListFunctions,
+    // and `{ name }` from the box's own VM listing.
+    const name = item.FunctionName ?? item.name;
+    const tags = item.Tags ?? item.tags;
+    if (typeof name !== "string") skipped.push({ name: null, why: "no name" });
+    else if (NEVER_TOUCH.has(name)) skipped.push({ name, why: "on the never-touch list" });
     else if (!APP_NAME_RE.test(name)) skipped.push({ name, why: "not a boxcode-app-* name" });
-    else if (!fn.Tags || fn.Tags[REQUIRED_TAG] === undefined)
+    else if (tags !== undefined && (!tags || tags[REQUIRED_TAG] === undefined))
       skipped.push({ name, why: `no ${REQUIRED_TAG} tag` });
     else allowed.push(name);
   }

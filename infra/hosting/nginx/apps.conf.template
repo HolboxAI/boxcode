@@ -13,6 +13,16 @@
 # Per-app routes are written into this directory by the hosting control-plane,
 # one file per live project, never into this file -- certbot edits this one in
 # place, and regenerating it from the template would destroy that edit.
+#
+# The same fact makes this a bad home for anything new. setup.sh copies this
+# file only when it does not already exist, so a directive added here reaches a
+# fresh box and never an existing one. That is how the $connection_upgrade map
+# came to be missing in production: every per-project route referenced it,
+# `nginx -t` failed on every deploy, and vm.sh's `nginx -t && reload` swallowed
+# the failure -- so deploys reported success, the microVM ran, the app answered
+# on its own address, and the edge served the catch-all 404. It now lives in
+# conf.d/00-boxcode-upgrade-map.conf, rewritten on every setup run. Put http-level
+# additions there, not here.
 server {
     listen 80;
     server_name apps.boxcode.sh;

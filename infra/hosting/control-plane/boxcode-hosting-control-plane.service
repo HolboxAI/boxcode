@@ -1,0 +1,51 @@
+[Unit]
+Description=boxcode hosting control-plane
+After=network.target postgresql.service nginx.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+# Its own Node, not the system one -- infra/db/setup.sh learned that AL2023's
+# packaged nodejs is v18, and nothing here targets v18.
+ExecStart=/opt/node22/bin/node /opt/boxcode-hosting/control-plane/index.mjs
+WorkingDirectory=/opt/boxcode-hosting
+Environment=NODE_ENV=production
+Environment=BOXCODE_HOSTING_DIR=/opt/boxcode-hosting
+Environment=BOXCODE_STATE_DIR=/opt/boxcode-hosting/state
+
+Restart=always
+RestartSec=2
+# In [Unit] rather than here: systemd logs "Unknown key ... ignoring" for these
+# under [Service] and starts anyway, so the ceiling would be silently absent.
+# Learned from the generated app units earlier in this branch.
+
+# Runs as root, and that is not an oversight worth quietly fixing later. It
+# drives jailer, ip, iptables, nginx and psql-as-postgres. The isolation on this
+# box is between the GUESTS and the host, not between this process and the host;
+# a control plane that could not stop a microVM would not be a control plane.
+User=root
+
+# What it does not need, taken away anyway. None of these are load-bearing on
+# their own -- a root process can undo most of them -- but they cost nothing and
+# they document the intent.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectKernelTunables=no
+PrivateTmp=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# ProtectKernelTunables is explicitly OFF: the slot scripts set
+# net.ipv4.ip_forward, and turning this on makes that fail in a way that reads
+# as a networking bug rather than a unit-file one.
+
+MemoryMax=256M
+TasksMax=256
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=boxcode-hosting
+
+[Install]
+WantedBy=multi-user.target

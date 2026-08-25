@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mayTouch, partition, APP_NAME_RE, REQUIRED_TAG } from "./scope.mjs";
+import { mayTouch, partition, APP_NAME_RE, REQUIRED_TAG, NEVER_TOUCH } from "./scope.mjs";
 
 // Read off account 992382417943 on 2026-08-20. Every one of these is somebody
 // else's production service, and the kill switch firing must leave all of them
@@ -115,4 +115,65 @@ test("an empty account produces an empty action list, not an error", () => {
   const { allowed, skipped } = partition([]);
   assert.deepEqual(allowed, []);
   assert.deepEqual(skipped, []);
+});
+
+// ---- microVMs, which have no tags -----------------------------------------
+
+test("a microVM is judged on its name alone", () => {
+  // A VM has no AWS tags. Requiring one would mean the kill switch could never
+  // stop anything on the box -- the failure would be silent, and only visible
+  // during the incident it exists for.
+  assert.equal(mayTouch("boxcode-app-k9depef6"), true);
+  assert.equal(mayTouch("boxcode-app-abcd", undefined), true);
+});
+
+test("dropping the tag check does not widen what a name may be", () => {
+  for (const name of REAL_OTHER_FUNCTIONS) {
+    assert.equal(mayTouch(name), false, `${name} must never be touchable`);
+  }
+  for (const name of [
+    "boxcode-app", "boxcode-app-", "boxcode-app-abc", "not-boxcode-app-abcd",
+    "boxcode-app-abcd-prod", "BOXCODE-APP-ABCD", "boxcode-app-abcd extra",
+  ]) {
+    assert.equal(mayTouch(name), false, `${name} must not match`);
+  }
+});
+
+test("boxcode's own services are still never touched, tags or not", () => {
+  for (const name of NEVER_TOUCH) {
+    assert.equal(mayTouch(name), false, `${name} must never be touchable`);
+    assert.equal(mayTouch(name, { [REQUIRED_TAG]: "true" }), false);
+  }
+});
+
+test("an empty tag map is still a refusal, and no tag map is not", () => {
+  // These are different answers on purpose: `{}` means "it has tags and none
+  // is ours", which is a Lambda that must be refused. `undefined` means "it
+  // has no tags at all", which is a microVM.
+  assert.equal(mayTouch("boxcode-app-k9depef6", {}), false);
+  assert.equal(mayTouch("boxcode-app-k9depef6", null), false);
+  assert.equal(mayTouch("boxcode-app-k9depef6", undefined), true);
+});
+
+test("partition accepts the box's own listing shape", () => {
+  const { allowed, skipped } = partition([
+    { name: "boxcode-app-k9depef6", slot: 0, pid: 100 },
+    { name: "boxcode-app-abcd", slot: 1, pid: 101 },
+    { name: "boxcode-kill-switch", slot: 2, pid: 102 },
+    { name: "gpurouter-agent-agent", slot: 3, pid: 103 },
+    { name: null, slot: 4, pid: 104 },
+  ]);
+  assert.deepEqual(allowed, ["boxcode-app-k9depef6", "boxcode-app-abcd"]);
+  assert.equal(skipped.length, 3);
+  assert.ok(skipped.every((s) => s.why));
+});
+
+test("both listing shapes still work from one function", () => {
+  // Lambda's ListFunctions shape and the box's, side by side.
+  const { allowed } = partition([
+    { FunctionName: "boxcode-app-aaaa", Tags: { [REQUIRED_TAG]: "true" } },
+    { FunctionName: "boxcode-app-bbbb", Tags: {} },
+    { name: "boxcode-app-cccc" },
+  ]);
+  assert.deepEqual(allowed, ["boxcode-app-aaaa", "boxcode-app-cccc"]);
 });

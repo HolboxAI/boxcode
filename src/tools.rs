@@ -63,6 +63,7 @@ pub const DEPLOY_PROJECT: &str = "deploy_project";
 pub const PUBLISH_ARTIFACT: &str = "publish_artifact";
 pub const ENABLE_AUTH: &str = "enable_auth";
 pub const DB_QUERY: &str = "db_query";
+pub const DEPLOY_BACKEND: &str = "deploy_backend";
 pub const LIST_CHANGE_REQUESTS: &str = "list_change_requests";
 pub const RESOLVE_CHANGE_REQUEST: &str = "resolve_change_request";
 pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
@@ -544,6 +545,60 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> 
         json!({
             "type": "function",
             "function": {
+                "name": DEPLOY_BACKEND,
+                "description": "Host this project's backend as a real, running server on \
+                                boxcode's own infrastructure, at a URL under the same domain as \
+                                the published frontend. Requires the path to have been published \
+                                with publish_artifact first -- the backend is served at \
+                                /api/<project id>/, which only exists once the project does. \
+                                \
+                                Use this when the project needs something a static page cannot \
+                                do: a database with an ORM, sessions, background work, \
+                                WebSockets, or any API that must not run in the browser. Node.js \
+                                and Python only. The framework, the entrypoint and the runtime \
+                                are detected from the directory -- Express, Fastify, Koa, \
+                                NestJS, FastAPI, Flask and Django are recognised. \
+                                \
+                                A PostgreSQL database is created for the project and its URL is \
+                                in DATABASE_URL, so Prisma, SQLAlchemy, the Django ORM and \
+                                anything else that speaks Postgres work normally. The server must \
+                                listen on the port in the PORT environment variable. \
+                                \
+                                Four things it CANNOT do, which are properties of the design and \
+                                not temporary gaps -- say so before writing code that assumes \
+                                otherwise, not after the deploy fails: \
+                                (1) NO OUTBOUND INTERNET. The server cannot reach Stripe, \
+                                OpenAI, SendGrid, an SMTP host, or any other external API. \
+                                Anything that must call out has to happen somewhere else. \
+                                (2) It expires after 48 hours, like a published artifact. \
+                                (3) Dependencies are installed on the server from package.json \
+                                or requirements.txt -- do not commit node_modules, and do not \
+                                expect a local .env to travel; local secrets are never uploaded. \
+                                (4) There is a small number of these running at once across \
+                                everyone using boxcode. A refusal saying the limit is reached is \
+                                a real answer, not a retryable error. \
+                                \
+                                Deploying takes a few minutes: the source is uploaded, \
+                                dependencies are installed in an isolated build machine, and the \
+                                server is started. This tool waits for that and reports whether \
+                                the URL actually answered.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory holding the backend, relative to the \
+                                            workspace. The project must already be published \
+                                            from this same path with publish_artifact."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": DB_QUERY,
                 "description": "Run one SQL statement against an already-published project's own \
                                 database (SQLite -- one file per project, created automatically on \
@@ -824,6 +879,7 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> 
         schemas.retain(|schema| {
             let name = schema["function"]["name"].as_str().unwrap_or_default();
             name != DB_QUERY
+                && name != DEPLOY_BACKEND
                 && name != ENABLE_AUTH
                 && name != LIST_CHANGE_REQUESTS
                 && name != RESOLVE_CHANGE_REQUEST
@@ -837,7 +893,14 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> 
             // slip past a check that only looks at files -- but it builds the
             // project and puts it on the public internet, which is the least
             // reversible thing this program can do.
-            name != WRITE_FILE && name != EDIT_FILE && name != DEPLOY_PROJECT
+            // deploy_backend belongs here for the same reason deploy_project
+            // does, and more strongly: it changes nothing in the working
+            // directory, so a check that only looks at files would let it
+            // through -- and it runs this project's code on a public host.
+            name != WRITE_FILE
+                && name != EDIT_FILE
+                && name != DEPLOY_PROJECT
+                && name != DEPLOY_BACKEND
         });
         schemas.push(json!({
             "type": "function",
@@ -1633,6 +1696,11 @@ pub enum Action {
     /// Uploads static files to a temporary public URL so the user can look at
     /// them. Always approved, for the same reason `Deploy` is: it publishes.
     Publish { path: String },
+    /// Puts a real server on the internet for an already-published project:
+    /// its source is uploaded, built, and run in a microVM on boxcode's own
+    /// host. Always approved, same reasoning as `Publish`/`Deploy` -- and more
+    /// so, because this one runs the project's code rather than serving it.
+    DeployBackend { path: String },
     /// Provisions a live sign-up/sign-in service for an already-published
     /// project. Always approved, same reasoning as `Publish`/`Deploy`: it
     /// stands up a real backend on the public internet, not something a
@@ -1733,6 +1801,7 @@ impl Action {
                 if *production { "Production" } else { "Preview" }
             ),
             Action::Publish { path } => format!("preview {path} — public link, 48h"),
+            Action::DeployBackend { path } => format!("host backend {path} — live server, 48h"),
             Action::EnableAuth { path } => format!("auth {path} — sign-up/sign-in"),
             Action::DbQuery { path, sql } => format!("db {path} — {}", clip(sql, 50)),
             Action::ListChangeRequests { path } => format!("requests {path} — check mailbox"),
@@ -1762,6 +1831,11 @@ pub fn action_risk(action: &Action, workspace_root: &Path) -> danger::Risk {
         // unattended-mode setting made an hour ago should silently cover.
         Action::Publish { .. } => danger::Risk::Dangerous(
             "uploads these files to a public URL anyone with the link can open".to_string(),
+        ),
+        Action::DeployBackend { .. } => danger::Risk::Dangerous(
+            "uploads this project's source and RUNS it as a live server on boxcode's host, \
+             reachable by anyone with the link"
+                .to_string(),
         ),
         Action::EnableAuth { .. } => danger::Risk::Dangerous(
             "provisions a live sign-up/sign-in service on the public internet for this project"
@@ -1849,6 +1923,15 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
         Action::EnableAuth { .. } => Some(
             "Plan mode does not provision anything, so no auth service was created. Say in \
              your plan that this project will get sign-up/sign-in and call "
+                .to_string()
+                + EXIT_PLAN_MODE
+                + ".",
+        ),
+        // Named for the same reason Publish is, and more strongly: this one
+        // does not just serve the project's files, it runs the project's code.
+        Action::DeployBackend { .. } => Some(
+            "Plan mode does not host anything, so no server was started. Say in your plan \
+             that this project needs a backend, and what it would do, then call "
                 .to_string()
                 + EXIT_PLAN_MODE
                 + ".",
@@ -1953,6 +2036,16 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
                 return None;
             }
             Some(Action::Publish { path })
+        }
+        DEPLOY_BACKEND => {
+            #[derive(serde::Deserialize)]
+            struct Args { path: String }
+            let args: Args = serde_json::from_str(&call.function.arguments).ok()?;
+            let path = args.path.trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            Some(Action::DeployBackend { path })
         }
         DB_QUERY => {
             #[derive(serde::Deserialize)]
@@ -2303,6 +2396,7 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
         WEB_SEARCH => execute_web_search(call, config).await,
         DEPLOY_PROJECT => execute_deploy_project(call, workspace).await,
         PUBLISH_ARTIFACT => execute_publish_artifact(call, workspace, config).await,
+        DEPLOY_BACKEND => execute_deploy_backend(call, workspace, config).await,
         ENABLE_AUTH => execute_enable_auth(call, workspace, config).await,
         DB_QUERY => execute_db_query(call, workspace, config).await,
         LIST_CHANGE_REQUESTS => execute_list_change_requests(call, workspace, config).await,
@@ -3171,6 +3265,102 @@ async fn execute_publish_artifact(
 /// last published under -- `auth::provision` refuses on its own if that
 /// comes back empty, so the error the model sees either way is the same
 /// "publish this first" message.
+/// Hosts a project's backend as a running server.
+///
+/// The project id comes from the artifact registry rather than from the model:
+/// the backend is served at `/api/<id>/`, and that path only means anything for
+/// an id `publish_artifact` already minted for this same directory. Letting the
+/// model name it would let it point a backend at somebody else's project.
+async fn execute_deploy_backend(
+    call: &ToolCall,
+    workspace: &Workspace,
+    config: &ToolsConfig,
+) -> ToolOutcome {
+    let Some(Action::DeployBackend { path }) = describe_action(call) else {
+        return outcome(
+            &call.id,
+            "\u{1F5A5} host \u{2014} unusable arguments".to_string(),
+            format!("Error: {DEPLOY_BACKEND} needs a `path`."),
+        );
+    };
+    let resolved = match resolve_in_workspace(workspace, &path) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("\u{1F5A5} host {} \u{2014} refused", clip(&path, 40)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    let Some(id) = crate::artifacts::remembered_id(&resolved) else {
+        return outcome(
+            &call.id,
+            format!("\u{1F5A5} host {} \u{2014} not published", clip(&path, 40)),
+            format!(
+                "Error: {path} has not been published yet. A backend is served at \
+                 /api/<project id>/, and that id is minted by {PUBLISH_ARTIFACT} -- publish the \
+                 project first, then call {DEPLOY_BACKEND} again."
+            ),
+        );
+    };
+
+    let profile = match crate::deploy::backend::detect_backend(&resolved) {
+        Ok(profile) => profile,
+        Err(e) => {
+            return outcome(
+                &call.id,
+                format!("\u{1F5A5} host {} \u{2014} not a server", clip(&path, 40)),
+                format!("Error: {e}"),
+            )
+        }
+    };
+
+    match crate::backend::deploy(&resolved, &id, &profile, &config.backend_endpoint).await {
+        Ok(deployed) => {
+            // `verified` is a real request this call made against the live URL,
+            // not the server's own word for it. Reporting "deployed" either
+            // way, unqualified, is the gap between a claim and a checked fact
+            // that this field exists to close -- the same reasoning as
+            // `Published::verified`.
+            let confirmation = if deployed.verified {
+                "Confirmed live: the URL was requested right after the deploy and something \
+                 answered."
+            } else {
+                "NOT confirmed: the deploy reported success but the URL did not answer when \
+                 checked. The usual cause is a server that binds 127.0.0.1 or a hard-coded port \
+                 instead of listening on 0.0.0.0 and the port in PORT. Say this is unconfirmed \
+                 rather than done, and check the URL before telling the user it works."
+            };
+            outcome(
+                &call.id,
+                // The URL leads, for the same reason it does when publishing:
+                // it is the entire point of the call, and the user should not
+                // have to ask for it.
+                format!("\u{1F5A5} host \u{2014} {}", deployed.url),
+                format!(
+                    "Backend URL: {}\n\n\
+                     {confirmation}\n\n\
+                     It expires in {} hours, at the same time as the published frontend.\n\n\
+                     The frontend should call this with a RELATIVE path -- fetch(\"/api/{}/...\") \
+                     -- not the absolute URL. Same origin, so no CORS, and it keeps working if \
+                     the domain ever changes.\n\n\
+                     DATABASE_URL is set in the server's environment and points at a PostgreSQL \
+                     database created for this project. There is NO outbound internet: any call \
+                     to a third-party API will fail, whatever the code says.",
+                    deployed.url, deployed.expires_in_hours, deployed.id
+                ),
+            )
+        }
+        Err(e) => outcome(
+            &call.id,
+            format!("\u{1F5A5} host {} \u{2014} failed", clip(&path, 40)),
+            format!("Error: {e}"),
+        ),
+    }
+}
+
 async fn execute_enable_auth(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
     let Some(Action::EnableAuth { path }) = describe_action(call) else {
         return outcome(
@@ -5582,7 +5772,7 @@ mod tests {
     /// `disabling_deployment_withholds_the_schema_entirely` already
     /// established for a single tool.
     #[test]
-    fn an_unpublished_workspace_withholds_the_four_publish_gated_tools() {
+    fn an_unpublished_workspace_withholds_the_publish_gated_tools() {
         let names: Vec<String> = schemas(Mode::Normal, false, true, false)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
@@ -5591,16 +5781,21 @@ mod tests {
         assert!(!names.iter().any(|n| n == ENABLE_AUTH), "{names:?}");
         assert!(!names.iter().any(|n| n == LIST_CHANGE_REQUESTS), "{names:?}");
         assert!(!names.iter().any(|n| n == RESOLVE_CHANGE_REQUEST), "{names:?}");
+        // A backend is served at /api/<project id>/, and that id only exists
+        // once the project has been published -- so this one is gated for a
+        // stronger reason than the others: without an id there is nowhere to
+        // put it.
+        assert!(!names.iter().any(|n| n == DEPLOY_BACKEND), "{names:?}");
         // ...and the rest are untouched.
         assert!(names.iter().any(|n| n == RUN_COMMAND), "{names:?}");
         assert!(names.iter().any(|n| n == PUBLISH_ARTIFACT), "{names:?}");
-        assert_eq!(names.len(), schemas(Mode::Normal, false, true, true).len() - 4);
+        assert_eq!(names.len(), schemas(Mode::Normal, false, true, true).len() - 5);
     }
 
-    /// Once a workspace has been published, all four return -- this is a
+    /// Once a workspace has been published they all return -- this is a
     /// gate on precondition, not a permanent restriction.
     #[test]
-    fn a_published_workspace_offers_all_four() {
+    fn a_published_workspace_offers_them_all() {
         let names: Vec<String> = schemas(Mode::Normal, false, true, true)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
@@ -5609,6 +5804,39 @@ mod tests {
         assert!(names.iter().any(|n| n == ENABLE_AUTH), "{names:?}");
         assert!(names.iter().any(|n| n == LIST_CHANGE_REQUESTS), "{names:?}");
         assert!(names.iter().any(|n| n == RESOLVE_CHANGE_REQUEST), "{names:?}");
+        assert!(names.iter().any(|n| n == DEPLOY_BACKEND), "{names:?}");
+    }
+
+    /// Hosting a backend is never offered in plan mode, for the same reason
+    /// `deploy_project` is not: it changes nothing in the working directory,
+    /// so a check that only looks at files would wave it through -- and it
+    /// runs the project's code on a public host.
+    #[test]
+    fn plan_mode_never_offers_to_host_a_backend() {
+        let names: Vec<String> = schemas(Mode::Plan, false, true, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == DEPLOY_BACKEND), "{names:?}");
+        assert!(!names.iter().any(|n| n == DEPLOY_PROJECT), "{names:?}");
+        assert!(!names.iter().any(|n| n == WRITE_FILE), "{names:?}");
+    }
+
+    #[test]
+    fn hosting_a_backend_always_stops_for_a_decision() {
+        // Even with approval switched off entirely. It runs this project's
+        // code on somebody else's box, which is not something an
+        // unattended-mode setting made an hour ago should silently cover.
+        let risk = action_risk(
+            &Action::DeployBackend { path: "api".into() },
+            std::path::Path::new("/tmp"),
+        );
+        assert!(matches!(risk, danger::Risk::Dangerous(_)), "{risk:?}");
+        if let danger::Risk::Dangerous(why) = risk {
+            // The reason is shown at the prompt, so it has to say the thing a
+            // person would want to know before answering.
+            assert!(why.contains("RUNS"), "{why}");
+        }
     }
 
     /// The publish gate and the deploy gate are independent and must
@@ -5643,6 +5871,7 @@ mod tests {
                 GET_DESIGN_STARTER,
                 CHECK_CONTRAST,
                 PUBLISH_ARTIFACT,
+                DEPLOY_BACKEND,
                 DB_QUERY,
                 ENABLE_AUTH,
                 LIST_CHANGE_REQUESTS,

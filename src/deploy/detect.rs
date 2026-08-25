@@ -247,11 +247,22 @@ pub fn detect(root: &Path) -> Result<ProjectProfile, DetectError> {
         );
     }
     if !framework.is_static_hostable() {
-        warnings.push(
-            "This looks like a long-running Node server. Vercel and Netlify serve static output \
-             and serverless functions, so a plain `node server.js` app will not run as-is."
-                .to_string(),
-        );
+        // Named rather than guessed at where possible. "This looks like a
+        // long-running Node server" is true of an Express app and of a CLI
+        // with a start script, and only one of those is worth warning about
+        // in the same words -- so ask what kind of server it actually is.
+        let named = super::backend::detect_backend(root)
+            .ok()
+            .filter(|b| b.framework.is_recognised())
+            .map(|b| format!("This is {} ({}).", b.framework.label(), b.runtime.label()))
+            // The unchanged wording when nothing more specific is known. This
+            // branch only fires for `Framework::Node`, so "Node" is accurate
+            // even when the backend detector cannot name a framework.
+            .unwrap_or_else(|| "This looks like a long-running Node server.".to_string());
+        warnings.push(format!(
+            "{named} Vercel and Netlify serve static output and serverless functions, so a \
+             plain `node server.js` app will not run as-is."
+        ));
     }
     if let Some(dir) = &output_dir {
         if dir != "." && !root.join(dir).exists() {

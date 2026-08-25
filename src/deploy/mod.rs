@@ -36,6 +36,7 @@
 //! app never held.
 
 pub mod cli;
+pub mod backend;
 pub mod detect;
 pub mod history;
 pub mod netlify;
