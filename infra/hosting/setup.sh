@@ -495,6 +495,49 @@ else
 fi
 
 ##############################################################################
+# The disk metric the alarm reads
+#
+# boxcode-runner-disk watches CWAgent/disk_used_percent, and nothing was
+# publishing it -- so the alarm sat at INSUFFICIENT_DATA and could never fire.
+# That is worse than having no alarm, because a dashboard full of alarms reads
+# as coverage.
+#
+# Disk is the failure mode that matters most on this box: every project holds a
+# 2 GB image, builds leave npm and pip caches behind, and the box wedges rather
+# than degrades when it fills.
+#
+# aggregation_dimensions [[]] is the load-bearing line. By default the agent
+# publishes disk_used_percent with path/device/fstype/InstanceId dimensions, and
+# a CloudWatch alarm matches dimensions exactly -- the dimensionless alarm in
+# runner.tf would never have found dimensioned data. [[]] rolls it up to no
+# dimensions, which is what the alarm asks for.
+##############################################################################
+echo "== cloudwatch agent =="
+if ! rpm -q amazon-cloudwatch-agent >/dev/null 2>&1; then
+    sudo dnf install -y amazon-cloudwatch-agent >/dev/null
+fi
+sudo tee /opt/aws/amazon-cloudwatch-agent/etc/boxcode.json >/dev/null <<'EOF'
+{
+  "agent": { "metrics_collection_interval": 300 },
+  "metrics": {
+    "namespace": "CWAgent",
+    "aggregation_dimensions": [[]],
+    "metrics_collected": {
+      "disk": {
+        "resources": ["/"],
+        "measurement": ["disk_used_percent"],
+        "metrics_collection_interval": 300
+      }
+    }
+  }
+}
+EOF
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/boxcode.json >/dev/null
+systemctl is-active --quiet amazon-cloudwatch-agent \
+    || { echo "the cloudwatch agent did not start -- the disk alarm would be blind" >&2; exit 1; }
+
+##############################################################################
 # Control plane
 ##############################################################################
 
@@ -504,16 +547,30 @@ if [ -f "$SCRIPT_DIR/control-plane/index.mjs" ]; then
     # ../runtime/*.mjs by relative path and shells out to lifecycle/ and
     # rootfs/, so copying every .mjs into one directory -- which an earlier
     # version of this did -- breaks every import on the first start.
-    sudo mkdir -p /opt/boxcode-hosting/{control-plane,runtime,lifecycle,rootfs,nginx,state}
+    sudo mkdir -p /opt/boxcode-hosting/{control-plane,runtime,lifecycle,rootfs,nginx,kill-switch,state}
     sudo cp "$SCRIPT_DIR"/control-plane/*.mjs /opt/boxcode-hosting/control-plane/
     sudo cp "$SCRIPT_DIR"/runtime/*.mjs      /opt/boxcode-hosting/runtime/
     sudo cp "$SCRIPT_DIR"/lifecycle/*.sh     /opt/boxcode-hosting/lifecycle/
     sudo cp "$SCRIPT_DIR"/rootfs/*.sh        /opt/boxcode-hosting/rootfs/
     sudo cp "$SCRIPT_DIR"/nginx/*            /opt/boxcode-hosting/nginx/ 2>/dev/null || true
+    # scope.mjs decides which microVMs the kill switch may stop, and
+    # lifecycle/kill-switch.sh imports it by path. Leaving it out does not make
+    # the switch fall back to something cruder -- it makes the switch write its
+    # 503 block, crash on the missing import, and stop no VMs at all. Traffic
+    # blocked, everything still running and still billing: the one state a kill
+    # switch must never be able to reach. Found by firing it in production.
+    sudo cp "$SCRIPT_DIR"/kill-switch/*.mjs  /opt/boxcode-hosting/kill-switch/
     sudo chmod 0755 /opt/boxcode-hosting/lifecycle/*.sh /opt/boxcode-hosting/rootfs/*.sh
     # State is the registry and the deploy history: 0700, since the history
     # holds token hashes and the registry holds every project's slot.
     sudo chmod 0700 /opt/boxcode-hosting/state
+
+    # Checked here because the kill switch is the one thing whose first real use
+    # is an emergency. A missing file must fail provisioning, not the incident.
+    for f in /opt/boxcode-hosting/kill-switch/scope.mjs \
+             /opt/boxcode-hosting/lifecycle/kill-switch.sh; do
+        [ -s "$f" ] || { echo "kill switch is incomplete: $f is missing" >&2; exit 1; }
+    done
 
     # nginx has to reach the control plane for /api/deploy, and nothing else may.
     sudo tee /etc/nginx/conf.d/app-projects/_deploy.conf >/dev/null <<'EOF'

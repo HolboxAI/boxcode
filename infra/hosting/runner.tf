@@ -185,6 +185,24 @@ data "aws_iam_policy_document" "runner" {
     actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/boxcode/runner:*"]
   }
+
+  # So the disk alarm has something to read.
+  #
+  # PutMetricData takes no resource-level permission -- the only way to bound it
+  # is the namespace condition below, which keeps this box out of every other
+  # namespace in a shared account. Without this statement the CloudWatch agent
+  # publishes nothing and boxcode-runner-disk sits at INSUFFICIENT_DATA forever,
+  # which reads as coverage and is not.
+  statement {
+    sid       = "PublishItsOwnDiskMetric"
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = ["CWAgent"]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "runner" {

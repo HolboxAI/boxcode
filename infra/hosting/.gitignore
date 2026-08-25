@@ -6,3 +6,7 @@
 *.tfstate.*
 *.tfvars
 kill-switch.zip
+# archive_file writes the zip next to the module. The name comes from
+# output_path, which is .terraform-prefixed, so the bare name above never
+# matched it.
+.terraform-*
