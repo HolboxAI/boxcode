@@ -56,14 +56,24 @@ variable "budget_usd" {
     permanently-firing budget this file's header warns against, just scoped by
     tag instead of by account.
 
-    110 is chosen to sit between the two numbers that matter: comfortably above
-    the $96.81 estimate, so an ordinary month is silent, and below the $112.71
-    worst realistic overshoot, so a month that combines ten times the expected
-    traffic with a badly-behaved log producer trips it. The point is to be told
-    before the invoice, not after.
+    Was 110 against a $96.81 estimate. Applying the guards moved the baseline:
+    WAF is $5 for the web ACL plus $1 per rule for three rules, the alarms are
+    $0.30, and seven daily snapshots of the runner volume land near $1.50 once
+    ten projects are actually on it. That is about $107, and 110 left roughly
+    three percent of headroom.
+
+    That matters more here than it would for an alert, because this budget does
+    not only warn -- it fires the kill switch, which stops every hosted project.
+    A threshold that trips in an ordinary month is not a noisy alarm, it is a
+    monthly self-inflicted outage that stays down until someone runs restore.
+
+    125 sits about seventeen percent above the baseline: silent in a normal
+    month, and still far below anything that could be called runaway. The point
+    is to be told before the invoice, not after -- and to be told only when
+    there is something to be told about.
   EOT
   type        = string
-  default     = "110"
+  default     = "125"
 }
 
 variable "alert_email" {
