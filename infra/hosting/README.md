@@ -328,6 +328,44 @@ isolation, and it is why ten is the number rather than thirty.
 Admission reads `MemAvailable` and refuses when accepting would eat the reserves,
 so ten idle FastAPI services and six Next.js servers are both correct answers.
 
+## Testing it end to end
+
+Everything that can be checked without KVM already is, in the test suites below.
+The rest needs a host with `/dev/kvm`, which means the runner box — macOS cannot
+do it and neither can Docker Desktop's Linux VM.
+
+**Testing is cheap because you stop the box afterwards.** `m8i.large` is
+$0.10584/hour; three hours is 32 cents. The $97/month figure is 24/7 running.
+
+```bash
+# 1. just the box -- not the WAF, budget or SNS, which need permissions you may
+#    not have and prove nothing about whether hosting works
+cd infra/hosting
+terraform apply -target=aws_instance.runner -target=aws_eip.runner \
+  -var runner_subnet_id=subnet-... -var runner_vpc_id=vpc-... -var alert_email=you@holbox.ai
+
+# 2. on the box, over plain HTTP -- no DNS, no certificate, no CloudFront
+sudo dnf install -y git && git clone <repo> && cd boxcode
+SKIP_TLS=1 bash infra/hosting/setup.sh
+
+# 3. the whole pipeline, end to end
+bash infra/hosting/smoke-test.sh
+
+# 4. stop it
+aws ec2 stop-instances --instance-ids <id>
+```
+
+`smoke-test.sh` builds a project that uses its database and reads `PORT`, takes
+it through provisioning, assembly, a build microVM and start, then checks it
+**serves**, **reaches PostgreSQL**, **cannot reach the internet**, and is
+**visible to reconciliation** — then removes it. Nothing is left behind.
+
+The egress check is the one to watch. A failure there means the highest-value
+control in the design is not working, and it is the one thing that cannot be
+inferred from the unit tests.
+
+Only once that passes is there any point in DNS, a certificate, or CloudFront.
+
 ## Testing
 
 ```bash
@@ -343,7 +381,7 @@ node --test infra/hosting/runtime/capacity.test.mjs  # 11
 node --test infra/hosting/kill-switch/scope.test.mjs # 10
 ```
 
-`setup.sh` additionally asserts at run time that its own `SLOT_COUNT` and
+`setup.sh` also asserts at run time that its own `SLOT_COUNT` and
 `SUBNET_PREFIX` agree with `runtime/network.mjs`. They are duplicated — one
 creates the devices, the other decides what to look for — and a silent
 disagreement shows up as microVMs that boot with no network rather than as
