@@ -14,11 +14,15 @@
 //! being wrong -- everything here is a default the user can override, so the
 //! cost of a bad guess is an edit rather than a broken deployment.
 //!
-//! What this is *for*: boxcode-hosted backends run on Lambda, which does not
-//! start a server. The user writes an ordinary Express or FastAPI app and an
-//! adapter turns the platform's event into the request that app expects. So
-//! detection has to find two things -- which adapter, and which file exports
-//! the app for it to wrap.
+//! What this is *for*: a boxcode-hosted backend runs in its own Firecracker
+//! microVM, as an ordinary long-running server process. So detection has to find
+//! two things -- which base image the guest needs, and which file starts the
+//! server -- and `BackendProfile::start_command` turns them into the argv that
+//! becomes the guest's pid 1.
+//!
+//! (An earlier version of this comment said backends ran on Lambda behind an
+//! adapter, which was true when the file was written and stopped being true two
+//! substrates ago. Nothing about the detection changed; only what it feeds.)
 
 use super::detect::DetectError;
 use serde_json::Value;
@@ -682,3 +686,4 @@ mod tests {
         assert!(!deps.iter().any(|d| d.starts_with('#')), "{deps:?}");
     }
 }
+
