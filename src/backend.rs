@@ -53,6 +53,16 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// How long to wait for a deploy after it is accepted. The build VM is capped at
 /// five minutes and the rest is seconds, so this is generous rather than tight.
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long to keep asking the URL after the deploy says `running`.
+///
+/// These are two different events and the gap between them is real. `running`
+/// means the microVM booted; it does not mean the process inside has bound its
+/// port, and until it does nginx answers 502. A single probe fired the moment
+/// the state flips loses that race and reports `verified: false` for a deploy
+/// that is seconds from being fine -- which is exactly what it did on the first
+/// live run, on a site that was serving correctly by the time anyone looked.
+const PROBE_WINDOW: Duration = Duration::from_secs(90);
 const POLL_EVERY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
@@ -354,7 +364,7 @@ pub async fn deploy(
 
     let _ = total;
     let state = await_ready(&client, endpoint, &accepted.id).await?;
-    let verified = state == "running" && probe(&client, &accepted.url).await;
+    let verified = state == "running" && probe(&client, &accepted.url, &accepted.id).await;
 
     Ok(Deployed {
         id: accepted.id,
@@ -401,14 +411,46 @@ async fn await_ready(client: &reqwest::Client, endpoint: &str, id: &str) -> Resu
 
 /// One real request to the live URL.
 ///
-/// Any answer at all is enough. A backend is entitled to return 404 at its root,
-/// or 401, or a redirect -- what is being checked is that something is listening
-/// behind the route, not that the app agrees with our idea of a homepage.
-async fn probe(client: &reqwest::Client, url: &str) -> bool {
-    match client.get(url).timeout(Duration::from_secs(20)).send().await {
-        Ok(r) => r.status().as_u16() < 500,
-        Err(_) => false,
+/// A backend is entitled to answer 404 at its root, or 401, or a redirect, so
+/// the status alone cannot say whether it worked. What it also cannot say is
+/// whether the request reached the backend at all: an unrouted path returns the
+/// edge's own 404, which is equally "less than 500".
+///
+/// That is not hypothetical. The first live deploy reported itself verified
+/// while nginx had never reloaded, so every request fell through to
+/// "no app deployed at this path" -- a 404 from the front door, counted as
+/// success. The per-project route carries `X-Boxcode-Project` for exactly this
+/// reason: it is present only when the route is loaded, whatever the app then
+/// decides to answer.
+async fn probe(client: &reqwest::Client, url: &str, id: &str) -> bool {
+    let deadline = std::time::Instant::now() + PROBE_WINDOW;
+    loop {
+        if probe_once(client, url, id).await {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL_EVERY).await;
     }
+}
+
+/// One attempt.
+///
+/// The header is the whole point. Without it a 404 from the edge's catch-all --
+/// which is what an unrouted project gets -- reads as a live site, and the
+/// deploy reports a URL that serves nothing. Checking the status alone is not
+/// enough: the edge answers, it just does not answer for this project.
+async fn probe_once(client: &reqwest::Client, url: &str, id: &str) -> bool {
+    let Ok(r) = client.get(url).timeout(Duration::from_secs(20)).send().await else {
+        return false;
+    };
+    let routed = r
+        .headers()
+        .get("x-boxcode-project")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == id);
+    routed && r.status().as_u16() < 500
 }
 
 #[cfg(test)]
@@ -543,6 +585,55 @@ mod tests {
         let files = collect(dir.path()).unwrap();
         let keys: Vec<_> = files.iter().map(|f| f.key.as_str()).collect();
         assert_eq!(keys, vec!["a.js", "b.js", "c/d.js"]);
+    }
+
+    /// The real thing, end to end, against the live service.
+    ///
+    /// Ignored by default because it needs the network and it costs a slot on a
+    /// box with ten. Run it deliberately:
+    ///
+    ///   cargo test --  --ignored --nocapture live_deploy
+    ///
+    /// Follows the two network-gated tests in artifacts.rs, for the same reason
+    /// they exist: everything else here proves the client builds the right
+    /// request, and only this proves the request is one the server accepts.
+    #[tokio::test]
+    #[ignore]
+    async fn live_deploy_of_a_real_backend() {
+        let endpoint = std::env::var("BOXCODE_BACKEND_ENDPOINT")
+            .unwrap_or_else(|_| "https://boxcode.sh/api/deploy".to_string());
+        let id = std::env::var("BOXCODE_TEST_ID").unwrap_or_else(|_| "e2etest99".to_string());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"e2e","version":"1.0.0","main":"server.js","dependencies":{"express":"^4.19.2"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("server.js"),
+            r#"const express = require("express");
+const app = express();
+app.get("/", (_q, r) => r.json({ ok: true, from: "a microVM" }));
+app.get("/env", (_q, r) => r.json({ hasDatabaseUrl: Boolean(process.env.DATABASE_URL) }));
+app.listen(process.env.PORT || 3000, "0.0.0.0");
+"#,
+        )
+        .unwrap();
+
+        let profile = crate::deploy::backend::detect_backend(dir.path()).expect("detect");
+        eprintln!("detected: {} on {}", profile.framework.label(), profile.runtime.label());
+        eprintln!("start:    {:?}", profile.start_command());
+
+        match deploy(dir.path(), &id, &profile, &endpoint).await {
+            Ok(d) => {
+                eprintln!("url:      {}", d.url);
+                eprintln!("verified: {}", d.verified);
+                eprintln!("expires:  {}h", d.expires_in_hours);
+                assert!(d.verified, "deployed but the URL did not answer");
+            }
+            Err(e) => panic!("deploy failed: {e}"),
+        }
     }
 
     #[test]

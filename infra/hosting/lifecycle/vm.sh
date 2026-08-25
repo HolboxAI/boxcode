@@ -56,6 +56,21 @@ jail="$("$NODE" -e "
 " "$id" "$slot")"
 uid=$((30000 + slot))
 
+# `nginx -s reload`, never `systemctl reload nginx`.
+#
+# This script is run by the control plane, which is itself a systemd service.
+# systemctl from in there did not reload nginx and did not fail either: the
+# route file was written, `nginx -t` passed, and the workers kept running the
+# config from before the deploy. The deploy reported success, the microVM was
+# up, the app answered on its own address -- and every request through nginx
+# fell through to "no app deployed at this path".
+#
+# -s reload signals the master process directly. No systemd, nothing to refuse.
+reload_nginx() {
+    sudo nginx -t || return 1
+    sudo nginx -s reload
+}
+
 stop_vm() {
     # Firecracker has no graceful shutdown without the API socket, and the API
     # socket is deliberately not there -- it is a control channel into the VMM
@@ -83,7 +98,7 @@ stop)
     # Reloading after the route is gone, so nginx stops sending traffic to an
     # address with nothing behind it. A missed reload here is a 502 per request
     # rather than a clean 404.
-    sudo nginx -t && sudo systemctl reload nginx
+    reload_nginx
     echo "== $id: stopped =="
     ;;
 
@@ -150,7 +165,7 @@ start)
     " "$id" "$slot" | sudo tee "$NGINX_DIR/$id.conf" >/dev/null
     # Tested before reloading: one bad generated file would otherwise take every
     # other project's route down with it.
-    sudo nginx -t && sudo systemctl reload nginx
+    reload_nginx || { echo "nginx did not reload -- the route is written but not live" >&2; exit 1; }
 
     echo "== $id: running on slot $slot =="
     ;;

@@ -427,10 +427,35 @@ NODE="$NODE_DIR/bin/node" bash "$SCRIPT_DIR/lifecycle/database.sh" harden
 
 echo "== nginx =="
 sudo mkdir -p /etc/nginx/conf.d/app-projects
+
+# The WebSocket upgrade map, in its own file at http level, rewritten every run.
+#
+# It used to live at the top of apps.conf.template, and that was wrong in a way
+# that took a live deploy to find: setup.sh deliberately does NOT re-copy
+# apps.conf once certbot has edited it, so a box provisioned before the map was
+# added never got it. Every per-project route references $connection_upgrade, so
+# `nginx -t` failed on every deploy -- and vm.sh's `nginx -t && reload` meant the
+# reload was skipped in silence. The deploy reported success, the microVM ran,
+# the app answered on its own address, and nginx served the catch-all 404.
+#
+# 00- so it is included before anything that uses it, and outside apps.conf so
+# certbot has no reason to touch it.
+sudo tee /etc/nginx/conf.d/00-boxcode-upgrade-map.conf >/dev/null <<'EOF'
+# Written by infra/hosting/setup.sh. Do not edit.
+# Connection must say "upgrade" only when the client asked to upgrade, or
+# keep-alive breaks for every ordinary request.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+EOF
+
 if [ ! -f /etc/nginx/conf.d/apps.conf ]; then
     sudo cp "$SCRIPT_DIR/nginx/apps.conf.template" /etc/nginx/conf.d/apps.conf
 fi
-sudo nginx -t
+# Checked, and fatal. Continuing past a failed config test leaves a box that
+# looks provisioned and serves the previous configuration for everything.
+sudo nginx -t || { echo "nginx config is invalid -- refusing to continue" >&2; exit 1; }
 sudo systemctl enable --now nginx
 sudo systemctl reload nginx
 
@@ -498,7 +523,13 @@ location = /api/deploy {
     # Without this every deploy appears to come from 127.0.0.1 and every
     # per-address limit in the gate becomes a per-box limit.
     proxy_set_header X-Forwarded-For $remote_addr;
-    client_max_body_size 1m;
+    # A deploy carries the whole project base64-encoded: 8 MB of source is
+    # 11 MB on the wire. 1m here refused every real deploy with a 413 that
+    # never reached the control plane to be explained.
+    client_max_body_size 16m;
+    # The control plane accepts and returns immediately, but it writes the
+    # project to disk first, and that is not instant for 400 files.
+    proxy_read_timeout 120s;
 }
 # Quoted, and it has to be. nginx uses braces for blocks, so a regex
 # containing {4,16} is parsed as the end of the location block unless the

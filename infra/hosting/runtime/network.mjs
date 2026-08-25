@@ -115,6 +115,13 @@ location ^~ /api/${id}/ {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
+    # Proves this route is loaded, as opposed to the request having fallen
+    # through to the catch-all 404. The client's post-deploy check reads it: a
+    # backend is entitled to answer 404 at its root, so status alone cannot tell
+    # "the app said no" from "nginx never had a route" -- and the first version
+    # reported a deploy as verified when nginx had not reloaded at all.
+    add_header X-Boxcode-Project ${id} always;
+
     # WebSockets, which Lambda could not do at all.
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $connection_upgrade;

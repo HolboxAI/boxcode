@@ -28,7 +28,18 @@ COMMUNITY="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/community"
 # 1000 before starting the app. Without it every project runs as root inside its
 # guest -- survivable, since the microVM is the boundary that matters, but a
 # guest kernel exploit is easier from uid 0 and dropping costs nothing.
-COMMON="alpine-baselayout busybox busybox-suid musl ca-certificates su-exec"
+# busybox-suid is deliberately absent. It ships /bin/bbsuid, the only setuid
+# binary in the whole image, and nothing here needs it: the init runs as root,
+# mounts, and drops with su-exec -- which is NOT setuid, because it is called by
+# root and only ever gives privilege away.
+#
+# Two things improve at once. A single-app microVM stops carrying a setuid
+# binary at all. And `cp -a` stops trying to preserve a setuid bit, which the
+# control plane's own systemd hardening (RestrictSUIDSGID=yes) correctly refuses
+# -- every deploy failed with "preserving permissions for bbsuid: Operation not
+# permitted", which reads as a filesystem problem and is a security control
+# working.
+COMMON="alpine-baselayout busybox musl ca-certificates su-exec"
 
 # No check for a system apk. Amazon Linux has none, which is the whole reason
 # the static one is fetched below -- and `need apk || true` does not do what it
@@ -100,6 +111,16 @@ build_base() {
     if [ -n "$missing" ]; then
         echo "base $name is incomplete, missing:$missing" >&2
         echo "not writing the stamp -- the next run will rebuild rather than trust this" >&2
+        sudo rm -rf "$root"
+        exit 1
+    fi
+
+    # No setuid or setgid binaries. Nothing in a single-app guest needs one, and
+    # this is the check that keeps it that way when a package list changes.
+    SUID="$(sudo find "$root" -perm /6000 -type f 2>/dev/null)"
+    if [ -n "$SUID" ]; then
+        echo "base $name contains setuid/setgid files:" >&2
+        echo "$SUID" | sed "s|$root||;s|^|  |" >&2
         sudo rm -rf "$root"
         exit 1
     fi

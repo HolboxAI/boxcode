@@ -22,7 +22,7 @@
 //   what makes it safe rather than merely survivable.
 
 import { createServer } from "node:http";
-import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
+import { readFile, writeFile, rename, mkdir, rm } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomBytes } from "node:crypto";
@@ -32,6 +32,7 @@ import * as registryMod from "../runtime/registry.mjs";
 import * as gate from "../runtime/gate.mjs";
 import { reconcile, summarise } from "../runtime/reconcile.mjs";
 import { canFitAnother, describeCapacity } from "../runtime/capacity.mjs";
+import * as unpack from "../runtime/unpack.mjs";
 
 const run = promisify(execFile);
 
@@ -215,6 +216,34 @@ async function sweep() {
 // The deploy pipeline
 // ---------------------------------------------------------------------------
 
+/// Write the uploaded files out.
+///
+/// This step was missing entirely at first: the request carried the project and
+/// the pipeline went straight to provisioning, so every deploy died three
+/// stages later with "no such source directory". It passed every unit test,
+/// because the tests covered what the client sends and what each stage does
+/// with a directory -- and nothing covered the join between them.
+///
+/// Rewritten from scratch on each deploy rather than merged into. A redeploy
+/// that deleted a file should not leave it behind in the image, and merging
+/// makes the contents depend on every previous deploy.
+async function writeSource(id, files) {
+  const root = join(APPS_DIR, id, "src");
+  await rm(root, { recursive: true, force: true });
+  await mkdir(root, { recursive: true });
+
+  for (const f of files) {
+    // resolveUnder throws on anything validate would have caught, so a caller
+    // that skipped validation cannot get a usable path out of it.
+    const full = unpack.resolveUnder(root, f.path);
+    await mkdir(dirname(full), { recursive: true });
+    await writeFile(full, Buffer.from(f.content, "base64"));
+  }
+  // The build VM installs as uid 1000 and the app runs as it.
+  await run("/bin/chown", ["-R", "1000:1000", root]);
+  return root;
+}
+
 async function deploy({ id, slot, runtime, entrypoint, source }) {
   const mark = (state, reason) => {
     status.set(id, { state, reason, at: Date.now() });
@@ -259,6 +288,12 @@ async function acceptDeploy(body, address) {
   if (!Array.isArray(body.entrypoint) || body.entrypoint.length === 0) {
     return { status: 400, body: { error: "an entrypoint command is required" } };
   }
+
+  // Checked here, on the server, because the client checking the same things
+  // is UX -- it fails fast and says something useful -- and the client is not
+  // the only thing that can POST to this endpoint.
+  const payload = unpack.validate(body.files);
+  if (!payload.ok) return { status: 400, body: { error: payload.error } };
 
   if (await isKilled()) {
     // Accepting one would build an image and then refuse to start it, which
@@ -315,15 +350,22 @@ async function acceptDeploy(body, address) {
     blocked: gateState.blocked,
   }, null, 2));
 
+  // Written before the pipeline starts and after the gate has passed, so an
+  // unauthorised request never puts a byte on disk.
+  let source;
+  try {
+    source = await writeSource(body.id, body.files);
+    console.log(`${body.id}: wrote ${payload.files} files, ${payload.bytes} bytes`);
+  } catch (e) {
+    console.error(`${body.id}: could not write source: ${e.message}`);
+    return { status: 400, body: { error: `could not unpack the project: ${e.message}` } };
+  }
+
   deployInFlight = true;
   status.set(body.id, { state: "queued", reason: null, at: now });
 
   // Deliberately not awaited. The response goes back now; the client polls.
-  deploy({
-    id: body.id, slot, runtime,
-    entrypoint: body.entrypoint,
-    source: join(APPS_DIR, body.id, "src"),
-  })
+  deploy({ id: body.id, slot, runtime, entrypoint: body.entrypoint, source })
     .catch((e) => {
       const detail = (e.stderr || e.message || "").toString().trim().split("\n").slice(-3).join(" ");
       status.set(body.id, { state: "failed", reason: detail || "the deploy failed", at: Date.now() });
@@ -353,7 +395,13 @@ function send(res, code, value) {
   res.end(text);
 }
 
-async function readBody(req, limit = 64 * 1024) {
+/// 16 MB, not 64 KB.
+///
+/// The first version capped this at 64 KB, which is right for a request that
+/// carries only metadata and wrong for one carrying a project. 8 MB of source
+/// is 11 MB of base64, and the cap has to sit above that or every real deploy
+/// is refused as "too large" -- a limit that only ever fires on legitimate use.
+async function readBody(req, limit = 16 * 1024 * 1024) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {

@@ -54,7 +54,9 @@ location ^~ /api/ {
 EOF
     # ^~ so it beats every per-project location, which are also ^~ and would
     # otherwise win on being longer.
-    sudo nginx -t && sudo systemctl reload nginx
+    # -s reload, not systemctl: this runs from the control plane's own service
+    # context via SSM, where systemctl silently does not reload nginx.
+    sudo nginx -t && sudo nginx -s reload
     echo "   /api/* now returns 503"
 
     running="$(bash "$REPO/lifecycle/vm.sh" list || true)"
@@ -97,7 +99,7 @@ EOF
 restore)
     echo "== kill switch: restoring =="
     sudo rm -f "$FLAG" "$BLOCK_CONF"
-    sudo nginx -t && sudo systemctl reload nginx
+    sudo nginx -t && sudo nginx -s reload
     # Nothing is started here on purpose. The control plane's reconciliation
     # already knows what should be running -- it is the registry -- and starting
     # things from two places is how a box ends up with two VMs for one project.
