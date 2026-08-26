@@ -208,13 +208,137 @@ pub fn token_for(project_id: &str) -> String {
         return token.clone();
     }
 
-    if let Some(token) = registry.get(MACHINE_TOKEN_KEY) {
-        return token.clone();
-    }
-    let token = generate_token();
-    registry.insert(MACHINE_TOKEN_KEY.to_string(), token.clone());
+    let token = match registry.get(MACHINE_TOKEN_KEY) {
+        Some(existing) => existing.clone(),
+        None => {
+            let fresh = generate_token();
+            registry.insert(MACHINE_TOKEN_KEY.to_string(), fresh.clone());
+            fresh
+        }
+    };
+
+    // The id is recorded too, pointing at the same token.
+    //
+    // Not redundant, and leaving it out was a bug caught by the first test
+    // written against it: with one token for the machine there is otherwise
+    // nothing on disk naming the projects this machine deployed. Returning the
+    // shared token without noting the id made the whole registry a single
+    // entry, so `/hosted` had nothing to list and the machine had quietly
+    // stopped keeping track of its own work.
+    registry.insert(project_id.to_string(), token.clone());
     save_registry(&registry);
     token
+}
+
+// ---------------------------------------------------------------------------
+// What this machine has deployed
+// ---------------------------------------------------------------------------
+
+/// How many projects one machine may have live at once.
+///
+/// A mirror of the server's `MAX_APPS_PER_TOKEN`, and only a mirror: the server
+/// enforces it and this copy exists so `/hosted` can say where you stand
+/// before you hit the refusal rather than after. If the two ever disagree the
+/// server is right, and the worst this can do is quote a number that is out of
+/// date -- which is why nothing here refuses anything on its own.
+pub const MAX_LIVE_PER_MACHINE: usize = 2;
+
+/// Where a project is served, given the configured deploy endpoint.
+///
+/// Derived from the endpoint rather than assembled from a hard-coded host, so
+/// pointing `backend_endpoint` at a different install moves the links with it.
+/// The endpoint is `<origin>/api/deploy` and a project is `<origin>/api/<id>/`,
+/// so the shared part is everything before the last segment.
+pub fn project_url(endpoint: &str, id: &str) -> String {
+    let base = endpoint.trim_end_matches('/');
+    let root = base.rsplit_once('/').map(|(head, _)| head).unwrap_or(base);
+    format!("{root}/{id}/")
+}
+
+/// One hosted project this machine owns, as `/hosted` shows it./// One hosted project this machine owns, as `/hosted` shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mine {
+    pub id: String,
+    /// Where it was published from, when the artifact registry still
+    /// remembers. `None` for a project whose publish has aged out of that
+    /// registry while the deploy token for it is still on disk -- the id is
+    /// still ours and still worth listing, we just cannot say where it came
+    /// from any more.
+    pub path: Option<String>,
+    /// What the server says now: "running", "building", "failed", or `None`
+    /// when it could not be reached or does not know the id.
+    pub state: Option<String>,
+}
+
+/// The ids this machine holds a deploy token for, newest publish first.
+///
+/// Local only, and deliberately so -- there is no endpoint that lists a
+/// caller's projects, and adding one would mean the server keeping a map from
+/// token to projects that it currently has no reason to hold.
+///
+/// The token registry is the source of truth for ownership because it is the
+/// thing the server actually checks. The artifact registry is joined onto it
+/// only to recover a human-readable path.
+pub fn mine() -> Vec<Mine> {
+    let owned = load_registry();
+
+    // Read once. `all_local` re-reads and re-sorts a file on every call, and
+    // an earlier version of this called it from inside the sort comparator.
+    let published = crate::artifacts::all_local();
+    let path_of: std::collections::HashMap<&str, &str> =
+        published.iter().map(|(path, id)| (id.as_str(), path.as_str())).collect();
+    let rank_of: std::collections::HashMap<&str, usize> =
+        published.iter().enumerate().map(|(i, (_, id))| (id.as_str(), i)).collect();
+
+    let mut out: Vec<Mine> = owned
+        .keys()
+        .filter(|id| id.as_str() != MACHINE_TOKEN_KEY)
+        .map(|id| Mine {
+            id: id.clone(),
+            path: path_of.get(id.as_str()).map(|p| (*p).to_string()),
+            state: None,
+        })
+        .collect();
+
+    // Newest publish first, then the ones the artifact registry has forgotten,
+    // and ties broken by id so two runs of the same command never disagree --
+    // the keys come from a HashMap, whose order is not stable between runs.
+    out.sort_by(|a, b| {
+        let ra = rank_of.get(a.id.as_str()).copied().unwrap_or(usize::MAX);
+        let rb = rank_of.get(b.id.as_str()).copied().unwrap_or(usize::MAX);
+        ra.cmp(&rb).then_with(|| a.id.cmp(&b.id))
+    });
+    out
+}
+
+/// Ask the control plane what each of these is doing now.
+///
+/// Concurrent, because this runs while someone is looking at a blank list, and
+/// serialising four requests behind each other's timeouts is the difference
+/// between a command that feels instant and one that feels broken.
+///
+/// A project the server does not know about comes back `None` rather than as an
+/// error: the ordinary reason is that it expired or was taken down, which is
+/// information, not a failure.
+pub async fn statuses(endpoint: &str, mut projects: Vec<Mine>) -> Vec<Mine> {
+    let base = endpoint.trim_end_matches('/').to_string();
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+        Ok(c) => c,
+        Err(_) => return projects,
+    };
+    let lookups = projects.iter().map(|m| {
+        let url = format!("{base}/status/{}", m.id);
+        let client = client.clone();
+        async move {
+            let text = client.get(&url).send().await.ok()?.text().await.ok()?;
+            serde_json::from_str::<StatusResponse>(&text).ok().map(|s| s.state)
+        }
+    });
+    let states = futures::future::join_all(lookups).await;
+    for (m, state) in projects.iter_mut().zip(states) {
+        m.state = state;
+    }
+    projects
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +782,64 @@ app.listen(process.env.PORT || 3000, "0.0.0.0");
             }
             Err(e) => panic!("deploy failed: {e}"),
         }
+    }
+
+    #[test]
+    fn a_project_url_is_derived_from_the_endpoint_not_hard_coded() {
+        assert_eq!(
+            project_url("https://boxcode.sh/api/deploy", "jqtqx9zf"),
+            "https://boxcode.sh/api/jqtqx9zf/"
+        );
+        // A different install must move the links with it, or /deploys prints
+        // URLs pointing at somebody else's platform.
+        assert_eq!(
+            project_url("https://hosting.example.com/api/deploy", "abcd2345"),
+            "https://hosting.example.com/api/abcd2345/"
+        );
+        // A trailing slash on the configured endpoint must not produce a
+        // doubled one in the link.
+        assert_eq!(
+            project_url("https://boxcode.sh/api/deploy/", "abcd2345"),
+            "https://boxcode.sh/api/abcd2345/"
+        );
+    }
+
+    #[test]
+    fn mine_lists_this_machines_projects_and_never_the_machine_key() {
+        crate::config::test_support::with_isolated_home(|| {
+            // Three projects, so the machine key has company and cannot be
+            // mistaken for the only odd entry.
+            for id in ["aaaa2345", "bbbb2345", "cccc2345"] {
+                let _ = token_for(id);
+            }
+            let listed = mine();
+            assert_eq!(listed.len(), 3, "{listed:?}");
+            assert!(
+                !listed.iter().any(|m| m.id == MACHINE_TOKEN_KEY),
+                "the machine's own token is not a project: {listed:?}"
+            );
+            assert!(listed.iter().all(|m| m.state.is_none()), "state is asked for separately");
+        });
+    }
+
+    #[test]
+    fn mine_is_ordered_the_same_way_twice() {
+        // The ids come from a HashMap, whose iteration order differs between
+        // runs. A list that reshuffles every time it is shown is one nobody
+        // can read down twice.
+        crate::config::test_support::with_isolated_home(|| {
+            for id in ["zzzz2345", "aaaa2345", "mmmm2345", "bbbb2345"] {
+                let _ = token_for(id);
+            }
+            let first: Vec<String> = mine().into_iter().map(|m| m.id).collect();
+            let again: Vec<String> = mine().into_iter().map(|m| m.id).collect();
+            assert_eq!(first, again);
+            // Nothing has been published here, so every entry ranks equally and
+            // the id is the tie-break -- which must be a real ordering.
+            let mut sorted = first.clone();
+            sorted.sort();
+            assert_eq!(first, sorted, "ties break by id");
+        });
     }
 
     #[test]

@@ -205,6 +205,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/usage", "what today cost, and the history"),
     ("/quota", "what is left today, and your own limits"),
     ("/subagents", "what each subagent did, step by step"),
+    ("/hosted", "projects this machine is hosting, and whether they are live"),
     ("/rollback", "undo every file the model wrote this session"),
 ];
 
@@ -376,6 +377,11 @@ pub struct App {
     /// compaction, a resume) and the session log must rotate to a fresh file
     /// -- length alone cannot tell replacement from growth. Same
     /// mark-and-let-main-write pattern as `plan_dirty`/`quota_dirty`.
+    /// Projects `/hosted` has asked the control plane about, waiting to be
+    /// spawned by the event loop. Same shape as `deploy_action`: the app
+    /// decides what should happen, the loop does the awaiting, because a
+    /// network call on the event loop freezes the UI.
+    pub hosted_request: Option<Vec<crate::backend::Mine>>,
     pub session_reset: bool,
     pub messages: Vec<Message>,
     /// Raw text of the prompt box. May contain '\n' (Alt/Shift-Enter inserts one).
@@ -606,6 +612,7 @@ impl App {
             session_reset: false,
             messages: Vec::new(),
             input_buffer: String::new(),
+            hosted_request: None,
             cursor: 0,
             streaming_response: String::new(),
             request_id: 0,
@@ -778,6 +785,7 @@ impl App {
                         "/usage" => self.show_usage(),
                         "/quota" => self.show_quota(),
                         "/subagents" => self.show_subagents(),
+                        "/hosted" => self.start_hosted(),
                         "/rollback" => self.start_rollback(),
                         other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
                     }
@@ -1935,6 +1943,71 @@ impl App {
     /// others, leaving the disk in a state no one asked for and the summary
     /// wrong about it. Waiting costs a keystroke; getting it wrong costs the
     /// thing the command exists to protect.
+    /// `/hosted` -- what this machine has hosted, and whether it is still up.
+    ///
+    /// The list itself is local: the token registry knows which ids this
+    /// machine owns, because that is the thing the server checks. Liveness is
+    /// not local and must not be guessed from it -- a project taken down an
+    /// hour ago still has its token on disk, and a list built from that alone
+    /// would report a dead project as running with complete confidence.
+    ///
+    /// So the ids are gathered here and the states are asked for in the event
+    /// loop, which is the only place allowed to await.
+    fn start_hosted(&mut self) {
+        let mine = crate::backend::mine();
+        if mine.is_empty() {
+            self.messages.push(Message::new(
+                Role::System,
+                "Nothing hosted from this machine yet.\n\nPublish a project, then deploy its \
+                 backend -- the backend runs at the same id as the published page."
+                    .to_string(),
+            ));
+            return;
+        }
+        // No placeholder message. The reply replaces nothing, so an earlier
+        // "checking..." would just be a line that scrolls past and stays in the
+        // history for good.
+        self.hosted_request = Some(mine);
+    }
+
+    /// Called by the event loop once the control plane has answered.
+    pub fn show_hosted(&mut self, projects: Vec<crate::backend::Mine>) {
+        let live = projects.iter().filter(|m| m.state.as_deref() == Some("running")).count();
+        let mut out = String::new();
+
+        for m in &projects {
+            let state = match m.state.as_deref() {
+                Some("running") => "running",
+                Some("building") => "building",
+                Some("failed") => "failed",
+                // Not an error worth apologising for: expired or taken down is
+                // the ordinary end of a hosted project's life.
+                Some(_) | None => "gone",
+            };
+            out.push_str(&format!("  {:<10}  {state}\n", m.id));
+            if state != "gone" {
+                out.push_str(&format!(
+                    "    {}\n",
+                    crate::backend::project_url(&self.config.tools.backend_endpoint, &m.id)
+                ));
+            }
+            if let Some(path) = &m.path {
+                out.push_str(&format!("    {path}\n"));
+            }
+        }
+
+        // The cap, stated whether or not it has been reached. Someone who can
+        // see they are at the limit before they hit it can decide what to drop;
+        // someone told only at the refusal has already done the work.
+        out.push_str(&format!(
+            "\n{live} of {} live. A third needs one of these gone first -- deploy over it, or \
+             ask for it to be taken down.",
+            crate::backend::MAX_LIVE_PER_MACHINE
+        ));
+
+        self.messages.push(Message::new(Role::System, out));
+    }
+
     fn start_rollback(&mut self) {
         self.follow_tail = true;
 
