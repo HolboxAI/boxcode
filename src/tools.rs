@@ -3204,6 +3204,38 @@ async fn execute_publish_artifact(
 
     match crate::artifacts::publish(&resolved, &config.artifact_endpoint).await {
         Ok(published) => {
+            // Whether this same directory also holds a server.
+            //
+            // Asked here rather than left to the person, because publishing is
+            // the moment the option first exists -- `deploy_backend` is not
+            // even offered until a project has been published -- and nothing
+            // else in the session ever mentions it. Someone who has just put a
+            // frontend online has no way to learn that the API beside it could
+            // be running too.
+            //
+            // A suggestion, and only that. The deploy itself is
+            // `Risk::Dangerous`, so it stops for approval like every other
+            // irreversible act; this text cannot start one.
+            let backend_hint = match crate::deploy::backend::detect_backend(&resolved) {
+                Ok(profile) => format!(
+                    "\n\nThis directory also holds a {} backend. It is not running -- only the \
+                     static files were published. Offer to deploy it with {DEPLOY_BACKEND} on \
+                     path {:?}, in one short sentence, and say it will be live at {} with its \
+                     own PostgreSQL database. Do not call {DEPLOY_BACKEND} unless they say yes: \
+                     it runs their code on a public host and cannot be undone by them.",
+                    profile.framework.label(),
+                    path,
+                    // Both halves share an id, so the backend URL is the
+                    // published one with the prefix swapped. Derived rather
+                    // than rebuilt from parts: whatever the artifact endpoint
+                    // is configured to be, this follows it.
+                    published.url.replacen("/artifacts/", "/api/", 1).trim_end_matches('/').to_string() + "/",
+                ),
+                // No backend, or nothing recognisable as one. Silence is right:
+                // a suggestion offered on every publish is one nobody reads by
+                // the third time.
+                Err(_) => String::new(),
+            };
             // `published.verified` is a real live GET this call already made
             // against the URL below, not the model's own judgment -- so it is
             // the one thing here safe to state as fact rather than repeat as
@@ -3247,7 +3279,7 @@ async fn execute_publish_artifact(
                     published.bytes as f64 / 1024.0,
                     published.url,
                     published.expires_in_hours
-                ),
+                ) + &backend_hint,
             )
         }
         Err(e) => outcome(
