@@ -175,20 +175,44 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The token for a project, minted once and never rotated.
+/// Where this machine's own token is filed, alongside the per-project entries
+/// that predate it. A project id cannot collide with it: ids match
+/// `^[a-z2-9]{4,16}$`, and this contains characters that pattern excludes.
+const MACHINE_TOKEN_KEY: &str = "$machine";
+
+/// The token this machine deploys with.
 ///
-/// Trust on first use, same shape as [`crate::db`]'s per-project key. The first
-/// token to claim an id owns it; regenerating would lock this machine out of a
-/// project it deployed, since the server has no other way to recognise the
-/// owner. Kept out of the model's reach for the same reason the database key is:
-/// it must never end up in a file the model can read back and put in a page.
+/// One token for the machine, not one per project, and the difference is a
+/// control rather than a detail. The server's A2 refuses a third live project
+/// from a token that already holds two -- it is what stops one person quietly
+/// occupying every slot on a shared platform. An earlier version of this minted
+/// a fresh token per project id, which meant the count the server did was
+/// always of a token holding exactly one project. The check ran, passed, and
+/// could not have done anything else. A4's three-new-projects-a-day was left
+/// doing all the work alone, which is not what it was sized for.
+///
+/// Trust on first use either way: the first token to claim an id owns it, and
+/// regenerating would lock this machine out of a project it deployed, since the
+/// server has no other way to recognise the owner. Kept out of the model's
+/// reach for the same reason the database key is -- it must never end up in a
+/// file the model can read back and put in a page.
 pub fn token_for(project_id: &str) -> String {
     let mut registry = load_registry();
+
+    // A project deployed before this change owns its id under a token of its
+    // own, and the server will not accept any other. Honoured rather than
+    // migrated: the alternative is a 403 on the next deploy of a project that
+    // was working, to tidy up a handful of entries that expire in 48 hours
+    // anyway.
     if let Some(token) = registry.get(project_id) {
         return token.clone();
     }
+
+    if let Some(token) = registry.get(MACHINE_TOKEN_KEY) {
+        return token.clone();
+    }
     let token = generate_token();
-    registry.insert(project_id.to_string(), token.clone());
+    registry.insert(MACHINE_TOKEN_KEY.to_string(), token.clone());
     save_registry(&registry);
     token
 }
@@ -647,7 +671,53 @@ app.listen(process.env.PORT || 3000, "0.0.0.0");
             assert_eq!(first.len(), 64, "32 bytes hex-encoded");
             assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
             assert_eq!(token_for("k9depef6"), first, "the same project must keep its token");
-            assert_ne!(token_for("aaaabbbb"), first, "different projects must differ");
         });
+    }
+
+    #[test]
+    fn one_token_covers_every_project_on_this_machine() {
+        // This assertion used to run the other way -- "different projects must
+        // differ" -- which is what a per-project token does and reads as
+        // perfectly sensible on its own. It also made the server's A2 check
+        // dead: A2 refuses a third live project from a token already holding
+        // two, and a token that holds exactly one project by construction can
+        // never reach two. The test passed, the control was inert, and nothing
+        // anywhere said so.
+        crate::config::test_support::with_isolated_home(|| {
+            let a = token_for("k9depef6");
+            let b = token_for("aaaabbbb");
+            let c = token_for("zzzz2345");
+            assert_eq!(a, b, "one machine deploys with one token");
+            assert_eq!(b, c, "and that does not drift as projects are added");
+        });
+    }
+
+    #[test]
+    fn a_project_that_already_owns_a_token_keeps_it() {
+        // Projects deployed before the change own their id under a token of
+        // their own, and the server accepts no other. Migrating them would mean
+        // a 403 on the next deploy of something that was working.
+        crate::config::test_support::with_isolated_home(|| {
+            let legacy = "f".repeat(64);
+            let mut registry = load_registry();
+            registry.insert("oldproj12".to_string(), legacy.clone());
+            save_registry(&registry);
+
+            assert_eq!(token_for("oldproj12"), legacy, "the old token still owns the old id");
+            assert_ne!(token_for("newproj34"), legacy, "a new project uses the machine token");
+            assert_eq!(
+                token_for("newproj34"),
+                token_for("othernew5"),
+                "and every new project shares it"
+            );
+        });
+    }
+
+    #[test]
+    fn the_machine_key_cannot_collide_with_a_project_id() {
+        // Ids are ^[a-z2-9]{4,16}$ server-side. If the key ever became a legal
+        // id, a project could claim the machine's own token.
+        let id_re = regex::Regex::new("^[a-z2-9]{4,16}$").unwrap();
+        assert!(!id_re.is_match(MACHINE_TOKEN_KEY), "{MACHINE_TOKEN_KEY} must not be a valid id");
     }
 }
