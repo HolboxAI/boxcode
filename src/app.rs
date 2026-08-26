@@ -230,6 +230,17 @@ pub const CHARS_PER_TOKEN: usize = 4;
 /// happening. The whole chain of thought on a hard problem runs to thousands
 /// of characters, and keeping it would mean growing a buffer, on every frame,
 /// for text nobody can read at streaming speed.
+/// The most a paste may put in the prompt box.
+///
+/// Sized off the context window rather than off the terminal: at
+/// `CHARS_PER_TOKEN` this is roughly fifty thousand tokens, which is a large
+/// but real prompt on every model this talks to. Past it the request is not
+/// merely slow, it cannot be answered -- so the useful place to say so is here,
+/// where the person is still holding the thing they pasted, rather than after a
+/// round trip that fails for a reason the error will describe in the
+/// provider's words instead of theirs.
+const MAX_PASTE_CHARS: usize = 200_000;
+
 const MAX_REASONING_TAIL: usize = 400;
 
 const COMPACT_INSTRUCTION: &str = "\
@@ -867,6 +878,37 @@ impl App {
     /// active (nothing to paste into).
     pub fn handle_paste(&mut self, text: String) {
         let cleaned = text.replace("\r\n", "\n").replace('\r', "\n");
+
+        // A paste this size is not a prompt, whatever it was meant to be.
+        //
+        // It was accepted without limit before, and everything downstream then
+        // had to cope with a buffer of arbitrary size -- the wrap, the render,
+        // the request body, and the model's context window, which a paste of
+        // this size exceeds on its own before a single word of the question is
+        // added. Refusing here is not a restriction so much as saying no once,
+        // clearly, instead of failing further along where the cause is no
+        // longer visible.
+        //
+        // Refused rather than truncated. Silently keeping the first hundred
+        // thousand characters produces an answer about a fragment, and the
+        // person asking has no way to tell that is what happened.
+        let incoming = cleaned.chars().count();
+        if incoming > MAX_PASTE_CHARS || self.input_buffer.chars().count() + incoming > MAX_PASTE_CHARS
+        {
+            self.messages.push(Message::new(
+                Role::System,
+                format!(
+                    "That paste is {} characters and the prompt box holds {}. Nothing was \
+                     inserted.\n\nFor something this size, put it in a file and ask about the \
+                     file instead -- it can then be read in the parts that matter, which also \
+                     costs a fraction of sending the whole thing.",
+                    crate::quota::thousands(incoming as u64),
+                    crate::quota::thousands(MAX_PASTE_CHARS as u64),
+                ),
+            ));
+            return;
+        }
+
         match &self.overlay {
             Some(Overlay::ApiKeyPrompt { .. }) | Some(Overlay::CustomEndpoint(_)) => {
                 insert_into(&mut self.overlay_input, &mut self.overlay_cursor, &cleaned);
@@ -3655,6 +3697,58 @@ fn delete_after_in(buf: &mut String, cursor: &mut usize) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A paste far past the cap is refused whole, and says so.
+    #[test]
+    fn an_enormous_paste_is_refused_rather_than_silently_truncated() {
+        let mut app = App::new(crate::config::Config::default());
+        app.handle_paste("x".repeat(MAX_PASTE_CHARS + 1));
+        assert!(app.input_buffer.is_empty(), "nothing may reach the buffer");
+        let said = app.messages.last().expect("a message explaining why");
+        assert!(said.content.contains("200,000"), "quotes the limit: {}", said.content);
+        assert!(said.content.contains("file"), "names the way out: {}", said.content);
+    }
+
+    /// Truncating instead would answer a question about a fragment while
+    /// looking exactly like an answer about the whole thing.
+    #[test]
+    fn a_paste_that_fits_is_inserted_untouched() {
+        let mut app = App::new(crate::config::Config::default());
+        let text = "a".repeat(MAX_PASTE_CHARS);
+        app.handle_paste(text.clone());
+        assert_eq!(app.input_buffer, text);
+        assert_eq!(app.cursor, text.len());
+    }
+
+    /// The cap is on the buffer, not on one paste: two that each fit but do
+    /// not fit together must not add up past it.
+    #[test]
+    fn pastes_are_capped_in_total_not_individually() {
+        let mut app = App::new(crate::config::Config::default());
+        let half = "b".repeat(MAX_PASTE_CHARS / 2 + 1);
+        app.handle_paste(half.clone());
+        assert_eq!(app.input_buffer.chars().count(), half.chars().count());
+        app.handle_paste(half.clone());
+        assert_eq!(
+            app.input_buffer.chars().count(),
+            half.chars().count(),
+            "the second paste must be refused, not appended"
+        );
+    }
+
+    /// Counted in characters, so a paste of non-ASCII text is measured the way
+    /// a person would count it rather than by how many bytes it happens to
+    /// take -- and the count never lands mid-character.
+    #[test]
+    fn the_cap_counts_characters_not_bytes() {
+        let mut app = App::new(crate::config::Config::default());
+        // Four bytes each, so this is well past the cap in bytes and well
+        // under it in characters.
+        let emoji = "\u{1F600}".repeat(MAX_PASTE_CHARS / 2);
+        app.handle_paste(emoji.clone());
+        assert_eq!(app.input_buffer, emoji, "under the cap in characters, so it goes in");
+    }
+
     use super::*;
     use crate::config::test_support::with_isolated_home;
     use crate::config::Config;

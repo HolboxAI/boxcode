@@ -3290,6 +3290,47 @@ mod tests {
             .collect()
     }
 
+    /// Pasting something enormous into the prompt must not take the app down.
+    ///
+    /// A pasted file or a long log is a completely ordinary thing to put in
+    /// front of a coding agent, and the cost of getting it wrong is the whole
+    /// session -- the buffer, the conversation and any work not yet written.
+    #[test]
+    fn an_enormous_paste_does_not_crash_the_prompt() {
+        for size in [10_000usize, 200_000, 2_000_000] {
+            let mut app = App::new(crate::config::Config::default());
+            app.input_buffer = "x".repeat(size);
+            app.cursor = app.input_buffer.len();
+            let rows = rendered_rows(&mut app, 80, 24);
+            assert_eq!(rows.len(), 24, "{size} characters still renders 24 rows");
+        }
+    }
+
+    #[test]
+    #[ignore = "measures cost rather than asserting behaviour"]
+    fn how_expensive_is_rendering_a_large_paste() {
+        for size in [100_000usize, 1_000_000, 5_000_000, 20_000_000] {
+            let mut app = App::new(crate::config::Config::default());
+            app.input_buffer = "x".repeat(size);
+            app.cursor = app.input_buffer.len();
+            let t = std::time::Instant::now();
+            let _ = rendered_rows(&mut app, 80, 24);
+            eprintln!("  {size:>10} chars -> one frame in {:?}", t.elapsed());
+        }
+    }
+
+    /// The same, made of many short lines rather than one long one -- a pasted
+    /// log wraps differently from a pasted minified file, and the row counting
+    /// runs per logical line.
+    #[test]
+    fn an_enormous_multiline_paste_does_not_crash_the_prompt() {
+        let mut app = App::new(crate::config::Config::default());
+        app.input_buffer = "a line of pasted log output\n".repeat(60_000);
+        app.cursor = app.input_buffer.len();
+        let rows = rendered_rows(&mut app, 80, 24);
+        assert_eq!(rows.len(), 24);
+    }
+
     // ---- the /rollback confirmation ----------------------------------------
 
     fn rollback_overlay(files: usize, warning: Option<&str>) -> App {
