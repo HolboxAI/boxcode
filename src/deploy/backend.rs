@@ -657,6 +657,21 @@ mod tests {
         );
     }
 
+    /// The suggestion `publish_artifact` appends is driven entirely by whether
+    /// this returns Ok, so the two cases that matter are that it fires for a
+    /// real server and stays quiet for a page. A suggestion offered on every
+    /// publish is one nobody reads by the third time.
+    #[test]
+    fn a_published_backend_is_detected_so_the_publish_can_offer_it() {
+        let dir = project(&[
+            ("package.json", r#"{"name":"shop","dependencies":{"express":"^4.19.0"}}"#),
+            ("server.js", "require('express')()\n"),
+        ]);
+        let p = detect_backend(dir.path()).expect("an Express app is a backend");
+        assert_eq!(p.framework, BackendFramework::Express);
+        assert_eq!(p.framework.label(), "Express", "the label goes into the suggestion verbatim");
+    }
+
     /// A frontend is not a backend. Detecting one as such would package a
     /// React app as a server and deploy something that cannot start.
     #[test]
