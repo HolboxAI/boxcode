@@ -387,6 +387,12 @@ pub struct ToolsConfig {
     /// who would rather boxcode could not publish anything.
     #[serde(default = "default_artifact_endpoint")]
     pub artifact_endpoint: String,
+    /// Where `deploy_backend` sends a project's source to be hosted as a real
+    /// server. Same reasoning as `artifact_endpoint`, and the same escape
+    /// hatch: "" switches backend hosting off for anyone who would rather this
+    /// build could not stand up a server on somebody else's box.
+    #[serde(default = "default_backend_endpoint")]
+    pub backend_endpoint: String,
     /// Where `enable_auth` sends a project id to be provisioned with
     /// sign-up/sign-in. Same reasoning as `artifact_endpoint`: a URL, not a
     /// constant, so a fork or a self-hosted control-plane can be pointed at
@@ -459,6 +465,10 @@ fn default_artifact_endpoint() -> String {
     "https://boxcode.sh/api/artifact".to_string()
 }
 
+fn default_backend_endpoint() -> String {
+    "https://boxcode.sh/api/deploy".to_string()
+}
+
 fn default_auth_endpoint() -> String {
     "https://auth.boxcode.sh/provision".to_string()
 }
@@ -506,6 +516,7 @@ impl Default for ToolsConfig {
             python_bin: default_python_bin(),
             search_timeout_secs: default_search_timeout(),
             artifact_endpoint: default_artifact_endpoint(),
+            backend_endpoint: default_backend_endpoint(),
             auth_endpoint: default_auth_endpoint(),
             db_endpoint: default_db_endpoint(),
             requests_endpoint: default_requests_endpoint(),

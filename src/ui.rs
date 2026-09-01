@@ -19,7 +19,7 @@ const MAX_INPUT_HEIGHT: u16 = 10;
 const MAX_APPROVAL_HEIGHT: u16 = 24;
 /// Tall enough for every command in `app::COMMANDS` plus its border. There is
 /// a test.
-const MAX_COMMAND_MENU_HEIGHT: u16 = 14;
+const MAX_COMMAND_MENU_HEIGHT: u16 = 15;
 /// The deployment panel is allowed to be taller than the approval prompt: it
 /// carries a checklist, a menu and a live log at the same time, and clipping
 /// the log is what makes a failed build undiagnosable.
@@ -1383,6 +1383,28 @@ fn tool_approval_parts(
                 lines.push(Line::from(Span::styled(wrapped, theme::faint())));
             }
             (" Publish a preview? ", "publish", "skip")
+        }
+        Action::DeployBackend { path } => {
+            for wrapped in wrap(path, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            // Three facts, chosen because they are the ones the answer turns
+            // on and the ones a person would otherwise find out afterwards:
+            // this runs their code rather than serving it, it is reachable by
+            // anyone, and it cannot call out to anything.
+            for wrapped in wrap(
+                "Uploads this project's source and RUNS it as a live server anyone with the \
+                 link can reach. It gets a database, has no outbound internet, and expires \
+                 after 48 hours.",
+                inner,
+            ) {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            (" Host this backend? ", "host", "skip")
         }
         Action::EnableAuth { path } => {
             for wrapped in wrap(path, inner) {
@@ -3244,6 +3266,47 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buffer.get(x, y).symbol()).collect())
             .collect()
+    }
+
+    /// Pasting something enormous into the prompt must not take the app down.
+    ///
+    /// A pasted file or a long log is a completely ordinary thing to put in
+    /// front of a coding agent, and the cost of getting it wrong is the whole
+    /// session -- the buffer, the conversation and any work not yet written.
+    #[test]
+    fn an_enormous_paste_does_not_crash_the_prompt() {
+        for size in [10_000usize, 200_000, 2_000_000] {
+            let mut app = App::new(crate::config::Config::default());
+            app.input_buffer = "x".repeat(size);
+            app.cursor = app.input_buffer.len();
+            let rows = rendered_rows(&mut app, 80, 24);
+            assert_eq!(rows.len(), 24, "{size} characters still renders 24 rows");
+        }
+    }
+
+    #[test]
+    #[ignore = "measures cost rather than asserting behaviour"]
+    fn how_expensive_is_rendering_a_large_paste() {
+        for size in [100_000usize, 1_000_000, 5_000_000, 20_000_000] {
+            let mut app = App::new(crate::config::Config::default());
+            app.input_buffer = "x".repeat(size);
+            app.cursor = app.input_buffer.len();
+            let t = std::time::Instant::now();
+            let _ = rendered_rows(&mut app, 80, 24);
+            eprintln!("  {size:>10} chars -> one frame in {:?}", t.elapsed());
+        }
+    }
+
+    /// The same, made of many short lines rather than one long one -- a pasted
+    /// log wraps differently from a pasted minified file, and the row counting
+    /// runs per logical line.
+    #[test]
+    fn an_enormous_multiline_paste_does_not_crash_the_prompt() {
+        let mut app = App::new(crate::config::Config::default());
+        app.input_buffer = "a line of pasted log output\n".repeat(60_000);
+        app.cursor = app.input_buffer.len();
+        let rows = rendered_rows(&mut app, 80, 24);
+        assert_eq!(rows.len(), 24);
     }
 
     // ---- the /rollback confirmation ----------------------------------------

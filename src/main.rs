@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod approval;
 mod artifacts;
+mod backend;
 mod auth;
 mod config;
 mod contrast;
@@ -247,6 +248,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // transport's event type would make every match there carry cases that
     // cannot occur.
     let (deploy_tx, mut deploy_rx) = mpsc::channel::<deploy::DeployEvent>(256);
+    // And a third, for the same reason again: `/hosted` asks the hosting
+    // control plane about several projects at once, which is neither the model
+    // talking nor a deployment running. One message, sent once.
+    let (hosted_tx, mut hosted_rx) = mpsc::channel::<Vec<backend::Mine>>(8);
 
     let result = run_app(
         &mut terminal,
@@ -257,6 +262,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &mut rx,
         deploy_tx,
         &mut deploy_rx,
+        hosted_tx,
+        &mut hosted_rx,
         enhanced,
         alternate_screen,
     )
@@ -521,6 +528,8 @@ async fn run_app<B: ratatui::backend::Backend>(
     rx: &mut mpsc::Receiver<(u64, StreamEvent)>,
     deploy_tx: mpsc::Sender<deploy::DeployEvent>,
     deploy_rx: &mut mpsc::Receiver<deploy::DeployEvent>,
+    hosted_tx: mpsc::Sender<Vec<backend::Mine>>,
+    hosted_rx: &mut mpsc::Receiver<Vec<backend::Mine>>,
     enhanced: bool,
     alternate_screen: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -567,6 +576,22 @@ async fn run_app<B: ratatui::backend::Backend>(
         // and one line per frame would show a finished build still scrolling.
         while let Ok(event) = deploy_rx.try_recv() {
             app.handle_deploy_event(event);
+        }
+
+        while let Ok(projects) = hosted_rx.try_recv() {
+            app.show_hosted(projects);
+        }
+
+        // `/hosted` asking the control plane what is still up. Spawned like
+        // everything else that touches the network: four requests behind each
+        // other's timeouts would freeze the UI for as long as the slowest one.
+        if let Some(projects) = app.hosted_request.take() {
+            let hosted_tx = hosted_tx.clone();
+            let endpoint = app.config.tools.backend_endpoint.clone();
+            tokio::spawn(async move {
+                let answered = backend::statuses(&endpoint, projects).await;
+                let _ = hosted_tx.send(answered).await;
+            });
         }
 
         // Work the deployment flow asked for. Spawned, never awaited inline:

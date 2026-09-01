@@ -205,6 +205,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/usage", "what today cost, and the history"),
     ("/quota", "what is left today, and your own limits"),
     ("/subagents", "what each subagent did, step by step"),
+    ("/hosted", "projects this machine is hosting, and whether they are live"),
     ("/rollback", "undo every file the model wrote this session"),
 ];
 
@@ -216,6 +217,17 @@ pub const COMMANDS: &[(&str, &str)] = &[
 /// `~`. Centralised so the live spinner, the usage log and `/compact`'s
 /// before/after cannot drift into three different approximations.
 pub const CHARS_PER_TOKEN: usize = 4;
+
+/// The most a paste may put in the prompt box.
+///
+/// Sized off the context window rather than off the terminal: at
+/// `CHARS_PER_TOKEN` this is roughly fifty thousand tokens, which is a large
+/// but real prompt on every model this talks to. Past it the request is not
+/// merely slow, it cannot be answered -- so the useful place to say so is here,
+/// where the person is still holding the thing they pasted, rather than after a
+/// round trip that fails for a reason the error will describe in the
+/// provider's words instead of theirs.
+const MAX_PASTE_CHARS: usize = 200_000;
 
 /// What `/compact` asks the model for.
 ///
@@ -356,6 +368,11 @@ pub struct App {
     /// compaction, a resume) and the session log must rotate to a fresh file
     /// -- length alone cannot tell replacement from growth. Same
     /// mark-and-let-main-write pattern as `plan_dirty`/`quota_dirty`.
+    /// Projects `/hosted` has asked the control plane about, waiting to be
+    /// spawned by the event loop. Same shape as `deploy_action`: the app
+    /// decides what should happen, the loop does the awaiting, because a
+    /// network call on the event loop freezes the UI.
+    pub hosted_request: Option<Vec<crate::backend::Mine>>,
     pub session_reset: bool,
     pub messages: Vec<Message>,
     /// Raw text of the prompt box. May contain '\n' (Alt/Shift-Enter inserts one).
@@ -583,6 +600,7 @@ impl App {
             session_reset: false,
             messages: Vec::new(),
             input_buffer: String::new(),
+            hosted_request: None,
             cursor: 0,
             streaming_response: String::new(),
             request_id: 0,
@@ -754,6 +772,7 @@ impl App {
                         "/usage" => self.show_usage(),
                         "/quota" => self.show_quota(),
                         "/subagents" => self.show_subagents(),
+                        "/hosted" => self.start_hosted(),
                         "/rollback" => self.start_rollback(),
                         other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
                     }
@@ -854,6 +873,37 @@ impl App {
     /// active (nothing to paste into).
     pub fn handle_paste(&mut self, text: String) {
         let cleaned = text.replace("\r\n", "\n").replace('\r', "\n");
+
+        // A paste this size is not a prompt, whatever it was meant to be.
+        //
+        // It was accepted without limit before, and everything downstream then
+        // had to cope with a buffer of arbitrary size -- the wrap, the render,
+        // the request body, and the model's context window, which a paste of
+        // this size exceeds on its own before a single word of the question is
+        // added. Refusing here is not a restriction so much as saying no once,
+        // clearly, instead of failing further along where the cause is no
+        // longer visible.
+        //
+        // Refused rather than truncated. Silently keeping the first hundred
+        // thousand characters produces an answer about a fragment, and the
+        // person asking has no way to tell that is what happened.
+        let incoming = cleaned.chars().count();
+        if incoming > MAX_PASTE_CHARS || self.input_buffer.chars().count() + incoming > MAX_PASTE_CHARS
+        {
+            self.messages.push(Message::new(
+                Role::System,
+                format!(
+                    "That paste is {} characters and the prompt box holds {}. Nothing was \
+                     inserted.\n\nFor something this size, put it in a file and ask about the \
+                     file instead -- it can then be read in the parts that matter, which also \
+                     costs a fraction of sending the whole thing.",
+                    crate::quota::thousands(incoming as u64),
+                    crate::quota::thousands(MAX_PASTE_CHARS as u64),
+                ),
+            ));
+            return;
+        }
+
         match &self.overlay {
             Some(Overlay::ApiKeyPrompt { .. }) | Some(Overlay::CustomEndpoint(_)) => {
                 insert_into(&mut self.overlay_input, &mut self.overlay_cursor, &cleaned);
@@ -1877,6 +1927,71 @@ impl App {
     /// others, leaving the disk in a state no one asked for and the summary
     /// wrong about it. Waiting costs a keystroke; getting it wrong costs the
     /// thing the command exists to protect.
+    /// `/hosted` -- what this machine has hosted, and whether it is still up.
+    ///
+    /// The list itself is local: the token registry knows which ids this
+    /// machine owns, because that is the thing the server checks. Liveness is
+    /// not local and must not be guessed from it -- a project taken down an
+    /// hour ago still has its token on disk, and a list built from that alone
+    /// would report a dead project as running with complete confidence.
+    ///
+    /// So the ids are gathered here and the states are asked for in the event
+    /// loop, which is the only place allowed to await.
+    fn start_hosted(&mut self) {
+        let mine = crate::backend::mine();
+        if mine.is_empty() {
+            self.messages.push(Message::new(
+                Role::System,
+                "Nothing hosted from this machine yet.\n\nPublish a project, then deploy its \
+                 backend -- the backend runs at the same id as the published page."
+                    .to_string(),
+            ));
+            return;
+        }
+        // No placeholder message. The reply replaces nothing, so an earlier
+        // "checking..." would just be a line that scrolls past and stays in the
+        // history for good.
+        self.hosted_request = Some(mine);
+    }
+
+    /// Called by the event loop once the control plane has answered.
+    pub fn show_hosted(&mut self, projects: Vec<crate::backend::Mine>) {
+        let live = projects.iter().filter(|m| m.state.as_deref() == Some("running")).count();
+        let mut out = String::new();
+
+        for m in &projects {
+            let state = match m.state.as_deref() {
+                Some("running") => "running",
+                Some("building") => "building",
+                Some("failed") => "failed",
+                // Not an error worth apologising for: expired or taken down is
+                // the ordinary end of a hosted project's life.
+                Some(_) | None => "gone",
+            };
+            out.push_str(&format!("  {:<10}  {state}\n", m.id));
+            if state != "gone" {
+                out.push_str(&format!(
+                    "    {}\n",
+                    crate::backend::project_url(&self.config.tools.backend_endpoint, &m.id)
+                ));
+            }
+            if let Some(path) = &m.path {
+                out.push_str(&format!("    {path}\n"));
+            }
+        }
+
+        // The cap, stated whether or not it has been reached. Someone who can
+        // see they are at the limit before they hit it can decide what to drop;
+        // someone told only at the refusal has already done the work.
+        out.push_str(&format!(
+            "\n{live} of {} live. A third needs one of these gone first -- deploy over it, or \
+             ask for it to be taken down.",
+            crate::backend::MAX_LIVE_PER_MACHINE
+        ));
+
+        self.messages.push(Message::new(Role::System, out));
+    }
+
     fn start_rollback(&mut self) {
         self.follow_tail = true;
 
@@ -3628,6 +3743,58 @@ fn delete_after_in(buf: &mut String, cursor: &mut usize) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A paste far past the cap is refused whole, and says so.
+    #[test]
+    fn an_enormous_paste_is_refused_rather_than_silently_truncated() {
+        let mut app = App::new(crate::config::Config::default());
+        app.handle_paste("x".repeat(MAX_PASTE_CHARS + 1));
+        assert!(app.input_buffer.is_empty(), "nothing may reach the buffer");
+        let said = app.messages.last().expect("a message explaining why");
+        assert!(said.content.contains("200,000"), "quotes the limit: {}", said.content);
+        assert!(said.content.contains("file"), "names the way out: {}", said.content);
+    }
+
+    /// Truncating instead would answer a question about a fragment while
+    /// looking exactly like an answer about the whole thing.
+    #[test]
+    fn a_paste_that_fits_is_inserted_untouched() {
+        let mut app = App::new(crate::config::Config::default());
+        let text = "a".repeat(MAX_PASTE_CHARS);
+        app.handle_paste(text.clone());
+        assert_eq!(app.input_buffer, text);
+        assert_eq!(app.cursor, text.len());
+    }
+
+    /// The cap is on the buffer, not on one paste: two that each fit but do
+    /// not fit together must not add up past it.
+    #[test]
+    fn pastes_are_capped_in_total_not_individually() {
+        let mut app = App::new(crate::config::Config::default());
+        let half = "b".repeat(MAX_PASTE_CHARS / 2 + 1);
+        app.handle_paste(half.clone());
+        assert_eq!(app.input_buffer.chars().count(), half.chars().count());
+        app.handle_paste(half.clone());
+        assert_eq!(
+            app.input_buffer.chars().count(),
+            half.chars().count(),
+            "the second paste must be refused, not appended"
+        );
+    }
+
+    /// Counted in characters, so a paste of non-ASCII text is measured the way
+    /// a person would count it rather than by how many bytes it happens to
+    /// take -- and the count never lands mid-character.
+    #[test]
+    fn the_cap_counts_characters_not_bytes() {
+        let mut app = App::new(crate::config::Config::default());
+        // Four bytes each, so this is well past the cap in bytes and well
+        // under it in characters.
+        let emoji = "\u{1F600}".repeat(MAX_PASTE_CHARS / 2);
+        app.handle_paste(emoji.clone());
+        assert_eq!(app.input_buffer, emoji, "under the cap in characters, so it goes in");
+    }
+
     use super::*;
     use crate::config::test_support::with_isolated_home;
     use crate::config::Config;

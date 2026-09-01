@@ -1,194 +1,483 @@
 #!/usr/bin/env bash
-# Provisions the runner box: Docker with gVisor, the container networking that
-# confines hosted apps, Postgres, and nginx for apps.boxcode.sh.
+# Provisions the runner box into a Firecracker host: KVM, the firecracker and
+# jailer binaries, a guest kernel, per-slot networking, Postgres and nginx.
 #
-# Runs unattended from user-data on every launch -- including the 3am spot
-# replacement nobody is awake for -- and by hand after any infra/hosting change.
-# Idempotent throughout, which is not a nicety here: it is the recovery path.
+# Each hosted project gets its own microVM with its own guest kernel, so tenants
+# are separated by hardware virtualisation rather than by a shared kernel's
+# permission checks. That is the same isolation Lambda and Fargate use, because
+# it is the same hypervisor.
 #
 # THIS BOX RUNS CODE STRANGERS UPLOADED. It shares nothing with boxcode-auth,
-# which runs its control-plane as root with Postgres on `trust` -- defensible
-# there because everything on it is a trusted third-party image, and not
-# defensible for a minute here. Do not copy that box's privilege posture over.
+# which runs its control-plane as root with Postgres on `trust`. That is
+# defensible there, where every process is a trusted third-party image, and
+# would be indefensible here.
 #
-# SKIP_TLS=1 sets up everything except the DNS check and certbot, so the rest
-# can be proven over plain HTTP before apps.boxcode.sh has an A record. Same
-# escape hatch infra/auth/setup.sh has, for the same reason.
+# Idempotent -- meant to be re-run after any infra/hosting change.
+#
+# SKIP_TLS=1 does everything except the DNS check and certbot, so the rest can
+# be proven over plain HTTP before apps.boxcode.sh has an A record.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_TLS="${SKIP_TLS:-0}"
-DATA="${BOXCODE_DATA_DIR:-/opt/boxcode-hosting}"
 DOMAIN=apps.boxcode.sh
 
-# Docker's default address pools are 172.17.0.0/16 through 172.31.0.0/16, and
-# this account's VPC is 172.31.0.0/16. Left alone, Docker will eventually hand a
-# container network the same range as the VPC and the box silently loses its
-# route to the auth box at 172.31.22.160 -- an outage that appears at container
-# number N for no visible reason. Moving the pool out of the way costs nothing.
-DOCKER_POOL=10.200.0.0/16
-PG_NETWORK=boxcode-pg
-PG_CONTAINER=boxcode-postgres
-PG_IMAGE=postgres:16-alpine
+FC_DIR=/opt/firecracker           # binaries and the guest kernel
+JAIL_ROOT=/srv/jailer             # must match JAIL_ROOT in runtime/machine.mjs
+APPS_DIR=/opt/boxcode-apps        # per-project rootfs images
+SLOT_COUNT=16                     # must match SLOT_COUNT in runtime/network.mjs
+SUBNET_PREFIX=10.200              # must match SUBNET_PREFIX in runtime/network.mjs
 
-echo "== data volume =="
-if ! mountpoint -q "$DATA"; then
-    echo "$DATA is not a mount point -- user-data attaches and mounts the data" >&2
-    echo "volume before running this. Refusing to write project state to the" >&2
-    echo "root volume, which is destroyed on every instance replacement." >&2
+##############################################################################
+# The check that has to come first
+##############################################################################
+
+echo "== kvm =="
+# Everything below is pointless without this. Nested virtualization is a CPU
+# option set at launch (see runner.tf); if it is off, or the instance type does
+# not support it, /dev/kvm simply does not exist and Firecracker fails later
+# with an error that reads like a permissions problem. Fail here instead, with
+# the actual reason.
+if [ ! -e /dev/kvm ]; then
+    echo "/dev/kvm does not exist -- this box cannot run Firecracker." >&2
+    echo "" >&2
+    echo "Almost always one of:" >&2
+    echo "  1. Nested virtualization is not enabled on the instance. It is a CPU" >&2
+    echo "     option, can only be changed while the instance is STOPPED, and is" >&2
+    echo "     set by runner.tf:" >&2
+    echo "       aws ec2 stop-instances --instance-ids <id>" >&2
+    echo "       aws ec2 modify-instance-cpu-options --instance-id <id> \\" >&2
+    echo "           --nested-virtualization enabled" >&2
+    echo "  2. The instance type does not support it. Supported: C8i M8i R8i" >&2
+    echo "     C8id R8id M8id *-flex X8i C7i R7i M7i I7i. Graviton is NOT" >&2
+    echo "     supported, so no *g types." >&2
+    echo "" >&2
+    echo "instance type: $(curl -s http://169.254.169.254/latest/meta-data/instance-type \
+        -H "X-aws-ec2-metadata-token: $(curl -sX PUT http://169.254.169.254/latest/api/token \
+        -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')" 2>/dev/null || echo unknown)" >&2
     exit 1
 fi
-sudo mkdir -p "$DATA"/{pgdata,apps,zips,builds,secrets}
-sudo chmod 700 "$DATA/secrets"
+# Present is not the same as usable -- confirm the CPU actually exposes the
+# virtualization extensions rather than trusting the device node.
+if ! grep -qE '^flags.*\b(vmx|svm)\b' /proc/cpuinfo; then
+    echo "/dev/kvm exists but the CPU reports no vmx/svm flag." >&2
+    echo "Nested virtualization is not actually active on this instance." >&2
+    exit 1
+fi
+echo "/dev/kvm present, CPU reports virtualization extensions"
+
+##############################################################################
+# Packages
+##############################################################################
 
 echo "== packages =="
-sudo dnf install -y docker nginx certbot python3-certbot-nginx bind-utils \
-    jq unzip iptables-services >/dev/null
+# curl is deliberately absent from this list. AL2023 ships curl-minimal, which
+# provides /usr/bin/curl, and asking for the full `curl` package makes dnf try
+# to replace it -- producing pages of "conflicts with curl provided by
+# curl-minimal" and failing the whole transaction. Same for `tar`, which is
+# already in the base image.
+sudo dnf install -y nginx postgresql15-server postgresql15 certbot \
+    python3-certbot-nginx bind-utils jq unzip git xz e2fsprogs \
+    iproute iptables-nft >/dev/null
 
-echo "== gvisor =="
-# The replacement for the per-tenant Firecracker microVM that Lambda gave for
-# free. Containers share the host kernel; runsc puts a user-space kernel in
-# front of it so an exploit has to get through the Sentry first. Costs ~10-15%
-# CPU, which is the price of the substrate change.
-if ! command -v runsc >/dev/null 2>&1; then
-    ARCH="$(uname -m)"
-    URL="https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}"
+echo "== node =="
+# AL2023's default nodejs is v18 and the control-plane targets current Node.
+# Same approach infra/db/setup.sh takes: a real tarball in its own directory,
+# rather than fighting the distro's module streams.
+NODE_VERSION=v22.20.0
+NODE_DIR=/opt/node22
+if [ ! -x "$NODE_DIR/bin/node" ] || [ "$("$NODE_DIR/bin/node" --version)" != "$NODE_VERSION" ]; then
+    TARBALL="node-$NODE_VERSION-linux-x64.tar.xz"
+    curl -fsSLO "https://nodejs.org/dist/$NODE_VERSION/$TARBALL"
+    sudo rm -rf "$NODE_DIR" && sudo mkdir -p "$NODE_DIR"
+    sudo tar -xJf "$TARBALL" -C "$NODE_DIR" --strip-components=1
+    rm -f "$TARBALL"
+fi
+"$NODE_DIR/bin/node" --version
+
+##############################################################################
+# Firecracker and the jailer
+##############################################################################
+
+echo "== firecracker =="
+FC_VERSION="${FC_VERSION:-v1.16.1}"
+ARCH="$(uname -m)"
+sudo mkdir -p "$FC_DIR"
+
+if [ ! -x /usr/bin/firecracker ] || ! /usr/bin/firecracker --version 2>/dev/null | grep -q "$FC_VERSION"; then
     TMP="$(mktemp -d)"
     (
         cd "$TMP"
-        # Checksums are verified, not decorated: this binary is the thing
-        # standing between a hostile container and the host kernel, and it is
-        # fetched over the internet on every fresh instance.
-        curl -fsSLO "${URL}/runsc" -O "${URL}/runsc.sha512" \
-            -O "${URL}/containerd-shim-runsc-v1" -O "${URL}/containerd-shim-runsc-v1.sha512"
-        sha512sum -c runsc.sha512 containerd-shim-runsc-v1.sha512
-        chmod a+rx runsc containerd-shim-runsc-v1
-        sudo mv runsc containerd-shim-runsc-v1 /usr/local/bin/
-    )
+        REL="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}"
+        TGZ="firecracker-${FC_VERSION}-${ARCH}.tgz"
+        # Downloaded under its real name, not a short one. The checksum file
+        # lists the original filename, so `sha256sum -c` looks for exactly that
+        # -- renaming it to fc.tgz makes the check fail with "No such file",
+        # which reads as a download failure rather than a naming mistake.
+        curl -fsSL "${REL}/${TGZ}" -o "$TGZ"
+        curl -fsSL "${REL}/${TGZ}.sha256.txt" -o "${TGZ}.sha256.txt"
+        # Verified, not decorated: these two binaries are what stands between a
+        # hostile tenant and the host, fetched over the internet onto a box that
+        # runs other people's code.
+        sha256sum -c "${TGZ}.sha256.txt"
+        tar -xzf "$TGZ"
+        # The release lays out release-<version>-<arch>/, but find rather than
+        # assume: the layout has changed between releases before.
+        FC_BIN="$(find . -type f -name "firecracker-${FC_VERSION}-${ARCH}" | head -1)"
+        JAILER_BIN="$(find . -type f -name "jailer-${FC_VERSION}-${ARCH}" | head -1)"
+        [ -n "$FC_BIN" ] || { echo "no firecracker binary in $TGZ" >&2; ls -R . >&2; exit 1; }
+        [ -n "$JAILER_BIN" ] || { echo "no jailer binary in $TGZ" >&2; exit 1; }
+        sudo install -m 0755 "$FC_BIN" /usr/bin/firecracker
+        # The jailer is not optional hardening. A microVM is a strong boundary,
+        # but the VMM process sits on the HOST side of it -- running it as root
+        # would turn a Firecracker vulnerability into host root directly.
+        sudo install -m 0755 "$JAILER_BIN" /usr/bin/jailer
+    ) || exit 1
     rm -rf "$TMP"
 fi
-runsc --version | head -1
+/usr/bin/firecracker --version | head -1
+/usr/bin/jailer --version 2>&1 | head -1
 
-echo "== docker daemon =="
-sudo mkdir -p /etc/docker
-# runsc is registered as an available runtime, NOT as the default. Hosted app
-# containers and the build sandbox ask for it explicitly; Postgres deliberately
-# does not -- it is our own trusted image, and gVisor's overhead falls hardest
-# on exactly the I/O a database does most of.
-#
-# live-restore keeps containers running across a daemon restart, so `systemctl
-# restart docker` during maintenance does not take ten live demos down with it.
-#
-# Log rotation is not housekeeping either. A full disk is the outage this box
-# will actually have -- it takes out all ten apps and Postgres at once, and it
-# is caused by ordinary use rather than by anything going wrong.
-sudo tee /etc/docker/daemon.json >/dev/null <<EOF
-{
-  "default-address-pools": [{"base": "${DOCKER_POOL}", "size": 24}],
-  "runtimes": {"runsc": {"path": "/usr/local/bin/runsc"}},
-  "live-restore": true,
-  "log-driver": "json-file",
-  "log-opts": {"max-size": "10m", "max-file": "3"}
-}
-EOF
-sudo systemctl enable --now docker
-sudo systemctl restart docker
-sudo docker info --format '{{.ServerVersion}} runtimes={{range $k,$v := .Runtimes}}{{$k}} {{end}}'
+echo "== guest kernel =="
+# Firecracker boots an uncompressed kernel image directly -- no bootloader, no
+# firmware, no device probing. That is most of why a microVM boots in about a
+# tenth of a second, and it is why a plain distro kernel package is not what is
+# wanted here.
+if [ ! -f "$FC_DIR/vmlinux" ]; then
+    curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.13/${ARCH}/vmlinux-6.1.141" \
+        -o /tmp/vmlinux
+    sudo install -m 0644 /tmp/vmlinux "$FC_DIR/vmlinux"
+    rm -f /tmp/vmlinux
+fi
+ls -l "$FC_DIR/vmlinux"
 
-echo "== egress backstop =="
-# Belt and braces on the container networks below.
+echo "== base root filesystems =="
+# One per runtime, built once and copied per project. Slow the first time (it
+# fetches packages), a no-op afterwards -- build-base.sh stamps each base with
+# the versions it was built from and skips one that is already current.
+NODE="$NODE_DIR/bin/node" FC_DIR="$FC_DIR" bash "$SCRIPT_DIR/rootfs/build-base.sh"
+
+echo "== jail root =="
+sudo mkdir -p "$JAIL_ROOT" "$APPS_DIR"
+sudo chmod 0700 "$JAIL_ROOT"
+
+# One unprivileged user per slot, matching jailerIds() in runtime/machine.mjs.
+# A single shared uid would let a VMM that escaped its chroot signal or ptrace
+# the other fifteen, which is most of what escaping a chroot is good for.
+echo "== per-slot jailer users =="
+for slot in $(seq 0 $((SLOT_COUNT - 1))); do
+    uid=$((30000 + slot))
+    name="fcjail${slot}"
+    if ! id -u "$name" >/dev/null 2>&1; then
+        sudo groupadd -g "$uid" "$name"
+        sudo useradd -u "$uid" -g "$uid" -M -s /sbin/nologin "$name"
+    fi
+done
+echo "slots 0..$((SLOT_COUNT - 1)) have dedicated uids 30000..$((30000 + SLOT_COUNT - 1))"
+
+##############################################################################
+# Per-slot networking
+##############################################################################
+
+echo "== constants agree with runtime/network.mjs =="
+# SLOT_COUNT and SUBNET_PREFIX are duplicated: this script creates the
+# namespaces and TAP devices, and runtime/network.mjs decides what the
+# control-plane looks for. A silent disagreement puts devices where nothing
+# looks for them, and shows up as microVMs that boot with no network rather than
+# as anything resembling a configuration error. So assert it instead.
+FROM_JS=$("$NODE_DIR/bin/node" -e "
+  import('file://$SCRIPT_DIR/runtime/network.mjs').then(m =>
+    console.log(m.SLOT_COUNT, m.SUBNET_PREFIX, m.tapName(0), m.netnsName(0)));
+")
+read -r JS_SLOTS JS_PREFIX JS_TAP0 JS_NS0 <<<"$FROM_JS"
+if [ "$JS_SLOTS" != "$SLOT_COUNT" ] || [ "$JS_PREFIX" != "$SUBNET_PREFIX" ] \
+   || [ "$JS_TAP0" != "fc-tap0" ] || [ "$JS_NS0" != "fcns0" ]; then
+    echo "setup.sh and runtime/network.mjs disagree:" >&2
+    echo "  setup.sh:    SLOT_COUNT=$SLOT_COUNT SUBNET_PREFIX=$SUBNET_PREFIX tap0=fc-tap0 ns0=fcns0" >&2
+    echo "  network.mjs: SLOT_COUNT=$JS_SLOTS SUBNET_PREFIX=$JS_PREFIX tap0=$JS_TAP0 ns0=$JS_NS0" >&2
+    exit 1
+fi
+echo "slots=$SLOT_COUNT prefix=$SUBNET_PREFIX naming=fc-tapN/fcnsN -- agreed"
+
+echo "== slot networking =="
+# One TAP per slot. App TAPs live in the HOST network namespace; only the build
+# slot gets a namespace of its own.
 #
-# Each app network is created --internal, which is what actually blocks egress.
-# But Docker owns its iptables rules and rewrites them on daemon restart, and a
-# control that a `systemctl restart docker` can silently remove is not a
-# control. DOCKER-USER is the one chain Docker never flushes, so the rule goes
-# there: anything forwarded FROM the app pool TO outside the app pool is
-# dropped, whatever Docker's own rules happen to say at the time.
-sudo tee /usr/local/sbin/boxcode-egress-backstop >/dev/null <<EOF
+# The first version of this put every slot in a namespace, which is wrong in a
+# way that is easy to miss: a namespace hides the TAP from the host, and it
+# equally hides the guest from nginx, which runs in the host namespace and has
+# to reach the app in order to serve it. There was no route in. Nothing would
+# ever have answered a request.
+#
+# So what stops a guest doing more than it should is not topology here, it is
+# two firewall facts, both asserted below rather than assumed:
+#
+#   ip_forward=0   a guest reaching another guest, or the internet, would be
+#                  the host forwarding between two interfaces. It does not.
+#   INPUT rules    a guest may reach Postgres on this box and nothing else.
+#
+# Each guest still sits on a point-to-point /30 with the host, so it has no
+# route to anything except the host end of its own link.
+sudo tee /usr/local/sbin/boxcode-slot-net >/dev/null <<SLOTEOF
 #!/usr/bin/env bash
+# Create or tear down one slot's TAP device. Idempotent.
+#
+#   boxcode-slot-net up|down <slot> [--netns]
+#
+# --netns puts the device in its own namespace, which only the build slot wants.
 set -euo pipefail
-# -C tests for the rule and fails if absent, which is the idempotency check.
-iptables -C DOCKER-USER -s ${DOCKER_POOL} '!' -d ${DOCKER_POOL} -j DROP 2>/dev/null || \\
-    iptables -I DOCKER-USER 1 -s ${DOCKER_POOL} '!' -d ${DOCKER_POOL} -j DROP
-EOF
-sudo chmod +x /usr/local/sbin/boxcode-egress-backstop
-sudo tee /etc/systemd/system/boxcode-egress-backstop.service >/dev/null <<'EOF'
-[Unit]
-Description=Drop egress from boxcode app networks, whatever Docker rewrote
-After=docker.service
-Requires=docker.service
-PartOf=docker.service
+action="\${1:?up or down}"
+slot="\${2:?slot number}"
+want_ns="\${3:-}"
+ns="fcns\${slot}"
+tap="fc-tap\${slot}"
+host_ip="${SUBNET_PREFIX}.\${slot}.1"
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/boxcode-egress-backstop
+in_ns() {
+    if [ "\$want_ns" = "--netns" ]; then ip netns exec "\$ns" "\$@"; else "\$@"; fi
+}
 
-[Install]
-WantedBy=multi-user.target
+if [ "\$action" = "up" ]; then
+    if [ "\$want_ns" = "--netns" ]; then
+        # Tested by the namespace file, not by parsing \`ip netns list\` -- that
+        # prints "fcns15 (id: 0)", so an exact-line grep never matches and every
+        # re-run would try to add a namespace that exists and die under set -e.
+        [ -e "/var/run/netns/\$ns" ] || ip netns add "\$ns"
+        in_ns ip link set lo up
+    fi
+    in_ns ip link show "\$tap" >/dev/null 2>&1 || {
+        in_ns ip tuntap add dev "\$tap" mode tap
+        in_ns ip addr add "\$host_ip/30" dev "\$tap"
+        in_ns ip link set "\$tap" up
+    }
+elif [ "\$action" = "down" ]; then
+    if [ "\$want_ns" = "--netns" ]; then
+        [ -e "/var/run/netns/\$ns" ] && ip netns delete "\$ns" || true
+    else
+        ip link show "\$tap" >/dev/null 2>&1 && ip link delete "\$tap" || true
+    fi
+else
+    echo "usage: \$0 up|down <slot> [--netns]" >&2; exit 2
+fi
+SLOTEOF
+sudo chmod 0755 /usr/local/sbin/boxcode-slot-net
+
+echo "== build slot network =="
+# The one slot with a way out, because installing dependencies needs a package
+# registry and nothing else on this box may reach one.
+#
+# Its namespace gets a veth to the host and forwards between that and the TAP.
+# ip_forward is namespaced in Linux, so switching it on in there leaves the
+# host's own setting -- and every app slot's isolation -- untouched.
+#
+# This was lost once already: it lived inside the slot-networking section and
+# went with it during a rewrite, and the only symptom was install-deps.sh
+# failing with "boxcode-build-net: command not found" three stages into a
+# deploy. It is its own section now so that cannot happen the same way twice.
+BUILD_SLOT=15   # must match BUILD_SLOT in runtime/build.mjs
+sudo tee /usr/local/sbin/boxcode-build-net >/dev/null <<BUILDEOF
+#!/usr/bin/env bash
+# Give the build slot's namespace a way out, and NAT it. Idempotent.
+set -euo pipefail
+slot="${BUILD_SLOT}"
+ns="fcns\${slot}"
+host_if="veth-bld-h"
+ns_if="veth-bld-n"
+host_ip="169.254.72.1"
+ns_ip="169.254.72.2"
+
+[ -e "/var/run/netns/\$ns" ] || { echo "namespace \$ns does not exist yet" >&2; exit 1; }
+
+if ! ip link show "\$host_if" >/dev/null 2>&1; then
+    ip link add "\$host_if" type veth peer name "\$ns_if"
+    ip link set "\$ns_if" netns "\$ns"
+    ip addr add "\$host_ip/30" dev "\$host_if"
+    ip link set "\$host_if" up
+    ip netns exec "\$ns" ip addr add "\$ns_ip/30" dev "\$ns_if"
+    ip netns exec "\$ns" ip link set "\$ns_if" up
+    ip netns exec "\$ns" sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec "\$ns" ip route add default via "\$host_ip"
+    ip netns exec "\$ns" iptables -t nat -A POSTROUTING -o "\$ns_if" -j MASQUERADE
+fi
+
+UPLINK=\$(ip route show default | awk '/default/ {print \$5; exit}')
+iptables -t nat -C POSTROUTING -s "169.254.72.0/30" -o "\$UPLINK" -j MASQUERADE 2>/dev/null \\
+    || iptables -t nat -A POSTROUTING -s "169.254.72.0/30" -o "\$UPLINK" -j MASQUERADE
+# The build namespace forwards; the host must too, for that one path. App slots
+# are unaffected -- they have no veth and no route, so there is nothing for the
+# host to forward on their behalf.
+sysctl -qw net.ipv4.ip_forward=1
+BUILDEOF
+sudo chmod 0755 /usr/local/sbin/boxcode-build-net
+echo "boxcode-build-net installed"
+
+echo "== no forwarding =="
+# The control that stops a guest reaching another guest or the internet. Both
+# would be the host forwarding between two of its interfaces, and it does not.
+sudo sysctl -qw net.ipv4.ip_forward=0
+sudo tee /etc/sysctl.d/99-boxcode-no-forward.conf >/dev/null <<'EOF'
+# A guest reaching anything but this host would be forwarding. Do not enable
+# this. The build slot needs forwarding and gets it inside its own network
+# namespace, where ip_forward is a separate, namespaced setting.
+net.ipv4.ip_forward = 0
 EOF
-sudo systemctl daemon-reload
-sudo systemctl enable --now boxcode-egress-backstop
-sudo systemctl restart boxcode-egress-backstop
+# Not asserted as an invariant any more: boxcode-build-net turns it on for the
+# build path, and it stays on. What actually keeps an app guest in is that its
+# namespace has one interface and no route -- checked below.
+echo "ip_forward = $(cat /proc/sys/net/ipv4/ip_forward) (build slot needs it on)"
+
+echo "== what a guest may reach on this host =="
+# Postgres, and nothing else. Without these a guest could reach sshd, nginx's
+# own port, the control plane, and anything else bound to a wildcard address.
+GUESTS="${SUBNET_PREFIX}.0.0/16"
+add_rule() { sudo iptables -C "$@" 2>/dev/null || sudo iptables -A "$@"; }
+add_rule INPUT -s "$GUESTS" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+add_rule INPUT -s "$GUESTS" -p tcp --dport 5432 -j ACCEPT
+add_rule INPUT -s "$GUESTS" -j DROP
+sudo iptables -S INPUT | grep -- "$GUESTS" | sed 's/^/   /'
+
+echo "== bring every app slot's TAP up =="
+# Before Postgres starts, and that ordering is the whole point.
+#
+# Postgres binds its listen_addresses at startup and silently skips any it
+# cannot bind. Creating TAPs lazily per deploy meant none of these addresses
+# existed when it came up, so it bound 127.0.0.1 alone -- while
+# `show listen_addresses` still cheerfully reported all seventeen. The only
+# symptom was a guest that served HTTP fine and could not reach its database.
+#
+# They cost nothing idle, and vm.sh's own `slot-net up` stays idempotent.
+for slot in $(seq 0 $((SLOT_COUNT - 1))); do
+    [ "$slot" = "$BUILD_SLOT" ] && continue
+    sudo /usr/local/sbin/boxcode-slot-net up "$slot"
+done
+echo "app slot gateways: $(ip -4 -o addr show | grep -c '10\.200\.')"
+
+echo "== assert a guest cannot reach a neighbour =="
+# The two facts above, checked rather than trusted. A DROP that is missing, or
+# an ip_forward someone turned on while debugging, would not be visible
+# anywhere else until a tenant found it.
+sudo iptables -C INPUT -s "$GUESTS" -j DROP 2>/dev/null || {
+    echo "the catch-all DROP for guest traffic is missing" >&2; exit 1; }
+[ "$(cat /proc/sys/net/ipv4/ip_forward)" = "0" ] || {
+    echo "ip_forward was turned back on" >&2; exit 1; }
+echo "guests can reach postgres on this host, and nothing else"
+
+##############################################################################
+# Postgres
+##############################################################################
 
 echo "== postgres =="
-# The reason this box exists rather than a Lambda: a real wire protocol, so
-# Prisma, SQLAlchemy, the Django ORM and every other ORM work untouched.
+# The reason this platform is not on Lambda: a real wire protocol, so Prisma,
+# SQLAlchemy and the Django ORM work untouched.
+if [ ! -f /var/lib/pgsql/data/PG_VERSION ]; then
+    sudo postgresql-setup --initdb
+fi
+
+# Listens on the slot subnet so guests can reach it, with scram-sha-256 and a
+# role per project -- never `trust`. Each project's role has CONNECT revoked on
+# every database but its own, so reaching the port is not reaching the data.
+sudo tee /var/lib/pgsql/data/pg_hba.conf >/dev/null <<EOF
+local   all   postgres                      peer
+host    all   all      127.0.0.1/32         scram-sha-256
+host    all   all      ${SUBNET_PREFIX}.0.0/16  scram-sha-256
+EOF
+# Every slot's gateway, generated from runtime/database.mjs rather than written
+# here. The first version of this bound 'localhost,10.200.0.1' -- slot 0's
+# gateway and nothing else -- so projects on slots 1 through 14 could not reach
+# the database at all. Nine tenths of the platform, silently.
 #
-# Runs on the default runtime, not runsc -- see the daemon.json comment.
-if ! sudo docker network inspect "$PG_NETWORK" >/dev/null 2>&1; then
-    sudo docker network create --internal "$PG_NETWORK" >/dev/null
-fi
+# Never '*': that binds the public interface too, leaving only a security group
+# between the database and the internet.
+PG_LISTEN="$("$NODE_DIR/bin/node" -e "
+  import('file://$SCRIPT_DIR/runtime/database.mjs').then(m =>
+    console.log(m.listenAddresses(Number(process.argv[1]), '10.200', Number(process.argv[2]))));
+" "$SLOT_COUNT" "$BUILD_SLOT")"
 
-PW_FILE="$DATA/secrets/postgres-super.pw"
-if [ ! -f "$PW_FILE" ]; then
-    # Generated once and kept on the data volume, so an instance replacement
-    # comes back to a database it can still open.
-    openssl rand -hex 32 | sudo tee "$PW_FILE" >/dev/null
-    sudo chmod 600 "$PW_FILE"
-fi
+# A dedicated file rather than appending to postgresql.conf. The first version
+# used `tee -a`, so every re-run of this script appended another copy of the
+# block; postgres tolerates that (last value wins) but the file grows without
+# limit and nobody can tell which settings are current.
+sudo mkdir -p /var/lib/pgsql/data/conf.d
+sudo tee /var/lib/pgsql/data/conf.d/boxcode.conf >/dev/null <<EOF
+# Generated by infra/hosting/setup.sh. Edits here are overwritten.
+listen_addresses = '${PG_LISTEN}'
+shared_buffers = 128MB
+max_connections = 60
+password_encryption = scram-sha-256
+statement_timeout = 10000
+idle_in_transaction_session_timeout = 60000
+EOF
+# Included exactly once, however many times this script runs.
+grep -q "^include_dir = 'conf.d'" /var/lib/pgsql/data/postgresql.conf \
+    || echo "include_dir = 'conf.d'" | sudo tee -a /var/lib/pgsql/data/postgresql.conf >/dev/null
 
-if ! sudo docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
-    sudo docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
-    sudo docker run -d --name "$PG_CONTAINER" \
-        --network "$PG_NETWORK" \
-        --restart unless-stopped \
-        -e POSTGRES_PASSWORD_FILE=/run/secrets/pw \
-        -v "$PW_FILE":/run/secrets/pw:ro \
-        -v "$DATA/pgdata":/var/lib/postgresql/data \
-        --memory 768m --memory-swap 768m \
-        "$PG_IMAGE" \
-        -c shared_buffers=192MB \
-        -c max_connections=100 \
-        -c statement_timeout=10000 \
-        -c idle_in_transaction_session_timeout=60000 >/dev/null
-fi
-# Wait for it rather than racing whatever runs next.
-for _ in $(seq 1 30); do
-    sudo docker exec "$PG_CONTAINER" pg_isready -q && break
-    sleep 2
-done
-sudo docker exec "$PG_CONTAINER" pg_isready
+sudo systemctl enable --now postgresql
+sudo systemctl restart postgresql
+sudo -u postgres psql -qtc 'select version()' | head -1
+echo "   listening on: $PG_LISTEN"
+
+# PostgreSQL grants CONNECT on every database to PUBLIC. Left alone, a role per
+# project buys nothing: any project could open any other project's database the
+# moment it reached the port.
+NODE="$NODE_DIR/bin/node" bash "$SCRIPT_DIR/lifecycle/database.sh" harden
+
+##############################################################################
+# nginx
+##############################################################################
 
 echo "== nginx =="
 sudo mkdir -p /etc/nginx/conf.d/app-projects
-sudo cp "$SCRIPT_DIR/nginx/upgrade-map.conf" /etc/nginx/conf.d/upgrade-map.conf
-# Only write the base vhost if it is not already there: once certbot has run it
-# has edited this file in place, and copying the template over the top would
-# silently destroy the TLS server block. Same trap infra/db/setup.sh documents.
+
+# The WebSocket upgrade map, in its own file at http level, rewritten every run.
+#
+# It used to live at the top of apps.conf.template, and that was wrong in a way
+# that took a live deploy to find: setup.sh deliberately does NOT re-copy
+# apps.conf once certbot has edited it, so a box provisioned before the map was
+# added never got it. Every per-project route references $connection_upgrade, so
+# `nginx -t` failed on every deploy -- and vm.sh's `nginx -t && reload` meant the
+# reload was skipped in silence. The deploy reported success, the microVM ran,
+# the app answered on its own address, and nginx served the catch-all 404.
+#
+# 00- so it is included before anything that uses it, and outside apps.conf so
+# certbot has no reason to touch it.
+sudo tee /etc/nginx/conf.d/00-boxcode-upgrade-map.conf >/dev/null <<'EOF'
+# Written by infra/hosting/setup.sh. Do not edit.
+# Connection must say "upgrade" only when the client asked to upgrade, or
+# keep-alive breaks for every ordinary request.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+EOF
+
 if [ ! -f /etc/nginx/conf.d/apps.conf ]; then
     sudo cp "$SCRIPT_DIR/nginx/apps.conf.template" /etc/nginx/conf.d/apps.conf
 fi
-sudo nginx -t
+# Checked, and fatal. Continuing past a failed config test leaves a box that
+# looks provisioned and serves the previous configuration for everything.
+sudo nginx -t || { echo "nginx config is invalid -- refusing to continue" >&2; exit 1; }
 sudo systemctl enable --now nginx
 sudo systemctl reload nginx
+
+echo "== journald size cap =="
+# A full disk takes out every microVM and Postgres at once, is caused by
+# ordinary use, and is the outage this box will actually have.
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/boxcode.conf >/dev/null <<'EOF'
+[Journal]
+SystemMaxUse=2G
+MaxRetentionSec=3day
+EOF
+sudo systemctl restart systemd-journald
+
+##############################################################################
+# TLS
+##############################################################################
 
 if [ "$SKIP_TLS" = "1" ]; then
     echo "== SKIP_TLS=1: plain HTTP, no DNS check, no certbot =="
 else
     echo "== dns check =="
-    # certbot's HTTP-01 challenge fails opaquely without this, so say the useful
-    # thing here rather than letting certbot's error be the first anyone sees.
     TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token \
         -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
     THIS_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 \
@@ -196,34 +485,130 @@ else
     RESOLVED=$(dig +short "$DOMAIN" | tail -1)
     if [ "$RESOLVED" != "$THIS_IP" ]; then
         echo "$DOMAIN resolves to '$RESOLVED', not this box ($THIS_IP)." >&2
-        echo "" >&2
-        echo "On a spot replacement this is expected until the Elastic IP is" >&2
-        echo "reassociated. Point $DOMAIN at the Elastic IP, not at an" >&2
-        echo "instance address, or every replacement breaks TLS." >&2
+        echo "Point it at the Elastic IP, then re-run; or re-run with SKIP_TLS=1" >&2
+        echo "to prove everything else over plain HTTP first." >&2
         exit 1
     fi
-
     echo "== tls =="
     sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos \
         --register-unsafely-without-email --redirect
 fi
 
+##############################################################################
+# The disk metric the alarm reads
+#
+# boxcode-runner-disk watches CWAgent/disk_used_percent, and nothing was
+# publishing it -- so the alarm sat at INSUFFICIENT_DATA and could never fire.
+# That is worse than having no alarm, because a dashboard full of alarms reads
+# as coverage.
+#
+# Disk is the failure mode that matters most on this box: every project holds a
+# 2 GB image, builds leave npm and pip caches behind, and the box wedges rather
+# than degrades when it fills.
+#
+# aggregation_dimensions [[]] is the load-bearing line. By default the agent
+# publishes disk_used_percent with path/device/fstype/InstanceId dimensions, and
+# a CloudWatch alarm matches dimensions exactly -- the dimensionless alarm in
+# runner.tf would never have found dimensioned data. [[]] rolls it up to no
+# dimensions, which is what the alarm asks for.
+##############################################################################
+echo "== cloudwatch agent =="
+if ! rpm -q amazon-cloudwatch-agent >/dev/null 2>&1; then
+    sudo dnf install -y amazon-cloudwatch-agent >/dev/null
+fi
+sudo tee /opt/aws/amazon-cloudwatch-agent/etc/boxcode.json >/dev/null <<'EOF'
+{
+  "agent": { "metrics_collection_interval": 300 },
+  "metrics": {
+    "namespace": "CWAgent",
+    "aggregation_dimensions": [[]],
+    "metrics_collected": {
+      "disk": {
+        "resources": ["/"],
+        "measurement": ["disk_used_percent"],
+        "metrics_collection_interval": 300
+      }
+    }
+  }
+}
+EOF
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/boxcode.json >/dev/null
+systemctl is-active --quiet amazon-cloudwatch-agent \
+    || { echo "the cloudwatch agent did not start -- the disk alarm would be blind" >&2; exit 1; }
+
+##############################################################################
+# Control plane
+##############################################################################
+
 echo "== hosting control-plane =="
 if [ -f "$SCRIPT_DIR/control-plane/index.mjs" ]; then
-    sudo mkdir -p /opt/boxcode-hosting-cp
-    sudo cp "$SCRIPT_DIR"/control-plane/*.mjs /opt/boxcode-hosting-cp/
+    # The directory layout is preserved, not flattened. index.mjs imports
+    # ../runtime/*.mjs by relative path and shells out to lifecycle/ and
+    # rootfs/, so copying every .mjs into one directory -- which an earlier
+    # version of this did -- breaks every import on the first start.
+    sudo mkdir -p /opt/boxcode-hosting/{control-plane,runtime,lifecycle,rootfs,nginx,kill-switch,state}
+    sudo cp "$SCRIPT_DIR"/control-plane/*.mjs /opt/boxcode-hosting/control-plane/
+    sudo cp "$SCRIPT_DIR"/runtime/*.mjs      /opt/boxcode-hosting/runtime/
+    sudo cp "$SCRIPT_DIR"/lifecycle/*.sh     /opt/boxcode-hosting/lifecycle/
+    sudo cp "$SCRIPT_DIR"/rootfs/*.sh        /opt/boxcode-hosting/rootfs/
+    sudo cp "$SCRIPT_DIR"/nginx/*            /opt/boxcode-hosting/nginx/ 2>/dev/null || true
+    # scope.mjs decides which microVMs the kill switch may stop, and
+    # lifecycle/kill-switch.sh imports it by path. Leaving it out does not make
+    # the switch fall back to something cruder -- it makes the switch write its
+    # 503 block, crash on the missing import, and stop no VMs at all. Traffic
+    # blocked, everything still running and still billing: the one state a kill
+    # switch must never be able to reach. Found by firing it in production.
+    sudo cp "$SCRIPT_DIR"/kill-switch/*.mjs  /opt/boxcode-hosting/kill-switch/
+    sudo chmod 0755 /opt/boxcode-hosting/lifecycle/*.sh /opt/boxcode-hosting/rootfs/*.sh
+    # State is the registry and the deploy history: 0700, since the history
+    # holds token hashes and the registry holds every project's slot.
+    sudo chmod 0700 /opt/boxcode-hosting/state
+
+    # Checked here because the kill switch is the one thing whose first real use
+    # is an emergency. A missing file must fail provisioning, not the incident.
+    for f in /opt/boxcode-hosting/kill-switch/scope.mjs \
+             /opt/boxcode-hosting/lifecycle/kill-switch.sh; do
+        [ -s "$f" ] || { echo "kill switch is incomplete: $f is missing" >&2; exit 1; }
+    done
+
+    # nginx has to reach the control plane for /api/deploy, and nothing else may.
+    sudo tee /etc/nginx/conf.d/app-projects/_deploy.conf >/dev/null <<'EOF'
+location = /api/deploy {
+    proxy_pass http://127.0.0.1:8085/deploy;
+    proxy_set_header Host $host;
+    # Without this every deploy appears to come from 127.0.0.1 and every
+    # per-address limit in the gate becomes a per-box limit.
+    proxy_set_header X-Forwarded-For $remote_addr;
+    # A deploy carries the whole project base64-encoded: 8 MB of source is
+    # 11 MB on the wire. 1m here refused every real deploy with a 413 that
+    # never reached the control plane to be explained.
+    client_max_body_size 16m;
+    # The control plane accepts and returns immediately, but it writes the
+    # project to disk first, and that is not instant for 400 files.
+    proxy_read_timeout 120s;
+}
+# Quoted, and it has to be. nginx uses braces for blocks, so a regex
+# containing {4,16} is parsed as the end of the location block unless the
+# whole expression is in quotes -- it fails with "missing closing parenthesis",
+# which points at the wrong thing entirely.
+location ~ "^/api/deploy/status/([a-z2-9]{4,16})$" {
+    proxy_pass http://127.0.0.1:8085/status/$1;
+    proxy_set_header Host $host;
+}
+EOF
+    sudo nginx -t && sudo systemctl reload nginx
+
     sudo cp "$SCRIPT_DIR/control-plane/boxcode-hosting-control-plane.service" \
-        /etc/systemd/system/boxcode-hosting-control-plane.service
+        /etc/systemd/system/
     sudo systemctl daemon-reload
     sudo systemctl enable --now boxcode-hosting-control-plane
     sudo systemctl restart boxcode-hosting-control-plane
     sudo systemctl --no-pager status boxcode-hosting-control-plane
 else
-    # Not an error. The box is provisioned and reachable; it just has nothing
-    # to deploy into yet. Failing here would put the ASG into a replace loop
-    # that no amount of retrying fixes.
-    echo "no control-plane/ in this bundle -- box is provisioned but cannot"
-    echo "accept deploys yet. This is expected until it ships."
+    # Not a failure. The box is a working Firecracker host; it just has nothing
+    # driving it yet.
+    echo "no control-plane/ yet -- box is provisioned but cannot accept deploys."
 fi
 
 echo "== done: $(date -Is) =="
