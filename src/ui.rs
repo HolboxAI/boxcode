@@ -504,28 +504,6 @@ fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
         }
         if let Some(status) = activity_line(app) {
             lines.push(status);
-            // One line of what the model is actually thinking about, under the
-            // spinner. One line, not the stream: this redraws every frame, and
-            // a chain of thought scrolling past at streaming speed is not
-            // something anyone reads -- it is something that proves the thing
-            // is alive, which one line does just as well.
-            if let Some(thought) = app.thinking_line() {
-                let room = width.saturating_sub(2).max(8);
-                // The *end* of the line when it does not fit, not the start:
-                // what the model is working through right now is the part that
-                // shows it is still moving, and the head of a long thought
-                // would sit frozen while the tail scrolled on invisibly.
-                let shown = if thought.chars().count() > room {
-                    let skip = thought.chars().count() - (room - 1);
-                    format!("…{}", thought.chars().skip(skip).collect::<String>())
-                } else {
-                    thought.to_string()
-                };
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(shown, theme::faint()),
-                ]));
-            }
         }
     }
 
@@ -591,7 +569,7 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
             // that looks hung and one that looks busy. A reasoning model can
             // spend minutes here, and every byte of it used to be discarded
             // with nothing on screen to show for it.
-            let verb = if app.thinking_line().is_some() {
+            let verb = if app.is_thinking() {
                 "Thinking"
             } else {
                 "Responding"
@@ -4282,11 +4260,11 @@ mod tests {
         assert!(!idle.contains("esc to interrupt"), "{idle}");
     }
 
-    /// The bug this whole change exists for: a reasoning model streams its
-    /// chain of thought before a word of the answer, and with nothing on
-    /// screen the app was indistinguishable from hung.
+    /// A reasoning model spends its first moments streaming chain of thought;
+    /// the spinner must show "Thinking" without printing that thought, then
+    /// flip to "Responding" once the answer starts.
     #[test]
-    fn reasoning_shows_as_thinking_with_the_thought_underneath() {
+    fn reasoning_shows_as_thinking_without_the_thought() {
         let mut app = App::new(crate::config::Config::default());
         app.greeted = true;
         app.state = AppState::Streaming;
@@ -4296,12 +4274,11 @@ mod tests {
         let rendered = rendered_text(&mut app, 80, 24);
         assert!(rendered.contains("Thinking…"), "{rendered}");
         assert!(
-            rendered.contains("The entry point is main.jsx"),
-            "the latest thought should be on screen: {rendered}"
+            !rendered.contains("The entry point is main.jsx"),
+            "the chain of thought must not be printed: {rendered}"
         );
 
-        // The answer starting is what ends it: a thought left standing under a
-        // reply that has moved on reads as still deliberating.
+        // The answer starting is what ends it.
         app.append_token("Here is the app.");
         let answering = rendered_text(&mut app, 80, 24);
         assert!(answering.contains("Responding…"), "{answering}");

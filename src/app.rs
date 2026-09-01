@@ -218,19 +218,6 @@ pub const COMMANDS: &[(&str, &str)] = &[
 /// before/after cannot drift into three different approximations.
 pub const CHARS_PER_TOKEN: usize = 4;
 
-/// What `/compact` asks the model for.
-///
-/// Written as instructions to itself rather than as a request for a report:
-/// the reply *becomes* the conversation, so anything it leaves out is gone for
-/// good. Hence the emphasis on specifics -- a summary that says "fixed the
-/// bug" instead of naming the file has thrown away the only copy.
-/// How much of a reasoning stream is kept for the live area.
-///
-/// Enough to hold the sentence in progress, and no more: this is not a
-/// transcript of the model's thinking, it is evidence that thinking is
-/// happening. The whole chain of thought on a hard problem runs to thousands
-/// of characters, and keeping it would mean growing a buffer, on every frame,
-/// for text nobody can read at streaming speed.
 /// The most a paste may put in the prompt box.
 ///
 /// Sized off the context window rather than off the terminal: at
@@ -242,8 +229,12 @@ pub const CHARS_PER_TOKEN: usize = 4;
 /// provider's words instead of theirs.
 const MAX_PASTE_CHARS: usize = 200_000;
 
-const MAX_REASONING_TAIL: usize = 400;
-
+/// What `/compact` asks the model for.
+///
+/// Written as instructions to itself rather than as a request for a report:
+/// the reply *becomes* the conversation, so anything it leaves out is gone for
+/// good. Hence the emphasis on specifics -- a summary that says "fixed the
+/// bug" instead of naming the file has thrown away the only copy.
 const COMPACT_INSTRUCTION: &str = "\
 Summarise the conversation above so that it can replace it entirely as your context.
 
@@ -485,19 +476,16 @@ pub struct App {
     /// estimate -- the same kind of approximation Claude Code's own live
     /// counter is understood to show mid-stream.
     pub streamed_chars: usize,
-    /// Reasoning characters streamed this turn, and the tail of them.
+    /// Reasoning characters streamed this turn.
     ///
     /// Held apart from `streaming_response` on purpose: reasoning is never
-    /// persisted, never replayed by `/resume`, and never sent back on the
-    /// wire. It exists to answer "is anything happening", and the moment
-    /// visible content starts arriving it has answered that question.
-    ///
-    /// The tail is bounded because this is a live area that redraws on every
-    /// frame, and because the whole chain of thought on a hard problem runs to
-    /// thousands of characters that nobody is going to read as it scrolls past
-    /// at streaming speed.
+    /// shown, never persisted, never replayed by `/resume`, and never sent
+    /// back on the wire. It is counted so the live token estimate and the
+    /// persisted usage log still bill a reasoning model's chain of thought,
+    /// and its arrival while no answer has started is what flips the spinner
+    /// label to "Thinking" -- evidence of life, without printing the thoughts
+    /// themselves.
     pub reasoning_chars: usize,
-    pub reasoning_tail: String,
     /// Completed turns' usage, queued for `main.rs` to persist to
     /// `usage.jsonl` and drain. Deliberately not written to disk from in
     /// here: `App`'s methods are exercised directly by a few hundred unit
@@ -640,7 +628,6 @@ impl App {
             request_started: None,
             streamed_chars: 0,
             reasoning_chars: 0,
-            reasoning_tail: String::new(),
             pending_usage: Vec::new(),
             quota: crate::quota::DailyQuota::default(),
             exact_usage: None,
@@ -1004,7 +991,6 @@ impl App {
         self.busy_started = Some(std::time::Instant::now());
         self.streamed_chars = 0;
         self.reasoning_chars = 0;
-        self.reasoning_tail.clear();
         // Recall skips consecutive duplicates: pressing Enter twice on the same
         // prompt should not mean pressing Up twice to get past it.
         if self.prompt_history.last().map(String::as_str) != Some(prompt.as_str()) {
@@ -1537,7 +1523,6 @@ impl App {
         self.busy_started = Some(std::time::Instant::now());
         self.streamed_chars = 0;
         self.reasoning_chars = 0;
-        self.reasoning_tail.clear();
         self.messages.push(Message::new(Role::User, prompt));
         self.state = AppState::Sending;
     }
@@ -1594,7 +1579,6 @@ impl App {
         self.stream_printed = 0;
         self.streamed_chars = 0;
         self.reasoning_chars = 0;
-        self.reasoning_tail.clear();
         self.tool_steps = 0;
         self.busy_started = Some(std::time::Instant::now());
         self.state = AppState::Sending;
@@ -2643,42 +2627,31 @@ impl App {
         if self.state == AppState::Streaming {
             self.streaming_response.push_str(token);
             self.streamed_chars += token.chars().count();
-            // The answer has started, so the thinking is over. Cleared rather
-            // than left standing: a stale line of reasoning under a reply that
-            // has moved on reads as the model still deliberating about
-            // something it already answered.
-            self.reasoning_tail.clear();
+            // The answer has started, so the thinking label is over. Nothing
+            // more to do here: the spinner verb is derived from the response
+            // being empty, which this just made false.
         }
     }
 
-    /// A fragment of the model's reasoning. Counted and kept only as a tail --
-    /// see `reasoning_tail`.
+    /// A fragment of the model's reasoning. Counted toward the turn's token
+    /// estimate, and that is all: the chain of thought is the model's private
+    /// working, so it is never shown, persisted, replayed, or sent back on the
+    /// wire.
     pub fn append_reasoning(&mut self, text: &str) {
         if self.state != AppState::Streaming {
             return;
         }
         self.reasoning_chars += text.chars().count();
-        self.reasoning_tail.push_str(text);
-        if self.reasoning_tail.chars().count() > MAX_REASONING_TAIL {
-            // Kept from the *end*: what the model is thinking about now is the
-            // part that shows it is still moving.
-            let skip = self.reasoning_tail.chars().count() - MAX_REASONING_TAIL;
-            self.reasoning_tail = self.reasoning_tail.chars().skip(skip).collect();
-        }
     }
 
-    /// The most recent line of reasoning, for the live area. `None` once
-    /// content has started arriving, or when there is nothing to show.
-    ///
-    /// Split on newlines only. An earlier version also broke on `.` to get the
-    /// last *sentence*, which is a reasonable idea about prose and a bad one
-    /// about this prose: reasoning is full of `main.jsx`, `v1.8.0` and
-    /// `package.json`, and the rule reliably reduced a whole thought to `jsx`.
-    pub fn thinking_line(&self) -> Option<&str> {
-        self.reasoning_tail
-            .rsplit('\n')
-            .map(str::trim)
-            .find(|part| !part.is_empty())
+    /// Whether the model is still thinking: reasoning has arrived and no
+    /// answer token has started. Drives the live spinner's "Thinking" label,
+    /// so a long reasoning phase reads as busy rather than hung -- without
+    /// printing the thoughts themselves.
+    pub fn is_thinking(&self) -> bool {
+        self.state == AppState::Streaming
+            && self.reasoning_chars > 0
+            && self.streaming_response.is_empty()
     }
 
     /// Terminates the turn. Deliberately a no-op unless still `Streaming`: a
@@ -6190,13 +6163,13 @@ mod tests {
     // ---- live progress ------------------------------------------------------
 
     /// Reasoning is evidence the model is working, not part of the answer: it
-    /// is counted and shown, and it never reaches the transcript or the wire.
+    /// is counted and it never reaches the transcript or the wire.
     #[test]
-    fn reasoning_is_shown_but_never_kept() {
+    fn reasoning_is_counted_but_never_kept() {
         let mut a = streaming_app();
         a.append_reasoning("Checking the scaffold.\nmain.jsx is the entry point");
 
-        assert_eq!(a.thinking_line(), Some("main.jsx is the entry point"));
+        assert!(a.is_thinking());
         assert!(a.reasoning_chars > 0);
         // Not part of the reply, so not in the transcript and not on the wire.
         assert!(a.streaming_response.is_empty());
@@ -6208,28 +6181,17 @@ mod tests {
         );
     }
 
-    /// The answer starting is what ends the thinking. A thought left standing
-    /// under a reply that has moved on reads as still deliberating.
+    /// The answer starting is what ends the thinking label. A spinner still
+    /// saying "Thinking" under a reply that has moved on reads as still
+    /// deliberating.
     #[test]
-    fn the_first_token_of_the_answer_clears_the_thought() {
+    fn the_first_token_of_the_answer_ends_the_thinking_label() {
         let mut a = streaming_app();
         a.append_reasoning("weighing the options");
-        assert!(a.thinking_line().is_some());
+        assert!(a.is_thinking());
 
         a.append_token("Here it is.");
-        assert_eq!(a.thinking_line(), None);
-    }
-
-    /// Unbounded, this grows on every frame for the length of a long think.
-    #[test]
-    fn the_reasoning_tail_is_bounded() {
-        let mut a = streaming_app();
-        for _ in 0..200 {
-            a.append_reasoning("thinking about this some more, at length. ");
-        }
-        assert!(a.reasoning_tail.chars().count() <= MAX_REASONING_TAIL);
-        // The count is of everything, not of what was kept.
-        assert!(a.reasoning_chars > MAX_REASONING_TAIL);
+        assert!(!a.is_thinking());
     }
 
     /// Reasoning that arrives after the turn has moved on is dropped rather
@@ -6240,7 +6202,7 @@ mod tests {
         a.state = AppState::ExecutingTools;
         a.append_reasoning("late");
         assert_eq!(a.reasoning_chars, 0);
-        assert_eq!(a.thinking_line(), None);
+        assert!(!a.is_thinking());
     }
 
     /// Reasoning is billed as completion tokens, so an estimate that ignored
