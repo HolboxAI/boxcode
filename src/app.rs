@@ -502,6 +502,16 @@ pub struct App {
     /// Exact counts for the turn in flight, when the endpoint reported them.
     /// `None` means fall back to the character estimate.
     pub exact_usage: Option<crate::llm::ApiUsage>,
+    /// Prompt tokens this session that the endpoint reported, and how many of
+    /// them it served from its prefix cache.
+    ///
+    /// Cumulative rather than per-request because the ratio is what matters
+    /// and a single request only ever reads 0% or ~100%. Both providers in
+    /// `providers.rs` cache automatically, so a low rate here is a bug in what
+    /// this end sends -- anything that changes the front of the request
+    /// invalidates the whole prefix -- not a missing feature.
+    pub cache_prompt_tokens: usize,
+    pub cache_hit_tokens: usize,
     /// Set once a day so an approaching-limit notice appears once rather than
     /// before every prompt.
     pub warned_today: bool,
@@ -631,6 +641,8 @@ impl App {
             pending_usage: Vec::new(),
             quota: crate::quota::DailyQuota::default(),
             exact_usage: None,
+            cache_prompt_tokens: 0,
+            cache_hit_tokens: 0,
             warned_today: false,
             quota_dirty: false,
             workspace_status: String::new(),
@@ -1375,6 +1387,10 @@ impl App {
         self.follow_tail = true;
         self.greeted = true;
         self.last_prompt_tokens = None;
+        // Session-scoped, like the transcript itself: a cache rate measured
+        // across a conversation that no longer exists describes nothing.
+        self.cache_prompt_tokens = 0;
+        self.cache_hit_tokens = 0;
         // "Forget what we discussed" reasonably includes "and stop offering to
         // undo it": the transcript naming those writes is about to go, and an
         // undo the user can no longer see the reason for is a trap. `/compact`
@@ -1664,8 +1680,20 @@ impl App {
         // context actually is -- is still true after the turn ends.
         if usage.prompt_tokens > 0 {
             self.last_prompt_tokens = Some(usage.prompt_tokens);
+            self.cache_prompt_tokens = self.cache_prompt_tokens.saturating_add(usage.prompt_tokens);
+            self.cache_hit_tokens =
+                self.cache_hit_tokens.saturating_add(usage.cached_prompt_tokens());
         }
         self.exact_usage = Some(usage);
+    }
+
+    /// The share of this session's prompt tokens the endpoint served from
+    /// cache, as a percentage. `None` until an endpoint has reported prompt
+    /// tokens at all, which is not the same as a rate of zero: one means
+    /// "nothing to say yet", the other means "every request paid full price".
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        (self.cache_prompt_tokens > 0)
+            .then(|| self.cache_hit_tokens as f64 * 100.0 / self.cache_prompt_tokens as f64)
     }
 
     /// Fold the finished turn into today's quota. Called once per request,
@@ -4709,6 +4737,73 @@ mod tests {
         assert_eq!(a.quota.prompt_tokens, 1000);
         assert_eq!(a.quota.completion_tokens, 500);
         assert!(!a.quota.any_estimated, "reported counts are not estimates");
+    }
+
+    /// The rate has to be cumulative: one request is either a cache hit or a
+    /// miss, so a per-request figure only ever reads 0% or ~100% and says
+    /// nothing about whether the session is being billed well.
+    #[test]
+    fn the_cache_rate_accumulates_across_a_sessions_requests() {
+        let mut a = app();
+        assert_eq!(
+            a.cache_hit_rate(),
+            None,
+            "nothing reported yet is not the same as a rate of zero"
+        );
+
+        // A cold request: the prefix was not there to reuse.
+        a.record_exact_usage(crate::llm::ApiUsage {
+            prompt_tokens: 1_000,
+            completion_tokens: 10,
+            ..Default::default()
+        });
+        assert_eq!(a.cache_hit_rate(), Some(0.0));
+
+        // A warm one, reported the way DeepSeek reports it.
+        a.record_exact_usage(crate::llm::ApiUsage {
+            prompt_tokens: 1_000,
+            completion_tokens: 10,
+            prompt_cache_hit_tokens: 1_000,
+            ..Default::default()
+        });
+        assert_eq!(
+            a.cache_hit_rate(),
+            Some(50.0),
+            "1,000 of the session's 2,000 prompt tokens came from cache"
+        );
+    }
+
+    /// OpenAI nests the same figure a level further down. Both spellings must
+    /// reach the same counter, or the readout silently reads zero for everyone
+    /// on one of the two providers.
+    #[test]
+    fn either_providers_spelling_of_the_cache_figure_is_counted() {
+        let mut a = app();
+        a.record_exact_usage(crate::llm::ApiUsage {
+            prompt_tokens: 400,
+            completion_tokens: 5,
+            prompt_tokens_details: crate::llm::PromptTokensDetails { cached_tokens: 300 },
+            ..Default::default()
+        });
+
+        assert_eq!(a.cache_hit_rate(), Some(75.0));
+    }
+
+    /// A turn the endpoint said nothing about must not be counted as a miss:
+    /// that would drag the rate down for endpoints that simply do not report,
+    /// and read as a caching problem that is not there.
+    #[test]
+    fn a_turn_with_no_reported_usage_does_not_count_against_the_rate() {
+        let mut a = app();
+        a.record_exact_usage(crate::llm::ApiUsage {
+            prompt_tokens: 500,
+            completion_tokens: 5,
+            prompt_cache_hit_tokens: 500,
+            ..Default::default()
+        });
+        a.record_exact_usage(crate::llm::ApiUsage::default());
+
+        assert_eq!(a.cache_hit_rate(), Some(100.0));
     }
 
     #[test]
