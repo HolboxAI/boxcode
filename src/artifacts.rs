@@ -132,6 +132,13 @@ fn collect(root: &Path) -> Result<Vec<Candidate>, String> {
         ]);
     }
 
+    // A JS framework's project root also has an index.html -- Vite's
+    // template -- so collecting from there "succeeds" and previews an
+    // unstyled scaffold. When a real build output sits beside it, that is
+    // what a first publish should put online.
+    let built = prefer_built_output(root);
+    let root = built.as_path();
+
     let mut out = Vec::new();
     walk(root, root, &mut out)?;
     if out.is_empty() {
@@ -181,6 +188,30 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Candidate>) -> Result<(), String>
         out.push(Candidate { source: path, key, size });
     }
     Ok(())
+}
+
+/// Directories a JS framework's build actually writes to. `public/` is not
+/// among them: it is source input for Vite and Next, not output, and picking
+/// it would publish the unbuilt tree under a different name.
+const BUILT_OUTPUT_DIRS: &[&str] = &["dist", "build", "out"];
+
+/// If `root` is a JS project that has already been built, return the build
+/// output directory; otherwise return `root` unchanged.
+fn prefer_built_output(root: &Path) -> PathBuf {
+    if !root.is_dir() || !root.join("package.json").is_file() {
+        return root.to_path_buf();
+    }
+    if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+        if BUILT_OUTPUT_DIRS.contains(&name) {
+            return root.to_path_buf();
+        }
+    }
+    for dir in BUILT_OUTPUT_DIRS {
+        if root.join(dir).join("index.html").is_file() {
+            return root.join(dir);
+        }
+    }
+    root.to_path_buf()
 }
 
 /// Write a tiny `index.html` that displays `name`, so the artifact link opens
@@ -379,37 +410,51 @@ fn served_under(url: &str) -> String {
     }
 }
 
-/// Rewrites root-absolute URLs in HTML so they resolve under the artifact's
-/// own prefix: `src="/assets/app.js"` becomes
-/// `src="/artifacts/k9depef6/assets/app.js"`.
+/// Rewrites asset URLs in HTML so they resolve under the artifact's own
+/// prefix. Two shapes, one failure:
 ///
-/// Without this a perfectly good publish serves a blank page. Every build
-/// tool defaults to assuming it owns the domain root -- Vite's `base`, CRA's
-/// `homepage`, Next's `basePath` all default to `/` -- so a built `index.html`
-/// asks the browser for `/assets/app.js`. An artifact is served from a
-/// sub-path, where that resolves to the domain root and 404s. The upload
-/// succeeded, S3 holds every byte, and the page is empty: the single most
-/// confusing way this can fail, because nothing anywhere reports an error.
+/// - A Vite build emits `src="/assets/app.js"` (domain root).
+/// - A handmade page emits `href="style.css"` (relative).
 ///
-/// Rewriting to an absolute prefix rather than a relative `./` is deliberate.
-/// The artifact URL carries no trailing slash and is not redirected to one,
-/// so a browser resolving `./assets/app.js` from `/artifacts/k9depef6` asks
-/// for `/artifacts/assets/app.js` -- still wrong, just differently. An
-/// absolute prefix does not depend on how the URL was written.
+/// The artifact URL has no trailing slash and is not redirected to one, so a
+/// browser treats the last segment as a file: `./style.css` on
+/// `/artifacts/k9depef6` asks for `/artifacts/style.css`. Either way the
+/// upload succeeds, S3 holds every byte, and the page is unstyled -- the
+/// single most confusing way this can fail, because nothing anywhere
+/// reports an error until the visitor opens it.
 ///
-/// Only `="/x` and `='/x` are touched. `//host/path` is protocol-relative and
-/// already points at another origin, so it is left alone; so is everything
-/// with a scheme, which cannot match this pattern in the first place.
-fn rebase_absolute_urls(html: &[u8], prefix: &str) -> Vec<u8> {
+/// Rewriting to an absolute prefix rather than a relative `./` is
+/// deliberate: an absolute prefix does not depend on how the URL was
+/// written. `//host/path` is protocol-relative and already points at
+/// another origin, so it is left alone; so is everything with a scheme.
+///
+/// `file_key` is the artifact-relative path of this HTML file, so a nested
+/// page's `../style.css` lands at the prefix root rather than being
+/// naively prefixed.
+fn rebase_page_urls(html: &[u8], prefix: &str, file_key: &str) -> Vec<u8> {
     if prefix.is_empty() {
         return html.to_vec();
     }
+    let Ok(text) = std::str::from_utf8(html) else {
+        // Surrounding markup may be any encoding at all. The byte-wise
+        // root-absolute pass still applies; relative URLs are left alone
+        // rather than corrupting a page this cannot parse.
+        return rebase_root_absolute_bytes(html, prefix);
+    };
+    let with_attrs = rebase_html_attr_urls(text, prefix, file_key);
+    rebase_css_urls(with_attrs.as_bytes(), prefix)
+}
+
+/// Tests and the Vite fixture call this with an implicit `index.html`.
+#[cfg(test)]
+fn rebase_absolute_urls(html: &[u8], prefix: &str) -> Vec<u8> {
+    rebase_page_urls(html, prefix, "index.html")
+}
+
+fn rebase_root_absolute_bytes(html: &[u8], prefix: &str) -> Vec<u8> {
     let prefix = prefix.as_bytes();
     let mut out = Vec::with_capacity(html.len() + 128);
     let mut i = 0;
-    // Byte-wise rather than over `String`: the surrounding markup may be any
-    // encoding at all, and copying bytes through untouched is what keeps a
-    // page this cannot parse from being corrupted by trying.
     while i < html.len() {
         if html[i] == b'='
             && i + 3 < html.len()
@@ -420,8 +465,6 @@ fn rebase_absolute_urls(html: &[u8], prefix: &str) -> Vec<u8> {
             out.push(b'=');
             out.push(html[i + 1]);
             out.extend_from_slice(prefix);
-            // The `/` at i+2 is copied by the next turn of the loop, so the
-            // prefix joins the path without either doubling or losing it.
             i += 2;
             continue;
         }
@@ -429,6 +472,204 @@ fn rebase_absolute_urls(html: &[u8], prefix: &str) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+fn rebase_html_attr_urls(text: &str, prefix: &str, file_key: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 128);
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_attr_name(bytes, i, b"src") || is_attr_name(bytes, i, b"href") {
+            if let Some((consumed, rewritten)) = rewrite_quoted_attr(text, i, prefix, file_key) {
+                out.push_str(&rewritten);
+                i += consumed;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().expect("index is in-bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn is_attr_name(bytes: &[u8], i: usize, name: &[u8]) -> bool {
+    let end = i + name.len();
+    if end > bytes.len() || !bytes[i..end].eq_ignore_ascii_case(name) {
+        return false;
+    }
+    if i > 0 {
+        let prev = bytes[i - 1];
+        if !prev.is_ascii_whitespace() && prev != b'<' {
+            return false;
+        }
+    }
+    matches!(
+        bytes.get(end),
+        Some(b'=') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+    )
+}
+
+/// From the start of an attribute name, copy through the closing quote,
+/// rewriting the URL. `None` when the attribute is not a quoted value, so
+/// the caller copies bytes through unchanged.
+fn rewrite_quoted_attr(
+    text: &str,
+    i: usize,
+    prefix: &str,
+    file_key: &str,
+) -> Option<(usize, String)> {
+    let bytes = text.as_bytes();
+    let mut j = i;
+    while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+        j += 1;
+    }
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b'=' {
+        return None;
+    }
+    j += 1;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let quote = *bytes.get(j)?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    j += 1;
+    let value_start = j;
+    while j < bytes.len() && bytes[j] != quote {
+        j += 1;
+    }
+    if j >= bytes.len() {
+        return None;
+    }
+    let value = &text[value_start..j];
+    let mut out = String::from(&text[i..value_start]);
+    out.push_str(&rebase_url_value(value, prefix, file_key));
+    out.push(quote as char);
+    Some((j + 1 - i, out))
+}
+
+fn rebase_url_value(value: &str, prefix: &str, file_key: &str) -> String {
+    let trimmed = value.trim();
+    if skip_external_url(trimmed) {
+        return value.to_string();
+    }
+    let prefix = prefix.trim_end_matches('/');
+    if trimmed.starts_with('/') {
+        if trimmed == prefix || trimmed.starts_with(&format!("{prefix}/")) {
+            return value.to_string();
+        }
+        return format!("{prefix}{trimmed}");
+    }
+    let resolved = resolve_relative(file_key, trimmed);
+    if resolved.is_empty() {
+        return value.to_string();
+    }
+    format!("{prefix}/{resolved}")
+}
+
+fn skip_external_url(value: &str) -> bool {
+    value.is_empty()
+        || value.starts_with('#')
+        || value.starts_with('?')
+        || value.starts_with("data:")
+        || value.starts_with("mailto:")
+        || value.starts_with("tel:")
+        || value.starts_with("javascript:")
+        || value.starts_with("//")
+        || value.contains("://")
+}
+
+/// Resolves `relative` against the directory of `file_key` the way a
+/// browser would if the page URL *did* have a trailing slash -- which is
+/// the location the file actually occupies in the artifact.
+fn resolve_relative(file_key: &str, relative: &str) -> String {
+    let (path, suffix) = match relative.find(['?', '#']) {
+        Some(i) => (&relative[..i], &relative[i..]),
+        None => (relative, ""),
+    };
+    let dir = match file_key.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    };
+    let mut stack: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            stack.pop();
+            continue;
+        }
+        stack.push(seg);
+    }
+    let mut out = stack.join("/");
+    out.push_str(suffix);
+    out
+}
+
+/// Rewrites root-absolute `url(/...)` in a stylesheet. Relative `url(x)`
+/// is left alone: a CSS file is served with a filename, so the browser
+/// already resolves those against the file's directory, which is correct.
+fn rebase_css_urls(input: &[u8], prefix: &str) -> Vec<u8> {
+    if prefix.is_empty() {
+        return input.to_vec();
+    }
+    let Ok(text) = std::str::from_utf8(input) else {
+        return input.to_vec();
+    };
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 4 <= bytes.len() && bytes[i..i + 4].eq_ignore_ascii_case(b"url(") {
+            out.push_str(&text[i..i + 4]);
+            i += 4;
+            let ws_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            out.push_str(&text[ws_start..i]);
+            let quote = bytes.get(i).copied().filter(|b| *b == b'"' || *b == b'\'');
+            if let Some(q) = quote {
+                out.push(q as char);
+                i += 1;
+            }
+            let val_start = i;
+            let val_end = match quote {
+                Some(q) => text[i..].find(q as char).map(|n| i + n).unwrap_or(text.len()),
+                None => {
+                    let mut k = i;
+                    while k < bytes.len() && bytes[k] != b')' && !bytes[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    k
+                }
+            };
+            let value = &text[val_start..val_end];
+            if value.starts_with('/') && !value.starts_with("//") {
+                let p = prefix.trim_end_matches('/');
+                if value == p || value.starts_with(&format!("{p}/")) {
+                    out.push_str(value);
+                } else {
+                    out.push_str(p);
+                    out.push_str(value);
+                }
+            } else {
+                out.push_str(value);
+            }
+            i = val_end;
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("index is in-bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out.into_bytes()
 }
 
 fn extension(name: &str) -> Option<String> {
@@ -548,7 +789,9 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
         let bytes = if is_html(&candidate.key) {
             // Rebase before injecting, so the reload script is never itself a
             // candidate for rewriting.
-            inject_live_reload(rebase_absolute_urls(&bytes, &prefix))
+            inject_live_reload(rebase_page_urls(&bytes, &prefix, &candidate.key))
+        } else if extension(&candidate.key).as_deref() == Some("css") {
+            rebase_css_urls(&bytes, &prefix)
         } else {
             bytes
         };
@@ -986,13 +1229,67 @@ mod tests {
         assert!(!text.contains("/artifacts/abc"), "nothing should have been rewritten: {text}");
     }
 
-    /// Relative URLs already resolve correctly and must not be touched --
-    /// rewriting them would double the prefix on a republish.
+    /// Relative URLs do *not* resolve correctly on an artifact URL: there is
+    /// no trailing slash, so the browser drops the id. They have to become
+    /// prefix-absolute the same way Vite's `/assets/` URLs do. Rewriting
+    /// from the file on disk (never from previously uploaded HTML) means a
+    /// republish cannot double the prefix.
     #[test]
-    fn relative_urls_are_untouched() {
-        let html = br#"<img src="logo.png"><img src="./a/b.png"><a href="../up.html">"#;
+    fn relative_urls_are_rewritten_to_the_artifact_prefix() {
+        let html = br#"<link rel="stylesheet" href="style.css"><img src="./a/b.png"><script src="assets/app.js">"#;
         let out = rebase_absolute_urls(html, "/artifacts/abc");
-        assert_eq!(out, html.to_vec());
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#"href="/artifacts/abc/style.css""#), "{text}");
+        assert!(text.contains(r#"src="/artifacts/abc/a/b.png""#), "{text}");
+        assert!(text.contains(r#"src="/artifacts/abc/assets/app.js""#), "{text}");
+        // After rewrite, a browser opening the artifact URL fetches the
+        // stylesheet from the prefix -- the path that actually exists --
+        // instead of one directory too high.
+        assert_eq!(
+            referenced_assets(&text, "https://boxcode.sh/artifacts/abc"),
+            vec![
+                "https://boxcode.sh/artifacts/abc/a/b.png".to_string(),
+                "https://boxcode.sh/artifacts/abc/assets/app.js".to_string(),
+                "https://boxcode.sh/artifacts/abc/style.css".to_string(),
+            ]
+        );
+    }
+
+    /// A nested page's `../style.css` must land at the artifact root, not
+    /// at `/artifacts/id/../style.css` (which is `/artifacts/style.css`).
+    #[test]
+    fn nested_relative_urls_resolve_against_the_file_not_the_prefix() {
+        let html = br#"<link rel="stylesheet" href="../style.css"><img src="./photo.png">"#;
+        let out = rebase_page_urls(html, "/artifacts/abc", "pages/about.html");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#"href="/artifacts/abc/style.css""#), "{text}");
+        assert!(text.contains(r#"src="/artifacts/abc/pages/photo.png""#), "{text}");
+    }
+
+    /// A stylesheet that assumes it owns the domain root 404s its fonts
+    /// and images the same way Vite 404s `/assets/`. Relative `url(x)` is
+    /// already correct (the CSS file has a filename, so the directory is
+    /// the artifact prefix) and must not be rewritten.
+    #[test]
+    fn root_absolute_urls_inside_css_are_rebased() {
+        let css = br#"@import url("/fonts/figtree.css");
+body{background:url(/img/bg.png)}
+h1{background:url(logo.png)}"#;
+        let out = rebase_css_urls(css, "/artifacts/abc");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#"url("/artifacts/abc/fonts/figtree.css")"#), "{text}");
+        assert!(text.contains("url(/artifacts/abc/img/bg.png)"), "{text}");
+        assert!(text.contains("url(logo.png)"), "relative css urls must be left alone: {text}");
+    }
+
+    /// Republishing HTML that was already rebased (or a page that linked
+    /// with the prefix already in it) must not stack a second copy.
+    #[test]
+    fn an_already_prefixed_url_is_not_prefixed_again() {
+        let html = br#"<link href="/artifacts/abc/style.css" rel="stylesheet">"#;
+        let out = rebase_absolute_urls(html, "/artifacts/abc");
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("/artifacts/abc").count(), 1, "{text}");
     }
 
     /// Single quotes are as valid as double in HTML, and a bare `href="/"`
@@ -1236,6 +1533,44 @@ mod tests {
         let mut keys: Vec<String> = collect(&dir).expect("collect").into_iter().map(|c| c.key).collect();
         keys.sort();
         assert_eq!(keys, vec!["assets/app.css", "assets/app.js", "index.html"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pointing publish at a Vite/React project root after `npm run build`
+    /// must upload `dist/` (or `build/`/`out/`), not the unbuilt template
+    /// sitting at the root. Without this, a first preview is an unstyled
+    /// scaffold even though the built CSS is on disk.
+    #[test]
+    fn a_js_project_root_publishes_its_build_output() {
+        let dir = temp("js-root");
+        write(&dir, "package.json", r#"{"name":"app","scripts":{"build":"vite build"}}"#);
+        write(&dir, "index.html", "<script type=module src=/src/main.js></script>");
+        write(&dir, "src/main.js", "import './style.css'");
+        write(&dir, "dist/index.html", r#"<link rel="stylesheet" href="/assets/app.css">"#);
+        write(&dir, "dist/assets/app.css", "body{}");
+
+        let mut keys: Vec<String> = collect(&dir).expect("collect").into_iter().map(|c| c.key).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["assets/app.css", "index.html"],
+            "the unbuilt src/ tree must not be what is published: {keys:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A handmade HTML site with a package.json but no build output is
+    /// still published from the root -- there is nothing else to pick.
+    #[test]
+    fn a_static_site_with_package_json_is_not_forced_into_a_missing_dist() {
+        let dir = temp("static-pkg");
+        write(&dir, "package.json", r#"{"name":"site"}"#);
+        write(&dir, "index.html", r#"<link rel="stylesheet" href="style.css">"#);
+        write(&dir, "style.css", "body{}");
+
+        let mut keys: Vec<String> = collect(&dir).expect("collect").into_iter().map(|c| c.key).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["index.html", "package.json", "style.css"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
