@@ -27,6 +27,13 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
+/// OpenAI reports the cached share of the prompt nested one level down.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: usize,
+}
+
 /// Token counts as the endpoint reports them, when it does.
 #[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ApiUsage {
@@ -34,11 +41,30 @@ pub struct ApiUsage {
     pub prompt_tokens: usize,
     #[serde(default)]
     pub completion_tokens: usize,
+    /// DeepSeek's name for the part of the prompt that hit its context cache.
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: usize,
+    /// OpenAI's name for the same figure. Both are read because the two
+    /// providers in `providers.rs` disagree about where to put it, and a
+    /// custom endpoint may be either shape.
+    #[serde(default)]
+    pub prompt_tokens_details: PromptTokensDetails,
 }
 
 impl ApiUsage {
     pub fn total(&self) -> usize {
         self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
+
+    /// How much of the prompt the endpoint served from cache.
+    ///
+    /// Not added to `total`: a cached token is a *discounted* prompt token,
+    /// already counted in `prompt_tokens`, not an extra one. Reported by at
+    /// most one of the two field names, so the larger wins rather than the
+    /// sum -- adding them would double-count an endpoint that sends both.
+    pub fn cached_prompt_tokens(&self) -> usize {
+        self.prompt_cache_hit_tokens
+            .max(self.prompt_tokens_details.cached_tokens)
     }
 }
 
@@ -1321,7 +1347,10 @@ mod tests {
             StreamEvent::Usage(u) => Some(*u),
             _ => None,
         });
-        assert_eq!(usage, Some(ApiUsage { prompt_tokens: 123, completion_tokens: 45 }));
+        assert_eq!(
+            usage,
+            Some(ApiUsage { prompt_tokens: 123, completion_tokens: 45, ..Default::default() })
+        );
     }
 
     #[tokio::test]
