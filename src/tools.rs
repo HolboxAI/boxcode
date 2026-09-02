@@ -2571,6 +2571,8 @@ async fn execute_run_command(call: &ToolCall, workspace: &Workspace, config: &To
         content.push_str("(no output)\n");
     }
 
+    content = compact_command_output(&command, &content);
+
     let lines = stdout.lines().count() + stderr.lines().count();
     let status = match code {
         Some(0) => format!("{lines} line{}", if lines == 1 { "" } else { "s" }),
@@ -4370,6 +4372,14 @@ pub fn stub_heavy_tool_result(call: &crate::llm::ToolCall, content: &str) -> Str
             call.function.name,
             content.len()
         ),
+        RUN_COMMAND => {
+            let command = json_string_field(&call.function.arguments, "command")
+                .unwrap_or_else(|| "the command".to_string());
+            format!(
+                "[{RUN_COMMAND} `{command}`: {} bytes already shown; run it again if you need the log back]",
+                content.len()
+            )
+        }
         _ => content.to_string(),
     }
 }
@@ -4412,6 +4422,108 @@ fn clip_output(s: &str, max: usize) -> String {
          Do not summarise or count from this partial output -- narrow the command (a filter, \
          fewer fields, --jq, a smaller --limit, or head/tail) and run it again.]"
     )
+}
+
+/// npm/tsc/vite logs are tens of kilobytes of progress the model does not
+/// act on. A successful install still needs the exit code and the last few
+/// lines (the "built in 1.2s"); a failed `tsc` still needs the error
+/// lines. Everything in between is resent on every later round of a
+/// webpage turn unless it is cut here, on the way in.
+fn compact_command_output(command: &str, content: &str) -> String {
+    if !looks_like_noisy_build(command) {
+        return content.to_string();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    if content.starts_with("exit code: 0\n") {
+        compact_successful_build(&lines)
+    } else {
+        compact_failed_build(&lines)
+    }
+}
+
+fn looks_like_noisy_build(command: &str) -> bool {
+    let c = command.to_ascii_lowercase();
+    if c.contains("cargo build") || c.contains("cargo test") || c.contains("pip install") || c.contains("pip3 install")
+    {
+        return true;
+    }
+    // Whole tokens, not substrings: `rustc` contains `tsc`, `description` does not
+    // but must not catch a compiler name by accident either.
+    c.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-'))
+        .any(|tok| {
+            let tok = tok.trim_end_matches(".cmd").trim_end_matches(".exe");
+            matches!(tok, "npm" | "npx" | "yarn" | "pnpm" | "tsc" | "vite" | "webpack" | "esbuild")
+        })
+}
+
+const BUILD_TAIL_LINES: usize = 12;
+const BUILD_FAIL_KEEP: usize = 40;
+
+fn compact_successful_build(lines: &[&str]) -> String {
+    if lines.len() <= BUILD_TAIL_LINES + 2 {
+        return lines.join("\n") + "\n";
+    }
+    let dropped = lines.len().saturating_sub(1 + BUILD_TAIL_LINES);
+    let mut out = String::new();
+    if let Some(first) = lines.first() {
+        out.push_str(first);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "[{dropped} quiet build/install lines omitted; the command succeeded. Tail follows.]\n"
+    ));
+    let tail = &lines[lines.len().saturating_sub(BUILD_TAIL_LINES)..];
+    for line in tail {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn compact_failed_build(lines: &[&str]) -> String {
+    if lines.len() <= BUILD_FAIL_KEEP {
+        return lines.join("\n") + "\n";
+    }
+    let mut seen = vec![false; lines.len()];
+    let mut order: Vec<usize> = Vec::new();
+    let take = |i: usize, seen: &mut [bool], order: &mut Vec<usize>| {
+        if !seen[i] {
+            seen[i] = true;
+            order.push(i);
+        }
+    };
+    if !lines.is_empty() {
+        take(0, &mut seen, &mut order);
+    }
+    for (i, line) in lines.iter().enumerate() {
+        let l = line.to_ascii_lowercase();
+        if l.contains("error")
+            || l.contains("fail")
+            || l.contains("cannot find")
+            || l.contains("not found")
+            || line.contains("error TS")
+        {
+            take(i, &mut seen, &mut order);
+        }
+    }
+    let tail_from = lines.len().saturating_sub(20);
+    for i in tail_from..lines.len() {
+        take(i, &mut seen, &mut order);
+    }
+    order.sort_unstable();
+    let dropped = lines.len() - order.len();
+    if dropped == 0 {
+        return lines.join("\n") + "\n";
+    }
+    let mut out = String::new();
+    for i in order {
+        out.push_str(lines[i]);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "[{dropped} progress lines omitted; the errors and the tail are above.]\n"
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -6829,6 +6941,47 @@ mod tests {
 
         let err = stub_heavy_tool_result(&call, &format!("Error: {}", "x".repeat(STUB_BODY_AFTER + 1)));
         assert!(err.starts_with("Error:"), "{err}");
+    }
+
+    #[test]
+    fn a_successful_npm_install_is_cut_to_a_tail() {
+        let mut log = String::from("exit code: 0\n--- stdout ---\n");
+        for i in 0..80 {
+            log.push_str(&format!("added package {i}\n"));
+        }
+        log.push_str("added 412 packages in 3s\n");
+        let out = compact_command_output("npm install", &log);
+        assert!(out.contains("exit code: 0"), "{out}");
+        assert!(out.contains("quiet build/install lines omitted"), "{out}");
+        assert!(out.contains("added 412 packages in 3s"), "{out}");
+        assert!(!out.contains("added package 0\n"), "the progress spam must be gone: {out}");
+        assert!(out.len() < log.len() / 2, "should be far shorter: {} vs {}", out.len(), log.len());
+    }
+
+    #[test]
+    fn a_failing_tsc_keeps_the_error_lines() {
+        let mut log = String::from("exit code: 2\n--- stderr ---\n");
+        for i in 0..60 {
+            log.push_str(&format!("compiling file {i}.ts\n"));
+        }
+        log.push_str("src/App.tsx(12,5): error TS2322: Type 'string' is not assignable to type 'number'.\n");
+        log.push_str("Found 1 error.\n");
+        let out = compact_command_output("npx tsc --noEmit", &log);
+        assert!(out.contains("exit code: 2"), "{out}");
+        assert!(out.contains("error TS2322"), "{out}");
+        assert!(out.contains("Found 1 error"), "{out}");
+        assert!(!out.contains("compiling file 0.ts"), "{out}");
+    }
+
+    #[test]
+    fn an_ordinary_command_is_not_compacted() {
+        let log = "exit code: 0\n--- stdout ---\nhello\n";
+        assert_eq!(compact_command_output("echo hello", log), log);
+        assert_eq!(
+            compact_command_output("rustc --version", log),
+            log,
+            "rustc contains the letters tsc and must not be treated as a TS build"
+        );
     }
 
     #[tokio::test]
