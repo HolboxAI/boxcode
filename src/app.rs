@@ -3860,7 +3860,7 @@ mod tests {
     fn a_turn_past_the_threshold_compacts_itself_with_a_notice() {
         let mut a = a_conversation();
         a.config.compact.auto_at_tokens = 4_000;
-        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 5_000, completion_tokens: 20 });
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 5_000, completion_tokens: 20, ..Default::default() });
         a.state = AppState::Streaming;
         a.streaming_response = "Done.".to_string();
 
@@ -3877,7 +3877,7 @@ mod tests {
     fn a_turn_below_the_threshold_does_not_compact() {
         let mut a = a_conversation();
         a.config.compact.auto_at_tokens = 4_000;
-        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 3_000, completion_tokens: 20 });
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 3_000, completion_tokens: 20, ..Default::default() });
         a.state = AppState::Streaming;
         a.streaming_response = "Done.".to_string();
 
@@ -3892,7 +3892,7 @@ mod tests {
         let mut a = a_conversation();
         a.config.compact.auto = false;
         a.config.compact.auto_at_tokens = 4_000;
-        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 50_000, completion_tokens: 20 });
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 50_000, completion_tokens: 20, ..Default::default() });
         a.state = AppState::Streaming;
         a.streaming_response = "Done.".to_string();
 
@@ -3909,7 +3909,7 @@ mod tests {
     fn a_failed_request_does_not_trigger_auto_compaction() {
         let mut a = a_conversation();
         a.config.compact.auto_at_tokens = 4_000;
-        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 50_000, completion_tokens: 0 });
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 50_000, completion_tokens: 0, ..Default::default() });
         a.state = AppState::Streaming;
 
         a.fail_stream("connection reset".to_string());
@@ -4701,7 +4701,7 @@ mod tests {
     fn exact_counts_from_the_endpoint_are_preferred_over_the_estimate() {
         let mut a = app();
         a.quota.date = crate::quota::today();
-        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 1000, completion_tokens: 500 });
+        a.record_exact_usage(crate::llm::ApiUsage { prompt_tokens: 1000, completion_tokens: 500, ..Default::default() });
         a.state = AppState::Streaming;
         a.append_token(&"x".repeat(4000)); // would estimate ~1000
         a.finish_stream();
@@ -4821,6 +4821,7 @@ mod tests {
         a.record_exact_usage(crate::llm::ApiUsage {
             prompt_tokens: 36_110,
             completion_tokens: 17_300,
+            ..Default::default()
         });
         a.finish_stream();
 
@@ -5308,6 +5309,7 @@ mod tests {
         a.record_exact_usage(crate::llm::ApiUsage {
             prompt_tokens: 4_000,
             completion_tokens: 300,
+            ..Default::default()
         });
         a.streaming_response = "Short summary.".to_string();
         a.finish_stream();
