@@ -601,14 +601,17 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
     } else {
         String::new()
     };
-    Some(Line::from(vec![
-        Span::styled(format!("{frame} "), theme::accent()),
-        Span::styled(format!("{verb}… "), Style::default().fg(theme::p().accent_soft)),
-        Span::styled(
-            format!("({secs}s{detail}{turn_note} · esc to interrupt)"),
-            theme::faint(),
-        ),
-    ]))
+    let mut spans = vec![Span::styled(format!("{frame} "), theme::accent())];
+    spans.extend(theme::shine(
+        &format!("{verb}…"),
+        request.unwrap_or_default(),
+    ));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        format!("({secs}s{detail}{turn_note} · esc to interrupt)"),
+        theme::faint(),
+    ));
+    Some(Line::from(spans))
 }
 
 /// The greeting shown until the first prompt.
