@@ -1113,12 +1113,15 @@ pub fn subagent_system_prompt(workspace: &Workspace, steps_used: usize, max_step
 /// The operating system is stated outright because the single most common way
 /// this tool fails is a model reaching for `ls` on Windows. `tools_available`
 /// goes false once the step budget is spent.
+///
+/// The standing briefing, identical for every request in a session so it can
+/// serve as a cache prefix. Anything that changes between rounds of one turn
+/// belongs in [`turn_status`] instead.
 pub fn system_prompt(
     workspace: &Workspace,
     config: &ToolsConfig,
     steps_used: usize,
     mode: Mode,
-    active_plan: Option<&crate::plan::Plan>,
 ) -> String {
     if steps_used >= config.max_steps {
         return format!(
@@ -1335,6 +1338,32 @@ pub fn system_prompt(
         ));
     }
 
+    prompt
+}
+
+/// The part of the briefing that changes between rounds of the *same* turn:
+/// plan progress, and what is left of the tool budget.
+///
+/// Deliberately not part of [`system_prompt`]. Both providers in
+/// `providers.rs` bill a request at a large discount for whatever prefix of it
+/// matches the previous one, and the system prompt is the first thing in that
+/// prefix -- so a ticked checkbox or a step counter in there invalidated the
+/// system prompt, the tool schemas *and the entire transcript behind them*, on
+/// every single round. The budget line was the worse of the two: it embedded
+/// `steps_used`, which increments every round, so past three quarters of the
+/// budget the cache could never hit at all.
+///
+/// Returned separately so the caller can append it after the conversation,
+/// where changing it costs only itself. `None` when there is nothing to say --
+/// the common case, and the one that leaves a request byte-identical to the
+/// last.
+pub fn turn_status(
+    config: &ToolsConfig,
+    steps_used: usize,
+    active_plan: Option<&crate::plan::Plan>,
+) -> Option<String> {
+    let mut status = String::new();
+
     // The plan is restated in full on every request, with each step's current
     // state, rather than left to survive in the conversation. Two reasons: a
     // long implementation eventually pushes the original proposal out of the
@@ -1366,7 +1395,7 @@ pub fn system_prompt(
             )
         };
 
-        prompt.push_str(&format!(
+        status.push_str(&format!(
             "\n\nYOU ARE IMPLEMENTING AN APPROVED PLAN — {done}/{total} steps done.\n\
              The user read this and agreed to it. It is saved at {}, and that file is updated as \
              you go, so it is also what anyone picking this up later will work from.\n\n\
@@ -1394,7 +1423,7 @@ pub fn system_prompt(
     // land the turn; one that discovers it cannot.
     if steps_used * 4 >= config.max_steps * 3 {
         let steps_left = config.max_steps - steps_used;
-        prompt.push_str(&format!(
+        status.push_str(&format!(
             "\n\nBUDGET: {steps_used} of {} tool rounds used this turn -- {steps_left} left. \
              Wrap up rather than starting anything new: finish the immediate work, verify \
              cheaply, and answer. If the task genuinely needs more rounds, say where you got \
@@ -1403,7 +1432,16 @@ pub fn system_prompt(
         ));
     }
 
-    prompt
+    // Framed, because this lands after the conversation as an ordinary message
+    // rather than in the system prompt: without saying so, a model can read an
+    // automatic status block as something the user just typed and is waiting on
+    // a reply to.
+    (!status.is_empty()).then(|| {
+        format!(
+            "[boxcode status — automatic, not typed by the user. \
+             Do not reply to this block; act on it.]{status}"
+        )
+    })
 }
 
 #[derive(Deserialize)]
@@ -5613,7 +5651,7 @@ mod tests {
     #[test]
     fn the_system_prompt_names_the_platform_and_the_shell() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
 
         assert!(prompt.contains(std::env::consts::OS), "{prompt}");
         assert!(prompt.contains(shell().0), "{prompt}");
@@ -5624,29 +5662,68 @@ mod tests {
             assert!(prompt.contains("Unix-like"), "{prompt}");
         }
 
-        let exhausted = system_prompt(&ws, &cfg, cfg.max_steps, Mode::Normal, None);
+        let exhausted = system_prompt(&ws, &cfg, cfg.max_steps, Mode::Normal);
         assert!(exhausted.contains("Answer the user now"), "{exhausted}");
     }
 
     /// The budget must not be a cliff the model discovers by falling off it:
-    /// past three quarters, the prompt says how many rounds are left and to
-    /// wrap up; before that, no budget talk at all.
+    /// past three quarters, it is told how many rounds are left and to wrap
+    /// up; before that, no budget talk at all.
+    ///
+    /// This rides in `turn_status`, not the system prompt: it embeds a counter
+    /// that changes every single round, which in the prompt invalidated the
+    /// provider's cache prefix on every request past the threshold.
     #[test]
-    fn the_system_prompt_warns_at_three_quarters_of_the_step_budget() {
+    fn the_turn_status_warns_at_three_quarters_of_the_step_budget() {
         let (_dir, ws, cfg) = fixture();
         let three_quarters = cfg.max_steps * 3 / 4;
 
-        let early = system_prompt(&ws, &cfg, three_quarters.saturating_sub(1), Mode::Normal, None);
-        assert!(!early.contains("BUDGET:"), "{early}");
+        assert_eq!(
+            turn_status(&cfg, three_quarters.saturating_sub(1), None),
+            None,
+            "before the threshold there is nothing to append at all"
+        );
 
-        let late = system_prompt(&ws, &cfg, three_quarters, Mode::Normal, None);
+        let late = turn_status(&cfg, three_quarters, None).expect("past the threshold it warns");
         assert!(late.contains("BUDGET:"), "{late}");
         assert!(
             late.contains(&format!("{} left", cfg.max_steps - three_quarters)),
             "{late}"
         );
+
+        // The counter must stay out of the prompt, which is the cache prefix.
+        let prompt = system_prompt(&ws, &cfg, three_quarters, Mode::Normal);
+        assert!(!prompt.contains("BUDGET:"), "{prompt}");
         // Warned, but still working: the full tool list is still described.
-        assert!(late.contains(GREP_SEARCH), "{late}");
+        assert!(prompt.contains(GREP_SEARCH), "{prompt}");
+    }
+
+    /// The property the `turn_status` split exists to protect.
+    ///
+    /// Both providers bill whatever prefix of a request matches the previous
+    /// one at a fraction of the rate, and the system prompt is the first thing
+    /// in that prefix. If it varies between rounds of a single turn, the
+    /// discount is lost on the prompt, the tool schemas, *and* the whole
+    /// transcript behind them -- which on a long agentic turn is most of the
+    /// bill. So it must not vary, however far into the budget the turn is.
+    #[test]
+    fn the_system_prompt_does_not_vary_between_rounds_of_one_turn() {
+        let (_dir, ws, cfg) = fixture();
+        let first = system_prompt(&ws, &cfg, 0, Mode::Normal);
+
+        for steps in [1, 5, cfg.max_steps * 3 / 4, cfg.max_steps - 1] {
+            assert_eq!(
+                system_prompt(&ws, &cfg, steps, Mode::Normal),
+                first,
+                "the prompt changed by round {steps}, which costs the cache the entire prefix"
+            );
+        }
+
+        // The exception, and it is deliberate: once the budget is spent the
+        // schemas are withheld and the prompt becomes a short "answer now"
+        // instruction. That is one request at the end of a turn, not one per
+        // round, and it has no schemas left to discount.
+        assert_ne!(system_prompt(&ws, &cfg, cfg.max_steps, Mode::Normal), first);
     }
 
     /// BOXCODE.md and AGENTS.md ride along on every request when present, and
@@ -5655,13 +5732,13 @@ mod tests {
     fn the_system_prompt_carries_the_project_memory_files() {
         let (_dir, ws, cfg) = fixture();
 
-        let without = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        let without = system_prompt(&ws, &cfg, 0, Mode::Normal);
         assert!(!without.contains("PROJECT NOTES"), "{without}");
 
         std::fs::write(ws.root().join("BOXCODE.md"), "Run `cargo test` before committing.\n")
             .unwrap();
         std::fs::write(ws.root().join("AGENTS.md"), "The API layer lives in src/api.\n").unwrap();
-        let with = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        let with = system_prompt(&ws, &cfg, 0, Mode::Normal);
         assert!(with.contains("PROJECT NOTES from BOXCODE.md"), "{with}");
         assert!(with.contains("Run `cargo test` before committing."), "{with}");
         assert!(with.contains("PROJECT NOTES from AGENTS.md"), "{with}");
@@ -5674,7 +5751,7 @@ mod tests {
     fn an_oversized_memory_file_is_clipped_not_sent_whole() {
         let (_dir, ws, cfg) = fixture();
         std::fs::write(ws.root().join("BOXCODE.md"), "x".repeat(100_000)).unwrap();
-        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
         assert!(prompt.contains("truncated"), "{prompt}");
         assert!(prompt.len() < 60_000, "the whole file went through: {}", prompt.len());
     }
@@ -5685,7 +5762,7 @@ mod tests {
     fn an_empty_memory_file_is_ignored() {
         let (_dir, ws, cfg) = fixture();
         std::fs::write(ws.root().join("BOXCODE.md"), "   \n\n").unwrap();
-        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
         assert!(!prompt.contains("PROJECT NOTES"), "{prompt}");
     }
 
@@ -5696,7 +5773,7 @@ mod tests {
     #[test]
     fn the_system_prompt_requires_narration_before_and_after_tool_use() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
 
         assert!(prompt.contains("Before acting"), "{prompt}");
         assert!(prompt.contains("After tool results come back"), "{prompt}");
@@ -5715,7 +5792,7 @@ mod tests {
     #[test]
     fn the_system_prompt_asks_for_multiple_calls_in_one_turn_rather_than_one_narrated_turn_each() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
 
         assert!(prompt.contains("request all of them in the same turn"), "{prompt}");
         assert!(
@@ -5730,7 +5807,7 @@ mod tests {
     #[test]
     fn the_system_prompt_requires_verifying_work_before_declaring_success() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
 
         assert!(prompt.contains("Verify before declaring success"), "{prompt}");
         assert!(
@@ -5751,7 +5828,7 @@ mod tests {
     #[test]
     fn the_system_prompt_offers_to_open_viewable_output_without_skipping_approval() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
 
         assert!(
             prompt.contains("offer to open it with"),
@@ -6296,7 +6373,7 @@ mod tests {
     #[test]
     fn the_system_prompt_tells_the_model_when_and_when_not_to_deploy() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
         assert!(prompt.contains(DEPLOY_PROJECT), "{prompt}");
         assert!(prompt.contains("public internet"), "{prompt}");
         assert!(prompt.contains("Default to a preview"), "{prompt}");
@@ -6412,7 +6489,7 @@ mod tests {
     #[test]
     fn the_plan_mode_prompt_says_what_is_unavailable_and_how_to_get_out() {
         let (_dir, ws, cfg) = fixture();
-        let prompt = system_prompt(&ws, &cfg, 0, Mode::Plan, None);
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Plan);
 
         assert!(prompt.contains("PLAN MODE"), "{prompt}");
         assert!(prompt.contains(EXIT_PLAN_MODE), "{prompt}");
@@ -6498,8 +6575,11 @@ mod tests {
     /// The plan is restated on every request, with live step state, because a
     /// long implementation pushes the original proposal out of the context
     /// window and a resumed plan was never in the conversation at all.
+    ///
+    /// In `turn_status` rather than the system prompt: the tick marks change as
+    /// the work proceeds, and a prompt that changes cannot be a cache prefix.
     #[test]
-    fn an_active_plan_is_restated_in_the_prompt_with_its_progress() {
+    fn an_active_plan_is_restated_in_the_turn_status_with_its_progress() {
         let (_dir, ws, cfg) = fixture();
         let mut plan = crate::plan::Plan {
             title: "Rate limiting".to_string(),
@@ -6517,18 +6597,22 @@ mod tests {
         };
         plan.mark(1, true, None).unwrap();
 
-        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal, Some(&plan));
-        assert!(prompt.contains("1/2 steps done"), "{prompt}");
-        assert!(prompt.contains("[x] 1. Add the limiter"), "{prompt}");
-        assert!(prompt.contains("[ ] 2. Wrap the router"), "{prompt}");
-        assert!(prompt.contains("Distributed limiting"), "{prompt}");
-        assert!(prompt.contains(PLAN_PROGRESS), "{prompt}");
+        let status = turn_status(&cfg, 0, Some(&plan)).expect("an unfinished plan says something");
+        assert!(status.contains("1/2 steps done"), "{status}");
+        assert!(status.contains("[x] 1. Add the limiter"), "{status}");
+        assert!(status.contains("[ ] 2. Wrap the router"), "{status}");
+        assert!(status.contains("Distributed limiting"), "{status}");
+        assert!(status.contains(PLAN_PROGRESS), "{status}");
+
+        // ...and nowhere in the system prompt, which has to stay identical
+        // between rounds for the provider's prefix cache to hit at all.
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
+        assert!(!prompt.contains("IMPLEMENTING AN APPROVED PLAN"), "{prompt}");
 
         // A finished plan is not restated: there is nothing left to follow,
         // and repeating it invites the model to redo work.
         plan.mark(2, true, None).unwrap();
-        let done = system_prompt(&ws, &cfg, 0, Mode::Normal, Some(&plan));
-        assert!(!done.contains("IMPLEMENTING AN APPROVED PLAN"), "{done}");
+        assert_eq!(turn_status(&cfg, 0, Some(&plan)), None);
     }
 
     #[test]

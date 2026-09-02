@@ -87,7 +87,6 @@ pub fn fire_request(
                 &app.config.tools,
                 app.tool_steps,
                 app.mode,
-                app.active_plan.as_ref(),
             )),
         ),
         None => (Vec::new(), None),
