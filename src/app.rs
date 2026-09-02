@@ -1421,6 +1421,7 @@ impl App {
     /// arguments included, since a rejected `rm -rf` still occupies the
     /// context that carried it -- and never the local notices, which are free.
     pub fn context_size(&self) -> ContextSize {
+        let keep_ids = self.last_tool_round_ids();
         let mut chars = 0usize;
         let mut messages = 0usize;
         for message in &self.messages {
@@ -1430,7 +1431,11 @@ impl App {
                 continue;
             }
             messages += 1;
-            chars += message.content.chars().count();
+            if message.role == Role::Tool {
+                chars += self.wire_tool_content(message, &keep_ids).chars().count();
+            } else {
+                chars += message.content.chars().count();
+            }
             for call in &message.tool_calls {
                 let stubbed = crate::tools::stub_heavy_tool_args(call);
                 chars += stubbed.function.name.chars().count()
@@ -2874,6 +2879,7 @@ impl App {
     /// `tool_calls` were dropped here would leave the following `tool` messages
     /// answering nothing.
     pub fn history(&self, system: Option<&str>) -> Vec<ChatMessage> {
+        let keep_ids = self.last_tool_round_ids();
         let mut out = Vec::new();
         if let Some(system) = system {
             out.push(ChatMessage::text("system", system));
@@ -2894,7 +2900,7 @@ impl App {
                 }),
                 Role::Tool => out.push(ChatMessage {
                     role: "tool".to_string(),
-                    content: Some(message.content.clone()),
+                    content: Some(self.wire_tool_content(message, &keep_ids)),
                     tool_calls: Vec::new(),
                     tool_call_id: message.tool_call_id.clone(),
                 }),
@@ -2908,6 +2914,39 @@ impl App {
             }
         }
         out
+    }
+
+    /// Tool results from the round the model is about to act on stay intact.
+    /// Older ones are what later rounds would otherwise resend for no reason.
+    fn last_tool_round_ids(&self) -> HashSet<&str> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+            .map(|m| m.tool_calls.iter().map(|c| c.id.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    fn wire_tool_content(&self, message: &Message, keep_full_ids: &HashSet<&str>) -> String {
+        if message
+            .tool_call_id
+            .as_deref()
+            .is_some_and(|id| keep_full_ids.contains(id))
+        {
+            return message.content.clone();
+        }
+        let Some(id) = message.tool_call_id.as_deref() else {
+            return message.content.clone();
+        };
+        match self
+            .messages
+            .iter()
+            .flat_map(|m| m.tool_calls.iter())
+            .find(|c| c.id == id)
+        {
+            Some(call) => crate::tools::stub_heavy_tool_result(call, &message.content),
+            None => message.content.clone(),
+        }
     }
 
     // ---- input buffer editing -------------------------------------------------
@@ -6383,6 +6422,48 @@ mod tests {
             a.context_size().approx_tokens < raw_chars / 4,
             "the estimate must count the stub, not the discarded body"
         );
+    }
+
+    /// The round that just read a file still gets the body -- that is the
+    /// round the model acts on. An older read of a stylesheet must not be
+    /// resent on every later request of a webpage turn.
+    #[test]
+    fn later_rounds_drop_older_read_file_bodies() {
+        let mut a = app();
+        let css = "body{color:red;font-size:16px}".repeat(20);
+        let html = "<!doctype html><h1>hello</h1>".repeat(20);
+
+        let mut first = Message::new(Role::Assistant, "");
+        first.tool_calls = vec![read_file_call("c1", "style.css")];
+        a.messages.push(first);
+        let mut first_result = Message::new(Role::Tool, css.clone());
+        first_result.tool_call_id = Some("c1".to_string());
+        a.messages.push(first_result);
+
+        // Only one round so far: the body must still be on the wire.
+        let only = a.history(None);
+        let only_tool = only.iter().find(|m| m.role == "tool").unwrap();
+        assert_eq!(only_tool.content.as_deref(), Some(css.as_str()));
+
+        let mut second = Message::new(Role::Assistant, "");
+        second.tool_calls = vec![read_file_call("c2", "index.html")];
+        a.messages.push(second);
+        let mut second_result = Message::new(Role::Tool, html.clone());
+        second_result.tool_call_id = Some("c2".to_string());
+        a.messages.push(second_result);
+
+        let tools: Vec<_> = a
+            .history(None)
+            .into_iter()
+            .filter(|m| m.role == "tool")
+            .collect();
+        assert_eq!(tools.len(), 2);
+        let old = tools[0].content.as_deref().unwrap();
+        let latest = tools[1].content.as_deref().unwrap();
+        assert!(old.contains("already shown"), "{old}");
+        assert!(old.contains("style.css"), "{old}");
+        assert!(!old.contains(&css), "older read must not be resent: {old}");
+        assert_eq!(latest, html, "the latest read is what the model acts on");
     }
 
     // ---- the default approval posture ---------------------------------------
