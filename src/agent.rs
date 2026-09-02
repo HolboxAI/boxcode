@@ -91,11 +91,26 @@ pub fn fire_request(
         ),
         None => (Vec::new(), None),
     };
-    let history = if app.compacting {
+    // The briefing that changes between rounds of one turn -- plan progress,
+    // what is left of the budget -- goes *after* the conversation rather than
+    // into the system prompt. Both providers bill a matching prefix at a
+    // fraction of the rate, and the prompt is the first thing in that prefix:
+    // a step counter up there invalidated the schemas and the whole transcript
+    // behind them on every round. See `tools::turn_status`.
+    let status = match workspace {
+        Some(_) if !app.compacting => {
+            tools::turn_status(&app.config.tools, app.tool_steps, app.active_plan.as_ref())
+        }
+        _ => None,
+    };
+    let mut history = if app.compacting {
         app.compaction_history()
     } else {
         app.history(system.as_deref())
     };
+    if let Some(status) = status {
+        history.push(ChatMessage::text("user", status));
+    }
     let tx = tx.clone();
 
     let handle = tokio::spawn(async move {
