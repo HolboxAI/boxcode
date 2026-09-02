@@ -424,6 +424,15 @@ pub struct App {
     /// cost of being wrong is one extra keystroke; the cost of the old
     /// behaviour was a session.
     pub quit_armed: bool,
+    /// True once Esc has been pressed once, while a turn is running, and is
+    /// waiting to be confirmed.
+    ///
+    /// Esc is also the reflex for "stop", and a single slip interrupts a turn
+    /// that may be most of the way to a useful answer -- the same reasoning as
+    /// `quit_armed`, but for cancelling the request rather than quitting the
+    /// app. The first press only arms this and says so; any other key disarms
+    /// it, and so does a second Esc, which actually cancels.
+    pub interrupt_armed: bool,
     /// Set once the user has interacted, so the welcome panel gives way to the transcript.
     pub greeted: bool,
     /// `Some` while `/provider` or `/model` is active; see `Overlay`.
@@ -625,6 +634,7 @@ impl App {
             config,
             should_exit: false,
             quit_armed: false,
+            interrupt_armed: false,
             greeted: false,
             overlay: None,
             overlay_input: String::new(),
@@ -739,6 +749,12 @@ impl App {
         // from turning a much later, unrelated Ctrl-C into an instant exit.
         if key.kind != KeyEventKind::Release {
             self.quit_armed = false;
+            // Same for a pending Esc interrupt, except Esc itself is allowed to
+            // be the confirming press -- disarming it here would make the
+            // second press indistinguishable from the first.
+            if key.code != KeyCode::Esc {
+                self.interrupt_armed = false;
+            }
         }
         // Terminals that support the kitty keyboard protocol also report key *releases*.
         // Without this guard every keystroke would be inserted twice.
@@ -872,7 +888,17 @@ impl App {
                 self.scroll = self.scroll.saturating_add(10);
             }
 
-            KeyCode::Esc => self.cancel(),
+            // Esc interrupts a running turn, but asks twice: the first press
+            // arms the interrupt and says so, the second carries it out. A
+            // single slip should not throw away a turn that was mid-answer.
+            KeyCode::Esc => {
+                if self.interrupt_armed {
+                    self.interrupt_armed = false;
+                    self.cancel();
+                } else if self.is_busy() {
+                    self.interrupt_armed = true;
+                }
+            }
 
             _ => {}
         }
@@ -929,6 +955,9 @@ impl App {
         if self.is_busy() {
             return;
         }
+        // A fresh turn starts unarmed; a stale arm from before an earlier turn
+        // finished must not make the next Esc an instant interrupt.
+        self.interrupt_armed = false;
         let prompt = self.input_buffer.trim().to_string();
         if prompt.is_empty() {
             // Nothing to send; clear stray whitespace so the box looks responsive.
@@ -1019,6 +1048,9 @@ impl App {
         if !self.is_busy() {
             return;
         }
+        // Whatever path got here, the turn is over -- a pending "press Esc
+        // again" arm must not survive into the next, idle state.
+        self.interrupt_armed = false;
         if let Some(handle) = self.abort.take() {
             handle.abort();
         }
@@ -5027,6 +5059,52 @@ mod tests {
         }
     }
 
+    // ---- Esc asks before interrupting ---------------------------------------
+
+    /// Esc is the reflex for "stop" too, and a single slip used to throw away
+    /// a turn that was mid-answer. The first press only arms the interrupt.
+    #[test]
+    fn one_esc_arms_the_interrupt_but_does_not_cancel() {
+        let mut a = streaming_app();
+        a.handle_key(key(KeyCode::Esc));
+
+        assert!(a.interrupt_armed, "the first press arms the interrupt");
+        assert_eq!(a.state, AppState::Streaming, "the turn must still be running");
+    }
+
+    /// The second Esc is the deliberate one: it actually cancels the turn.
+    #[test]
+    fn a_second_esc_interrupts() {
+        let mut a = streaming_app();
+        a.handle_key(key(KeyCode::Esc));
+        a.handle_key(key(KeyCode::Esc));
+
+        assert!(!a.interrupt_armed, "the arm is spent");
+        assert_eq!(a.state, AppState::AwaitingInput, "the turn is cancelled");
+    }
+
+    /// A stale arm must not turn a later, unrelated Esc into an instant
+    /// cancellation -- exactly the same protection Ctrl-C gets.
+    #[test]
+    fn any_other_key_disarms_the_pending_interrupt() {
+        let mut a = streaming_app();
+        a.handle_key(key(KeyCode::Esc));
+        assert!(a.interrupt_armed);
+
+        a.handle_key(key(KeyCode::Char('h')));
+        assert!(!a.interrupt_armed, "typing should cancel a pending interrupt");
+        assert_eq!(a.state, AppState::Streaming, "and leave the turn running");
+    }
+
+    /// Idle Esc stays a no-op: there is nothing to arm and nothing to cancel.
+    #[test]
+    fn esc_when_idle_does_nothing() {
+        let mut a = app();
+        a.handle_key(key(KeyCode::Esc));
+        assert!(!a.interrupt_armed);
+        assert_eq!(a.state, AppState::AwaitingInput);
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -5414,6 +5492,7 @@ mod tests {
         compact(&mut a);
         a.state = AppState::Streaming;
         a.streaming_response = "half a summ".to_string();
+        a.handle_key(key(KeyCode::Esc));
         a.handle_key(key(KeyCode::Esc));
 
         assert_eq!(a.history(None).len(), before);
@@ -5978,6 +6057,7 @@ mod tests {
         a.state = AppState::Streaming;
         a.append_token("partial");
 
+        a.handle_key(key(KeyCode::Esc));
         a.handle_key(key(KeyCode::Esc));
 
         assert_eq!(a.state, AppState::AwaitingInput);
@@ -6992,6 +7072,7 @@ mod tests {
         a.request_tools(vec![agent_tool_call("call_1", "map the config loading")]);
         a.record_subagent_activity("call_1", "read config.rs".to_string(), 1);
 
+        a.handle_key(key(KeyCode::Esc));
         a.handle_key(key(KeyCode::Esc));
 
         assert_eq!(a.subagent_trails[0].finished.as_deref(), Some("cancelled"));
