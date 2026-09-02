@@ -17,6 +17,7 @@
 //! nothing that reads a colour from this module needs to think about it.
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -422,6 +423,71 @@ const FRAME: u128 = 80;
 pub fn spinner(elapsed: Duration) -> &'static str {
     let index = (elapsed.as_millis() / FRAME) as usize % SPINNER.len();
     SPINNER[index]
+}
+
+// ---- shine ---------------------------------------------------------------------
+
+/// How long one full left-to-right-and-back sweep of the gloss takes.
+const SHINE_PERIOD: u128 = 1600;
+
+/// `text` drawn with a glossy "glint" sweeping across it, left to right and
+/// back again, like light running over a lit sign.
+///
+/// Every character is its own span so each can take its own colour. A bright
+/// band -- a lightened tint of `accent_soft` -- travels the length of the text
+/// on a triangle wave, so it eases to a stop and reverses at each end rather
+/// than snapping. Characters nearest the band's centre glow at full strength
+/// and the glow falls off with a Gaussian, which is what makes it read as a
+/// sheen instead of a hard cursor.
+///
+/// The base tone is `accent_soft`, the colour the status already used, so a
+/// terminal that never redraws a frame (or a user who stops looking) still
+/// reads the same violet they are used to.
+pub fn shine(text: &str, elapsed: Duration) -> Vec<Span<'static>> {
+    let base = p().accent_soft;
+    let peak = mix(base, Color::Rgb(255, 255, 255), 0.7);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let n = chars.len();
+
+    // The glint is a window about half the text wide, but never so thin it
+    // disappears on a two-word label nor so fat it lights the whole line.
+    let band = (n as f64 * 0.5).clamp(2.0, 6.0);
+
+    // A triangle wave driving the band's centre: off the left edge, across,
+    // off the right edge, and back. Derived from elapsed time (like the
+    // spinner) rather than a per-frame counter, so a burst of input events
+    // can't make the sheen race.
+    let phase = (elapsed.as_millis() % SHINE_PERIOD) as f64 / SHINE_PERIOD as f64;
+    let tri = 1.0 - (2.0 * phase - 1.0).abs();
+    let centre = -band + tri * (n as f64 + 2.0 * band);
+
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(i, ch)| {
+            let d = i as f64 - centre;
+            let glow = (-(d * d) / (band * band)).exp();
+            Span::styled(ch.to_string(), Style::default().fg(mix(base, peak, glow)))
+        })
+        .collect()
+}
+
+/// Linear interpolation between two colours, clamped to `[0, 1]`. Falls back
+/// to `b` when either side is not plain RGB (a named or indexed colour), which
+/// only happens if a palette grows a non-RGB entry -- the glint then simply
+/// holds its peak colour.
+fn mix(a: Color, b: Color, t: f64) -> Color {
+    match (a, b) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let t = t.clamp(0.0, 1.0);
+            let step = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * t).round() as u8;
+            Color::Rgb(step(r1, r2), step(g1, g2), step(b1, b2))
+        }
+        _ => b,
+    }
 }
 
 // ---- styles -------------------------------------------------------------------
@@ -858,6 +924,44 @@ mod tests {
         for frame in SPINNER {
             assert_eq!(frame.chars().count(), 1, "{frame:?} is not a single char");
         }
+    }
+
+    /// The gloss must not eat or reorder a single character: it is a colour
+    /// treatment laid over the status word, not a rewrite of it.
+    #[test]
+    fn shine_preserves_the_text_exactly() {
+        let spans = shine("Thinking…", Duration::from_millis(0));
+        let rejoined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rejoined, "Thinking…");
+        assert_eq!(spans.len(), "Thinking…".chars().count());
+        assert!(shine("", Duration::from_millis(0)).is_empty());
+    }
+
+    /// The brightest character starts at the left edge, travels to the right
+    /// by the middle of the period, and comes home at the end of it -- the
+    /// "left to right and back again" the effect exists to produce.
+    #[test]
+    fn shine_travels_left_to_right_and_back() {
+        let text = "Responding…";
+        let brightest = |at: u128| -> usize {
+            let spans = shine(text, Duration::from_millis(at as u64));
+            spans
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, s)| {
+                    let Color::Rgb(r, g, b) = s.style.fg.unwrap() else {
+                        panic!("expected an RGB glint");
+                    };
+                    r as u32 + g as u32 + b as u32
+                })
+                .map(|(i, _)| i)
+                .expect("non-empty")
+        };
+
+        assert_eq!(brightest(0), 0, "starts off the left edge");
+        let mid = SHINE_PERIOD / 2;
+        assert_eq!(brightest(mid), text.chars().count() - 1, "reaches the right edge");
+        assert_eq!(brightest(SHINE_PERIOD), 0, "returns to the left edge");
     }
 
     /// Rows of different widths make the mascot lean, and centring it computes
