@@ -78,7 +78,17 @@ pub fn fire_request(
                 // (only nested under) the directory `Workspace::new`
                 // resolves it to.
                 let published = crate::artifacts::any_published_under(ws.root());
-                tools::schemas(app.mode, app.active_plan.is_some(), app.config.deploy.enabled, published)
+                // File count, not step count: the schema list has to stay
+                // byte-identical across rounds of one turn or the prefix
+                // cache is busted. A webpage tree withholds `agent`; a
+                // codebase at the threshold keeps it.
+                tools::schemas_for(
+                    app.mode,
+                    app.active_plan.is_some(),
+                    app.config.deploy.enabled,
+                    published,
+                    tools::SchemaDiet::for_workspace(ws.root()),
+                )
             } else {
                 Vec::new()
             },
