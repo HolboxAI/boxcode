@@ -1811,6 +1811,18 @@ impl App {
             );
         }
 
+        // What the prompt cache is doing for this session. Both providers in
+        // `providers.rs` cache automatically and bill a hit at a fraction of
+        // the rate, so this reads as a diagnostic rather than a setting: a low
+        // rate means something near the front of each request keeps changing,
+        // which invalidates the prefix and everything after it.
+        if let Some(rate) = self.cache_hit_rate() {
+            lines.push(format!(
+                "  Cache:       {rate:.0}% of {} prompt tokens read from cache this session",
+                crate::quota::thousands(self.cache_prompt_tokens as u64),
+            ));
+        }
+
         let history = usage::summary();
         lines.push(String::new());
         lines.push(format!(
