@@ -47,6 +47,12 @@ pub const EXPIRY_HOURS: u32 = 48;
 /// all, since they share one wrong base path.
 const MAX_VERIFIED_ASSETS: usize = 10;
 
+/// How many presigned PUTs to keep in flight at once. A typical webpage
+/// dist is a handful of files; the cap is for a larger tree, not because
+/// the signer needs ordering. Rebase still happens first, in series,
+/// because HTML/CSS rewriting is local and cheap next to the round trips.
+const MAX_PARALLEL_UPLOADS: usize = 8;
+
 #[derive(Debug)]
 pub struct Published {
     pub url: String,
@@ -714,6 +720,24 @@ fn check_limits(files: &[Candidate]) -> Result<u64, String> {
     Ok(total)
 }
 
+/// Read one candidate and apply the same HTML/CSS rewrite the sequential
+/// uploader used to do inline. Kept as its own step so the PUTs can fan
+/// out without each task also owning the rebase, and so `index_len` is
+/// captured from the bytes that will actually be served.
+fn upload_bytes(candidate: &Candidate, prefix: &str) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(&candidate.source)
+        .map_err(|e| format!("could not read {}: {e}", candidate.source.display()))?;
+    Ok(if is_html(&candidate.key) {
+        // Rebase before injecting, so the reload script is never itself a
+        // candidate for rewriting.
+        inject_live_reload(rebase_page_urls(&bytes, prefix, &candidate.key))
+    } else if extension(&candidate.key).as_deref() == Some("css") {
+        rebase_css_urls(&bytes, prefix)
+    } else {
+        bytes
+    })
+}
+
 /// Publish `path` and return the link.
 ///
 /// `endpoint` is the signing URL. Configurable rather than compiled in so a
@@ -776,46 +800,57 @@ pub async fn publish(path: &Path, endpoint: &str) -> Result<Published, String> {
     // did not include `index.html` (a diffing signer may only have asked
     // for the files that actually changed), in which case there is nothing
     // fresh to verify against and `verify_live` degrades to a reachability
-    // check.
-    let mut index_len = None;
+    // check. Taken from the prepared bytes, not from disk, because HTML
+    // grows when it is rebased and the reload script is injected.
     let prefix = served_under(&signed.url);
+    let mut prepared = Vec::with_capacity(signed.uploads.len());
+    let mut index_len = None;
     for upload in &signed.uploads {
         let candidate = files
             .iter()
             .find(|f| f.key == upload.path)
             .ok_or_else(|| format!("the service asked for a file that was not offered: {}", upload.path))?;
-        let bytes = std::fs::read(&candidate.source)
-            .map_err(|e| format!("could not read {}: {e}", candidate.source.display()))?;
-        let bytes = if is_html(&candidate.key) {
-            // Rebase before injecting, so the reload script is never itself a
-            // candidate for rewriting.
-            inject_live_reload(rebase_page_urls(&bytes, &prefix, &candidate.key))
-        } else if extension(&candidate.key).as_deref() == Some("css") {
-            rebase_css_urls(&bytes, &prefix)
-        } else {
-            bytes
-        };
+        let bytes = upload_bytes(candidate, &prefix)?;
         if candidate.key == "index.html" {
             index_len = Some(bytes.len());
         }
-        let put = client
-            .put(&upload.url)
-            .header("content-type", &upload.content_type)
-            // Not part of the presigned signature (the signer never required
-            // it, so old and new clients both still upload fine either way),
-            // but S3 stores it as the object's metadata regardless, and
-            // CloudFront honors it from there. Without it, a same-URL update
-            // publishes correctly to S3 but can sit behind a day-old cached
-            // copy at the edge -- confirmed live: CloudFront serves the new
-            // bytes on the very next request once this header is set.
-            .header("cache-control", "no-cache")
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|e| format!("could not upload {}: {e}", upload.path))?;
-        if !put.status().is_success() {
-            return Err(format!("uploading {} failed ({})", upload.path, put.status()));
-        }
+        prepared.push((upload.path.clone(), upload.content_type.clone(), upload.url.clone(), bytes));
+    }
+
+    // The PUTs have no ordering: each URL is already signed for one object.
+    // Sequential round trips were the whole wait on a Vite dist. Cap the
+    // in-flight count so a 60-file tree does not open 60 sockets at once.
+    use futures::stream::{self, StreamExt};
+    let results: Vec<Result<(), String>> = stream::iter(prepared)
+        .map(|(path, content_type, url, bytes)| {
+            let client = client.clone();
+            async move {
+                let put = client
+                    .put(&url)
+                    .header("content-type", &content_type)
+                    // Not part of the presigned signature (the signer never required
+                    // it, so old and new clients both still upload fine either way),
+                    // but S3 stores it as the object's metadata regardless, and
+                    // CloudFront honors it from there. Without it, a same-URL update
+                    // publishes correctly to S3 but can sit behind a day-old cached
+                    // copy at the edge -- confirmed live: CloudFront serves the new
+                    // bytes on the very next request once this header is set.
+                    .header("cache-control", "no-cache")
+                    .body(bytes)
+                    .send()
+                    .await
+                    .map_err(|e| format!("could not upload {path}: {e}"))?;
+                if !put.status().is_success() {
+                    return Err(format!("uploading {path} failed ({})", put.status()));
+                }
+                Ok(())
+            }
+        })
+        .buffer_unordered(MAX_PARALLEL_UPLOADS)
+        .collect()
+        .await;
+    for result in results {
+        result?;
     }
 
     let verified = verify_live(&client, &signed.url, index_len).await;
@@ -1329,6 +1364,32 @@ h1{background:url(logo.png)}"#;
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(r#"src="/artifacts/abc/assets/a.js""#), "{text}");
         assert!(text.contains("location.reload"), "the reload script survived: {text}");
+    }
+
+    /// Parallel PUTs still send the rebased HTML, not the file on disk.
+    /// The bug this would hide: fan-out that skipped the prepare step and
+    /// uploaded `href="style.css"` against a URL with no trailing slash.
+    #[test]
+    fn upload_bytes_rebases_html_before_the_put() {
+        let dir = temp("upload-bytes");
+        write(
+            &dir,
+            "index.html",
+            r#"<html><body><link rel="stylesheet" href="style.css"></body></html>"#,
+        );
+        let candidate = Candidate {
+            source: dir.join("index.html"),
+            key: "index.html".to_string(),
+            size: 1,
+        };
+        let bytes = upload_bytes(&candidate, "/artifacts/abc").expect("read");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(
+            text.contains("/artifacts/abc/style.css"),
+            "relative href must be rebased before the PUT: {text}"
+        );
+        assert!(text.contains("location.reload"), "reload script is part of the served bytes: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn write(dir: &Path, name: &str, contents: &str) {
