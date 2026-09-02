@@ -238,6 +238,84 @@ pub fn shell() -> (&'static str, &'static str) {
 /// workspace's life; this narrows the exposure window, it does not remove
 /// the underlying tradeoff.
 pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> Vec<Value> {
+    schemas_for(mode, active_plan, deploy, published, SchemaDiet::full())
+}
+
+/// Which optional schemas to send. The list has to stay byte-identical
+/// between rounds of one turn -- the same reason plan progress left the
+/// system prompt -- so this is computed from the workspace, not from how
+/// far the turn has gotten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchemaDiet {
+    /// The `agent` schema is large and only pays for itself on a tree big
+    /// enough that reading it by hand would swamp the parent's transcript.
+    /// A four-file webpage does not need it, and offering it there is how
+    /// a model spends a round spawning a child instead of writing HTML.
+    pub agent: bool,
+    pub web_search: bool,
+}
+
+impl SchemaDiet {
+    pub fn full() -> Self {
+        Self { agent: true, web_search: true }
+    }
+
+    /// Count files, not lines: a new project is empty, a webpage is a
+    /// handful, a real codebase is dozens. Stop at the threshold so a
+    /// giant tree is not walked just to decide.
+    pub fn for_workspace(root: &Path) -> Self {
+        Self {
+            agent: source_file_count(root) >= AGENT_MIN_FILES,
+            web_search: true,
+        }
+    }
+}
+
+/// Below this, a research subagent costs more in schema tokens every round
+/// than it could save in one search.
+const AGENT_MIN_FILES: usize = 20;
+
+fn source_file_count(root: &Path) -> usize {
+    fn walk(dir: &Path, n: &mut usize) {
+        if *n >= AGENT_MIN_FILES {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if *n >= AGENT_MIN_FILES {
+                return;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                if SKIP_DIRS.iter().any(|d| *d == name) {
+                    continue;
+                }
+                walk(&path, n);
+            } else {
+                *n += 1;
+            }
+        }
+    }
+    let mut n = 0;
+    walk(root, &mut n);
+    n
+}
+
+/// Same list as [`schemas`], with optional tools dropped for small trees.
+pub fn schemas_for(
+    mode: Mode,
+    active_plan: bool,
+    deploy: bool,
+    published: bool,
+    diet: SchemaDiet,
+) -> Vec<Value> {
     let (shell_name, shell_flag) = shell();
     let mut schemas = vec![
         json!({
@@ -1000,6 +1078,13 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> 
                 }
             }
         }));
+    }
+
+    if !diet.agent {
+        schemas.retain(|schema| schema["function"]["name"] != AGENT);
+    }
+    if !diet.web_search {
+        schemas.retain(|schema| schema["function"]["name"] != WEB_SEARCH);
     }
 
     schemas
@@ -6226,6 +6311,61 @@ mod tests {
                 DEPLOY_PROJECT,
                 AGENT
             ]
+        );
+    }
+
+    fn schema_names(diet: SchemaDiet) -> Vec<String> {
+        schemas_for(Mode::Normal, false, true, true, diet)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// A four-file webpage must not pay the `agent` schema on every round.
+    /// That schema is large, and offering it is how the model spends a step
+    /// spawning a child instead of writing HTML.
+    #[test]
+    fn a_small_webpage_is_not_offered_the_agent_schema() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("index.html"), "<h1>hi</h1>").unwrap();
+        std::fs::write(dir.path().join("style.css"), "body{}").unwrap();
+        let diet = SchemaDiet::for_workspace(dir.path());
+        assert!(!diet.agent, "a handful of files is below the threshold");
+        assert!(diet.web_search, "search stays; this diet is only the agent schema");
+        let names = schema_names(diet);
+        assert!(!names.iter().any(|n| n == AGENT), "{names:?}");
+        assert!(names.iter().any(|n| n == WEB_SEARCH), "{names:?}");
+    }
+
+    /// Same workspace, same diet: the list has to stay byte-identical
+    /// between rounds or the prompt-cache prefix is busted.
+    #[test]
+    fn the_diet_does_not_change_mid_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for i in 0..AGENT_MIN_FILES {
+            std::fs::write(dir.path().join(format!("f{i}.rs")), "x").unwrap();
+        }
+        let first = SchemaDiet::for_workspace(dir.path());
+        let second = SchemaDiet::for_workspace(dir.path());
+        assert_eq!(first, second);
+        assert!(first.agent);
+        assert!(schema_names(first).iter().any(|n| n == AGENT));
+    }
+
+    /// `node_modules` is skipped the same way glob/list already skip it, so
+    /// installing packages cannot flip the diet mid-session.
+    #[test]
+    fn build_output_does_not_count_toward_the_agent_threshold() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("index.html"), "x").unwrap();
+        let nm = dir.path().join("node_modules/pkg");
+        std::fs::create_dir_all(&nm).unwrap();
+        for i in 0..30 {
+            std::fs::write(nm.join(format!("{i}.js")), "x").unwrap();
+        }
+        assert!(
+            !SchemaDiet::for_workspace(dir.path()).agent,
+            "vendor trees must not look like a codebase worth delegating into"
         );
     }
 
