@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "boxcode"
-version = "1.11.13"
+version = "1.11.14"
 dependencies = [
  "crossterm",
  "futures",

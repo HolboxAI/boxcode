@@ -601,17 +601,21 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
     } else {
         String::new()
     };
-    let mut spans = vec![Span::styled(format!("{frame} "), theme::accent())];
-    spans.extend(theme::shine(
-        &format!("{verb}…"),
-        request.unwrap_or_default(),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("({secs}s{detail}{turn_note} · esc to interrupt)"),
-        theme::faint(),
-    ));
-    Some(Line::from(spans))
+    // Esc interrupts, but asks twice; while the first press is waiting to be
+    // confirmed the hint has to say so, not silently keep claiming one press.
+    let interrupt_hint = if app.interrupt_armed {
+        " · press esc again to interrupt"
+    } else {
+        " · esc to interrupt"
+    };
+    Some(Line::from(vec![
+        Span::styled(format!("{frame} "), theme::accent()),
+        Span::styled(format!("{verb}… "), Style::default().fg(theme::p().accent_soft)),
+        Span::styled(
+            format!("({secs}s{detail}{turn_note}{interrupt_hint})"),
+            theme::faint(),
+        ),
+    ]))
 }
 
 /// The greeting shown until the first prompt.
@@ -1051,6 +1055,9 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         // they act on. Repeating them here put the same three keys on screen
         // twice, one row apart, which reads as two different prompts.
         AppState::AwaitingApproval => &[("^c", "exit")],
+        // Esc interrupts, but asks twice -- the first press arms it, and the
+        // footer has to say so rather than leave a second press unexplained.
+        _ if app.interrupt_armed => &[("esc", "press again to interrupt"), ("^c", "exit")],
         _ if app.is_busy() => &[("esc", "interrupt"), ("^c", "exit")],
         _ => &[
             ("↵", "send"),
@@ -5406,6 +5413,22 @@ mod tests {
         app.request_quit();
         let shown = rendered_rows(&mut app, 80, 24).concat();
         assert!(shown.contains("press again to quit"), "{shown}");
+    }
+
+    /// Esc now asks twice, and the first press has to say so -- otherwise the
+    /// second press is a surprise.
+    #[test]
+    fn a_pending_interrupt_says_so_in_the_key_bar() {
+        let mut app = App::new(crate::config::Config::default());
+        app.greeted = true;
+        app.state = crate::app::AppState::Streaming;
+
+        let unarmed = rendered_rows(&mut app, 80, 24).concat();
+        assert!(unarmed.contains("esc to interrupt"), "{unarmed}");
+
+        app.interrupt_armed = true;
+        let armed = rendered_rows(&mut app, 80, 24).concat();
+        assert!(armed.contains("press again to interrupt"), "{armed}");
     }
 
     /// The cap on the menu's height has to stay above the number of commands.
