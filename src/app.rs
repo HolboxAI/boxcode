@@ -1432,8 +1432,9 @@ impl App {
             messages += 1;
             chars += message.content.chars().count();
             for call in &message.tool_calls {
-                chars +=
-                    call.function.name.chars().count() + call.function.arguments.chars().count();
+                let stubbed = crate::tools::stub_heavy_tool_args(call);
+                chars += stubbed.function.name.chars().count()
+                    + stubbed.function.arguments.chars().count();
             }
         }
         ContextSize {
@@ -2884,7 +2885,11 @@ impl App {
                     role: "assistant".to_string(),
                     // None rather than "" when the model only asked for tools.
                     content: Some(message.content.clone()).filter(|c| !c.trim().is_empty()),
-                    tool_calls: message.tool_calls.clone(),
+                    tool_calls: message
+                        .tool_calls
+                        .iter()
+                        .map(crate::tools::stub_heavy_tool_args)
+                        .collect(),
                     tool_call_id: None,
                 }),
                 Role::Tool => out.push(ChatMessage {
@@ -6342,6 +6347,41 @@ mod tests {
         assert!(
             after > before + component.len() / 8,
             "the generated file should dominate the count: {before} -> {after}"
+        );
+    }
+
+    /// Once the write has happened, later rounds must not resend the file
+    /// body -- that is the cost this stub exists to cut. The on-screen
+    /// transcript still holds the original arguments (the approval already
+    /// happened); only the wire copy is slimmed.
+    #[test]
+    fn later_rounds_do_not_resend_a_written_file_body() {
+        let mut a = streaming_app();
+        let page = "<!doctype html><style>body{color:red}</style>".repeat(40);
+        a.request_tools(vec![write_file_call("call_1", "index.html", &page)]);
+
+        let stored = &a.messages.iter().find(|m| m.role == Role::Assistant).unwrap().tool_calls[0];
+        assert!(
+            stored.function.arguments.contains(&page),
+            "the transcript keeps the original write"
+        );
+
+        let wire = a.history(None);
+        let assistant = wire.iter().find(|m| m.role == "assistant").unwrap();
+        let sent = &assistant.tool_calls[0].function.arguments;
+        assert!(sent.contains("index.html"), "{sent}");
+        assert!(sent.contains("already on disk"), "{sent}");
+        assert!(!sent.contains(&page), "the body must not go back on the wire: {sent}");
+
+        let raw_chars = stored.function.arguments.chars().count();
+        let wire_chars = assistant.tool_calls[0].function.arguments.chars().count();
+        assert!(
+            wire_chars * 4 < raw_chars,
+            "stub should be far smaller than the page: {wire_chars} vs {raw_chars}"
+        );
+        assert!(
+            a.context_size().approx_tokens < raw_chars / 4,
+            "the estimate must count the stub, not the discarded body"
         );
     }
 

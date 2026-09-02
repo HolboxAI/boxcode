@@ -4267,6 +4267,87 @@ fn clip_label(s: &str, max: usize) -> String {
     format!("{}…", kept.trim_end())
 }
 
+/// Bodies already on disk are not sent again. A `write_file` of a webpage
+/// is tens of kilobytes that every later round of the turn would otherwise
+/// resend -- which is the dominant cost of building HTML/JS/CSS. Below this
+/// the stub is larger than the body, so small files stay as they are.
+const STUB_BODY_AFTER: usize = 256;
+
+/// Drop file bodies from a tool call that has already been executed, so later
+/// rounds do not resend what the disk already holds. Path and tool name stay,
+/// so the transcript still says what happened; the model can `read_file` if
+/// it needs the bytes back.
+pub fn stub_heavy_tool_args(call: &crate::llm::ToolCall) -> crate::llm::ToolCall {
+    match call.function.name.as_str() {
+        WRITE_FILE => stub_named_string_fields(call, &["content"]),
+        EDIT_FILE => stub_edit_file_args(call),
+        _ => call.clone(),
+    }
+}
+
+fn stub_named_string_fields(call: &crate::llm::ToolCall, fields: &[&str]) -> crate::llm::ToolCall {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+        return call.clone();
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return call.clone();
+    };
+    let mut changed = false;
+    for field in fields {
+        if stub_string_field(obj, field) {
+            changed = true;
+        }
+    }
+    if !changed {
+        return call.clone();
+    }
+    let mut out = call.clone();
+    out.function.arguments = value.to_string();
+    out
+}
+
+fn stub_edit_file_args(call: &crate::llm::ToolCall) -> crate::llm::ToolCall {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+        return call.clone();
+    };
+    let mut changed = false;
+    if let Some(obj) = value.as_object_mut() {
+        changed |= stub_string_field(obj, "old_string");
+        changed |= stub_string_field(obj, "new_string");
+        if let Some(edits) = obj.get_mut("edits").and_then(|e| e.as_array_mut()) {
+            for edit in edits {
+                if let Some(span) = edit.as_object_mut() {
+                    changed |= stub_string_field(span, "old_string");
+                    changed |= stub_string_field(span, "new_string");
+                }
+            }
+        }
+    }
+    if !changed {
+        return call.clone();
+    }
+    let mut out = call.clone();
+    out.function.arguments = value.to_string();
+    out
+}
+
+fn stub_string_field(obj: &mut serde_json::Map<String, serde_json::Value>, field: &str) -> bool {
+    let Some(text) = obj.get(field).and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if text.len() <= STUB_BODY_AFTER {
+        return false;
+    }
+    let n = text.len();
+    obj.insert(
+        field.to_string(),
+        serde_json::Value::String(format!(
+            "[{field} already on disk, {n} bytes; read the file if you need it back]"
+        )),
+    );
+    true
+}
+
 /// Truncate to `max` characters (not bytes -- this must never split a char).
 fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -6657,6 +6738,50 @@ mod tests {
         execute(&write_call("hello.txt", "new content\n"), &ws, &cfg).await;
         let out = execute(&read_call("hello.txt"), &ws, &cfg).await;
         assert_eq!(out.content, "new content\n");
+    }
+
+    /// The property later rounds of a turn depend on: a webpage's body is
+    /// already on disk, so resending it inside the original `write_file`
+    /// arguments would be the bulk of every subsequent request.
+    #[test]
+    fn a_large_write_file_body_is_stubbed_and_a_small_one_is_not() {
+        let large = "x".repeat(STUB_BODY_AFTER + 1);
+        let stubbed = stub_heavy_tool_args(&write_call("index.html", &large));
+        let args: serde_json::Value = serde_json::from_str(&stubbed.function.arguments).unwrap();
+        assert_eq!(args["path"], "index.html");
+        let content = args["content"].as_str().unwrap();
+        assert!(content.contains("already on disk"), "{content}");
+        assert!(content.contains(&format!("{} bytes", large.len())), "{content}");
+        assert!(!content.contains(&large), "the body itself must be gone");
+
+        let small = stub_heavy_tool_args(&write_call("hello.py", "print('hi')\n"));
+        assert_eq!(
+            small.function.arguments,
+            write_call("hello.py", "print('hi')\n").function.arguments,
+            "a small write is cheaper to keep than to stub"
+        );
+    }
+
+    #[test]
+    fn a_large_edit_file_span_is_stubbed() {
+        let old = "a".repeat(STUB_BODY_AFTER + 10);
+        let new = "b".repeat(STUB_BODY_AFTER + 10);
+        let call = tool_call(
+            EDIT_FILE,
+            json!({ "path": "app.css", "old_string": old, "new_string": new }),
+        );
+        let stubbed = stub_heavy_tool_args(&call);
+        let args: serde_json::Value = serde_json::from_str(&stubbed.function.arguments).unwrap();
+        assert_eq!(args["path"], "app.css");
+        assert!(args["old_string"].as_str().unwrap().contains("already on disk"));
+        assert!(args["new_string"].as_str().unwrap().contains("already on disk"));
+    }
+
+    #[test]
+    fn other_tools_are_not_stubbed() {
+        let call = tool_call(RUN_COMMAND, json!({ "command": "x".repeat(STUB_BODY_AFTER + 1) }));
+        let stubbed = stub_heavy_tool_args(&call);
+        assert_eq!(stubbed.function.arguments, call.function.arguments);
     }
 
     #[tokio::test]
