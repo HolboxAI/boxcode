@@ -521,7 +521,11 @@ pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> 
                                 published before -- say the file is written and stop. Works for \
                                 a built site or SPA (point at the output directory, e.g. dist/), \
                                 a single HTML page, a chart or diagram, a CSV or a text file. \
-                                Publishing the same path again (e.g. after editing it) updates \
+                                For a JS frontend (Vite, React, ...), run the build first; \
+                                pointing at the project root of an unbuilt app previews the \
+                                empty template, not the styled page. HTML pages must <link> \
+                                their stylesheets -- a .css file sitting next to the page is \
+                                not loaded by itself. Publishing the same path again (e.g. after editing it) updates \
                                 that link in place rather than creating a new one, so there is no \
                                 new link to hand over -- but that update only happens when you \
                                 call this tool again. If a path has already been published and \
@@ -1273,7 +1277,10 @@ pub fn system_prompt(
            {CHECK_CONTRAST} before publishing; you have no way to look at the result yourself, \
            so this is the one part of the claim that is actually verified rather than assumed. \
            A utilitarian page (a form, an internal tool) does not need this treatment -- \
-           calibrate to what was asked for, not every page into a landing page.\n\
+           calibrate to what was asked for, not every page into a landing page. Every HTML \
+           page that should be styled must `<link rel=\"stylesheet\" href=\"/design-tokens.css\">` \
+           (leading slash) -- a stylesheet file is not loaded just because it sits next to \
+           the page, and a relative href 404s on the preview host.\n\
          - {PUBLISH_ARTIFACT} is for when the user wants to LOOK at something: \"show me\", \
            \"let me see it\", \"how does it look\", \"preview\", \"open it\", \"share this\". \
            Only then, for a path never published before. Once a path HAS been published, an \
@@ -2907,6 +2914,9 @@ fn execute_get_design_starter(call: &ToolCall) -> ToolOutcome {
             "{DESIGN_STARTER_CSS}\n\nWrite this into the project (design-tokens.css or similar), \
              then replace --accent, --accent-hover, --font-display and --font-body before \
              publishing anything meant to feel distinctive -- the file's own header explains why. \
+             Link it from every HTML page with a leading slash: \
+             <link rel=\"stylesheet\" href=\"/design-tokens.css\">. A relative href 404s on the \
+             preview host because the page URL has no trailing slash. \
              Check any accent you land on with check_contrast against both --surface and \
              --surface-raised, in both light and dark."
         ),
@@ -6108,6 +6118,11 @@ mod tests {
         // The guidance telling the model to replace it travels with the CSS,
         // not left implicit for the model to infer.
         assert!(out.content.contains("--accent"), "{}", out.content);
+        assert!(
+            out.content.contains("href=\"/design-tokens.css\""),
+            "must tell the model to link the stylesheet with a leading slash: {}",
+            out.content
+        );
     }
 
     #[test]
