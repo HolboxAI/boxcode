@@ -4348,6 +4348,40 @@ fn stub_string_field(obj: &mut serde_json::Map<String, serde_json::Value>, field
     true
 }
 
+/// Drop a tool *result* that later rounds no longer need. The round that just
+/// produced it still sends the full body -- that is the round the model acts
+/// on. Older `read_file` of a stylesheet would otherwise be resent on every
+/// subsequent request of a webpage turn.
+pub fn stub_heavy_tool_result(call: &crate::llm::ToolCall, content: &str) -> String {
+    if content.len() <= STUB_BODY_AFTER || content.starts_with("Error:") {
+        return content.to_string();
+    }
+    match call.function.name.as_str() {
+        READ_FILE => {
+            let path = json_string_field(&call.function.arguments, "path")
+                .unwrap_or_else(|| "the file".to_string());
+            format!(
+                "[{READ_FILE} {path}: {} bytes already shown; read the file again if you need it back]",
+                content.len()
+            )
+        }
+        LIST_DIR | GLOB | GREP_SEARCH => format!(
+            "[{}: {} bytes already shown; call the tool again if you need the listing back]",
+            call.function.name,
+            content.len()
+        ),
+        _ => content.to_string(),
+    }
+}
+
+fn json_string_field(arguments: &str, field: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get(field)?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Truncate to `max` characters (not bytes -- this must never split a char).
 fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -6782,6 +6816,19 @@ mod tests {
         let call = tool_call(RUN_COMMAND, json!({ "command": "x".repeat(STUB_BODY_AFTER + 1) }));
         let stubbed = stub_heavy_tool_args(&call);
         assert_eq!(stubbed.function.arguments, call.function.arguments);
+    }
+
+    #[test]
+    fn a_large_read_file_result_is_stubbed_and_an_error_is_not() {
+        let call = read_call("style.css");
+        let body = "body{color:red}".repeat(40);
+        let stubbed = stub_heavy_tool_result(&call, &body);
+        assert!(stubbed.contains("already shown"), "{stubbed}");
+        assert!(stubbed.contains("style.css"), "{stubbed}");
+        assert!(!stubbed.contains("color:red"), "{stubbed}");
+
+        let err = stub_heavy_tool_result(&call, &format!("Error: {}", "x".repeat(STUB_BODY_AFTER + 1)));
+        assert!(err.starts_with("Error:"), "{err}");
     }
 
     #[tokio::test]
