@@ -72,14 +72,18 @@ pub struct Message {
     /// Which call this message answers. Only ever set on `Role::Tool`.
     #[serde(default)]
     pub tool_call_id: Option<String>,
-    /// What this tool call changed on disk, if it changed a file. Only ever
-    /// set on `Role::Tool`, and drawn under the tool line as a `-`/`+` diff.
+    /// What this tool call changed on disk, if it changed a file. Set on
+    /// `Role::Tool` and drawn under the tool line as a `-`/`+` diff; also set
+    /// on the `Role::System` messages `/diff` pushes, one per changed file,
+    /// where it is drawn the same way.
     ///
     /// Carried on the message rather than re-derived at render time for the
     /// same reason `Deploy`'s summary is: the file has already been written by
     /// the time this is drawn, so asking the disk again would show the diff
     /// against the *new* contents -- which is to say, nothing. It has to be
-    /// captured at the moment of the change or not at all.
+    /// captured at the moment of the change or not at all. (`/diff` is the
+    /// one exception -- it exists precisely to diff against what is on disk
+    /// *right now*, so it computes fresh rather than reusing a captured one.)
     ///
     /// `#[serde(default)]`, like every field above it, so a session file
     /// written before this existed still loads.
@@ -207,6 +211,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/subagents", "what each subagent did, step by step"),
     ("/hosted", "projects this machine is hosting, and whether they are live"),
     ("/rollback", "undo every file the model wrote this session"),
+    ("/diff", "show everything changed on disk this session"),
 ];
 
 /// Roughly how many characters one token is worth.
@@ -802,6 +807,7 @@ impl App {
                         "/subagents" => self.show_subagents(),
                         "/hosted" => self.start_hosted(),
                         "/rollback" => self.start_rollback(),
+                        "/diff" => self.show_diff(),
                         other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
                     }
                 } else {
@@ -2181,6 +2187,90 @@ impl App {
         // no longer exists. `Role::Context` is the only local role `history`
         // forwards, and this is what it is for.
         self.messages.push(Message::new(Role::Context, report.notice()));
+    }
+
+    /// `/diff` -- show everything the model has changed on disk this
+    /// session, file by file, as real diffs.
+    ///
+    /// No new diff engine: this walks the same journal `/rollback` reads --
+    /// its first-touch "before" snapshot for every recorded path -- and
+    /// diffs each one against what is on disk right now with the very same
+    /// `diff::diff` an `edit_file`/`write_file` approval already runs, drawn
+    /// with the very same renderer (a `Role::Tool`-style message carrying a
+    /// `FileDiff`). `/diff` only asks a different question of data the
+    /// journal was already keeping: "what changed" instead of "undo it".
+    fn show_diff(&mut self) {
+        self.follow_tail = true;
+
+        if self.rollback.is_empty() {
+            self.messages.push(Message::new(
+                Role::System,
+                "No changes yet this session — no file has been written or edited.",
+            ));
+            return;
+        }
+
+        let mut shown = 0usize;
+        for step in self.rollback.plan() {
+            // What the file held before this session touched it. A file
+            // this session created has no such state -- diffed against ""
+            // it renders as a full addition, same as any other new file.
+            let (before, created_this_session) = match &step.action {
+                crate::rollback::Action::Restore(text) => (text.clone(), false),
+                crate::rollback::Action::Delete => (String::new(), true),
+                crate::rollback::Action::Blocked(why) => {
+                    self.messages.push(Message::new(
+                        Role::System,
+                        format!("{} — cannot diff: {why}", step.display),
+                    ));
+                    continue;
+                }
+            };
+
+            let now = match std::fs::read_to_string(&step.path) {
+                Ok(text) => text,
+                // Gone from disk since -- diffed against "" so it renders as
+                // a full removal, the mirror image of a new file.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    self.messages.push(Message::new(
+                        Role::System,
+                        format!("{} — cannot diff: it is not a text file now", step.display),
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    self.messages.push(Message::new(
+                        Role::System,
+                        format!("{} — cannot diff: {e}", step.display),
+                    ));
+                    continue;
+                }
+            };
+
+            let file_diff = crate::diff::diff(&before, &now);
+            if file_diff.is_empty() {
+                // Created and since deleted again, or otherwise back to
+                // exactly what it started as -- nothing to show.
+                continue;
+            }
+            shown += 1;
+            let note = if created_this_session { " (new this session)" } else { "" };
+            let mut msg = Message::new(
+                Role::System,
+                format!("{}{note} — {}", step.display, file_diff.tally()),
+            );
+            msg.diff = Some(file_diff);
+            self.messages.push(msg);
+        }
+
+        if shown == 0 {
+            self.messages.push(Message::new(
+                Role::System,
+                "No changes yet this session — every touched file already matches what it \
+                 held before.",
+            ));
+        }
     }
 
     /// Whether `call` needs a human decision before it runs.
@@ -4358,6 +4448,96 @@ mod tests {
         assert!(COMMANDS.iter().any(|(name, _)| *name == "/rollback"));
         type_str(&mut a, "/rollb");
         assert_eq!(a.selected_command(), Some("/rollback"));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.input_buffer.is_empty(), "the command ran");
+    }
+
+    // ---- /diff -------------------------------------------------------
+
+    /// With nothing written this session, `/diff` says so rather than
+    /// drawing an empty view.
+    #[test]
+    fn diff_with_nothing_written_says_so() {
+        let mut a = app();
+        a.show_diff();
+        assert_eq!(a.messages.len(), 1);
+        assert!(a.messages[0].content.contains("No changes yet this session"));
+        assert!(a.messages[0].diff.is_none());
+    }
+
+    /// A file this session edited is diffed against what is on disk right
+    /// now, using the real diff engine -- not the journal's captured before,
+    /// which by itself says nothing about the current state.
+    #[test]
+    fn diff_shows_the_real_change_for_an_edited_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "after\n").unwrap();
+
+        let mut a = app();
+        a.push_tool_outcome(write_outcome(
+            "1",
+            "a.rs",
+            &path,
+            crate::rollback::Before::Text("before\n".to_string()),
+        ));
+        a.show_diff();
+
+        let msg = a.messages.last().expect("a diff message");
+        assert!(msg.content.contains("a.rs"));
+        let diff = msg.diff.as_ref().expect("a diff");
+        assert_eq!((diff.added, diff.removed), (1, 1));
+    }
+
+    /// A file created this session has no "before" state to speak of --
+    /// `/diff` shows it as a full addition against the empty string, the
+    /// same as any other brand new file's diff.
+    #[test]
+    fn diff_shows_a_file_created_this_session_as_a_full_addition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("new.rs");
+        std::fs::write(&path, "brand new\n").unwrap();
+
+        let mut a = app();
+        wrote_new(&mut a, "1", "new.rs", path.to_str().unwrap());
+        a.show_diff();
+
+        let msg = a.messages.last().expect("a diff message");
+        assert!(msg.content.contains("new.rs"));
+        assert!(msg.content.contains("new this session"));
+        let diff = msg.diff.as_ref().expect("a diff");
+        assert_eq!((diff.added, diff.removed), (1, 0));
+    }
+
+    /// A file already back to exactly what it started as -- e.g. edited and
+    /// then edited back -- has nothing to show, and is left out rather than
+    /// drawn as an empty diff.
+    #[test]
+    fn diff_skips_a_file_that_matches_its_before_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "same\n").unwrap();
+
+        let mut a = app();
+        a.push_tool_outcome(write_outcome(
+            "1",
+            "a.rs",
+            &path,
+            crate::rollback::Before::Text("same\n".to_string()),
+        ));
+        a.show_diff();
+
+        assert!(a.messages.last().unwrap().content.contains("No changes yet this session"));
+    }
+
+    /// The command is reachable the way every other one is: typed, matched
+    /// by prefix, run on Enter.
+    #[test]
+    fn diff_is_dispatched_from_the_command_menu() {
+        let mut a = app();
+        assert!(COMMANDS.iter().any(|(name, _)| *name == "/diff"));
+        type_str(&mut a, "/dif");
+        assert_eq!(a.selected_command(), Some("/diff"));
         a.handle_key(key(KeyCode::Enter));
         assert!(a.input_buffer.is_empty(), "the command ran");
     }
