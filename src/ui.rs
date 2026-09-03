@@ -19,7 +19,7 @@ const MAX_INPUT_HEIGHT: u16 = 10;
 const MAX_APPROVAL_HEIGHT: u16 = 24;
 /// Tall enough for every command in `app::COMMANDS` plus its border. There is
 /// a test.
-const MAX_COMMAND_MENU_HEIGHT: u16 = 15;
+const MAX_COMMAND_MENU_HEIGHT: u16 = 16;
 /// The deployment panel is allowed to be taller than the approval prompt: it
 /// carries a checklist, a menu and a live log at the same time, and clipping
 /// the log is what makes a failed build undiagnosable.
@@ -277,6 +277,12 @@ pub fn message_lines(msg: &Message, width: usize) -> Vec<Line<'static>> {
             )]));
             for wrapped in wrap(msg.body(), width) {
                 lines.push(Line::from(Span::styled(wrapped, theme::text())));
+            }
+            // `/diff` pushes one such message per changed file, each
+            // carrying its own `FileDiff` -- the same widget a tool result's
+            // diff draws with, reused rather than rebuilt.
+            if let Some(diff) = &msg.diff {
+                lines.extend(diff_lines(diff, width, 2));
             }
         }
         Role::Tool => unreachable!("handled above"),

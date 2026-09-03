@@ -1323,6 +1323,10 @@ pub fn system_prompt(
          - Commands run through {RUN_COMMAND} are NON-INTERACTIVE: stdin is closed. Never run \
            anything that waits for input, opens an editor (vim, nano), or runs a server in the \
            foreground. Such a command will simply time out after {} seconds.\n\
+         - When a task requires running the same test or command repeatedly (e.g. a flaky or \
+           concurrency test 5 times), write a single script or shell loop that performs the \
+           repetition automatically and run that once, rather than issuing N separate \
+           {RUN_COMMAND} calls -- each one is a fresh approval for the user to answer.\n\
          - The user approves every write, every command, and every web search before it runs \
            (reads of a short, conservative allowlist may go through without asking). If something \
            is declined, do not retry it — take a different approach or answer without it.\n\
