@@ -351,7 +351,28 @@ async fn run(
         req = req.bearer_auth(api_key);
     }
 
-    let response = req.send().await.map_err(|e| network_failure(&url, &e))?;
+    // Retry the connection/status-check phase only -- never once a token has
+    // reached the caller, since replaying a request that already streamed part
+    // of an answer would risk duplicate or garbled output. `try_clone` always
+    // succeeds here because the body is buffered JSON, not a stream.
+    let mut attempt: u32 = 0;
+    let response = loop {
+        let this_req = req
+            .try_clone()
+            .expect("request body is buffered JSON, so it is always cloneable");
+        let response = this_req.send().await.map_err(|e| network_failure(&url, &e))?;
+        let status = response.status();
+        if attempt >= MAX_RETRY_ATTEMPTS || !is_retryable_status(status) {
+            break response;
+        }
+        let wait = retry_after_duration(&response).unwrap_or_else(|| backoff_delay(attempt));
+        attempt += 1;
+        // A plain `.await`: this task is spawned with an `AbortHandle` the app
+        // already holds (see `agent.rs`), and aborting it drops this future --
+        // including mid-sleep -- so a user cancelling during backoff works the
+        // same way cancelling mid-stream already does.
+        tokio::time::sleep(wait).await;
+    };
 
     // Surface HTTP failures (401 bad key, 404 wrong path, 400 bad model) as text
     // in the transcript instead of silently ending the stream.
@@ -644,6 +665,43 @@ pub fn parse_sse_line(line: &str) -> SseLine {
 /// first one on a large prompt -- and short enough that a connection which
 /// died silently does not leave the spinner turning indefinitely.
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How many extra attempts a request gets after a retryable failure (429 or
+/// 5xx) before giving up and surfacing the error, on top of the first try.
+/// Small on purpose: a request stuck retrying is a request the user cannot
+/// see progress on, and three chances at exponential backoff already covers
+/// the ordinary case of a rate limit or a server hiccup clearing itself.
+const MAX_RETRY_ATTEMPTS: u32 = 3;
+
+/// The backoff cap. However high `attempt` climbs, never wait longer than this
+/// between retries.
+const MAX_BACKOFF: Duration = Duration::from_secs(16);
+
+/// A 429 (rate limited) or 5xx (server-side fault) is worth retrying
+/// automatically -- both are usually transient. A 4xx other than 429 (bad
+/// key, bad model, malformed request) will fail again identically, so
+/// retrying it would only delay the error the user needs to see.
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Exponential backoff for the `attempt`-th retry (0-indexed): 1s, 2s, 4s, ...,
+/// capped at `MAX_BACKOFF`.
+fn backoff_delay(attempt: u32) -> Duration {
+    let secs = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+    Duration::from_secs(secs).min(MAX_BACKOFF)
+}
+
+/// The `Retry-After` header, when the endpoint sends one, as the delay-seconds
+/// form (`Retry-After: 20`) rather than an HTTP-date. Preferred over the
+/// exponential backoff guess whenever it is present, since the endpoint is
+/// telling us exactly how long it wants; clamped so a misbehaving endpoint
+/// cannot stall a retry indefinitely.
+fn retry_after_duration(response: &reqwest::Response) -> Option<Duration> {
+    let raw = response.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_secs(secs).min(Duration::from_secs(60)))
+}
 
 /// The host part of an endpoint URL, for a message a person has to read.
 ///
@@ -1049,6 +1107,27 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Serve a sequence of canned HTTP responses, one per accepted connection,
+    /// in order. Used to exercise retries: an early connection can fail while
+    /// a later one succeeds, the way a rate limit clearing itself would.
+    async fn serve_sequence(responses: Vec<Vec<u8>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await; // consume the request
+                if socket.write_all(&response).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
     async fn collect(endpoint: &str) -> Vec<StreamEvent> {
         let (tx, mut rx) = mpsc::channel(64);
         stream_chat(
@@ -1359,6 +1438,86 @@ mod tests {
         let events = collect("http://127.0.0.1:1").await;
         match events.last() {
             Some(StreamEvent::Error(e)) => assert!(e.contains("Could not reach"), "{e}"),
+            other => panic!("expected an Error event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_429_and_5xx_are_retried() {
+        for code in [429, 500, 502, 503, 599] {
+            assert!(
+                is_retryable_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                "{code} should be retried"
+            );
+        }
+        // Client errors other than 429 will fail again identically -- retrying
+        // them only delays the error the user actually needs to see.
+        for code in [400, 401, 403, 404] {
+            assert!(
+                !is_retryable_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                "{code} should not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_and_is_capped() {
+        assert_eq!(backoff_delay(0), Duration::from_secs(1));
+        assert_eq!(backoff_delay(1), Duration::from_secs(2));
+        assert_eq!(backoff_delay(2), Duration::from_secs(4));
+        // However high the attempt count climbs, it never exceeds the cap.
+        assert_eq!(backoff_delay(10), MAX_BACKOFF);
+    }
+
+    /// A 429 with no `Retry-After` is retried automatically -- a rate limit is
+    /// exactly the transient failure this exists for -- and the retry can
+    /// succeed, with the answer reaching the caller as if the first attempt
+    /// had never happened.
+    ///
+    /// `Retry-After: 0` keeps this test fast without weakening what it checks:
+    /// the code path taken is the same one a real rate limit's backoff would
+    /// use, just with a delay of zero.
+    #[tokio::test]
+    async fn a_429_is_retried_and_the_retry_can_succeed() {
+        let body = r#"{"error":{"message":"slow down"}}"#;
+        let rate_limited = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\
+             Retry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let ok_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
+        let ok = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{ok_body}"
+        )
+        .into_bytes();
+        let addr = serve_sequence(vec![rate_limited, ok]).await;
+
+        let events = collect(&addr).await;
+        assert_eq!(text_of(&events), "Hi");
+        assert!(matches!(events.last(), Some(StreamEvent::Done)));
+    }
+
+    /// Retries are bounded: a rate limit that never clears still ends in the
+    /// same user-facing error as before, not an infinite or unbounded wait.
+    #[tokio::test]
+    async fn a_429_that_never_clears_still_surfaces_the_original_error() {
+        let body = r#"{"error":{"message":"slow down"}}"#;
+        let responses = (0..=MAX_RETRY_ATTEMPTS)
+            .map(|_| {
+                format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\
+                     Retry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            })
+            .collect();
+        let addr = serve_sequence(responses).await;
+
+        let events = collect(&addr).await;
+        match events.last() {
+            Some(StreamEvent::Error(e)) => assert!(e.contains("rate limit"), "{e}"),
             other => panic!("expected an Error event, got {other:?}"),
         }
     }
