@@ -50,6 +50,7 @@ pub fn fire_request(
     let model = app.config.llm.model.clone();
     let api_key = app.config.llm.api_key.clone();
     let max_tokens = app.config.llm.max_tokens;
+    let temperature = app.config.llm.effective_temperature();
 
     // Withholding the schemas once the budget is spent is what actually
     // stops a runaway loop: the model has nothing left to call, so it
@@ -131,6 +132,7 @@ pub fn fire_request(
                 api_key: &api_key,
                 max_tokens,
                 include_usage,
+                temperature,
             },
             history,
             schemas,
@@ -313,6 +315,7 @@ pub async fn run_subagent(
                 api_key: &config.llm.api_key,
                 max_tokens: config.llm.max_tokens,
                 include_usage: config.quota.enabled && config.quota.include_usage,
+                temperature: config.llm.effective_temperature(),
             },
             history.clone(),
             schemas,
