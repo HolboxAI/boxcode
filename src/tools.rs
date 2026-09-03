@@ -2507,6 +2507,23 @@ fn gh_api_is_read_only(args: &[&str]) -> bool {
 }
 
 pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
+    execute_truncated(call, workspace, config, false).await
+}
+
+/// Same as [`execute`], but additionally tells `write_file`/`edit_file`
+/// whether the LLM response `call` came from was cut off by the token budget
+/// (`finish_reason == "length"`) rather than finishing on its own -- see
+/// `App::truncated_response`. Every other tool ignores the flag, since only
+/// those two write model-generated content to disk on the model's word alone.
+/// Split from `execute` rather than adding the parameter there so the
+/// ordinary case -- everywhere except the live agent loop, including every
+/// existing test -- keeps calling `execute` unchanged.
+pub async fn execute_truncated(
+    call: &ToolCall,
+    workspace: &Workspace,
+    config: &ToolsConfig,
+    truncated: bool,
+) -> ToolOutcome {
     // Belt and braces. `app::advance_approvals` already refuses blocked calls
     // before they can be queued, so reaching this is a bug -- but the cost of
     // the check is a string scan and the cost of missing it is an erased disk,
@@ -2520,11 +2537,11 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
     match call.function.name.as_str() {
         RUN_COMMAND => execute_run_command(call, workspace, config).await,
         READ_FILE => execute_read_file(call, workspace, config).await,
-        WRITE_FILE => execute_write_file(call, workspace).await,
+        WRITE_FILE => execute_write_file(call, workspace, truncated).await,
         LIST_DIR => execute_list_dir(call, workspace),
         GLOB => execute_glob(call, workspace),
         GREP_SEARCH => execute_grep_search(call, workspace),
-        EDIT_FILE => execute_edit_file(call, workspace),
+        EDIT_FILE => execute_edit_file(call, workspace, truncated),
         GET_DESIGN_STARTER => execute_get_design_starter(call),
         CHECK_CONTRAST => execute_check_contrast(call),
         WEB_SEARCH => execute_web_search(call, config).await,
@@ -2790,7 +2807,108 @@ async fn execute_read_file(call: &ToolCall, workspace: &Workspace, config: &Tool
     }
 }
 
-async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+/// Phrases a model reaches for when it gives up partway through and
+/// *describes* the rest of the file instead of writing it -- "// ... rest of
+/// code unchanged" and its many spellings. Matched against the lowercased
+/// text, so each entry only needs the words that actually vary between
+/// comment styles (`//`, `#`, `/* */`, `<!-- -->`), not the punctuation
+/// around them.
+///
+/// Deliberately narrow. A real `// TODO: handle the empty-list case` must
+/// never trip this -- false positives are worse than an occasional miss here,
+/// since this runs on every write and edit and `finish_reason` (checked
+/// first, in `check_complete`) already carries the more reliable signal.
+/// Every entry below names the *shape* of a placeholder ("rest ...
+/// unchanged", "complete implementation") rather than a word ("todo",
+/// "rest") that shows up constantly in ordinary code and comments.
+const PLACEHOLDER_PHRASES: &[&str] = &[
+    "rest of the code unchanged",
+    "rest of code unchanged",
+    "rest of the file unchanged",
+    "rest of file unchanged",
+    "rest of the function unchanged",
+    "rest of function unchanged",
+    "rest unchanged",
+    "remainder unchanged",
+    "remaining code unchanged",
+    "rest of the code remains the same",
+    "rest of code remains the same",
+    "rest of the code stays the same",
+    "code continues unchanged",
+    "todo: complete implementation",
+    "todo: complete the implementation",
+    "todo: finish implementation",
+    "todo: finish the implementation",
+    "todo: implement the rest",
+    "content truncated",
+    "truncated for brevity",
+    "omitted for brevity",
+    "rest omitted for brevity",
+];
+
+/// Why `content` looks like it was never finished, or `None` if nothing here
+/// objects. Two checks, in the order they are trusted:
+///
+///  1. Any [`PLACEHOLDER_PHRASES`] entry, found anywhere in the text.
+///  2. The last non-blank line being a *commented-out* run of three or more
+///     dots and nothing else (`// ...`, `# ...`, `<!-- ... -->`) -- the shape
+///     of a reply that trailed off rather than closed whatever it was
+///     writing. Restricted to a comment: a bare `...` is legitimate syntax on
+///     its own (a Python stub body, a TypeScript ambient declaration), and
+///     only becomes suspicious once it is something a person or model wrote
+///     *about* the code rather than *as* the code.
+fn placeholder_marker(content: &str) -> Option<String> {
+    let lower = content.to_lowercase();
+    if let Some(&phrase) = PLACEHOLDER_PHRASES.iter().find(|p| lower.contains(**p)) {
+        return Some(format!("contains the phrase \"{phrase}\""));
+    }
+
+    let last_line = content.lines().rev().find(|l| !l.trim().is_empty())?.trim();
+    const MARKERS: &[(&str, &str)] =
+        &[("//", ""), ("#", ""), ("/*", "*/"), ("<!--", "-->")];
+    for (prefix, suffix) in MARKERS {
+        let Some(rest) = last_line.strip_prefix(prefix) else { continue };
+        let rest = if suffix.is_empty() { rest } else { rest.strip_suffix(suffix).unwrap_or(rest) };
+        let rest = rest.trim();
+        if rest.len() >= 3 && rest.chars().all(|c| c == '.') {
+            return Some(
+                "ends with a commented-out '...' and nothing else, the shape of a reply that \
+                 trailed off rather than finished"
+                    .to_string(),
+            );
+        }
+        break;
+    }
+    None
+}
+
+/// Whether `content` -- the text a model just generated for `write_file` or
+/// as an `edit_file` replacement -- looks like a genuine, finished piece of
+/// writing rather than something a truncated generation gave up on.
+///
+/// `truncated_response` is `finish_reason == "length"` for the response this
+/// content came from: the token budget ran out before the model stopped on
+/// its own, which is a far more reliable signal than any pattern in the text
+/// -- DeepSeek's `reasoning_content` in particular can eat most of that
+/// budget before the model gets to the answer, leaving a tool call that
+/// parses as valid JSON but stops mid-argument. Checked first, and it
+/// short-circuits the text search below: there is no need to go hunting for
+/// a placeholder phrase once the transport has already confirmed the cutoff.
+fn check_complete(content: &str, truncated_response: bool) -> Result<(), String> {
+    if truncated_response {
+        return Err(
+            "the response that produced it was cut off by the token budget \
+             (finish_reason: \"length\") before the model finished writing"
+                .to_string(),
+        );
+    }
+    if let Some(marker) = placeholder_marker(content) {
+        return Err(format!("it {marker}"));
+    }
+    Ok(())
+}
+
+async fn execute_write_file(call: &ToolCall, workspace: &Workspace, truncated: bool) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<WriteFileArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
@@ -2807,6 +2925,17 @@ async fn execute_write_file(call: &ToolCall, workspace: &Workspace) -> ToolOutco
             &call.id,
             "write_file — empty path".to_string(),
             "Error: the path was empty. Nothing was written.".to_string(),
+        );
+    }
+
+    if let Err(reason) = check_complete(&args.content, truncated) {
+        return outcome(
+            &call.id,
+            format!("write {} — refused, looks incomplete", clip(path, 50)),
+            format!(
+                "Error: this write to {path} appears incomplete -- {reason}. Nothing was \
+                 written. Please provide the complete file content and try again."
+            ),
         );
     }
 
@@ -4090,7 +4219,7 @@ fn execute_grep_search(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
 }
 
 /// `edit_file` -- replace an exact span, leaving the rest of the file alone.
-fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
+fn execute_edit_file(call: &ToolCall, workspace: &Workspace, truncated: bool) -> ToolOutcome {
     let Ok(args) = serde_json::from_str::<EditFileArgs>(&call.function.arguments) else {
         return outcome(
             &call.id,
@@ -4113,6 +4242,21 @@ fn execute_edit_file(call: &ToolCall, workspace: &Workspace) -> ToolOutcome {
         Err(e) => return fail(format!("Error: {e}")),
     };
     let batch = spans.len() > 1;
+
+    // Checked against the replacement text the model actually generated, not
+    // against the file it lands in -- the file is mostly pre-existing content
+    // that has nothing to do with whether *this* generation was cut short.
+    let new_text = spans.iter().map(|s| s.new.as_str()).collect::<Vec<_>>().join("\n");
+    if let Err(reason) = check_complete(&new_text, truncated) {
+        return outcome(
+            &call.id,
+            format!("edit {requested} — refused, looks incomplete"),
+            format!(
+                "Error: this edit to '{requested}' appears incomplete -- {reason}. Nothing was \
+                 written. Please provide the complete replacement text and try again."
+            ),
+        );
+    }
 
     let path = match resolve_in_workspace(workspace, &requested) {
         Ok(p) => p,
@@ -7028,6 +7172,167 @@ mod tests {
         execute(&write_call("hello.txt", "new content\n"), &ws, &cfg).await;
         let out = execute(&read_call("hello.txt"), &ws, &cfg).await;
         assert_eq!(out.content, "new content\n");
+    }
+
+    // ---- write/edit completeness guardrail ---------------------------------
+    //
+    // The bug this section covers: a reasoning model (DeepSeek in particular)
+    // can spend most or all of `max_tokens` on `reasoning_content` before it
+    // ever gets to the answer, so the write/edit it does emit is truncated --
+    // sometimes mid-argument, sometimes trailing off into a placeholder like
+    // "// rest of the code unchanged". Written to disk as-is, that silently
+    // breaks the file until someone notices later.
+
+    #[test]
+    fn a_normal_complete_write_is_not_flagged() {
+        assert!(check_complete("fn main() {\n    println!(\"hi\");\n}\n", false).is_ok());
+    }
+
+    #[test]
+    fn a_truncated_response_is_caught_even_with_ordinary_looking_content() {
+        // The content itself is unremarkable -- nothing here would trip the
+        // text heuristics. `finish_reason: length` alone is enough.
+        let err = check_complete("fn main() {\n    println!(\"hi\");\n}\n", true)
+            .expect_err("a length-truncated response must be refused");
+        assert!(err.contains("finish_reason"), "{err}");
+        assert!(err.contains("length"), "{err}");
+    }
+
+    #[test]
+    fn a_trailing_placeholder_comment_is_caught() {
+        let content = "fn main() {\n    println!(\"hi\");\n    // ... rest of code unchanged\n}\n";
+        let err =
+            check_complete(content, false).expect_err("a placeholder stub must be refused");
+        assert!(err.contains("rest of code unchanged"), "{err}");
+    }
+
+    #[test]
+    fn other_placeholder_spellings_are_also_caught() {
+        for content in [
+            "# ... (rest unchanged)\n",
+            "/* TODO: complete implementation */\n",
+            "// TODO: complete the implementation\n",
+            "content continues below\ncontent truncated for length\n",
+        ] {
+            assert!(
+                check_complete(content, false).is_err(),
+                "should have been flagged: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lone_trailing_commented_ellipsis_is_caught() {
+        let content = "def handler():\n    return 42\n\n# ...\n";
+        assert!(check_complete(content, false).is_err(), "{content:?}");
+    }
+
+    #[test]
+    fn a_genuine_todo_comment_is_not_a_placeholder() {
+        // The false-positive case: real, everyday comments that happen to
+        // share a word with the placeholder phrases must sail through.
+        for content in [
+            "// TODO: handle the empty-list case\nfn f() {}\n",
+            "# TODO: add retry logic here\ndef g():\n    pass\n",
+            "// the rest of this function is unrelated\nfn h() {}\n",
+            "def stub() -> None:\n    ...\n", // real Python Ellipsis body
+            "class Proto(Protocol):\n    def run(self) -> int: ...\n",
+        ] {
+            assert!(check_complete(content, false).is_ok(), "false positive on: {content:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_from_a_truncated_response_is_refused_and_nothing_is_written() {
+        let (dir, ws, cfg) = fixture();
+        let out = execute_truncated(&write_call("new.rs", "fn f() {\n"), &ws, &cfg, true).await;
+        assert!(out.content.starts_with("Error:"), "{}", out.content);
+        assert!(out.content.contains("incomplete"), "{}", out.content);
+        assert!(!dir.path().join("new.rs").exists(), "nothing should have been written");
+    }
+
+    #[tokio::test]
+    async fn a_write_containing_a_placeholder_stub_is_refused() {
+        let (dir, ws, cfg) = fixture();
+        let content = "fn main() {}\n// rest of the code unchanged\n";
+        let out = execute_truncated(&write_call("new.rs", content), &ws, &cfg, false).await;
+        assert!(out.content.starts_with("Error:"), "{}", out.content);
+        assert!(!dir.path().join("new.rs").exists(), "nothing should have been written");
+    }
+
+    #[tokio::test]
+    async fn a_normal_write_is_unaffected_by_the_guardrail() {
+        let (dir, ws, cfg) = fixture();
+        let out = execute_truncated(&write_call("new.rs", "fn f() {}\n"), &ws, &cfg, false).await;
+        assert!(out.content.contains("Wrote"), "{}", out.content);
+        assert!(dir.path().join("new.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn an_edit_from_a_truncated_response_is_refused_and_the_file_is_untouched() {
+        let (dir, ws, cfg) = fixture();
+        let before = tokio::fs::read_to_string(dir.path().join("hello.txt")).await.unwrap();
+        let out = execute_truncated(
+            &tool_call(
+                EDIT_FILE,
+                json!({"path": "hello.txt", "old_string": "two", "new_string": "TWO"}),
+            ),
+            &ws,
+            &cfg,
+            true,
+        )
+        .await;
+        assert!(out.content.starts_with("Error:"), "{}", out.content);
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("hello.txt")).await.unwrap(),
+            before,
+            "a refused edit must not touch the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_whose_replacement_is_a_placeholder_stub_is_refused() {
+        let (dir, ws, cfg) = fixture();
+        let before = tokio::fs::read_to_string(dir.path().join("hello.txt")).await.unwrap();
+        let out = execute_truncated(
+            &tool_call(
+                EDIT_FILE,
+                json!({
+                    "path": "hello.txt",
+                    "old_string": "two",
+                    "new_string": "// ... rest of the file unchanged"
+                }),
+            ),
+            &ws,
+            &cfg,
+            false,
+        )
+        .await;
+        assert!(out.content.starts_with("Error:"), "{}", out.content);
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("hello.txt")).await.unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn a_normal_edit_is_unaffected_by_the_guardrail() {
+        let (dir, ws, cfg) = fixture();
+        let out = execute_truncated(
+            &tool_call(
+                EDIT_FILE,
+                json!({"path": "hello.txt", "old_string": "two", "new_string": "TWO"}),
+            ),
+            &ws,
+            &cfg,
+            false,
+        )
+        .await;
+        assert!(out.content.contains("Replaced"), "{}", out.content);
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("hello.txt")).await.unwrap(),
+            "one\nTWO\nthree\n"
+        );
     }
 
     /// The property later rounds of a turn depend on: a webpage's body is

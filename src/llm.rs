@@ -208,7 +208,14 @@ pub enum StreamEvent {
     /// replayed and resent, while this is scaffolding that exists to prove the
     /// model is working and is dropped the moment it stops.
     Reasoning(String),
-    ToolCalls(Vec<ToolCall>),
+    /// `bool` is `finish_reason == "length"` for the response these calls came
+    /// from -- the model was cut off by the token budget rather than stopping
+    /// on its own. Carried alongside the calls, not as a separate event,
+    /// because it describes *this* response and every call in it: a
+    /// `write_file`/`edit_file` whose arguments were still streaming when the
+    /// cap hit is a truncated write wearing valid JSON, and the tool runner
+    /// needs to know that before it trusts the content.
+    ToolCalls(Vec<ToolCall>, bool),
     /// Not from the endpoint: the local command runner reports back on the same
     /// channel, so the event loop has one place to drain and one stale-id guard
     /// covering both sources.
@@ -435,13 +442,16 @@ async fn run(
         if let Some(usage) = parsed.usage.filter(|u| u.total() > 0) {
             let _ = tx.send((request_id, StreamEvent::Usage(usage))).await;
         }
-        if let Some(message) = parsed.choices.into_iter().next().and_then(|c| c.message) {
-            if let Some(text) = message.content.filter(|t| !t.is_empty()) {
-                let _ = tx.send((request_id, StreamEvent::Token(text))).await;
-            }
-            let calls = finalize_tool_calls(message.tool_calls);
-            if !calls.is_empty() {
-                let _ = tx.send((request_id, StreamEvent::ToolCalls(calls))).await;
+        if let Some(choice) = parsed.choices.into_iter().next() {
+            let truncated = choice.finish_reason.as_deref() == Some("length");
+            if let Some(message) = choice.message {
+                if let Some(text) = message.content.filter(|t| !t.is_empty()) {
+                    let _ = tx.send((request_id, StreamEvent::Token(text))).await;
+                }
+                let calls = finalize_tool_calls(message.tool_calls);
+                if !calls.is_empty() {
+                    let _ = tx.send((request_id, StreamEvent::ToolCalls(calls, truncated))).await;
+                }
             }
         }
         return Ok(());
@@ -527,10 +537,14 @@ async fn run(
     }
 
     // Tool calls are only complete once the stream is, since `arguments` is
-    // assembled from fragments and is not valid JSON before then.
+    // assembled from fragments and is not valid JSON before then. `finish_reason`
+    // is already known by now (set as soon as the chunk carrying it arrived), so
+    // a call built from a response the endpoint cut off for length is marked as
+    // such before anything downstream sees it.
     let calls = finalize_tool_calls(pending);
     if !calls.is_empty() {
-        let _ = tx.send((request_id, StreamEvent::ToolCalls(calls))).await;
+        let truncated = finish_reason.as_deref() == Some("length");
+        let _ = tx.send((request_id, StreamEvent::ToolCalls(calls, truncated))).await;
     }
 
     // Truncation is otherwise silent: a cut-off answer looks like a finished
@@ -1159,7 +1173,7 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::ToolCalls(calls) => Some(calls.clone()),
+                StreamEvent::ToolCalls(calls, _) => Some(calls.clone()),
                 _ => None,
             })
             .flatten()
@@ -1266,7 +1280,7 @@ mod tests {
             .map(|e| match e {
                 StreamEvent::Token(_) => "token",
                 StreamEvent::Reasoning(_) => "reasoning",
-                StreamEvent::ToolCalls(_) => "tools",
+                StreamEvent::ToolCalls(..) => "tools",
                 StreamEvent::ToolsFinished(_) => "finished",
                 StreamEvent::AgentActivity { .. } => "activity",
                 StreamEvent::Usage(_) => "usage",
@@ -1276,6 +1290,52 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["token", "tools", "done"]);
+    }
+
+    fn truncated_flag_of(events: &[StreamEvent]) -> Option<bool> {
+        events.iter().find_map(|e| match e {
+            StreamEvent::ToolCalls(_, truncated) => Some(*truncated),
+            _ => None,
+        })
+    }
+
+    /// A tool call whose response was cut off by the token cap must carry
+    /// that fact, so `write_file`/`edit_file` can refuse content that never
+    /// finished generating instead of writing it to disk as if it had.
+    #[tokio::test]
+    async fn a_tool_call_cut_off_by_length_is_flagged_truncated() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\",\\\"content\\\":\\\"fn a\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+        let events = collect(&addr).await;
+
+        assert_eq!(truncated_flag_of(&events), Some(true));
+    }
+
+    /// The ordinary case: a tool call that arrives because the model finished
+    /// on its own must not be flagged.
+    #[tokio::test]
+    async fn a_tool_call_that_finishes_normally_is_not_flagged_truncated() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+        let events = collect(&addr).await;
+
+        assert_eq!(truncated_flag_of(&events), Some(false));
     }
 
     /// Endpoints that ignore `stream: true` must still produce an answer.
@@ -1307,6 +1367,20 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_9");
         assert_eq!(calls[0].function.name, "list_dir");
+    }
+
+    /// The non-streaming fallback path reads `finish_reason` from the same
+    /// choice as the tool calls, not just the streaming path.
+    #[tokio::test]
+    async fn a_non_streaming_tool_call_carries_its_finish_reason() {
+        let body = r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"a.rs\",\"content\":\"fn a\"}"}}]}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let addr = serve(response.into_bytes(), 4096).await;
+
+        assert_eq!(truncated_flag_of(&collect(&addr).await), Some(true));
     }
 
     #[tokio::test]

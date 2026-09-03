@@ -155,7 +155,7 @@ pub fn handle_event(app: &mut App, id: u64, event: StreamEvent) {
     match event {
         StreamEvent::Token(token) => app.append_token(&token),
         StreamEvent::Reasoning(text) => app.append_reasoning(&text),
-        StreamEvent::ToolCalls(calls) => app.request_tools(calls),
+        StreamEvent::ToolCalls(calls, truncated) => app.request_tools_truncated(calls, truncated),
         StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
         StreamEvent::AgentActivity { call_id, label, rounds } => {
             app.record_subagent_activity(&call_id, label, rounds)
@@ -184,6 +184,12 @@ pub fn execute_approved(
         return;
     }
     let calls = std::mem::take(&mut app.approved_tools);
+    // Whether the response these calls came from was cut off by the token
+    // budget (`finish_reason == "length"`) rather than finishing on its own --
+    // set by `request_tools_truncated` when the calls first arrived, and read
+    // here rather than threaded through `approved_tools` because every call in
+    // one batch shares one response and so shares one answer to this question.
+    let truncated = app.truncated_response;
     // The whole config, not just `[tools]`: an `agent` call spawns a child
     // loop, and a loop needs the endpoint. Everything else still sees only
     // the `tools` half it always saw.
@@ -203,7 +209,7 @@ pub fn execute_approved(
                     outcomes.push(if call.function.name == tools::AGENT {
                         run_subagent(call, &ws, &config, Some((id, &tx))).await
                     } else {
-                        tools::execute(call, &ws, &config.tools).await
+                        tools::execute_truncated(call, &ws, &config.tools, truncated).await
                     });
                 }
                 let _ = tx.send((id, StreamEvent::ToolsFinished(outcomes))).await;
@@ -329,7 +335,11 @@ pub async fn run_subagent(
                 _ = &mut stream, if !stream_finished => stream_finished = true,
                 received = rx.recv() => match received {
                     Some((_, StreamEvent::Token(t))) => text.push_str(&t),
-                    Some((_, StreamEvent::ToolCalls(c))) => calls = c,
+                    // The truncation flag is dropped here on purpose: a
+                    // subagent's schemas never include write_file/edit_file
+                    // (see `SUBAGENT_TOOLS`), so nothing it calls can act on
+                    // it.
+                    Some((_, StreamEvent::ToolCalls(c, _))) => calls = c,
                     Some((_, StreamEvent::Usage(u))) => usage = Some(u),
                     // Notices ("answer was truncated") are addressed to a
                     // user, and this loop has none; ToolsFinished and
