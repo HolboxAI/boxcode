@@ -466,7 +466,17 @@ fn default_max_tokens() -> u32 {
 }
 
 fn default_command_timeout() -> u64 {
-    60
+    // 60s was sized for a shell one-liner -- `ls`, `grep`, a quick script. It
+    // is routinely too short for the commands this tool actually spends most
+    // of its time running: a `cargo build`, an `npm install` against a slow
+    // registry, or a real test suite. Those regularly clear a minute on an
+    // ordinary machine, which killed the process mid-build and reported a
+    // misleading timeout instead of the real result. 300s (5 minutes) is
+    // still bounded -- a genuinely hung command is killed well before anyone
+    // would wait it out by hand -- but it is sized for the workloads this
+    // tool is for rather than the ones it happened to be tested against.
+    // Still fully overridable via `command_timeout_secs` in config.toml.
+    300
 }
 
 fn default_max_output_bytes() -> usize {
@@ -1383,6 +1393,16 @@ mod tests {
         assert_eq!(config.tools.workspace, ".");
         assert_eq!(config.tools.python_bin, "python3");
         assert_eq!(config.tools.search_timeout_secs, 1);
+    }
+
+    /// 60s was sized for a shell one-liner and was routinely too short for a
+    /// real `cargo build`/`npm install`/test suite -- see
+    /// `default_command_timeout`. Pinned here so a future edit that quietly
+    /// shrinks it again gets caught by a test, not by someone's build dying
+    /// mid-way in the field.
+    #[test]
+    fn the_default_command_timeout_is_sized_for_real_build_and_test_workloads() {
+        assert_eq!(Config::default().tools.command_timeout_secs, 300);
     }
 
     #[test]

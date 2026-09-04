@@ -362,6 +362,12 @@ pub struct App {
     /// user approves a proposal, or when an unfinished plan is resumed from
     /// disk in a later session.
     pub active_plan: Option<crate::plan::Plan>,
+    /// The model's own short-term checklist, set and replaced wholesale by
+    /// `update_todos`. Unlike `active_plan` this is pure session state: there
+    /// is no file, it is never restated into the prompt (the model already
+    /// holds the list it just sent), and it resets with `/new` along with the
+    /// rest of the conversation.
+    pub todos: Vec<tools::TodoItem>,
     /// True when `active_plan` has changed and not yet been written.
     ///
     /// A flag rather than a write, for the same reason as `quota_dirty`:
@@ -628,6 +634,7 @@ impl App {
             state: AppState::AwaitingInput,
             mode: Mode::Normal,
             active_plan: None,
+            todos: Vec::new(),
             plan_dirty: false,
             session_reset: false,
             messages: Vec::new(),
@@ -1267,6 +1274,15 @@ impl App {
                 self.record_progress(&call, step, done, note);
                 continue;
             }
+            // `update_todos`: in-memory bookkeeping like `Progress` above, and
+            // resolved the same way and for the same reason -- there is
+            // nothing here for an approval prompt to protect, and asking
+            // permission to update a checklist would make the tool unusable.
+            if let Some(tools::Action::Todos(items)) = tools::describe_action(call) {
+                let call = self.pending_tools.pop_front().expect("front just matched");
+                self.update_todos(&call, items);
+                continue;
+            }
             if !self.needs_approval(call) {
                 let call = self.pending_tools.pop_front().expect("front just matched");
                 self.approved_tools.push(call);
@@ -1449,6 +1465,10 @@ impl App {
         self.streaming_response.clear();
         self.pending_tools.clear();
         self.approved_tools.clear();
+        // Scoped to the task being discussed, like the transcript itself --
+        // unlike `active_plan`, nothing on disk remembers this list, so there
+        // is nothing to resume and no reason to carry it into a fresh topic.
+        self.todos.clear();
         self.tool_steps = 0;
         self.scroll = 0;
         self.follow_tail = true;
@@ -2636,6 +2656,18 @@ impl App {
             }
             Err(reason) => self.push_tool_outcome(tools::progress_failed(call, &reason)),
         }
+        self.follow_tail = true;
+    }
+
+    /// `update_todos` -- replace the model's short-term checklist wholesale.
+    ///
+    /// No plan required, no approval, no file: this is `Mode::Normal`'s
+    /// lightweight alternative to `plan_progress`/`record_progress` above,
+    /// for the common case of a multi-step task the user never asked to see
+    /// a formal plan for. See `tools::Action::Todos`.
+    fn update_todos(&mut self, call: &ToolCall, items: Vec<tools::TodoItem>) {
+        self.todos = items;
+        self.push_tool_outcome(tools::todos_recorded(call, &self.todos));
         self.follow_tail = true;
     }
 
@@ -8162,6 +8194,21 @@ mod tests {
         }
     }
 
+    fn todos_call(id: &str, todos: &[(&str, &str)]) -> ToolCall {
+        let todos: Vec<serde_json::Value> = todos
+            .iter()
+            .map(|(content, status)| serde_json::json!({ "content": content, "status": status }))
+            .collect();
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::FunctionCall {
+                name: crate::tools::UPDATE_TODOS.to_string(),
+                arguments: serde_json::json!({ "todos": todos }).to_string(),
+            },
+        }
+    }
+
     /// A planning app whose workspace is a real temporary directory, so an
     /// approved plan has somewhere to be written.
     fn planning_app_in(dir: &std::path::Path) -> App {
@@ -8493,6 +8540,64 @@ mod tests {
 
         let told = a.messages.iter().rev().find(|m| m.role == Role::Tool).unwrap();
         assert!(told.content.contains("no plan"), "{}", told.content);
+    }
+
+    /// Regression test: `update_todos` must work in ordinary `Mode::Normal`
+    /// with no plan ever approved -- unlike `plan_progress`, which needs one
+    /// (see `recording_progress_with_no_active_plan_is_reported_not_crashed`
+    /// above). This is the whole point of the tool: a lightweight checklist
+    /// available without the plan ceremony.
+    #[test]
+    fn update_todos_works_with_no_active_plan_and_never_asks() {
+        let mut a = streaming_app();
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.active_plan.is_none());
+
+        a.request_tools(vec![todos_call(
+            "call_1",
+            &[("Add the schema", "in_progress"), ("Wire up execution", "pending")],
+        )]);
+
+        assert_eq!(a.overlay, None, "updating the checklist must never prompt");
+        assert!(a.approved_tools.is_empty(), "it is resolved locally, not run");
+        assert_eq!(a.todos.len(), 2);
+        assert_eq!(a.todos[0].content, "Add the schema");
+        assert_eq!(a.todos[0].status, crate::tools::TodoStatus::InProgress);
+        assert_eq!(a.todos[1].status, crate::tools::TodoStatus::Pending);
+
+        let told = a.messages.iter().rev().find(|m| m.role == Role::Tool).unwrap();
+        assert!(told.content.contains("0/2"), "{}", told.content);
+    }
+
+    /// Every call replaces the whole list rather than merging into it -- the
+    /// simplest model, and the one the tool's schema promises.
+    #[test]
+    fn update_todos_replaces_the_previous_list_rather_than_merging() {
+        let mut a = streaming_app();
+        a.request_tools(vec![todos_call(
+            "call_1",
+            &[("First", "completed"), ("Second", "in_progress"), ("Third", "pending")],
+        )]);
+        assert_eq!(a.todos.len(), 3);
+
+        a.state = AppState::Streaming;
+        a.request_tools(vec![todos_call("call_2", &[("Only this one now", "in_progress")])]);
+
+        assert_eq!(a.todos.len(), 1, "the old items must be gone, not merged with the new one");
+        assert_eq!(a.todos[0].content, "Only this one now");
+    }
+
+    /// An empty list is how the model clears the checklist once a task is
+    /// done -- it must not error or leave the old items in place.
+    #[test]
+    fn update_todos_with_an_empty_list_clears_it() {
+        let mut a = streaming_app();
+        a.request_tools(vec![todos_call("call_1", &[("One thing", "in_progress")])]);
+        assert_eq!(a.todos.len(), 1);
+
+        a.state = AppState::Streaming;
+        a.request_tools(vec![todos_call("call_2", &[])]);
+        assert!(a.todos.is_empty());
     }
 
     /// Losing the file does not undo the approval -- the user said yes and the
