@@ -1103,6 +1103,38 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             theme::faint(),
         ));
         spans.push(Span::styled("  ·  ", theme::faint()));
+    } else if !app.todos.is_empty() {
+        // The model's own lightweight checklist (`update_todos`), shown the
+        // same way an approved plan's progress is above -- but only while
+        // there is still something left to do, and with the current item's
+        // text next to it rather than the plan's title, since there is no
+        // title here to show.
+        let total = app.todos.len();
+        let done = app
+            .todos
+            .iter()
+            .filter(|t| t.status == crate::tools::TodoStatus::Completed)
+            .count();
+        if done < total {
+            spans.push(Span::styled(
+                format!("☑ {done}/{total}"),
+                Style::default()
+                    .fg(theme::p().accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            let current = app
+                .todos
+                .iter()
+                .find(|t| t.status == crate::tools::TodoStatus::InProgress)
+                .or_else(|| app.todos.iter().find(|t| t.status == crate::tools::TodoStatus::Pending));
+            if let Some(item) = current {
+                spans.push(Span::styled(
+                    format!(" {}", shorten(&item.content, 28)),
+                    theme::faint(),
+                ));
+            }
+            spans.push(Span::styled("  ·  ", theme::faint()));
+        }
     }
 
     for (i, (key, label)) in keys.iter().enumerate() {
@@ -1807,6 +1839,16 @@ fn tool_approval_parts(
                 theme::text(),
             )));
             (" Record this? ", "record", "skip")
+        }
+        // Never prompted, for the same reason `Progress` above is not: it is
+        // in-memory bookkeeping, resolved directly in `advance_approvals`.
+        // The renderer stays total anyway so this can never panic.
+        Action::Todos(items) => {
+            lines.push(Line::from(Span::styled(
+                format!("{} todo{}", items.len(), if items.len() == 1 { "" } else { "s" }),
+                theme::text(),
+            )));
+            (" Update the checklist? ", "update", "skip")
         }
     };
 
