@@ -1,80 +1,85 @@
 //! The wire protocol between `boxcode` and an external client (e.g.
-//! `boxcode-ide`) -- JSON-RPC 2.0 over NDJSON on stdio, one JSON object per
-//! line. Part of P0 (see `boxcode-ide`'s `docs/PLAN.md`, and `agent.rs`'s own
-//! doc comment: "step three of Phase 3 ... turns this trio into the body of
-//! a spawned `AgentLoop` task").
+//! `boxcode-ide`) -- the Agent Client Protocol (ACP), v1, over JSON-RPC 2.0
+//! on stdio. Part of P0 (see `boxcode-ide`'s `docs/PLAN.md`, and `agent.rs`'s
+//! own doc comment: "step three of Phase 3 ... turns this trio into the body
+//! of a spawned `AgentLoop` task").
 //!
-//! Scope of this module, deliberately: the wire *types* and their
-//! conversions from the internal [`crate::llm::StreamEvent`] /
-//! [`crate::approval::ApprovalRequest`] / [`crate::approval::Decision`] types
-//! that already exist and are already shaped correctly for this -- see
-//! `approval.rs`'s own doc comment, written before this module existed:
-//! "When the agent loop becomes its own task, these become the messages on
-//! the channel between it and the UI."
+//! This is a rewrite of an earlier, bespoke JSON-RPC schema this module used
+//! to define. That schema had zero callers (confirmed by grep before this
+//! rewrite) and was never wired to a real client, so replacing it here cost
+//! nothing in practice -- and the real industry convergence, confirmed by
+//! research before writing a line of this, is on ACP specifically: Cursor,
+//! Kiro (who published a real engineering account of building exactly this
+//! kind of shared-core-many-frontends architecture and choosing ACP for the
+//! client/agent boundary), Codex, and Gemini CLI are all registered ACP
+//! agents. A bespoke schema only ever works for `boxcode-ide`; ACP works
+//! with Zed, JetBrains, Neovim and Emacs too, for the same backend work.
 //!
-//! What is deliberately NOT here: the headless state machine that decides
-//! *when* to emit a [`NotificationParams::ApprovalRequest`] or advance a
-//! turn. That logic
-//! currently lives inside `App` (`advance_approvals`, `finish_stream`,
-//! `finish_tools` in `app.rs`) and extracting it is real, separate,
-//! higher-risk work -- `App` does not just react to agent events, it decides
-//! things (whether to compact, whether a response leaked tool-call markup as
-//! prose, when a turn is really over). This module exists so that
-//! extraction has a stable, tested wire contract to land on, and so a
-//! `boxcode-ide` client can be written against something real in the
-//! meantime.
+//! **Version: v1, deliberately, not v2.** Confirmed by reading both schemas
+//! (`agentclientprotocol/agent-client-protocol`, `schema/v1/schema.json` and
+//! `schema/v2/schema.json`) plus the repo's own `CHANGELOG.md` and
+//! `Cargo.toml` feature gates: v1 ships as `agent-client-protocol-schema`
+//! 1.7.0; v2 is `2.0.0-alpha.3`, gated behind an explicitly-opt-in
+//! `unstable_protocol_v2` Cargo feature the crate's own comment describes as
+//! "intentionally NOT part of the `unstable` umbrella" because it's a
+//! different wire version. v1 is what real clients speak today.
+//!
+//! **`fs/*` and `terminal/*` client methods are deliberately not
+//! implemented.** They exist in v1 (an agent can ask the client to read/
+//! write files or run commands in a client-managed terminal), but are
+//! optional -- `ClientCapabilities.fs`/`.terminal` default to `false`/absent
+//! capabilities, and an agent that never requests them is fully spec-
+//! compliant. `boxcode` already executes its own tools locally
+//! (`tools::execute`), which is the same model v2 standardized on for
+//! everyone (v2 deleted the client-delegated fs/terminal surface entirely,
+//! per that schema's own migration notes) -- so there is nothing to gain by
+//! implementing v1's optional version of it.
 //!
 //! Wire types are kept deliberately separate from the internal types they
-//! mirror rather than `#[derive(Serialize)]`-ing those types directly: the
-//! internal types stay free to change shape for the TUI's own needs without
-//! silently breaking the wire contract, and the wire contract stays free to
-//! evolve (rename a field for external clarity, add one) without touching
-//! internal code. The `From` conversions below are the only place the two
+//! mirror (`StreamEvent`, `Verdict`, `ToolOutcome`, ...) rather than
+//! `#[derive(Serialize)]`-ing those types directly: internal types stay free
+//! to change shape for the TUI's own needs without silently breaking the
+//! wire contract, and the wire contract stays free to evolve independently.
+//! The `From`/`fn to_acp` conversions below are the only place the two
 //! sides are allowed to know about each other.
 //!
-//! One deliberate omission, matching an existing product decision rather
-//! than an oversight: [`crate::llm::StreamEvent::Reasoning`] carries the
-//! model's raw chain-of-thought text, and `App::append_reasoning`'s own doc
-//! comment is explicit that this "is never shown, persisted, replayed, or
-//! sent back on the wire." This module keeps that guarantee -- reasoning
-//! becomes [`NotificationParams::Thinking`], a bare signal with no content,
-//! mirroring what `App::is_thinking()` already exposes to the TUI.
+//! **Concepts with no ACP equivalent, by design, not oversight** (confirmed
+//! against the full v1 schema before writing this, not discovered by trial
+//! and error):
+//! - Subagent progress (`StreamEvent::AgentActivity`) -- ACP has no nested-
+//!   session or subagent model at all. Dropped for now; `_meta` is the
+//!   sanctioned extension point if this needs to cross the wire later.
+//! - The write/edit truncation flag on `StreamEvent::ToolCalls`
+//!   (`finish_reason == "length"`) -- no ACP field for it. Closest fit is
+//!   ending the turn with `StopReason::MaxTokens`, not attempted here yet.
+//! - Cache-hit token accounting (`ApiUsage::cached_prompt_tokens`) -- ACP
+//!   has no such field.
+//! - Raw reasoning content (`StreamEvent::Reasoning`) -- matches an existing
+//!   product decision, not a new one: `App::append_reasoning`'s own doc
+//!   comment already says this "is never shown, persisted, replayed, or
+//!   sent back on the wire." ACP's own docs assume thought content IS shown
+//!   to the client (its worked examples stream real reasoning text) and
+//!   define no privacy/redaction concept anywhere in the schema -- confirmed
+//!   by an exhaustive grep, not assumed. The compromise that stays spec-
+//!   legal: `AgentThoughtChunk`'s `content` is required (chunks can't be
+//!   content-free), so reasoning is not streamed as chunks at all; nothing
+//!   currently signals "the model is thinking" on the wire either, since
+//!   that would need `SessionUpdate::CurrentModeUpdate` or a `_meta` signal
+//!   this module doesn't build yet. Documented as a real, known gap rather
+//!   than silently sending nothing and calling it done.
 
 use crate::approval::{ApprovalRequest, Decision};
-use crate::diff::FileDiff;
-use crate::llm::{ApiUsage, StreamEvent, ToolCall};
-use crate::tools::ToolOutcome;
+use crate::llm::{ApiUsage, ToolCall as InternalToolCall};
+use crate::tools::{Action, ToolOutcome};
 use serde::{Deserialize, Serialize};
 
-/// One JSON-RPC 2.0 notification -- no `id`, no response expected. Every
-/// [`StreamEvent`] this process ever emits (bar `Reasoning`, see module
-/// docs) becomes one of these, tagged with the turn's request id so a
-/// client juggling more than one in-flight turn -- there is at most one
-/// today, but the wire contract should not assume that stays true --
-/// can tell them apart the same way `agent::handle_event`'s stale-id guard
-/// already does internally.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct Notification {
-    pub jsonrpc: JsonRpcVersion,
-    pub method: NotificationMethod,
-    pub params: NotificationParams,
-}
-
-/// A request the client sends: to start a turn, answer a pending approval,
-/// or cancel. Carries an `id` because a well-behaved client may want to
-/// correlate it with whatever local action prompted it, even though this
-/// protocol answers requests via notifications on the turn's request id
-/// rather than a matching JSON-RPC response -- streaming output has no
-/// single "the response," so forcing one would mean modeling a whole turn
-/// as one giant reply instead of the sequence of notifications it actually
-/// is.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct Request {
-    pub jsonrpc: JsonRpcVersion,
-    pub id: u64,
-    pub method: RequestMethod,
-    pub params: RequestParams,
-}
+// ---------------------------------------------------------------------------
+// JSON-RPC 2.0 envelope -- generic, not ACP-specific. ACP is standard
+// JSON-RPC 2.0 (confirmed against the schema repo directly): the `"jsonrpc":
+// "2.0"` field is always present on the wire, unlike Codex's own app-server
+// convention (which omits it) -- that was a Codex-specific choice this
+// module's earlier draft mistakenly generalized from, not an ACP rule.
+// ---------------------------------------------------------------------------
 
 /// Always `"2.0"`. A distinct unit-like type rather than a bare `String` so
 /// a malformed envelope (wrong or missing version) fails to deserialize
@@ -102,432 +107,667 @@ impl<'de> Deserialize<'de> for JsonRpcVersion {
     }
 }
 
+/// One JSON-RPC request (expects a response) -- `id` is required and MUST
+/// be echoed back on the matching response. Used both for requests this
+/// process receives (`initialize`, `session/new`, `session/prompt`,
+/// unimplemented `fs/*`/`terminal/*`) and requests it sends
+/// (`session/request_permission`) -- ACP is bidirectional over one
+/// connection, both sides originate requests.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RpcRequest {
+    pub jsonrpc: JsonRpcVersion,
+    pub id: RequestId,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+/// A JSON-RPC id is a string or a number on the wire -- ACP itself just
+/// says "an identifier established by the Client" without constraining the
+/// type further, so this accepts either rather than assuming callers only
+/// ever send integers.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(untagged)]
+pub enum RequestId {
+    Number(i64),
+    String(String),
+}
+
+/// A successful JSON-RPC response.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RpcResponse {
+    pub jsonrpc: JsonRpcVersion,
+    pub id: RequestId,
+    pub result: serde_json::Value,
+}
+
+/// A JSON-RPC error response.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RpcError {
+    pub jsonrpc: JsonRpcVersion,
+    pub id: RequestId,
+    pub error: RpcErrorObject,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RpcErrorObject {
+    pub code: i64,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+/// A JSON-RPC notification -- no `id`, no response expected. Used for
+/// `session/update` (agent to client) and `session/cancel` (client to
+/// agent).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RpcNotification {
+    pub jsonrpc: JsonRpcVersion,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+impl RpcNotification {
+    /// One line of NDJSON, `\n`-terminated, ready to write to a stdout pipe.
+    pub fn to_ndjson_line(&self) -> String {
+        format!("{}\n", serde_json::to_string(self).expect("RpcNotification always serializes"))
+    }
+}
+
+impl RpcRequest {
+    pub fn to_ndjson_line(&self) -> String {
+        format!("{}\n", serde_json::to_string(self).expect("RpcRequest always serializes"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// initialize
+// ---------------------------------------------------------------------------
+
+/// A newtype so a malformed or out-of-range version fails to deserialize
+/// rather than silently accepting garbage -- mirrors the schema's own
+/// `uint16` constraint (`minimum: 0, maximum: 65535`).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotificationMethod {
-    #[serde(rename = "stream/token")]
-    Token,
-    /// See module docs: carries no reasoning text, only that the model is
-    /// (or has stopped) thinking -- mirrors `App::is_thinking()`.
-    #[serde(rename = "stream/thinking")]
-    Thinking,
-    /// One or more calls the model wants to make, each needing the user's
-    /// decision -- the wire form of [`ApprovalRequest`], including its
-    /// precomputed diff preview.
-    #[serde(rename = "stream/approvalRequest")]
-    ApprovalRequest,
-    #[serde(rename = "stream/toolsFinished")]
-    ToolsFinished,
-    #[serde(rename = "stream/agentActivity")]
-    AgentActivity,
-    #[serde(rename = "stream/usage")]
-    Usage,
-    #[serde(rename = "stream/done")]
-    Done,
-    #[serde(rename = "stream/notice")]
-    Notice,
-    #[serde(rename = "stream/error")]
-    Error,
+pub struct ProtocolVersion(pub u16);
+
+/// The version `boxcode` speaks. `1`, not `2` -- see module docs for why.
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct InitializeRequest {
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: ProtocolVersion,
+    #[serde(rename = "clientCapabilities", default, skip_serializing_if = "Option::is_none")]
+    pub client_capabilities: Option<serde_json::Value>,
+    #[serde(rename = "clientInfo", default, skip_serializing_if = "Option::is_none")]
+    pub client_info: Option<Implementation>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct InitializeResponse {
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: ProtocolVersion,
+    /// `{}` is the correct "nothing extra supported" value here, not
+    /// omission -- an absent `agentCapabilities` on the wire has its own
+    /// (different) meaning per the schema's defaults. Kept as raw JSON since
+    /// this module doesn't yet advertise any specific capability
+    /// sub-object; `serde_json::json!({})` is what callers should pass.
+    #[serde(rename = "agentCapabilities")]
+    pub agent_capabilities: serde_json::Value,
+    #[serde(rename = "authMethods", default)]
+    pub auth_methods: Vec<serde_json::Value>,
+    #[serde(rename = "agentInfo", default, skip_serializing_if = "Option::is_none")]
+    pub agent_info: Option<Implementation>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Implementation {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub version: String,
+}
+
+// ---------------------------------------------------------------------------
+// session/new
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionId(pub String);
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct NewSessionRequest {
+    pub cwd: String,
+    #[serde(rename = "additionalDirectories", default)]
+    pub additional_directories: Vec<String>,
+    /// Required by the v1 schema (`required: ["cwd", "mcpServers"]`) --
+    /// `boxcode` doesn't act as an MCP client yet, so this is always sent
+    /// empty, not omitted.
+    #[serde(rename = "mcpServers", default)]
+    pub mcp_servers: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct NewSessionResponse {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+}
+
+// ---------------------------------------------------------------------------
+// session/prompt -- the turn. Blocks (per v1) until `stopReason` is known;
+// progress streams via session/update notifications in the meantime.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PromptRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+    pub prompt: Vec<ContentBlock>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PromptResponse {
+    #[serde(rename = "stopReason")]
+    pub stop_reason: StopReason,
+}
+
+/// Only the `Text` variant is implemented -- the v1 schema's own baseline
+/// obligation is exactly this: "the Agent MUST support `ContentBlock::Text`
+/// and `ContentBlock::ResourceLink`, while other variants are optionally
+/// enabled via `PromptCapabilities`." `ResourceLink` isn't implemented yet
+/// either (no client-side file-reference flow exists in `boxcode-ide` yet
+/// to produce one) -- deserializing an unrecognized variant should fail
+/// loudly rather than silently drop content, hence no catch-all arm.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type")]
+pub enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestMethod {
-    #[serde(rename = "turn/send")]
-    TurnSend,
-    #[serde(rename = "approval/decide")]
-    ApprovalDecide,
-    #[serde(rename = "turn/cancel")]
-    TurnCancel,
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    MaxTokens,
+    MaxTurnRequests,
+    Refusal,
+    Cancelled,
 }
 
-/// Params for every [`NotificationMethod`] variant, tagged by an internal
-/// `kind` field so `{ "method": "stream/token", "params": { ... } }` still
-/// round-trips even though `method` and the shape of `params` are
-/// correlated -- JSON-RPC does not let a decoder pick `params`'s type from
-/// the sibling `method` field automatically, so this carries its own tag
-/// rather than relying on the caller to have read `method` first.
+// ---------------------------------------------------------------------------
+// session/cancel
+// ---------------------------------------------------------------------------
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(tag = "kind")]
-pub enum NotificationParams {
-    Token {
-        request_id: u64,
-        token: String,
-    },
-    Thinking {
-        request_id: u64,
-        thinking: bool,
-    },
-    ApprovalRequest {
-        request_id: u64,
-        request: ApprovalRequestDto,
-    },
-    ToolsFinished {
-        request_id: u64,
-        outcomes: Vec<ToolOutcomeDto>,
-    },
-    AgentActivity {
-        request_id: u64,
-        call_id: String,
-        label: String,
-        rounds: usize,
-    },
-    Usage {
-        request_id: u64,
-        usage: ApiUsage,
-    },
-    Done {
-        request_id: u64,
-    },
-    Notice {
-        request_id: u64,
-        note: String,
-    },
-    Error {
-        request_id: u64,
-        error: String,
-    },
+pub struct CancelNotification {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+}
+
+// ---------------------------------------------------------------------------
+// session/update -- the progress stream during a turn.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SessionNotification {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+    pub update: SessionUpdate,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(tag = "kind")]
-pub enum RequestParams {
-    /// The one field a headless client controls today: the user's message.
-    /// Everything `agent::fire_request` also needs -- workspace, config,
-    /// history -- is server-side state, not something a wire request
-    /// carries; a client sends what a person typed, not how to build a
-    /// prompt.
-    TurnSend {
-        message: String,
-    },
-    ApprovalDecide {
-        request_id: u64,
-        call_id: String,
-        decision: DecisionDto,
-    },
-    TurnCancel {
-        request_id: u64,
-    },
-}
+pub struct MessageId(pub String);
 
-/// The wire form of [`ToolCall`] plus [`crate::tools::Action`]'s rendered
-/// label and, when there is one, the diff the popup would draw -- everything
-/// [`ApprovalRequest`] already carries, none of it re-derived. `Action`
-/// itself is deliberately not mirrored variant-for-variant here: it is a
-/// large, still-growing enum whose only externally-relevant fact today is
-/// the one line it renders as (`Action::label`) and, for a `Write`/`Edit`,
-/// the diff already computed alongside it. A client that needs to
-/// special-case a specific action kind rather than just display the label
-/// does not exist yet; extend this DTO with a real field when one does,
-/// rather than speculatively mirroring an enum with call sites that would
-/// go untested here.
+/// A subset of v1's 11 `SessionUpdate` variants -- the ones an initial
+/// working turn loop actually needs. `available_commands_update`,
+/// `current_mode_update`, `config_option_update`, and `session_info_update`
+/// are real, legal ACP variants this module doesn't emit yet; add them when
+/// something in `boxcode` actually needs to report one, rather than
+/// speculatively wiring all eleven now.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct ApprovalRequestDto {
-    pub call: ToolCall,
-    /// `Action::label()` -- e.g. `"write src/App.tsx"`. See the struct docs
-    /// for why this is a label, not the full `Action`.
-    pub action_label: String,
-    pub remaining: usize,
-    pub preview: Option<FileDiff>,
+#[serde(tag = "sessionUpdate")]
+pub enum SessionUpdate {
+    #[serde(rename = "agent_message_chunk")]
+    AgentMessageChunk {
+        content: ContentBlock,
+        #[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<MessageId>,
+    },
+    #[serde(rename = "tool_call")]
+    ToolCall(AcpToolCall),
+    #[serde(rename = "tool_call_update")]
+    ToolCallUpdate(ToolCallUpdate),
+    #[serde(rename = "plan")]
+    Plan(Plan),
+    #[serde(rename = "usage_update")]
+    UsageUpdate {
+        used: u64,
+        size: u64,
+    },
 }
 
-impl From<&ApprovalRequest> for ApprovalRequestDto {
-    fn from(req: &ApprovalRequest) -> Self {
-        Self {
-            call: req.call.clone(),
-            action_label: req.action.label(),
-            remaining: req.remaining,
-            preview: req.preview.clone(),
+// ---------------------------------------------------------------------------
+// Tool calls
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ToolCallId(pub String);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+/// Named `AcpToolCall` (not `ToolCall`) to avoid colliding with
+/// `crate::llm::ToolCall` in this module's own imports -- the ACP schema's
+/// own name is unqualified `ToolCall`, this is purely a local Rust naming
+/// accommodation, not a wire-format difference.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct AcpToolCall {
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: ToolCallId,
+    pub title: String,
+    pub kind: ToolKind,
+    pub status: ToolCallStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ToolCallUpdate {
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: ToolCallId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ToolKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ToolCallStatus>,
+    /// Free-text result content -- `ToolOutcome::content`/`display` land
+    /// here. The full ACP `ToolCallContent` union (diffs, terminal refs) is
+    /// not implemented yet; text is enough for a first working turn loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    SwitchMode,
+    Other,
+}
+
+// ---------------------------------------------------------------------------
+// Plans -- boxcode's Verdict::Progress (plan-step bookkeeping) and
+// Verdict::Todos (the model's own checklist) both map onto this, as two
+// conceptually separate plans. v1 has no `planId` to keep them apart on the
+// wire (that's a v2 addition) -- see the Plan struct's own doc for how this
+// module handles that.
+// ---------------------------------------------------------------------------
+
+/// v1's `Plan` has no id -- only one plan can exist per session on the
+/// wire. `boxcode` has two independent bookkeeping concepts
+/// (`Verdict::Progress` against an approved plan, `Verdict::Todos` as the
+/// model's own short-term checklist) that would collide if both tried to
+/// emit a `Plan` update. Not resolved by this module: whichever one is
+/// wired into `HeadlessSession` first should own the wire's single `Plan`
+/// slot; the other stays local-only until v2's `planId` is worth adopting
+/// for this specifically.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Plan {
+    pub entries: Vec<PlanEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PlanEntry {
+    pub content: String,
+    pub priority: PlanEntryPriority,
+    pub status: PlanEntryStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanEntryPriority {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanEntryStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+// ---------------------------------------------------------------------------
+// session/request_permission -- boxcode's Verdict::Ask, on the wire.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RequestPermissionRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+    #[serde(rename = "toolCall")]
+    pub tool_call: ToolCallUpdate,
+    pub options: Vec<PermissionOption>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RequestPermissionResponse {
+    pub outcome: RequestPermissionOutcome,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PermissionOptionId(pub String);
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PermissionOption {
+    #[serde(rename = "optionId")]
+    pub option_id: PermissionOptionId,
+    pub name: String,
+    pub kind: PermissionOptionKind,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "outcome")]
+pub enum RequestPermissionOutcome {
+    #[serde(rename = "cancelled")]
+    Cancelled,
+    #[serde(rename = "selected")]
+    Selected {
+        #[serde(rename = "optionId")]
+        option_id: PermissionOptionId,
+    },
+}
+
+/// The two standing options `boxcode` offers on every permission request --
+/// "allow once" / "reject once" only. `allow_always`/`reject_always`
+/// (remembering the choice) aren't implemented yet; `config.tools.approval`
+/// is `boxcode`'s existing equivalent of "remember my choice" and already
+/// applies before a request is ever built (see `approval::verdict_for`), so
+/// there's nothing for an "always" *option on this specific request* to do
+/// that isn't already covered.
+pub fn standard_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption {
+            option_id: PermissionOptionId("allow".to_string()),
+            name: "Allow".to_string(),
+            kind: PermissionOptionKind::AllowOnce,
+        },
+        PermissionOption {
+            option_id: PermissionOptionId("reject".to_string()),
+            name: "Reject".to_string(),
+            kind: PermissionOptionKind::RejectOnce,
+        },
+    ]
+}
+
+impl From<RequestPermissionOutcome> for Decision {
+    fn from(outcome: RequestPermissionOutcome) -> Self {
+        match outcome {
+            RequestPermissionOutcome::Cancelled => Decision::Refused,
+            RequestPermissionOutcome::Selected { option_id } => {
+                if option_id.0 == "allow" {
+                    Decision::Allowed
+                } else {
+                    Decision::Refused
+                }
+            }
         }
     }
 }
 
-/// The wire form of [`ToolOutcome`]. `rollback` is deliberately dropped --
-/// it is local undo-journal bookkeeping (see `ToolOutcome::rollback`'s own
-/// docs: "not sent to the model"), meaningful only to the process holding
-/// the workspace on disk, never to a remote client.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct ToolOutcomeDto {
-    pub call_id: String,
-    pub display: String,
-    pub content: String,
-    pub diff: Option<FileDiff>,
+// ---------------------------------------------------------------------------
+// Conversions from boxcode's internal types
+// ---------------------------------------------------------------------------
+
+impl From<&InternalToolCall> for ToolCallId {
+    fn from(call: &InternalToolCall) -> Self {
+        ToolCallId(call.id.clone())
+    }
 }
 
-impl From<&ToolOutcome> for ToolOutcomeDto {
+/// `Action` (`crate::tools::Action`) isn't mirrored variant-for-variant --
+/// same reasoning as this module's earlier draft: a large, still-growing
+/// enum whose only externally-relevant fact today is what kind of tool it
+/// is and its rendered label. `Action::label()` becomes the ACP `title`;
+/// this match only decides `ToolKind`.
+fn tool_kind_for(action: &Action) -> ToolKind {
+    match action {
+        Action::Read { .. } | Action::List { .. } | Action::Glob { .. } | Action::Grep { .. } => {
+            ToolKind::Read
+        }
+        Action::Write { .. } | Action::Edit { .. } => ToolKind::Edit,
+        Action::Command { .. } => ToolKind::Execute,
+        Action::Search { .. } | Action::DesignStarter | Action::CheckContrast { .. } => {
+            ToolKind::Search
+        }
+        Action::Agent { .. } => ToolKind::Think,
+        Action::Deploy { .. }
+        | Action::DeployBackend { .. }
+        | Action::EnableAuth { .. }
+        | Action::DbQuery { .. }
+        | Action::ListChangeRequests { .. }
+        | Action::ResolveChangeRequest { .. }
+        | Action::Publish { .. } => ToolKind::Fetch,
+        Action::Plan(_) | Action::Progress { .. } | Action::Todos(_) => ToolKind::SwitchMode,
+    }
+}
+
+impl AcpToolCall {
+    /// The initial, `pending` announcement of a call awaiting a decision --
+    /// built from a [`Verdict::Ask`]'s carried [`Action`], the same
+    /// interpreted value [`ApprovalRequest`] already carries.
+    pub fn pending(call: &InternalToolCall, action: &Action) -> Self {
+        Self {
+            tool_call_id: call.into(),
+            title: action.label(),
+            kind: tool_kind_for(action),
+            status: ToolCallStatus::Pending,
+        }
+    }
+}
+
+impl From<&ApprovalRequest> for RequestPermissionRequest {
+    fn from(request: &ApprovalRequest) -> Self {
+        Self {
+            // Caller fills in session_id -- ApprovalRequest doesn't carry
+            // one, it's a per-session concept this module's types don't
+            // otherwise need to know about.
+            session_id: SessionId(String::new()),
+            tool_call: ToolCallUpdate {
+                tool_call_id: (&request.call).into(),
+                title: Some(request.action.label()),
+                kind: Some(tool_kind_for(&request.action)),
+                status: Some(ToolCallStatus::Pending),
+                content: None,
+            },
+            options: standard_options(),
+        }
+    }
+}
+
+impl From<&ToolOutcome> for ToolCallUpdate {
     fn from(outcome: &ToolOutcome) -> Self {
         Self {
-            call_id: outcome.call_id.clone(),
-            display: outcome.display.clone(),
-            content: outcome.content.clone(),
-            diff: outcome.diff.clone(),
+            tool_call_id: ToolCallId(outcome.call_id.clone()),
+            title: None,
+            kind: None,
+            status: Some(ToolCallStatus::Completed),
+            content: Some(outcome.content.clone()),
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecisionDto {
-    Allowed,
-    Refused,
-}
-
-impl From<DecisionDto> for Decision {
-    fn from(dto: DecisionDto) -> Self {
-        match dto {
-            DecisionDto::Allowed => Decision::Allowed,
-            DecisionDto::Refused => Decision::Refused,
-        }
+impl From<ApiUsage> for SessionUpdate {
+    fn from(usage: ApiUsage) -> Self {
+        // ACP's usage_update models context-window occupancy (used/size),
+        // not cumulative billing -- a real impedance mismatch with
+        // ApiUsage's prompt/completion split, confirmed against the schema
+        // before writing this, not guessed. `used` is the closest available
+        // proxy (total tokens spent this turn); `size` has no source in
+        // ApiUsage at all -- boxcode doesn't track the model's context
+        // limit anywhere yet, so this is a real gap, not a rounding choice.
+        SessionUpdate::UsageUpdate { used: usage.total() as u64, size: 0 }
     }
 }
 
-impl From<Decision> for DecisionDto {
-    fn from(decision: Decision) -> Self {
-        match decision {
-            Decision::Allowed => DecisionDto::Allowed,
-            Decision::Refused => DecisionDto::Refused,
-        }
-    }
-}
-
-impl Notification {
-    /// Build every [`Notification`] this process can send from one
-    /// [`StreamEvent`], tagged with the turn's request id -- the direct wire
-    /// counterpart of `agent::handle_event`'s match, minus the one variant
-    /// [`StreamEvent::Reasoning`] handles specially (see module docs) and
-    /// [`StreamEvent::ToolCalls`], which cannot become a
-    /// [`NotificationMethod::ApprovalRequest`] here: building an
-    /// [`ApprovalRequestDto`] needs the interpreted [`crate::tools::Action`]
-    /// and precomputed diff that only `App::advance_approvals` currently
-    /// derives (danger-checking, plan-mode filtering, `[tools] approval`
-    /// policy all happen there first) -- exactly the state-machine logic
-    /// this module's docs say is out of scope for this slice. A caller with
-    /// an already-built [`ApprovalRequest`] should reach for
-    /// [`Notification::approval_request`] directly instead. `ToolCalls`'s
-    /// `bool` (`finish_reason == "length"`, added after this module's first
-    /// draft -- see `App::request_tools_truncated`) isn't dropped silently:
-    /// there is simply nowhere on the wire for it to go until that same
-    /// state-machine extraction happens, since a headless client needs to
-    /// know a write/edit was truncated at exactly the point it would decide
-    /// whether to trust it -- i.e. as part of the eventual approval-request
-    /// notification, not a separate one.
-    pub fn from_stream_event(request_id: u64, event: &StreamEvent) -> Option<Self> {
-        let params = match event {
-            StreamEvent::Token(token) => NotificationParams::Token {
-                request_id,
-                token: token.clone(),
-            },
-            StreamEvent::Reasoning(_) => NotificationParams::Thinking {
-                request_id,
-                thinking: true,
-            },
-            StreamEvent::ToolCalls(_, _) => return None,
-            StreamEvent::ToolsFinished(outcomes) => NotificationParams::ToolsFinished {
-                request_id,
-                outcomes: outcomes.iter().map(ToolOutcomeDto::from).collect(),
-            },
-            StreamEvent::AgentActivity {
-                call_id,
-                label,
-                rounds,
-            } => NotificationParams::AgentActivity {
-                request_id,
-                call_id: call_id.clone(),
-                label: label.clone(),
-                rounds: *rounds,
-            },
-            StreamEvent::Usage(usage) => NotificationParams::Usage {
-                request_id,
-                usage: *usage,
-            },
-            StreamEvent::Done => NotificationParams::Done { request_id },
-            StreamEvent::Notice(note) => NotificationParams::Notice {
-                request_id,
-                note: note.clone(),
-            },
-            StreamEvent::Error(error) => NotificationParams::Error {
-                request_id,
-                error: error.clone(),
-            },
-        };
-        Some(Self::from_params(params))
-    }
-
-    /// The one notification [`Notification::from_stream_event`] cannot
-    /// build on its own -- see that method's docs.
-    pub fn approval_request(request_id: u64, request: &ApprovalRequest) -> Self {
-        Self::from_params(NotificationParams::ApprovalRequest {
-            request_id,
-            request: ApprovalRequestDto::from(request),
-        })
-    }
-
-    fn from_params(params: NotificationParams) -> Self {
-        let method = match &params {
-            NotificationParams::Token { .. } => NotificationMethod::Token,
-            NotificationParams::Thinking { .. } => NotificationMethod::Thinking,
-            NotificationParams::ApprovalRequest { .. } => NotificationMethod::ApprovalRequest,
-            NotificationParams::ToolsFinished { .. } => NotificationMethod::ToolsFinished,
-            NotificationParams::AgentActivity { .. } => NotificationMethod::AgentActivity,
-            NotificationParams::Usage { .. } => NotificationMethod::Usage,
-            NotificationParams::Done { .. } => NotificationMethod::Done,
-            NotificationParams::Notice { .. } => NotificationMethod::Notice,
-            NotificationParams::Error { .. } => NotificationMethod::Error,
-        };
-        Self {
-            jsonrpc: JsonRpcVersion,
-            method,
-            params,
-        }
-    }
-
-    /// One line of NDJSON, `\n`-terminated, ready to write to a stdout pipe
-    /// -- the same framing `codexAppServerClient.ts` (in the Code-OSS source
-    /// `boxcode-ide` forks) uses on its side of an equivalent bridge.
-    pub fn to_ndjson_line(&self) -> String {
-        format!(
-            "{}\n",
-            serde_json::to_string(self).expect("Notification always serializes")
-        )
+/// Builds the two [`SessionUpdate`]s a resolved [`Verdict::Progress`] or
+/// [`Verdict::Todos`] becomes -- see [`Plan`]'s own docs for why only one
+/// of these should actually be wired into a live session today.
+pub fn plan_for_todos(items: &[crate::tools::TodoItem]) -> Plan {
+    Plan {
+        entries: items
+            .iter()
+            .map(|item| PlanEntry {
+                content: item.content.clone(),
+                // TodoItem has no priority concept; ACP requires one.
+                // Medium is the least presumptive default -- neither
+                // over- nor under-stating urgency for something boxcode
+                // itself never asked the model to rank.
+                priority: PlanEntryPriority::Medium,
+                status: match item.status {
+                    crate::tools::TodoStatus::Pending => PlanEntryStatus::Pending,
+                    crate::tools::TodoStatus::InProgress => PlanEntryStatus::InProgress,
+                    crate::tools::TodoStatus::Completed => PlanEntryStatus::Completed,
+                },
+            })
+            .collect(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::FunctionCall;
-    use crate::tools::Action;
     use serde_json::json;
 
-    fn call(name: &str) -> ToolCall {
-        ToolCall {
-            id: "call_1".to_string(),
-            kind: "function".to_string(),
-            function: FunctionCall {
-                name: name.to_string(),
-                arguments: "{}".to_string(),
-            },
-        }
-    }
-
-    /// The schema is a contract with a separate TypeScript client that does
-    /// not exist yet -- pinned against literal JSON, not just "it
-    /// round-trips", so a future refactor here has to notice it changed the
-    /// wire shape rather than only keeping Rust's own serialize/deserialize
-    /// symmetric with itself.
+    /// Pinned against literal JSON, not just Rust round-trip symmetry --
+    /// this is a contract with real external clients (or, eventually,
+    /// boxcode-ide), not just with itself.
     #[test]
-    fn a_token_event_becomes_the_documented_wire_shape() {
-        let notification =
-            Notification::from_stream_event(7, &StreamEvent::Token("hello".to_string())).unwrap();
-        let value: serde_json::Value =
-            serde_json::from_str(&notification.to_ndjson_line()).unwrap();
-        assert_eq!(
-            value,
-            json!({
-                "jsonrpc": "2.0",
-                "method": "stream/token",
-                "params": { "kind": "Token", "request_id": 7, "token": "hello" }
-            })
-        );
-    }
-
-    #[test]
-    fn reasoning_carries_no_text_onto_the_wire() {
-        let notification = Notification::from_stream_event(
-            1,
-            &StreamEvent::Reasoning("the model's private chain of thought".to_string()),
-        )
-        .unwrap();
-        let line = notification.to_ndjson_line();
-        assert!(!line.contains("private chain of thought"));
-        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(
-            value,
-            json!({
-                "jsonrpc": "2.0",
-                "method": "stream/thinking",
-                "params": { "kind": "Thinking", "request_id": 1, "thinking": true }
-            })
-        );
-    }
-
-    #[test]
-    fn tool_calls_alone_produce_no_notification_truncated_or_not() {
-        assert!(Notification::from_stream_event(
-            1,
-            &StreamEvent::ToolCalls(vec![call("write_file")], false)
-        )
-        .is_none());
-        assert!(Notification::from_stream_event(
-            1,
-            &StreamEvent::ToolCalls(vec![call("write_file")], true)
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn an_approval_request_carries_the_label_and_preview_not_the_raw_action() {
-        let request = ApprovalRequest {
-            call: call("write_file"),
-            action: Action::Write {
-                path: "src/App.tsx".to_string(),
-                content: "x".to_string(),
-            },
-            remaining: 2,
-            preview: None,
+    fn initialize_request_matches_the_documented_v1_shape() {
+        let req = InitializeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            client_capabilities: None,
+            client_info: None,
         };
-        let notification = Notification::approval_request(3, &request);
-        let value: serde_json::Value =
-            serde_json::from_str(&notification.to_ndjson_line()).unwrap();
-        assert_eq!(value["method"], "stream/approvalRequest");
-        assert_eq!(
-            value["params"]["request"]["action_label"],
-            request.action.label()
-        );
-        assert_eq!(value["params"]["request"]["remaining"], 2);
-        assert!(value["params"]["request"]["preview"].is_null());
-        // The raw Action enum -- with its own field names, its own shape --
-        // never appears on the wire, only its rendered label.
-        assert!(!notification.to_ndjson_line().contains("App.tsx\":\"x\""));
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value, json!({ "protocolVersion": 1 }));
     }
 
     #[test]
-    fn a_decision_round_trips_through_its_dto() {
+    fn a_prompt_request_matches_the_documented_v1_shape() {
+        let req = PromptRequest {
+            session_id: SessionId("sess_1".to_string()),
+            prompt: vec![ContentBlock::Text { text: "start a new webapp project".to_string() }],
+        };
+        let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
-            Decision::from(DecisionDto::from(Decision::Allowed)),
+            value,
+            json!({
+                "sessionId": "sess_1",
+                "prompt": [{ "type": "text", "text": "start a new webapp project" }]
+            })
+        );
+    }
+
+    #[test]
+    fn a_prompt_response_carries_the_stop_reason_snake_case() {
+        let resp = PromptResponse { stop_reason: StopReason::EndTurn };
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(value, json!({ "stopReason": "end_turn" }));
+    }
+
+    #[test]
+    fn tool_call_update_omits_unset_fields_rather_than_nulling_them() {
+        let update = ToolCallUpdate {
+            tool_call_id: ToolCallId("call_1".to_string()),
+            title: None,
+            kind: None,
+            status: Some(ToolCallStatus::Completed),
+            content: Some("done".to_string()),
+        };
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            value,
+            json!({ "toolCallId": "call_1", "status": "completed", "content": "done" })
+        );
+    }
+
+    #[test]
+    fn a_session_update_tags_itself_by_sessionupdate_field() {
+        let update = SessionUpdate::AgentMessageChunk {
+            content: ContentBlock::Text { text: "hi".to_string() },
+            message_id: None,
+        };
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            value,
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } })
+        );
+    }
+
+    #[test]
+    fn a_selected_permission_outcome_becomes_the_matching_decision() {
+        assert_eq!(
+            Decision::from(RequestPermissionOutcome::Selected {
+                option_id: PermissionOptionId("allow".to_string())
+            }),
             Decision::Allowed
         );
         assert_eq!(
-            Decision::from(DecisionDto::from(Decision::Refused)),
+            Decision::from(RequestPermissionOutcome::Selected {
+                option_id: PermissionOptionId("reject".to_string())
+            }),
             Decision::Refused
         );
+        assert_eq!(Decision::from(RequestPermissionOutcome::Cancelled), Decision::Refused);
     }
 
     #[test]
-    fn a_turn_send_request_parses_from_the_documented_wire_shape() {
-        let line = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "turn/send",
-            "params": { "kind": "TurnSend", "message": "start a new webapp project" }
-        })
-        .to_string();
-        let request: Request = serde_json::from_str(&line).unwrap();
-        assert_eq!(request.method, RequestMethod::TurnSend);
-        match request.params {
-            RequestParams::TurnSend { message } => {
-                assert_eq!(message, "start a new webapp project")
-            }
-            other => panic!("expected TurnSend, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_unsupported_jsonrpc_version_is_rejected_not_silently_accepted() {
+    fn an_unsupported_jsonrpc_version_is_rejected() {
         let line = json!({
             "jsonrpc": "1.0",
             "id": 1,
-            "method": "turn/send",
-            "params": { "kind": "TurnSend", "message": "x" }
+            "method": "initialize",
+            "params": { "protocolVersion": 1 }
         })
         .to_string();
-        assert!(serde_json::from_str::<Request>(&line).is_err());
+        assert!(serde_json::from_str::<RpcRequest>(&line).is_err());
+    }
+
+    #[test]
+    fn a_todo_list_becomes_a_well_formed_plan() {
+        use crate::tools::{TodoItem, TodoStatus};
+        let plan = plan_for_todos(&[
+            TodoItem { content: "write the tests".to_string(), status: TodoStatus::InProgress },
+            TodoItem { content: "ship it".to_string(), status: TodoStatus::Pending },
+        ]);
+        assert_eq!(plan.entries.len(), 2);
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::InProgress);
+        assert_eq!(plan.entries[1].status, PlanEntryStatus::Pending);
     }
 }
