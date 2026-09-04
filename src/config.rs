@@ -215,6 +215,31 @@ pub struct LlmConfig {
     /// which case a standalone `/model` has nothing to scope to.
     #[serde(default)]
     pub provider: String,
+    /// Sampling temperature sent on the wire. `None` means "say nothing and
+    /// let the endpoint use its own default" -- most OpenAI-compatible
+    /// servers already default to something reasonable, and a blanket value
+    /// here would override that silently for every provider, not just the
+    /// one it was chosen for.
+    ///
+    /// Left unset in `config.toml`, the effective value still is not always
+    /// `None`: `effective_temperature` falls back to a per-provider default
+    /// (currently only DeepSeek's) for the same reason `max_tokens` has one
+    /// -- so the good setting is what a new install gets without anyone
+    /// having to discover the knob first. Set explicitly here to override
+    /// that default in either direction, including back to "send nothing"
+    /// by leaving it unset and picking a provider with no opinion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+}
+
+impl LlmConfig {
+    /// The temperature to actually send: the configured value if there is
+    /// one, otherwise this provider's built-in default (see
+    /// `providers::default_temperature`), which is `None` for every provider
+    /// without a specific reason to disagree with the endpoint's own default.
+    pub fn effective_temperature(&self) -> Option<f32> {
+        self.temperature.or_else(|| crate::providers::default_temperature(&self.provider))
+    }
 }
 
 /// Appearance.
@@ -873,6 +898,7 @@ impl Default for LlmConfig {
             api_key: String::new(),
             max_tokens: default_max_tokens(),
             provider: String::new(),
+            temperature: None,
         }
     }
 }
@@ -1002,6 +1028,7 @@ mod tests {
                     api_key: "sk-test-key".to_string(),
                     max_tokens: 8192,
                     provider: "deepseek".to_string(),
+                    temperature: Some(0.5),
                 },
                 tools: ToolsConfig::default(),
             };
@@ -1012,6 +1039,7 @@ mod tests {
             assert_eq!(loaded.llm.model, "deepseek-v4-pro");
             assert_eq!(loaded.llm.api_key, "sk-test-key");
             assert_eq!(loaded.llm.provider, "deepseek");
+            assert_eq!(loaded.llm.temperature, Some(0.5));
 
             for (k, v) in saved_env {
                 match v {
@@ -1225,6 +1253,37 @@ mod tests {
         // And a config written before this key existed still gets it.
         let parsed: Config = toml::from_str("[llm]\nendpoint = \"http://x\"\n").expect("parses");
         assert_eq!(parsed.llm.max_tokens, 32768);
+    }
+
+    /// DeepSeek gets a deterministic temperature without anyone having to
+    /// discover the setting; every other provider (and a blank/custom one)
+    /// sends nothing and defers to the endpoint's own default. An explicit
+    /// `temperature` in `config.toml` always wins over both.
+    #[test]
+    fn effective_temperature_defaults_to_zero_for_deepseek_and_none_elsewhere() {
+        let deepseek: Config = toml::from_str(
+            "[llm]\nendpoint = \"https://api.deepseek.com\"\nprovider = \"deepseek\"\n",
+        )
+        .expect("parses");
+        assert_eq!(deepseek.llm.temperature, None, "nothing written to disk yet");
+        assert_eq!(deepseek.llm.effective_temperature(), Some(0.0));
+
+        let openai: Config =
+            toml::from_str("[llm]\nendpoint = \"https://api.openai.com\"\nprovider = \"openai\"\n")
+                .expect("parses");
+        assert_eq!(openai.llm.effective_temperature(), None);
+
+        let custom: Config = toml::from_str("[llm]\nendpoint = \"http://localhost:8000\"\n")
+            .expect("parses");
+        assert_eq!(custom.llm.effective_temperature(), None);
+
+        // An explicit setting overrides the built-in default in either
+        // direction, including opting DeepSeek back out.
+        let overridden: Config = toml::from_str(
+            "[llm]\nendpoint = \"https://api.deepseek.com\"\nprovider = \"deepseek\"\ntemperature = 0.7\n",
+        )
+        .expect("parses");
+        assert_eq!(overridden.llm.effective_temperature(), Some(0.7));
     }
 
     /// The rename must not cost anyone their settings. The painful one is the
