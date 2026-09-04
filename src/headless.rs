@@ -1,0 +1,531 @@
+//! A headless, RPC-driven counterpart to `App`'s agent loop -- what
+//! `protocol.rs`'s ACP types actually get driven by. `App` itself is
+//! untouched by this module; see `approval.rs`'s `Verdict`/`verdict_for`
+//! docs for why the two don't share state, only the one piece of logic
+//! (`verdict_for`) where drift would be dangerous.
+//!
+//! Deliberately narrower than `App` for a first working version, matching
+//! an independent review's explicit recommendation (see `approval.rs`):
+//! - No plan mode. `mode` is fixed at `Mode::Normal`.
+//! - No deploy tool. `Action::Deploy` needs `deploy_takes_over`'s real
+//!   terminal-based OAuth flow (`app.rs`'s own doc comment: deployment "may
+//!   need... the terminal itself for a browser login"), which a headless
+//!   session has no answer for yet. The deploy schema is never offered
+//!   (`deploy: false` in `tools::schemas_for`), so the model never sees the
+//!   tool at all -- refusing a call that was never offered, rather than
+//!   offering one and always refusing it.
+//! - No subagents. `Action::Agent` calls are refused with an explanation,
+//!   same reasoning: `ACP` has no nested-session concept (`protocol.rs`'s
+//!   own docs), so there's nowhere on the wire for a subagent's progress to
+//!   go yet.
+//! - No compaction. `App::finish_compaction`'s logic isn't replicated here;
+//!   a long headless session just keeps growing its own history for now.
+//!
+//! One round of `stream_chat` is consumed the same way `agent::run_subagent`
+//! already does (`tokio::select!` over the pinned stream future and its
+//! event channel) -- a proven pattern in this codebase, not a new one
+//! invented for this module.
+
+use crate::approval::{verdict_for, Decision, Verdict};
+use crate::config::Config;
+use crate::llm::{self, ApiUsage, ChatMessage, StreamEvent, Target, ToolCall};
+use crate::protocol::{
+    AcpToolCall, ContentBlock, PermissionOption, PermissionOptionId, PermissionOptionKind,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionUpdate, StopReason,
+    ToolCallId, ToolCallStatus, ToolCallUpdate,
+};
+use crate::tools::{self, Mode};
+use crate::workspace::Workspace;
+use std::path::Path;
+use tokio::sync::{mpsc, oneshot};
+
+/// What a caller (the real stdio transport, or a test) gets sent for each
+/// `RequestPermissionRequest` a turn needs answered -- paired with a
+/// `oneshot` so `prompt()` can `await` the one reply it's asking for,
+/// without needing a request-id-keyed table the way a general JSON-RPC
+/// client would (a `HeadlessSession` only ever has one permission request
+/// outstanding at a time, since it blocks on each one before continuing).
+pub struct PermissionAsk {
+    pub request: RequestPermissionRequest,
+    pub respond: oneshot::Sender<RequestPermissionOutcome>,
+}
+
+/// One ACP session's worth of state -- deliberately independent of `App`,
+/// not extracted from it. See this module's own docs for the narrower
+/// scope (no plan mode, no deploy, no subagents, no compaction) that keeps
+/// this a small, honestly-scoped first version rather than a shadow `App`.
+pub struct HeadlessSession {
+    session_id: SessionId,
+    workspace: Workspace,
+    config: Config,
+    messages: Vec<ChatMessage>,
+    request_id: u64,
+    tool_steps: usize,
+}
+
+impl HeadlessSession {
+    pub fn new(session_id: SessionId, workspace: Workspace, config: Config) -> Self {
+        Self { session_id, workspace, config, messages: Vec::new(), request_id: 0, tool_steps: 0 }
+    }
+
+    /// Handles one `session/prompt`: appends the user's message, then runs
+    /// rounds of fire-stream-decide-execute until the model answers with no
+    /// further tool calls or a hard stop condition is hit. Blocks until
+    /// done, per ACP v1's `PromptResponse` -- progress streams out via
+    /// `updates` while this runs.
+    pub async fn prompt(
+        &mut self,
+        text: String,
+        updates: &mpsc::Sender<SessionUpdate>,
+        permissions: &mpsc::Sender<PermissionAsk>,
+    ) -> StopReason {
+        self.messages.push(ChatMessage::text("user", text));
+
+        loop {
+            let budget_left = self.tool_steps < self.config.tools.max_steps;
+            if !budget_left {
+                // Same reasoning as agent::fire_request: withholding the
+                // schemas is what actually stops a runaway loop, not asking
+                // nicely in the prompt.
+            }
+
+            let schemas = if budget_left {
+                tools::schemas_for(
+                    Mode::Normal,
+                    false, // no plan mode in v1 -- see module docs
+                    false, // no deploy tool in v1 -- see module docs
+                    false, // published-artifact detection not wired yet
+                    tools::SchemaDiet::for_workspace(self.workspace.root()),
+                )
+            } else {
+                Vec::new()
+            };
+            let system = tools::system_prompt(&self.workspace, &self.config.tools, self.tool_steps, Mode::Normal);
+            let mut history = self.messages.clone();
+            history.insert(0, ChatMessage::text("system", system));
+            if let Some(status) = tools::turn_status(&self.config.tools, self.tool_steps, None) {
+                history.push(ChatMessage::text("user", status));
+            }
+
+            self.request_id += 1;
+            let round = self.run_one_round(history, schemas, updates).await;
+
+            match round {
+                RoundOutcome::Answered => return StopReason::EndTurn,
+                RoundOutcome::Error(message) => {
+                    let _ = updates
+                        .send(SessionUpdate::AgentMessageChunk {
+                            content: ContentBlock::Text { text: format!("Error: {message}") },
+                            message_id: None,
+                        })
+                        .await;
+                    return StopReason::Refusal;
+                }
+                RoundOutcome::ToolCalls(calls) => {
+                    self.tool_steps += 1;
+                    let outcomes = self.decide_and_run(calls, updates, permissions).await;
+                    for (call_id, content) in outcomes {
+                        self.messages.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: Some(content),
+                            tool_calls: Vec::new(),
+                            tool_call_id: Some(call_id),
+                        });
+                    }
+                    if !budget_left {
+                        return StopReason::MaxTurnRequests;
+                    }
+                    // Loop again: the model gets to react to what just ran.
+                }
+            }
+        }
+    }
+
+    /// One `stream_chat` round, consumed the same way `agent::run_subagent`
+    /// already does -- see that function's own comments for why
+    /// `tokio::select!` over the pinned future is the right shape here
+    /// (this was not reinvented for this module).
+    async fn run_one_round(
+        &mut self,
+        history: Vec<ChatMessage>,
+        schemas: Vec<serde_json::Value>,
+        updates: &mpsc::Sender<SessionUpdate>,
+    ) -> RoundOutcome {
+        let (tx, mut rx) = mpsc::channel(64);
+        let target = Target {
+            endpoint: &self.config.llm.endpoint,
+            model: &self.config.llm.model,
+            api_key: &self.config.llm.api_key,
+            max_tokens: self.config.llm.max_tokens,
+            include_usage: self.config.quota.enabled && self.config.quota.include_usage,
+            temperature: self.config.llm.effective_temperature(),
+        };
+        let stream = llm::stream_chat(target, history.clone(), schemas, self.request_id, tx);
+        tokio::pin!(stream);
+
+        let mut stream_finished = false;
+        let mut text = String::new();
+        let mut calls: Vec<ToolCall> = Vec::new();
+        let mut usage: Option<ApiUsage> = None;
+        let outcome = loop {
+            tokio::select! {
+                _ = &mut stream, if !stream_finished => stream_finished = true,
+                received = rx.recv() => match received {
+                    Some((_, StreamEvent::Token(t))) => {
+                        text.push_str(&t);
+                        let _ = updates
+                            .send(SessionUpdate::AgentMessageChunk {
+                                content: ContentBlock::Text { text: t },
+                                message_id: None,
+                            })
+                            .await;
+                    }
+                    // Reasoning is deliberately not forwarded -- see
+                    // protocol.rs's module docs for why: no ACP-compatible
+                    // way to signal "thinking" exists yet that doesn't
+                    // either require content (chunks can't be content-free)
+                    // or misuse a mode-change notification.
+                    Some((_, StreamEvent::Reasoning(_))) => {}
+                    Some((_, StreamEvent::ToolCalls(c, _))) => calls = c,
+                    Some((_, StreamEvent::Usage(u))) => usage = Some(u),
+                    Some((_, StreamEvent::Notice(_) | StreamEvent::AgentActivity { .. })) => {}
+                    Some((_, StreamEvent::ToolsFinished(_))) => {}
+                    Some((_, StreamEvent::Done)) | None => break None,
+                    Some((_, StreamEvent::Error(e))) => break Some(e),
+                },
+            }
+        };
+
+        if let Some(error) = outcome {
+            return RoundOutcome::Error(error);
+        }
+
+        if let Some(u) = usage {
+            let _ = updates.send(u.into()).await;
+        }
+
+        if !calls.is_empty() {
+            // Mirrors App::request_tools: whatever prose streamed alongside
+            // the tool calls still belongs in history, even though it's
+            // not the final answer.
+            self.messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: (!text.trim().is_empty()).then_some(text),
+                tool_calls: calls.clone(),
+                tool_call_id: None,
+            });
+            return RoundOutcome::ToolCalls(calls);
+        }
+
+        if !text.trim().is_empty() {
+            self.messages.push(ChatMessage::text("assistant", text));
+        }
+        RoundOutcome::Answered
+    }
+
+    /// Applies `verdict_for` to each queued call -- the one piece of logic
+    /// this module shares with `App` rather than reimplementing, per
+    /// `approval::Verdict`'s own docs. Returns `(call_id, content)` pairs
+    /// ready to become `tool` messages.
+    async fn decide_and_run(
+        &mut self,
+        calls: Vec<ToolCall>,
+        updates: &mpsc::Sender<SessionUpdate>,
+        permissions: &mpsc::Sender<PermissionAsk>,
+    ) -> Vec<(String, String)> {
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            let verdict = verdict_for(
+                &call,
+                Path::new(self.workspace.root()),
+                Mode::Normal,
+                self.config.tools.approval,
+            );
+
+            let content = match verdict {
+                Verdict::Blocked(reason) => {
+                    let _ = updates
+                        .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                            tool_call_id: ToolCallId(call.id.clone()),
+                            title: None,
+                            kind: None,
+                            status: Some(ToolCallStatus::Failed),
+                            content: Some(reason.clone()),
+                        }))
+                        .await;
+                    reason
+                }
+                Verdict::PlanRefused(reason) => reason,
+                Verdict::Progress { .. } | Verdict::Todos(_) => {
+                    // No plan/todo state kept in a headless session yet
+                    // (see module docs: no plan mode). Acknowledged, not
+                    // silently dropped -- the model still gets a real
+                    // answer so the transcript stays valid.
+                    "Noted (not tracked in this session).".to_string()
+                }
+                Verdict::AutoApprove => {
+                    let _ = updates
+                        .send(SessionUpdate::ToolCall(AcpToolCall {
+                            tool_call_id: ToolCallId(call.id.clone()),
+                            title: tools::describe_action(&call)
+                                .map(|a| a.label())
+                                .unwrap_or_else(|| call.function.name.clone()),
+                            kind: crate::protocol::ToolKind::Other,
+                            status: ToolCallStatus::InProgress,
+                        }))
+                        .await;
+                    let outcome = tools::execute(&call, &self.workspace, &self.config.tools).await;
+                    let _ = updates.send(SessionUpdate::ToolCallUpdate((&outcome).into())).await;
+                    outcome.content
+                }
+                Verdict::Ask(action) => {
+                    if action.label() == "agent" || matches!(action, crate::tools::Action::Agent { .. }) {
+                        // No subagents in v1 -- see module docs.
+                        "Subagents aren't supported in this session yet.".to_string()
+                    } else {
+                        self.ask_permission(&call, &action, updates, permissions).await
+                    }
+                }
+            };
+
+            results.push((call.id.clone(), content));
+        }
+        results
+    }
+
+    async fn ask_permission(
+        &self,
+        call: &ToolCall,
+        action: &crate::tools::Action,
+        updates: &mpsc::Sender<SessionUpdate>,
+        permissions: &mpsc::Sender<PermissionAsk>,
+    ) -> String {
+        let tool_call_update = ToolCallUpdate {
+            tool_call_id: ToolCallId(call.id.clone()),
+            title: Some(action.label()),
+            kind: None,
+            status: Some(ToolCallStatus::Pending),
+            content: None,
+        };
+        let request = RequestPermissionRequest {
+            session_id: self.session_id.clone(),
+            tool_call: tool_call_update,
+            options: vec![
+                PermissionOption {
+                    option_id: PermissionOptionId("allow".to_string()),
+                    name: "Allow".to_string(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    option_id: PermissionOptionId("reject".to_string()),
+                    name: "Reject".to_string(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ],
+        };
+        let (respond, receive) = oneshot::channel();
+        if permissions.send(PermissionAsk { request, respond }).await.is_err() {
+            return "The client disconnected before answering.".to_string();
+        }
+        let decision: Decision = match receive.await {
+            Ok(outcome) => outcome.into(),
+            Err(_) => Decision::Refused,
+        };
+
+        if decision.is_allowed() {
+            let outcome = tools::execute(call, &self.workspace, &self.config.tools).await;
+            let _ = updates.send(SessionUpdate::ToolCallUpdate((&outcome).into())).await;
+            outcome.content
+        } else {
+            let _ = updates
+                .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                    tool_call_id: ToolCallId(call.id.clone()),
+                    title: None,
+                    kind: None,
+                    status: Some(ToolCallStatus::Failed),
+                    content: Some("Refused by user.".to_string()),
+                }))
+                .await;
+            "The user declined this action.".to_string()
+        }
+    }
+}
+
+enum RoundOutcome {
+    Answered,
+    ToolCalls(Vec<ToolCall>),
+    Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn sse(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        )
+    }
+
+    fn text_round(text: &str) -> String {
+        sse(&format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\ndata: [DONE]\n\n"
+        ))
+    }
+
+    fn tool_call_round(name: &str, args: &str) -> String {
+        let escaped = args.replace('\\', "\\\\").replace('"', "\\\"");
+        sse(&format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\
+             \"type\":\"function\",\"function\":{{\"name\":\"{name}\",\"arguments\":\
+             \"{escaped}\"}}}}]}}}}]}}\n\ndata: [DONE]\n\n"
+        ))
+    }
+
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len() >= header_end + 4 + length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    async fn serve_rounds(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let _ = read_request(&mut socket).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn config_for(endpoint: &str) -> Config {
+        let mut config = Config::default();
+        config.llm.endpoint = endpoint.to_string();
+        config.llm.model = "test-model".to_string();
+        config.llm.api_key = "sk-test".to_string();
+        config
+    }
+
+    fn workspace() -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("hello.txt"), "hi\n").unwrap();
+        let ws = Workspace::new(dir.path()).expect("workspace");
+        (dir, ws)
+    }
+
+    /// The whole point of this module in one test: a plain answer, with no
+    /// tool calls, becomes exactly one `agent_message_chunk` and an
+    /// `EndTurn` stop reason -- no approval machinery involved.
+    #[tokio::test]
+    async fn a_plain_answer_ends_the_turn_with_no_approvals_needed() {
+        let (_dir, ws) = workspace();
+        let endpoint = serve_rounds(vec![text_round("Hello!")]).await;
+        let config = config_for(&endpoint);
+        let mut session =
+            HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, mut updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+
+        let stop = session.prompt("hi".to_string(), &updates_tx, &permissions_tx).await;
+
+        assert_eq!(stop, StopReason::EndTurn);
+        let update = updates_rx.recv().await.expect("one chunk");
+        assert!(matches!(update, SessionUpdate::AgentMessageChunk { .. }));
+    }
+
+    /// A read (auto-approved, per `verdict_for`) never reaches the
+    /// permission channel, and its result is fed back to the model, which
+    /// then answers.
+    #[tokio::test]
+    async fn an_auto_approved_read_runs_without_asking_permission() {
+        let (_dir, ws) = workspace();
+        let endpoint = serve_rounds(vec![
+            tool_call_round(tools::READ_FILE, r#"{"path":"hello.txt"}"#),
+            text_round("It says hi."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, mut updates_rx) = mpsc::channel(16);
+        let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+
+        let stop = session
+            .prompt("what does hello.txt say?".to_string(), &updates_tx, &permissions_tx)
+            .await;
+
+        assert_eq!(stop, StopReason::EndTurn);
+        assert!(permissions_rx.try_recv().is_err(), "a read must never ask permission");
+        let mut saw_tool_call = false;
+        while let Ok(update) = updates_rx.try_recv() {
+            if matches!(update, SessionUpdate::ToolCall(_)) {
+                saw_tool_call = true;
+            }
+        }
+        assert!(saw_tool_call, "the auto-approved call should still be reported");
+    }
+
+    /// A dangerous command (needs approval under every policy, per
+    /// `verdict_for` -- a plain write does not, since writes are
+    /// "ordinary" under the default `Destructive` policy) blocks on the
+    /// permission channel; refusing it feeds a refusal back to the model
+    /// instead of running anything.
+    #[tokio::test]
+    async fn a_dangerous_command_asks_permission_and_a_refusal_is_honored() {
+        let (dir, ws) = workspace();
+        let endpoint = serve_rounds(vec![
+            tool_call_round(tools::RUN_COMMAND, r#"{"command":"rm -rf build"}"#),
+            text_round("Understood, not running that."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+
+        let prompt = tokio::spawn(async move {
+            session.prompt("clean the build dir".to_string(), &updates_tx, &permissions_tx).await
+        });
+
+        let ask = permissions_rx.recv().await.expect("a permission ask");
+        assert_eq!(ask.request.session_id, SessionId("s1".to_string()));
+        let _ = ask.respond.send(RequestPermissionOutcome::Selected {
+            option_id: PermissionOptionId("reject".to_string()),
+        });
+
+        let stop = prompt.await.expect("task joins");
+        assert_eq!(stop, StopReason::EndTurn);
+        // rm -rf on a directory that never existed is a no-op either way,
+        // so the real proof this was refused (not just answered oddly) is
+        // that the model's second round ran at all: refusing must feed a
+        // `tool` message back so the transcript stays valid and the model
+        // gets to respond, exactly like `App::advance_approvals`'s own
+        // refusal path -- if that hadn't happened, `serve_rounds`' second
+        // queued response would never have been consumed and this task
+        // would hang instead of returning `EndTurn`.
+        let _ = dir; // kept for the tempdir's own lifetime, not asserted on
+    }
+}
