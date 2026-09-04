@@ -252,6 +252,17 @@ write them down -- the messages above will not be sent again, so anything you \
 leave out is lost. Drop pleasantries, restatements, and anything since \
 superseded.
 
+Before the summary, in a section of its own headed `Proposed BOXCODE.md \
+updates:`, list any durable, non-obvious project facts from this conversation \
+that are worth keeping past this summary -- a build or test quirk, a wrong \
+assumption you were corrected on, a convention you were told -- and are not \
+already written down in the project notes. One line each, or none at all if \
+nothing in this conversation rises to that bar; do not strain to fill it. \
+No tools are available to you in this request, so only list them here -- do \
+not attempt to call one. They stay in view in the summary that replaces this \
+conversation, so once tools are available again, propose the actual edit to \
+BOXCODE.md through the normal approval, the same as any other file change.
+
 Write it as notes to yourself, not as a reply to the user, and do not comment \
 on the act of summarising.";
 
@@ -5603,6 +5614,29 @@ mod tests {
         let last = sent.last().expect("an instruction");
         assert_eq!(last.role, "user");
         assert!(last.content.as_deref().unwrap_or("").contains("Summarise"));
+    }
+
+    /// Compaction throws away the raw conversation, which is the only place a
+    /// durable project fact discovered mid-session would otherwise live. The
+    /// instruction must ask the model to surface any such facts as part of
+    /// the same turn, so they survive in the summary that replaces the
+    /// conversation rather than vanishing with it. No tools are sent on a
+    /// compacting request (see `fire_request`), so this can only be a
+    /// written proposal here -- not a tool call -- for a later turn to act
+    /// on through the normal approval.
+    #[test]
+    fn slash_compact_also_asks_for_durable_project_facts_worth_keeping() {
+        let mut a = a_conversation();
+        compact(&mut a);
+
+        let sent = a.compaction_history();
+        let last = sent.last().expect("an instruction");
+        let instruction = last.content.as_deref().unwrap_or("");
+        assert!(instruction.contains("BOXCODE.md"), "{instruction}");
+        assert!(
+            instruction.contains("No tools are available"),
+            "must not invite a tool call in a request that carries no schemas: {instruction}"
+        );
     }
 
     /// The reply replaces the conversation rather than being appended to it --
