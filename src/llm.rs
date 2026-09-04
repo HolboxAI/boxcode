@@ -20,6 +20,12 @@ pub struct ChatRequest {
     /// worth breaking a working endpoint over.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// Sampling temperature. Omitted entirely when `None` rather than sent as
+    /// `null`, so a provider nobody has an opinion about sees exactly the
+    /// request it saw before this field existed and falls back to its own
+    /// default. See `config::LlmConfig::effective_temperature`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -299,6 +305,11 @@ pub struct Target<'a> {
     /// Ask the endpoint for exact token counts. Off leaves the request byte for
     /// byte as it was before this existed.
     pub include_usage: bool,
+    /// Sampling temperature to send, or `None` to omit the field and let the
+    /// endpoint use its own default. Resolved by the caller from
+    /// `config::LlmConfig::effective_temperature`, which is where the
+    /// per-provider default (currently DeepSeek only) lives.
+    pub temperature: Option<f32>,
 }
 
 pub async fn stream_chat(
@@ -323,7 +334,7 @@ async fn run(
     request_id: u64,
     tx: &mpsc::Sender<(u64, StreamEvent)>,
 ) -> Result<(), String> {
-    let Target { endpoint, model, api_key, max_tokens, include_usage } = target;
+    let Target { endpoint, model, api_key, max_tokens, include_usage, temperature } = target;
     // A lone system prompt is not a conversation.
     if messages.iter().all(|m| m.role == "system") {
         return Err("Nothing to send.".to_string());
@@ -337,6 +348,7 @@ async fn run(
         max_tokens,
         tools,
         stream_options: include_usage.then_some(StreamOptions { include_usage: true }),
+        temperature,
     };
 
     let client = reqwest::Client::builder()
@@ -868,6 +880,7 @@ mod tests {
                 api_key: "",
                 max_tokens: 100,
                 include_usage: false,
+                temperature: None,
             },
             vec![ChatMessage {
                 role: "user".into(),
@@ -1131,7 +1144,14 @@ mod tests {
     async fn collect(endpoint: &str) -> Vec<StreamEvent> {
         let (tx, mut rx) = mpsc::channel(64);
         stream_chat(
-            Target { endpoint, model: "test-model", api_key: "sk-test", max_tokens: 4096, include_usage: true },
+            Target {
+                endpoint,
+                model: "test-model",
+                api_key: "sk-test",
+                max_tokens: 4096,
+                include_usage: true,
+                temperature: None,
+            },
             vec![ChatMessage::text("user", "hi")],
             Vec::new(),
             1,
@@ -1341,7 +1361,14 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(64);
         stream_chat(
-            Target { endpoint: &addr, model: "m", api_key: "k", max_tokens: 4096, include_usage: true },
+            Target {
+                endpoint: &addr,
+                model: "m",
+                api_key: "k",
+                max_tokens: 4096,
+                include_usage: true,
+                temperature: None,
+            },
             vec![ChatMessage::text("user", "hi")],
             vec![serde_json::json!({"type": "function"})],
             1,
@@ -1400,6 +1427,7 @@ mod tests {
             max_tokens: 4096,
             tools: Vec::new(),
             stream_options: None,
+            temperature: None,
         };
         assert!(!serde_json::to_string(&base).unwrap().contains("stream_options"));
 
@@ -1407,6 +1435,33 @@ mod tests {
         assert!(serde_json::to_string(&with)
             .unwrap()
             .contains(r#""stream_options":{"include_usage":true}"#));
+    }
+
+    /// The field this whole change adds: present and exactly `0.0` when the
+    /// DeepSeek default kicks in, absent entirely -- not sent as `null` --
+    /// for a provider nobody has configured an opinion for. An endpoint that
+    /// has never heard of the field should see the same request it saw
+    /// before this existed, the same reasoning `tools` and `stream_options`
+    /// are already held to above.
+    #[test]
+    fn temperature_is_omitted_unless_configured_and_present_when_it_is() {
+        let base = ChatRequest {
+            model: "deepseek-v4-pro".to_string(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            stream: true,
+            max_tokens: 4096,
+            tools: Vec::new(),
+            stream_options: None,
+            temperature: None,
+        };
+        assert!(!serde_json::to_string(&base).unwrap().contains("temperature"));
+
+        // What `effective_temperature` resolves to for the DeepSeek provider
+        // when `config.toml` sets nothing: an explicit, deterministic 0.0.
+        let deepseek_default = ChatRequest { temperature: Some(0.0), ..base };
+        assert!(serde_json::to_string(&deepseek_default)
+            .unwrap()
+            .contains(r#""temperature":0.0"#));
     }
 
     #[tokio::test]
