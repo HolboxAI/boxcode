@@ -69,6 +69,7 @@ pub const RESOLVE_CHANGE_REQUEST: &str = "resolve_change_request";
 pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
 pub const PLAN_PROGRESS: &str = "plan_progress";
 pub const AGENT: &str = "agent";
+pub const UPDATE_TODOS: &str = "update_todos";
 
 /// Whether the model is allowed to change anything yet.
 ///
@@ -522,6 +523,48 @@ pub fn schemas_for(
                         }
                     },
                     "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": UPDATE_TODOS,
+                "description": "Set or replace your short-term checklist for the CURRENT task, so its \
+                                 progress is visible while you work. Always available, in any mode -- \
+                                 unlike a formal plan, this needs no approval and no plan file, so use \
+                                 it liberally for any task with more than a couple of steps. Every call \
+                                 sends the WHOLE list, replacing whatever was there before -- there is no \
+                                 way to add or tick a single item, so re-send the full set each time \
+                                 (including items you have not started) with the ones you finished marked \
+                                 'completed'. Exactly one item should be 'in_progress' at a time -- the \
+                                 one you are doing right now -- so mark the previous item 'completed' \
+                                 and the next one 'in_progress' in the SAME call, rather than leaving \
+                                 several in progress at once. Call it with an empty list to clear the \
+                                 checklist once the task is done.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "todos": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "content": {
+                                        "type": "string",
+                                        "description": "Short description of one step, e.g. 'Add the rate limiter middleware'."
+                                    },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in_progress", "completed"]
+                                    }
+                                },
+                                "required": ["content", "status"]
+                            },
+                            "description": "The full checklist, in order. Replaces the previous list entirely."
+                        }
+                    },
+                    "required": ["todos"]
                 }
             }
         }),
@@ -1286,7 +1329,11 @@ pub fn system_prompt(
            get back only its final report. Use it when answering means reading many files whose \
            contents you will not need afterwards -- the child's transcript never enters yours. \
            Give it a self-contained task; it cannot see this conversation. Read-only, runs \
-           without asking.\n\n\
+           without asking.\n\
+         - {UPDATE_TODOS}(todos): set your short-term checklist for the current task -- a list \
+           of {{content, status}}, status one of pending/in_progress/completed. Always \
+           available, needs no plan and no approval. Every call replaces the whole list, so \
+           re-send it in full each time. Read-only in effect: nothing on disk changes.\n\n\
          Rules:\n\
          - {os_hint}\n\
          - Narrate in plain sentences, not just tool calls. Before acting, say in one short \
@@ -1298,6 +1345,15 @@ pub fn system_prompt(
            call to finish the thought -- write a file, then run it -- request all of them in the \
            same turn instead of one at a time: one before-sentence and one after-sentence should \
            cover the whole batch, not a fresh pair around each individual call.\n\
+         - For any task that takes more than two or three steps, call {UPDATE_TODOS} up front \
+           with the whole plan broken into short items, before you start the first one. Mark an \
+           item 'in_progress' when you begin it and 'completed' the moment it is actually \
+           finished and verified -- not in a batch at the end. Keep exactly one item \
+           'in_progress' at a time, so the user always sees what you are doing right now, not \
+           just what you have queued. This is separate from {EXIT_PLAN_MODE}/{PLAN_PROGRESS}: \
+           those are for a plan the user has explicitly approved; {UPDATE_TODOS} needs no \
+           approval and is for tracking your own work on an ordinary request. A quick one- or \
+           two-step task does not need it -- just do the work.\n\
          - Verify before declaring success: run what you wrote, or run a real check -- the test \
            suite, a linter, importing the module, curling the endpoint -- and read the actual \
            output. Do not assume something works because the code looks right. If a command \
@@ -1794,6 +1850,57 @@ struct PlanProgressArgs {
     note: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct UpdateTodosArgs {
+    todos: Vec<TodoItemArgs>,
+}
+
+#[derive(Deserialize)]
+struct TodoItemArgs {
+    content: String,
+    status: String,
+}
+
+/// How far along one entry of the model's short-term checklist is -- see
+/// [`UPDATE_TODOS`]. Three states rather than `plan_progress`'s two: a plan
+/// step is ticked only once verified, but a todo list earns its keep by
+/// showing the *current* item too, not just what is left, so "started but
+/// not finished" needs its own state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TodoStatus {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pending" => Some(TodoStatus::Pending),
+            "in_progress" => Some(TodoStatus::InProgress),
+            "completed" => Some(TodoStatus::Completed),
+            _ => None,
+        }
+    }
+
+    /// The glyph this status is drawn with, in both the transcript and the
+    /// footer -- one place so the two can never disagree.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            TodoStatus::Pending => "☐",
+            TodoStatus::InProgress => "▸",
+            TodoStatus::Completed => "☑",
+        }
+    }
+}
+
+/// One entry of the model's own short-term checklist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
 /// Bounds on how many results a single search may ask for. Below `MIN` a
 /// search would be pointless; above `MAX` it is a good way to fill the
 /// context window with snippets nobody reads.
@@ -1878,6 +1985,12 @@ pub enum Action {
     /// `plan_progress`: bookkeeping against a plan the user already approved.
     /// Also resolved in `app.rs`, since it edits the live plan.
     Progress { step: usize, done: bool, note: Option<String> },
+    /// `update_todos`: the model's own short-term checklist, replaced whole
+    /// on every call -- unlike `Progress`, this needs no approved plan and no
+    /// file: it is pure in-memory bookkeeping for `Mode::Normal`, resolved in
+    /// `app.rs` for the same reason `Progress` is (nothing to protect, and
+    /// asking permission to update a to-do list would make it unusable).
+    Todos(Vec<TodoItem>),
 }
 
 /// One replacement within an `Action::Edit` -- what `edit_file` shows the
@@ -1946,6 +2059,10 @@ impl Action {
             Action::Plan(p) => format!("plan: {}", p.title),
             Action::Progress { step, done, .. } => {
                 format!("{} step {step}", if *done { "☑" } else { "☐" })
+            }
+            Action::Todos(items) => {
+                let done = items.iter().filter(|t| t.status == TodoStatus::Completed).count();
+                format!("todos — {done}/{}", items.len())
             }
         }
     }
@@ -2018,7 +2135,10 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
         // against -- but listing it keeps this match exhaustive by intent
         // rather than by a catch-all arm that would silently allow the next
         // writing tool somebody adds.
-        | Action::Progress { .. } => None,
+        | Action::Progress { .. }
+        // Pure in-memory bookkeeping, like `Progress` -- it writes to no
+        // file and touches nothing plan mode exists to guard.
+        | Action::Todos(_) => None,
         Action::Command { command, .. } if is_read_only(command) => None,
         Action::Write { path, .. } => Some(format!(
             "Plan mode is read-only, so nothing was written to {path}. Describe this file and \
@@ -2315,6 +2435,21 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
                 note: args.note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
             })
         }
+        UPDATE_TODOS => {
+            let args: UpdateTodosArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let items: Vec<TodoItem> = args
+                .todos
+                .into_iter()
+                .filter_map(|t| {
+                    let content = t.content.trim().to_string();
+                    if content.is_empty() {
+                        return None;
+                    }
+                    Some(TodoItem { content, status: TodoStatus::parse(&t.status)? })
+                })
+                .collect();
+            Some(Action::Todos(items))
+        }
         _ => None,
     }
 }
@@ -2564,6 +2699,16 @@ pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfi
             "☐ progress — not handled".to_string(),
             "Error: that step was not recorded. Carry on with the work and tell the user which \
              steps you have finished."
+                .to_string(),
+        ),
+        // Never reached: `app::advance_approvals` resolves this itself, for
+        // the same reason it resolves `PLAN_PROGRESS` -- it is in-memory
+        // bookkeeping on `App`, and the runner has no access to `App`.
+        UPDATE_TODOS => outcome(
+            &call.id,
+            "todos — not handled".to_string(),
+            "Error: the checklist was not updated. Carry on with the work and tell the user \
+             what you're doing."
                 .to_string(),
         ),
         other => outcome(
@@ -4301,6 +4446,42 @@ pub fn progress_failed(call: &ToolCall, reason: &str) -> ToolOutcome {
         "☐ progress — not recorded".to_string(),
         format!("Error: {reason}"),
     )
+}
+
+/// The result of `update_todos`: the new list, replacing whatever was there.
+///
+/// Unlike `progress_recorded` there is no file to point at -- this is
+/// in-memory for the session, gone with it -- so the confirmation just states
+/// the counts and reminds the model of the one-in-progress convention rather
+/// than restating the whole list back (it just sent that list; echoing it
+/// would only spend tokens).
+pub fn todos_recorded(call: &ToolCall, items: &[TodoItem]) -> ToolOutcome {
+    let total = items.len();
+    let done = items.iter().filter(|t| t.status == TodoStatus::Completed).count();
+    let display = if total == 0 {
+        "todos — cleared".to_string()
+    } else {
+        // A glyph per item, in order -- a checklist glance-able from the
+        // transcript's one-line-per-tool-call view, not just a count.
+        let glyphs: String = items.iter().map(|t| t.status.glyph()).collect();
+        format!("todos {glyphs} — {done}/{total} done")
+    };
+    let content = if total == 0 {
+        "Checklist cleared.".to_string()
+    } else {
+        let in_progress = items.iter().filter(|t| t.status == TodoStatus::InProgress).count();
+        let reminder = if in_progress > 1 {
+            " More than one item is 'in_progress' -- keep it to the single one you are actually \
+             doing right now."
+        } else if in_progress == 0 && done < total {
+            " Nothing is marked 'in_progress' -- set the item you are about to work on next time \
+             you call this."
+        } else {
+            ""
+        };
+        format!("Checklist updated: {done}/{total} done.{reminder}")
+    };
+    outcome(&call.id, display, content)
 }
 
 /// The result of the user rejecting a plan. The session stays in plan mode,
@@ -6303,6 +6484,7 @@ mod tests {
                 GLOB,
                 GREP_SEARCH,
                 EDIT_FILE,
+                UPDATE_TODOS,
                 GET_DESIGN_STARTER,
                 CHECK_CONTRAST,
                 PUBLISH_ARTIFACT,
@@ -6943,6 +7125,30 @@ mod tests {
         assert!(with.contains(&PLAN_PROGRESS.to_string()), "{with:?}");
     }
 
+    /// Unlike `plan_progress`, `update_todos` is not gated behind an active
+    /// plan -- it is the lightweight alternative for `Mode::Normal`, the
+    /// actual default, where most work happens with no plan in sight.
+    #[test]
+    fn update_todos_is_offered_in_normal_mode_with_no_active_plan() {
+        let names: Vec<String> = schemas(Mode::Normal, false, true, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&UPDATE_TODOS.to_string()), "{names:?}");
+    }
+
+    /// Plan mode's whole promise is that nothing changes without an approved
+    /// plan -- but `update_todos` changes no file, so it stays available
+    /// there too, same as `plan_progress` does.
+    #[test]
+    fn update_todos_is_still_offered_in_plan_mode() {
+        let names: Vec<String> = schemas(Mode::Plan, false, true, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&UPDATE_TODOS.to_string()), "{names:?}");
+    }
+
     /// A status that is neither done nor blocked is a guess about what the
     /// model meant, and guessing wrong writes a false claim into a file the
     /// user will trust later.
@@ -6956,6 +7162,40 @@ mod tests {
             describe_action(&good),
             Some(Action::Progress { step: 2, done: true, note: None })
         );
+    }
+
+    /// `update_todos` parses its list into `Action::Todos`, preserving order
+    /// and each item's status.
+    #[test]
+    fn update_todos_parses_the_full_list_in_order() {
+        let call = tool_call(
+            UPDATE_TODOS,
+            json!({
+                "todos": [
+                    { "content": "Add the schema", "status": "completed" },
+                    { "content": "Wire up execution", "status": "in_progress" },
+                    { "content": "Render in the UI", "status": "pending" },
+                ]
+            }),
+        );
+        match describe_action(&call) {
+            Some(Action::Todos(items)) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0].content, "Add the schema");
+                assert_eq!(items[0].status, TodoStatus::Completed);
+                assert_eq!(items[1].status, TodoStatus::InProgress);
+                assert_eq!(items[2].status, TodoStatus::Pending);
+            }
+            other => panic!("expected todos, got {other:?}"),
+        }
+    }
+
+    /// An empty list is a valid call -- it is how the model clears the
+    /// checklist once a task is done -- not a malformed one.
+    #[test]
+    fn update_todos_accepts_an_empty_list() {
+        let call = tool_call(UPDATE_TODOS, json!({ "todos": [] }));
+        assert_eq!(describe_action(&call), Some(Action::Todos(Vec::new())));
     }
 
     /// The plan is restated on every request, with live step state, because a
