@@ -1412,6 +1412,19 @@ pub fn system_prompt(
         ));
     }
 
+    prompt.push_str(&format!(
+        "\n\nThese notes are yours to keep up to date, not just to read. When normal work \
+         turns up something durable and non-obvious about this project -- a build or test \
+         quirk that will bite the next session too, a wrong assumption you had to be \
+         corrected on, a convention you were told that is not written down above -- propose \
+         adding it with {EDIT_FILE} or {WRITE_FILE} on BOXCODE.md, the same way you would \
+         propose any other change, through the normal approval. This is not a habit to keep \
+         up on every turn: most work does not surface anything worth writing down, and \
+         nudging a routine fix or a one-off detail in there just adds noise the next session \
+         has to read past. Reach for it only when the fact would genuinely save the next \
+         session from rediscovering the same thing the hard way."
+    ));
+
     if mode.is_plan() {
         prompt.push_str(&format!(
             "\n\nPLAN MODE — you cannot change anything yet.\n\
@@ -6090,6 +6103,20 @@ mod tests {
         std::fs::write(ws.root().join("BOXCODE.md"), "   \n\n").unwrap();
         let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
         assert!(!prompt.contains("PROJECT NOTES"), "{prompt}");
+    }
+
+    /// Nothing today prompts the model to update BOXCODE.md mid-session when
+    /// it learns something durable -- /init is the only writer. The system
+    /// prompt should nudge it to propose an update through the normal
+    /// edit_file/write_file approval, and should do so whether or not a
+    /// memory file exists yet.
+    #[test]
+    fn the_system_prompt_nudges_self_updating_project_memory() {
+        let (_dir, ws, cfg) = fixture();
+        let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
+        assert!(prompt.contains("BOXCODE.md"), "{prompt}");
+        assert!(prompt.contains(EDIT_FILE), "{prompt}");
+        assert!(prompt.contains(WRITE_FILE), "{prompt}");
     }
 
     /// Regression: without this, a model that only emits tool calls leaves the
