@@ -50,6 +50,7 @@ pub fn fire_request(
     let model = app.config.llm.model.clone();
     let api_key = app.config.llm.api_key.clone();
     let max_tokens = app.config.llm.max_tokens;
+    let temperature = app.config.llm.effective_temperature();
 
     // Withholding the schemas once the budget is spent is what actually
     // stops a runaway loop: the model has nothing left to call, so it
@@ -131,6 +132,7 @@ pub fn fire_request(
                 api_key: &api_key,
                 max_tokens,
                 include_usage,
+                temperature,
             },
             history,
             schemas,
@@ -155,7 +157,7 @@ pub fn handle_event(app: &mut App, id: u64, event: StreamEvent) {
     match event {
         StreamEvent::Token(token) => app.append_token(&token),
         StreamEvent::Reasoning(text) => app.append_reasoning(&text),
-        StreamEvent::ToolCalls(calls) => app.request_tools(calls),
+        StreamEvent::ToolCalls(calls, truncated) => app.request_tools_truncated(calls, truncated),
         StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
         StreamEvent::AgentActivity { call_id, label, rounds } => {
             app.record_subagent_activity(&call_id, label, rounds)
@@ -184,6 +186,12 @@ pub fn execute_approved(
         return;
     }
     let calls = std::mem::take(&mut app.approved_tools);
+    // Whether the response these calls came from was cut off by the token
+    // budget (`finish_reason == "length"`) rather than finishing on its own --
+    // set by `request_tools_truncated` when the calls first arrived, and read
+    // here rather than threaded through `approved_tools` because every call in
+    // one batch shares one response and so shares one answer to this question.
+    let truncated = app.truncated_response;
     // The whole config, not just `[tools]`: an `agent` call spawns a child
     // loop, and a loop needs the endpoint. Everything else still sees only
     // the `tools` half it always saw.
@@ -194,7 +202,8 @@ pub fn execute_approved(
             let id = app.request_id;
             let tx = tx.clone();
             let handle = tokio::spawn(async move {
-                let outcomes = run_calls(&calls, &ws, &config, Some((id, &tx))).await;
+                let outcomes =
+                    run_calls(&calls, &ws, &config, truncated, Some((id, &tx))).await;
                 let _ = tx.send((id, StreamEvent::ToolsFinished(outcomes))).await;
             });
             app.abort = Some(handle.abort_handle());
@@ -261,6 +270,14 @@ async fn run_calls(
     calls: &[ToolCall],
     ws: &Workspace,
     config: &Config,
+    // Whether the response these calls came from was cut off by the token
+    // budget (`finish_reason == "length"`) -- see `App::truncated_response`.
+    // Threaded through to every dispatch below (not just the sequential
+    // branch) so a `write_file`/`edit_file` call is refused the same way
+    // regardless of whether it happened to land in a concurrent read run or
+    // not; only those two tools actually look at the flag, so it is a no-op
+    // for everything else.
+    truncated: bool,
     progress: Option<(u64, &mpsc::Sender<(u64, StreamEvent)>)>,
 ) -> Vec<ToolOutcome> {
     let mut outcomes = Vec::with_capacity(calls.len());
@@ -287,7 +304,9 @@ async fn run_calls(
                     let call = call.clone();
                     let ws = ws.clone();
                     let tools_config = config.tools.clone();
-                    async move { tools::execute(&call, &ws, &tools_config).await }
+                    async move {
+                        tools::execute_truncated(&call, &ws, &tools_config, truncated).await
+                    }
                 });
                 outcomes.extend(futures::future::join_all(futures).await);
             }
@@ -300,7 +319,7 @@ async fn run_calls(
             outcomes.push(if call.function.name == tools::AGENT {
                 run_subagent(call, ws, config, progress).await
             } else {
-                tools::execute(call, ws, &config.tools).await
+                tools::execute_truncated(call, ws, &config.tools, truncated).await
             });
             i += 1;
         }
@@ -402,6 +421,7 @@ pub async fn run_subagent(
                 api_key: &config.llm.api_key,
                 max_tokens: config.llm.max_tokens,
                 include_usage: config.quota.enabled && config.quota.include_usage,
+                temperature: config.llm.effective_temperature(),
             },
             history.clone(),
             schemas,
@@ -418,7 +438,11 @@ pub async fn run_subagent(
                 _ = &mut stream, if !stream_finished => stream_finished = true,
                 received = rx.recv() => match received {
                     Some((_, StreamEvent::Token(t))) => text.push_str(&t),
-                    Some((_, StreamEvent::ToolCalls(c))) => calls = c,
+                    // The truncation flag is dropped here on purpose: a
+                    // subagent's schemas never include write_file/edit_file
+                    // (see `SUBAGENT_TOOLS`), so nothing it calls can act on
+                    // it.
+                    Some((_, StreamEvent::ToolCalls(c, _))) => calls = c,
                     Some((_, StreamEvent::Usage(u))) => usage = Some(u),
                     // Notices ("answer was truncated") are addressed to a
                     // user, and this loop has none; ToolsFinished and
@@ -894,7 +918,7 @@ mod tests {
             run_command_call("6", list_command()),
         ];
 
-        let outcomes = run_calls(&calls, &ws, &config, None).await;
+        let outcomes = run_calls(&calls, &ws, &config, false, None).await;
 
         assert_eq!(outcomes.len(), calls.len());
         let ids: Vec<&str> = outcomes.iter().map(|o| o.call_id.as_str()).collect();
@@ -929,7 +953,7 @@ mod tests {
             read_call("3", "b.txt"),
         ];
 
-        let outcomes = run_calls(&calls, &ws, &config, None).await;
+        let outcomes = run_calls(&calls, &ws, &config, false, None).await;
 
         let ids: Vec<&str> = outcomes.iter().map(|o| o.call_id.as_str()).collect();
         assert_eq!(ids, vec!["1", "2", "3"]);
@@ -955,7 +979,7 @@ mod tests {
             write_call("2", "shared.txt", "second"),
         ];
 
-        let outcomes = run_calls(&calls, &ws, &config, None).await;
+        let outcomes = run_calls(&calls, &ws, &config, false, None).await;
 
         let ids: Vec<&str> = outcomes.iter().map(|o| o.call_id.as_str()).collect();
         assert_eq!(ids, vec!["1", "2"]);
