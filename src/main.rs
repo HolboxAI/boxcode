@@ -24,6 +24,7 @@ mod session;
 mod telemetry;
 mod tools;
 mod theme;
+mod transport;
 mod ui;
 mod upgrade;
 mod usage;
@@ -60,6 +61,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut force = false;
     let mut plan = false;
     let mut resume = false;
+    let mut acp = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-V" | "--version" => {
@@ -74,6 +76,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "-f" | "--force" => force = true,
             "-p" | "--plan" => plan = true,
             "-r" | "--resume" => resume = true,
+            "--acp" => acp = true,
             other => {
                 eprintln!("Unknown argument: {other}\n");
                 print_help();
@@ -111,6 +114,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let migrating = config::legacy_dir_pending();
 
     let config = Config::load()?;
+
+    // The ACP entry point never touches a terminal at all -- it reads/writes
+    // ndjson over stdio, so it has to branch off before `theme::init` (which
+    // asks the terminal a question) or `setup_terminal` (which takes it over
+    // outright). See transport.rs's own module docs for the protocol.
+    if acp {
+        return transport::run(config).await;
+    }
+
     // Before anything is drawn: the colours depend on the terminal's
     // background, and asking for that needs the terminal to itself, with
     // no alternate screen up and nothing else reading stdin.
