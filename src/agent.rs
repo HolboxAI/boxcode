@@ -157,7 +157,7 @@ pub fn handle_event(app: &mut App, id: u64, event: StreamEvent) {
     match event {
         StreamEvent::Token(token) => app.append_token(&token),
         StreamEvent::Reasoning(text) => app.append_reasoning(&text),
-        StreamEvent::ToolCalls(calls) => app.request_tools(calls),
+        StreamEvent::ToolCalls(calls, truncated) => app.request_tools_truncated(calls, truncated),
         StreamEvent::ToolsFinished(outcomes) => app.finish_tools(outcomes),
         StreamEvent::AgentActivity { call_id, label, rounds } => {
             app.record_subagent_activity(&call_id, label, rounds)
@@ -186,6 +186,12 @@ pub fn execute_approved(
         return;
     }
     let calls = std::mem::take(&mut app.approved_tools);
+    // Whether the response these calls came from was cut off by the token
+    // budget (`finish_reason == "length"`) rather than finishing on its own --
+    // set by `request_tools_truncated` when the calls first arrived, and read
+    // here rather than threaded through `approved_tools` because every call in
+    // one batch shares one response and so shares one answer to this question.
+    let truncated = app.truncated_response;
     // The whole config, not just `[tools]`: an `agent` call spawns a child
     // loop, and a loop needs the endpoint. Everything else still sees only
     // the `tools` half it always saw.
@@ -196,18 +202,8 @@ pub fn execute_approved(
             let id = app.request_id;
             let tx = tx.clone();
             let handle = tokio::spawn(async move {
-                let mut outcomes = Vec::with_capacity(calls.len());
-                for call in &calls {
-                    // Resolved here rather than in `tools::execute` because a
-                    // subagent is made of the pieces this module owns -- a
-                    // conversation, a stream, a tool runner -- and because the
-                    // runner deliberately never sees the LLM config.
-                    outcomes.push(if call.function.name == tools::AGENT {
-                        run_subagent(call, &ws, &config, Some((id, &tx))).await
-                    } else {
-                        tools::execute(call, &ws, &config.tools).await
-                    });
-                }
+                let outcomes =
+                    run_calls(&calls, &ws, &config, truncated, Some((id, &tx))).await;
                 let _ = tx.send((id, StreamEvent::ToolsFinished(outcomes))).await;
             });
             app.abort = Some(handle.abort_handle());
@@ -219,6 +215,116 @@ pub fn execute_approved(
             "The model asked to run a command, but the command tool is not enabled.".to_string(),
         ),
     }
+}
+
+/// How many pure-read calls run concurrently within one fan-out run. A turn
+/// can ask for dozens of reads at once (a model fanning `grep_search` out
+/// over a big tree); without a cap that opens dozens of file handles or
+/// spawns dozens of `run_command` processes in one instant. Same cap
+/// `artifacts.rs` uses for its own bounded upload fan-out.
+const MAX_CONCURRENT_READS: usize = 8;
+
+/// Whether `call` is a pure read: touches no file, no rollback journal, no
+/// process state that a concurrent sibling could race with. The whitelist is
+/// deliberately narrow -- `read_file`, `list_dir`, `glob`, `grep_search`, and
+/// a `run_command` that `tools::is_read_only` already vouches for elsewhere
+/// (the same allowlist `ApprovalMode::Always` trusts to skip a prompt).
+///
+/// `agent` is deliberately absent even though a subagent is read-only by
+/// construction: running one drives its own child request/response loop
+/// against the LLM endpoint via [`run_subagent`], which is a different shape
+/// of work than a single tool call and not something to fan out alongside a
+/// batch of file reads. It keeps running sequentially, exactly as before.
+/// `write_file` and `edit_file` are excluded because they are not reads at
+/// all: both do unlocked read-then-write on a path, so two calls to the same
+/// file racing would corrupt it, and both leave a first-record-wins entry in
+/// `rollback.rs`'s journal that depends on the order calls actually ran in.
+fn is_pure_read_call(call: &ToolCall) -> bool {
+    match call.function.name.as_str() {
+        tools::READ_FILE | tools::LIST_DIR | tools::GLOB | tools::GREP_SEARCH => true,
+        tools::RUN_COMMAND => matches!(
+            tools::describe_action(call),
+            Some(tools::Action::Command { command, .. }) if tools::is_read_only(&command)
+        ),
+        _ => false,
+    }
+}
+
+/// Run one turn's approved calls and hand back their outcomes in the same
+/// order `calls` came in, regardless of which read finished first.
+///
+/// The batch is walked once, splitting it into maximal runs: a contiguous
+/// stretch of [`is_pure_read_call`] calls is dispatched concurrently (capped
+/// at [`MAX_CONCURRENT_READS`] in flight), everything else -- writes, edits,
+/// non-read-only commands, `agent` calls -- still runs one at a time exactly
+/// as before. The two kinds of run are stitched back together in the order
+/// they occurred, so a `read, read, write, read` turn becomes "two reads
+/// concurrently, then the write, then the last read" rather than reordering
+/// anything the model or the transcript would notice.
+///
+/// Order within a concurrent run is preserved by `buffered` (not
+/// `buffer_unordered`): it polls up to the cap at once but still *yields*
+/// results in the order its futures were submitted in, i.e. the order the
+/// model asked for them -- so no explicit re-sorting is needed here.
+async fn run_calls(
+    calls: &[ToolCall],
+    ws: &Workspace,
+    config: &Config,
+    // Whether the response these calls came from was cut off by the token
+    // budget (`finish_reason == "length"`) -- see `App::truncated_response`.
+    // Threaded through to every dispatch below (not just the sequential
+    // branch) so a `write_file`/`edit_file` call is refused the same way
+    // regardless of whether it happened to land in a concurrent read run or
+    // not; only those two tools actually look at the flag, so it is a no-op
+    // for everything else.
+    truncated: bool,
+    progress: Option<(u64, &mpsc::Sender<(u64, StreamEvent)>)>,
+) -> Vec<ToolOutcome> {
+    let mut outcomes = Vec::with_capacity(calls.len());
+    let mut i = 0;
+    while i < calls.len() {
+        if is_pure_read_call(&calls[i]) {
+            let start = i;
+            while i < calls.len() && is_pure_read_call(&calls[i]) {
+                i += 1;
+            }
+            let run = &calls[start..i];
+            // Chunked rather than fanned out as one `join_all` over the whole
+            // run: a chunk's futures are polled together, so this is the cap
+            // on how many reads (file handles, `run_command` child processes)
+            // are ever in flight at once. `join_all` -- not
+            // `stream::buffered` -- because each future here owns its
+            // arguments (cloned per call); a version borrowing `ws`/`config`
+            // through the closure ran into rustc's known HRTB false-positive
+            // ("implementation of `FnOnce` is not general enough") when a
+            // `Stream::map` closure's return type is itself an `async fn`
+            // call rather than a fully owned `async move` block.
+            for chunk in run.chunks(MAX_CONCURRENT_READS) {
+                let futures = chunk.iter().map(|call| {
+                    let call = call.clone();
+                    let ws = ws.clone();
+                    let tools_config = config.tools.clone();
+                    async move {
+                        tools::execute_truncated(&call, &ws, &tools_config, truncated).await
+                    }
+                });
+                outcomes.extend(futures::future::join_all(futures).await);
+            }
+        } else {
+            let call = &calls[i];
+            // Resolved here rather than in `tools::execute` because a
+            // subagent is made of the pieces this module owns -- a
+            // conversation, a stream, a tool runner -- and because the
+            // runner deliberately never sees the LLM config.
+            outcomes.push(if call.function.name == tools::AGENT {
+                run_subagent(call, ws, config, progress).await
+            } else {
+                tools::execute_truncated(call, ws, &config.tools, truncated).await
+            });
+            i += 1;
+        }
+    }
+    outcomes
 }
 
 /// Run one read-only subagent to completion and return its report as the
@@ -332,7 +438,11 @@ pub async fn run_subagent(
                 _ = &mut stream, if !stream_finished => stream_finished = true,
                 received = rx.recv() => match received {
                     Some((_, StreamEvent::Token(t))) => text.push_str(&t),
-                    Some((_, StreamEvent::ToolCalls(c))) => calls = c,
+                    // The truncation flag is dropped here on purpose: a
+                    // subagent's schemas never include write_file/edit_file
+                    // (see `SUBAGENT_TOOLS`), so nothing it calls can act on
+                    // it.
+                    Some((_, StreamEvent::ToolCalls(c, _))) => calls = c,
                     Some((_, StreamEvent::Usage(u))) => usage = Some(u),
                     // Notices ("answer was truncated") are addressed to a
                     // user, and this loop has none; ToolsFinished and
@@ -726,5 +836,157 @@ mod tests {
         let requests = requests.await.expect("round served");
         assert!(requests[0].contains("Write your report now"), "the prompt demands an answer");
         assert!(!requests[0].contains("\"tools\""), "no schemas: stopping is enforced, not requested");
+    }
+
+    // -- Phase 1 parallel read-only fan-out (`run_calls`) --------------------
+
+    fn call_with(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: llm::FunctionCall { name: name.to_string(), arguments: args.to_string() },
+        }
+    }
+
+    fn read_call(id: &str, path: &str) -> ToolCall {
+        call_with(id, tools::READ_FILE, json!({ "path": path }))
+    }
+
+    fn write_call(id: &str, path: &str, content: &str) -> ToolCall {
+        call_with(id, tools::WRITE_FILE, json!({ "path": path, "content": content }))
+    }
+
+    /// Not on `is_read_only`'s allowlist even as a literal prefix (`rm` is
+    /// nowhere near it), so this is deliberately never classified as a pure
+    /// read -- used to prove a non-read `run_command` still runs like before.
+    fn run_command_call(id: &str, command: &str) -> ToolCall {
+        call_with(id, tools::RUN_COMMAND, json!({ "command": command }))
+    }
+
+    fn workspace_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (name, content) in files {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        let ws = Workspace::new(dir.path()).expect("workspace");
+        (dir, ws)
+    }
+
+    /// `is_pure_read_call` is the fence the whole fan-out depends on: it has
+    /// to agree with `tools::is_read_only` for commands, admit the four
+    /// dedicated read tools, and refuse everything that writes, edits, or
+    /// runs a subagent -- including a command `is_read_only` would not vouch
+    /// for.
+    #[test]
+    fn is_pure_read_call_matches_the_documented_allowlist() {
+        assert!(is_pure_read_call(&read_call("1", "a.txt")));
+        assert!(is_pure_read_call(&call_with("2", tools::LIST_DIR, json!({ "path": "." }))));
+        assert!(is_pure_read_call(&call_with("3", tools::GLOB, json!({ "pattern": "**/*.rs" }))));
+        assert!(is_pure_read_call(&call_with(
+            "4",
+            tools::GREP_SEARCH,
+            json!({ "pattern": "fn main" })
+        )));
+        assert!(is_pure_read_call(&run_command_call("5", "ls -la")));
+
+        assert!(!is_pure_read_call(&write_call("6", "a.txt", "x")));
+        assert!(!is_pure_read_call(&call_with(
+            "7",
+            tools::EDIT_FILE,
+            json!({ "path": "a.txt", "old_string": "x", "new_string": "y" })
+        )));
+        assert!(!is_pure_read_call(&run_command_call("8", "rm -rf a.txt")));
+        assert!(!is_pure_read_call(&agent_call(json!({ "task": "look around" }))));
+    }
+
+    /// A whole batch of reads -- the four dedicated tools plus a read-only
+    /// `run_command` -- runs through the concurrent fan-out, but the outcomes
+    /// still come back call-for-call in the order the model asked for them.
+    /// Correctness of the ordering, not the timing of the concurrency, is
+    /// what `ToolsFinished` consumers actually depend on.
+    #[tokio::test]
+    async fn a_batch_of_reads_comes_back_in_original_order() {
+        let (_dir, ws) =
+            workspace_with_files(&[("a.txt", "aaa"), ("b.txt", "bbb"), ("c.txt", "ccc")]);
+        let config = Config::default();
+        let calls = vec![
+            read_call("1", "a.txt"),
+            call_with("2", tools::LIST_DIR, json!({ "path": "." })),
+            read_call("3", "b.txt"),
+            call_with("4", tools::GLOB, json!({ "pattern": "*.txt" })),
+            read_call("5", "c.txt"),
+            run_command_call("6", list_command()),
+        ];
+
+        let outcomes = run_calls(&calls, &ws, &config, false, None).await;
+
+        assert_eq!(outcomes.len(), calls.len());
+        let ids: Vec<&str> = outcomes.iter().map(|o| o.call_id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2", "3", "4", "5", "6"], "results must match call order");
+        assert!(outcomes[0].content.contains("aaa"));
+        assert!(outcomes[2].content.contains("bbb"));
+        assert!(outcomes[4].content.contains("ccc"));
+    }
+
+    /// `dir` on Windows, `ls` elsewhere -- matches `tools.rs`'s own helper of
+    /// the same name, needed here because the read-only `run_command` in the
+    /// tests above has to be a real command on whatever platform runs them.
+    fn list_command() -> &'static str {
+        if cfg!(windows) {
+            "dir"
+        } else {
+            "ls"
+        }
+    }
+
+    /// A write sitting between two reads still lands in the outcome vector at
+    /// its original position, and the file it wrote is really there --
+    /// proving the read-only runs on either side of it did not smear it out
+    /// of order or skip it.
+    #[tokio::test]
+    async fn a_write_between_reads_keeps_its_place_in_the_order() {
+        let (dir, ws) = workspace_with_files(&[("a.txt", "aaa"), ("b.txt", "bbb")]);
+        let config = Config::default();
+        let calls = vec![
+            read_call("1", "a.txt"),
+            write_call("2", "out.txt", "written"),
+            read_call("3", "b.txt"),
+        ];
+
+        let outcomes = run_calls(&calls, &ws, &config, false, None).await;
+
+        let ids: Vec<&str> = outcomes.iter().map(|o| o.call_id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2", "3"]);
+        assert!(outcomes[0].content.contains("aaa"));
+        assert!(outcomes[2].content.contains("bbb"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+            "written",
+            "the write in the middle of the batch still ran"
+        );
+    }
+
+    /// A batch with nothing read-only in it -- two writes to the same path,
+    /// which only stay correct if they still run strictly one after another
+    /// -- behaves exactly like the pre-Phase-1 sequential loop: same order,
+    /// no interleaving, last write wins deterministically.
+    #[tokio::test]
+    async fn an_all_write_batch_still_runs_sequentially() {
+        let (dir, ws) = workspace_with_files(&[("shared.txt", "start")]);
+        let config = Config::default();
+        let calls = vec![
+            write_call("1", "shared.txt", "first"),
+            write_call("2", "shared.txt", "second"),
+        ];
+
+        let outcomes = run_calls(&calls, &ws, &config, false, None).await;
+
+        let ids: Vec<&str> = outcomes.iter().map(|o| o.call_id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2"]);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+            "second",
+            "sequential writes still apply in call order, exactly as before Phase 1"
+        );
     }
 }
