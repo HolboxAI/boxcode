@@ -8258,6 +8258,162 @@ mod tests {
         a
     }
 
+    /// Pins the full six-way ordering `approval::verdict_for` mirrors from
+    /// `advance_approvals` as one total order -- including the two
+    /// combinations an independent review found untested against each
+    /// other before this: bookkeeping (`Progress`/`Todos`) vs the
+    /// blocklist, and vs plan mode. `verdict_for` was extracted so a
+    /// headless session never reimplements this ordering independently;
+    /// this test is what would catch the ordering drifting from what
+    /// `advance_approvals` (tested via `request_tools` below) actually
+    /// does.
+    #[test]
+    fn verdict_for_matches_the_full_six_way_ordering() {
+        use crate::approval::{verdict_for, Verdict};
+
+        let root = std::path::Path::new("/tmp/project");
+
+        // 1. Blocked outranks everything, including plan mode.
+        let blocked = command_call("c1", "sudo rm -rf /");
+        assert!(matches!(
+            verdict_for(&blocked, root, Mode::Normal, ApprovalMode::Destructive),
+            Verdict::Blocked(_)
+        ));
+        assert!(
+            matches!(
+                verdict_for(&blocked, root, Mode::Plan, ApprovalMode::Destructive),
+                Verdict::Blocked(_)
+            ),
+            "blocked must outrank plan mode too"
+        );
+
+        // 2. Plan mode refuses a write, even under the loosest approval setting.
+        let write = write_call("c2", "notes.md", "hi");
+        assert!(matches!(
+            verdict_for(&write, root, Mode::Plan, ApprovalMode::Destructive),
+            Verdict::PlanRefused(_)
+        ));
+
+        // 3 & 4. Bookkeeping bypasses both plan mode and the strictest
+        // approval setting -- there is nothing here for a prompt to
+        // protect either way.
+        let progress = progress_call("c3", 1, "done");
+        let todos = todos_call("c4", &[("write the tests", "in_progress")]);
+        for mode in [Mode::Normal, Mode::Plan] {
+            for approval in [ApprovalMode::Destructive, ApprovalMode::Always] {
+                assert!(
+                    matches!(verdict_for(&progress, root, mode, approval), Verdict::Progress { .. }),
+                    "progress bookkeeping must bypass mode={mode:?} approval={approval:?}"
+                );
+                assert!(
+                    matches!(verdict_for(&todos, root, mode, approval), Verdict::Todos(_)),
+                    "todo bookkeeping must bypass mode={mode:?} approval={approval:?}"
+                );
+            }
+        }
+
+        // 5. A read is unconditionally read-only (`is_read_only_action`
+        // includes it outright) -- it needs no approval under the default
+        // policy, and stays auto-approved even under the strictest one.
+        // Only writes are singled out for that mode -- see
+        // `is_read_only_action`'s own doc comment for why.
+        let read = read_file_call("c5", "src/main.rs");
+        assert!(matches!(
+            verdict_for(&read, root, Mode::Normal, ApprovalMode::Destructive),
+            Verdict::AutoApprove
+        ));
+        assert!(
+            matches!(verdict_for(&read, root, Mode::Normal, ApprovalMode::Always), Verdict::AutoApprove),
+            "a read must stay auto-approved even under the strictest policy"
+        );
+        // A write, by contrast, does stop and ask under the strictest policy.
+        assert!(matches!(
+            verdict_for(&write, root, Mode::Normal, ApprovalMode::Always),
+            Verdict::Ask(_)
+        ));
+
+        // 6. An ordinary write is Normal risk, and the default policy
+        // (`Destructive`) deliberately treats writes as ordinary -- see its
+        // own doc comment ("Writes and edits are included in 'ordinary' on
+        // purpose"). It is auto-approved, same as a harmless read or an
+        // ordinary command.
+        assert!(matches!(
+            verdict_for(&write, root, Mode::Normal, ApprovalMode::Destructive),
+            Verdict::AutoApprove
+        ));
+        // What the default policy actually does single out is a genuinely
+        // dangerous command -- this is the case that asks.
+        let dangerous = command_call("c6", "rm -rf build");
+        assert!(matches!(
+            verdict_for(&dangerous, root, Mode::Normal, ApprovalMode::Destructive),
+            Verdict::Ask(_)
+        ));
+    }
+
+    /// Cross-checks `verdict_for` against what `App::advance_approvals`
+    /// (via `request_tools`, its real entry point) actually does, for the
+    /// same sample calls the ordering test above pins in isolation --
+    /// proving the extraction agrees with the running app, not just that
+    /// it looks plausible on its own.
+    #[test]
+    fn verdict_for_agrees_with_what_app_actually_does() {
+        use crate::approval::Verdict;
+
+        let samples: Vec<(&str, ToolCall, Mode, ApprovalMode)> = vec![
+            ("blocked command", command_call("s1", "sudo rm -rf /"), Mode::Normal, ApprovalMode::Destructive),
+            ("plan-mode write", write_call("s2", "x.txt", "y"), Mode::Plan, ApprovalMode::Destructive),
+            (
+                "progress in plan mode",
+                progress_call("s3", 1, "done"),
+                Mode::Plan,
+                ApprovalMode::Always,
+            ),
+            (
+                "todos under strict approval",
+                todos_call("s4", &[("a", "pending")]),
+                Mode::Normal,
+                ApprovalMode::Always,
+            ),
+            ("read under default policy", read_file_call("s5", "src/main.rs"), Mode::Normal, ApprovalMode::Destructive),
+            ("read under strict policy", read_file_call("s6", "src/main.rs"), Mode::Normal, ApprovalMode::Always),
+            ("ordinary write", write_call("s7", "x.txt", "y"), Mode::Normal, ApprovalMode::Destructive),
+        ];
+
+        for (label, call, mode, approval) in samples {
+            let mut a = streaming_app();
+            a.mode = mode;
+            a.config.tools.approval = approval;
+            let root = std::path::Path::new(&a.workspace_root);
+            let verdict = crate::approval::verdict_for(&call, root, mode, approval);
+
+            a.request_tools(vec![call.clone()]);
+
+            match verdict {
+                Verdict::Blocked(_) | Verdict::PlanRefused(_) => {
+                    assert!(
+                        a.pending_tools.is_empty() && a.approved_tools.is_empty(),
+                        "{label}: refusal verdict but App left the call queued or approved"
+                    );
+                }
+                Verdict::Progress { .. } | Verdict::Todos(_) => {
+                    assert!(
+                        a.pending_tools.is_empty() && a.approved_tools.is_empty(),
+                        "{label}: bookkeeping verdict but App left it queued"
+                    );
+                }
+                Verdict::AutoApprove => {
+                    assert!(
+                        a.approved_tools.iter().any(|c| c.id == call.id),
+                        "{label}: AutoApprove verdict but App didn't auto-approve"
+                    );
+                }
+                Verdict::Ask(_) => {
+                    assert!(a.overlay.is_some(), "{label}: Ask verdict but App didn't show a prompt");
+                }
+            }
+        }
+    }
+
     #[test]
     fn slash_plan_toggles_the_mode_both_ways() {
         let mut a = app();
