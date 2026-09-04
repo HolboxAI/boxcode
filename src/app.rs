@@ -458,6 +458,14 @@ pub struct App {
     pub pending_tools: VecDeque<ToolCall>,
     /// Calls the user allowed, waiting for the event loop to spawn them.
     pub approved_tools: Vec<ToolCall>,
+    /// Whether the LLM response `pending_tools`/`approved_tools` came from was
+    /// cut off by the token budget (`finish_reason == "length"`) rather than
+    /// finishing on its own. Set by `request_tools_truncated` and read by
+    /// `agent::execute_approved` just before running the batch, so
+    /// `write_file`/`edit_file` can refuse content that arrived truncated
+    /// instead of writing it to disk as if it were whole. One flag per batch,
+    /// not per call: every call in a batch came from the same response.
+    pub truncated_response: bool,
     /// A snapshot of `approved_tools` taken the moment execution starts, kept
     /// around purely for display. `main.rs` drains `approved_tools` as soon as
     /// it spawns the runner task, so by the next frame that list is empty --
@@ -653,6 +661,7 @@ impl App {
             overlay_cursor: 0,
             pending_tools: VecDeque::new(),
             approved_tools: Vec::new(),
+            truncated_response: false,
             running_tools: Vec::new(),
             subagent_trails: Vec::new(),
             tool_steps: 0,
@@ -1147,10 +1156,30 @@ impl App {
 
     /// The model asked to run something. Commit whatever prose it streamed
     /// alongside the request, then start asking the user about each command.
+    ///
+    /// `#[cfg(test)]`: the real event loop always knows whether the response
+    /// was truncated and calls `request_tools_truncated` directly (see
+    /// `agent::handle_event`); this untruncated shorthand exists purely so the
+    /// hundreds of existing tests that construct calls by hand -- and are not
+    /// about this feature -- do not all need an extra `, false`.
+    #[cfg(test)]
     pub fn request_tools(&mut self, calls: Vec<ToolCall>) {
+        self.request_tools_truncated(calls, false);
+    }
+
+    /// Same as `request_tools`, but additionally records whether the response
+    /// these calls came from was cut off by the token budget rather than
+    /// finishing on its own -- `finish_reason == "length"`, read all the way
+    /// back in `llm::run`. `write_file`/`edit_file` check this before trusting
+    /// their content: a DeepSeek-style reasoning model can spend most of
+    /// `max_tokens` on `reasoning_content` and leave the tool call itself
+    /// truncated mid-argument, which otherwise looks like a normal, if
+    /// slightly short, edit.
+    pub fn request_tools_truncated(&mut self, calls: Vec<ToolCall>, truncated: bool) {
         if self.state != AppState::Streaming || calls.is_empty() {
             return;
         }
+        self.truncated_response = truncated;
         self.abort = None;
         self.follow_tail = true;
         // Arguments are generated tokens like any other -- often the largest
@@ -6413,6 +6442,20 @@ mod tests {
     /// path that actually ships.
     fn asking_call(id: &str) -> ToolCall {
         command_call(id, "rm -rf build")
+    }
+
+    /// `request_tools_truncated` is what `agent::handle_event` actually calls;
+    /// the flag it records has to survive into `truncated_response` so
+    /// `execute_approved` can read it back before running the batch.
+    #[test]
+    fn request_tools_truncated_records_whether_the_response_was_cut_off() {
+        let mut a = streaming_app();
+        a.request_tools_truncated(vec![asking_call("call_1")], true);
+        assert!(a.truncated_response);
+
+        let mut a = streaming_app();
+        a.request_tools_truncated(vec![asking_call("call_1")], false);
+        assert!(!a.truncated_response);
     }
 
     /// Nothing runs until a human says so. If this ever regresses, the model has
