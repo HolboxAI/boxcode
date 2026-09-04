@@ -34,14 +34,19 @@ pub struct StreamOptions {
 }
 
 /// OpenAI reports the cached share of the prompt nested one level down.
-#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: usize,
 }
 
 /// Token counts as the endpoint reports them, when it does.
-#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// `Serialize` added alongside `Deserialize` for `protocol.rs`'s wire
+/// notifications -- previously only ever deserialized from a provider's API
+/// response, never sent back out; this is purely additive, nothing existing
+/// serialized this before.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ApiUsage {
     #[serde(default)]
     pub prompt_tokens: usize,

@@ -14,6 +14,7 @@ mod diff;
 mod llm;
 mod notice;
 mod plan;
+mod protocol;
 mod providers;
 mod quota;
 mod requests;
