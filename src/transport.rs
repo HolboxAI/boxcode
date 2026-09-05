@@ -35,8 +35,9 @@ use crate::headless::{BrowserCheckAsk, BrowserCheckResult, HeadlessSession, Perm
 use crate::protocol::{
     CheckInBrowserOutcome, CheckInBrowserRequest, Implementation, InitializeRequest,
     InitializeResponse, JsonRpcVersion, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest, RpcError,
-    RpcErrorObject, RpcRequest, RpcResponse, SessionId, SessionNotification, PROTOCOL_VERSION,
+    PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
+    RollbackRequest, RollbackResponse, RpcError, RpcErrorObject, RpcRequest, RpcResponse,
+    SessionId, SessionNotification, PROTOCOL_VERSION,
 };
 use crate::workspace::Workspace;
 use serde_json::json;
@@ -96,6 +97,12 @@ fn classify(value: &serde_json::Value) -> Incoming {
 /// A message sent to one session's own task.
 enum SessionMsg {
     Prompt { text: String, respond: oneshot::Sender<PromptResponse> },
+    /// `session/rollback`. Queued behind whatever `Prompt` this actor's
+    /// task is already working through -- one message at a time, same as
+    /// `Prompt` itself -- which is exactly right: rolling back files the
+    /// model might still be mid-turn writing to would be undoing work out
+    /// from under it, not after it.
+    Rollback { respond: oneshot::Sender<RollbackResponse> },
 }
 
 /// Everything a spawned task can produce for the outgoing stdout stream,
@@ -158,6 +165,9 @@ impl SessionActor {
                         drop(updates_tx); // let the drain task see the channel close
                         let _ = drain.await;
                         let _ = respond.send(PromptResponse { stop_reason });
+                    }
+                    SessionMsg::Rollback { respond } => {
+                        let _ = respond.send(session.rollback());
                     }
                 }
             }
@@ -305,6 +315,27 @@ impl Router {
                 );
                 self.sessions.insert(session_id.clone(), handle);
                 Ok(serde_json::to_value(NewSessionResponse { session_id }).expect("serializes"))
+            }
+            // Unlike session/prompt, this can be handled synchronously right
+            // here: rollback::apply is local disk I/O, never an LLM round
+            // trip, so there's no risk of the deadlock class that makes
+            // session/prompt's own response need deferring (see that
+            // method's own doc comment).
+            "session/rollback" => {
+                let req: RollbackRequest = serde_json::from_value(params)
+                    .map_err(|e| (-32602, format!("invalid params: {e}")))?;
+                let handle = self
+                    .sessions
+                    .get(&req.session_id)
+                    .ok_or_else(|| (-32001, "no such session".to_string()))?
+                    .clone();
+                let (respond, receive) = oneshot::channel();
+                handle
+                    .send(SessionMsg::Rollback { respond })
+                    .await
+                    .map_err(|_| (-32002, "session actor gone".to_string()))?;
+                let response = receive.await.map_err(|_| (-32002, "session actor gone".to_string()))?;
+                Ok(serde_json::to_value(response).expect("serializes"))
             }
             other => Err((-32601, format!("method not found: {other}"))),
         }
@@ -755,5 +786,94 @@ mod tests {
             serde_json::from_str(final_line.trim()).expect("valid JSON line");
         assert_eq!(final_value["id"], 3);
         assert_eq!(final_value["result"]["stopReason"], "end_turn");
+    }
+
+    /// `session/rollback` is a plain, synchronous request -- unlike
+    /// `session/prompt` and the two agent-initiated methods above, it never
+    /// needs `next_outgoing_client_request` at all, since `router.handle`
+    /// can return its result directly the same way `session/new` does.
+    /// Proves the whole path end to end: a real write happens through a
+    /// full `session/prompt` turn, then `session/rollback` actually puts
+    /// the file back, through the router, not just through
+    /// `HeadlessSession` directly.
+    #[tokio::test]
+    async fn a_rollback_request_round_trips_through_the_router() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("hello.txt"), "hi\n").expect("seed file");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\
+                 \"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\
+                 \"{\\\"path\\\":\\\"hello.txt\\\",\\\"content\\\":\\\"bye\\\\n\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                 data: {\"choices\":[{\"delta\":{\"content\":\"Updated it.\"}}]}\n\ndata: [DONE]\n\n",
+            ] {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let mut config = Config::default();
+        config.llm.endpoint = format!("http://{addr}");
+        config.llm.model = "test-model".to_string();
+        config.llm.api_key = "sk-test".to_string();
+
+        let (outgoing_tx, mut outgoing_in) = mpsc::channel(64);
+        let mut router = Router::new(config, outgoing_tx);
+
+        router
+            .handle(classify(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": 1 }
+            })))
+            .await;
+        router
+            .handle(classify(&json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": { "cwd": dir.path().display().to_string(), "mcpServers": [] }
+            })))
+            .await;
+        router
+            .handle(classify(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                "params": { "sessionId": "sess_1", "prompt": [{ "type": "text", "text": "say hi differently" }] }
+            })))
+            .await;
+
+        // Wait for the write to actually finish -- session/prompt's own
+        // response is deferred, so the write is only guaranteed done once
+        // that deferred response arrives.
+        loop {
+            match outgoing_in.recv().await.expect("the deferred prompt response arrives") {
+                Outgoing::Line(_) => break,
+                Outgoing::Update(_) => continue,
+            }
+        }
+        assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "bye\n");
+
+        let rollback_line = router
+            .handle(classify(&json!({
+                "jsonrpc": "2.0", "id": 4, "method": "session/rollback",
+                "params": { "sessionId": "sess_1" }
+            })))
+            .await
+            .expect("session/rollback answers synchronously, unlike session/prompt");
+        let rollback_value: serde_json::Value =
+            serde_json::from_str(rollback_line.trim()).expect("valid JSON line");
+        assert_eq!(rollback_value["id"], 4);
+        assert!(
+            rollback_value["result"]["summary"].as_str().unwrap().contains("Rolled back 1 file"),
+            "{rollback_value}"
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "hi\n");
     }
 }
