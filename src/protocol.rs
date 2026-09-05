@@ -387,11 +387,36 @@ pub struct ToolCallUpdate {
     pub kind: Option<ToolKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ToolCallStatus>,
-    /// Free-text result content -- `ToolOutcome::content`/`display` land
-    /// here. The full ACP `ToolCallContent` union (diffs, terminal refs) is
-    /// not implemented yet; text is enough for a first working turn loop.
+    /// `ToolOutcome::content`/`display` land here as `Text`; a pending
+    /// write/edit's before/after text lands here as `Diff` (see
+    /// `HeadlessSession::ask_permission`, `tools::preview_change_text`) --
+    /// only the two ACP `ToolCallContent` variants a client actually needs
+    /// to review a change before approving it. The rest of the real union
+    /// (terminal refs) is not implemented yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<ToolCallContent>,
+}
+
+/// The two ACP v1 `ToolCallContent` variants this module implements -- see
+/// `ToolCallUpdate::content`'s own doc comment for which ones and why.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type")]
+pub enum ToolCallContent {
+    #[serde(rename = "content")]
+    Text { text: String },
+    /// Plain whole-file before/after text, not pre-computed hunks: ACP
+    /// clients are expected to have their own real diff renderer (VS
+    /// Code's `vscode.changes`, for one) and hunk/render it themselves,
+    /// rather than being handed a hunk list shaped for boxcode's own TUI
+    /// (`crate::diff::FileDiff`, which stays TUI-only).
+    #[serde(rename = "diff")]
+    Diff {
+        path: String,
+        #[serde(rename = "oldText", default, skip_serializing_if = "Option::is_none")]
+        old_text: Option<String>,
+        #[serde(rename = "newText")]
+        new_text: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,7 +642,7 @@ impl From<&ToolOutcome> for ToolCallUpdate {
             title: None,
             kind: None,
             status: Some(ToolCallStatus::Completed),
-            content: Some(outcome.content.clone()),
+            content: Some(ToolCallContent::Text { text: outcome.content.clone() }),
         }
     }
 }
@@ -708,13 +733,48 @@ mod tests {
             title: None,
             kind: None,
             status: Some(ToolCallStatus::Completed),
-            content: Some("done".to_string()),
+            content: Some(ToolCallContent::Text { text: "done".to_string() }),
         };
         let value = serde_json::to_value(&update).unwrap();
         assert_eq!(
             value,
-            json!({ "toolCallId": "call_1", "status": "completed", "content": "done" })
+            json!({
+                "toolCallId": "call_1",
+                "status": "completed",
+                "content": { "type": "content", "text": "done" }
+            })
         );
+    }
+
+    /// The other half of `ToolCallContent`: a diff carries its path and
+    /// both texts, tagged the same way ACP's own `content` variant is --
+    /// one client-side switch on `type`, not two different envelopes.
+    #[test]
+    fn tool_call_content_diff_serializes_with_old_and_new_text() {
+        let content = ToolCallContent::Diff {
+            path: "src/app.rs".to_string(),
+            old_text: Some("before".to_string()),
+            new_text: "after".to_string(),
+        };
+        let value = serde_json::to_value(&content).unwrap();
+        assert_eq!(
+            value,
+            json!({ "type": "diff", "path": "src/app.rs", "oldText": "before", "newText": "after" })
+        );
+    }
+
+    /// A brand-new file has no "before" -- `oldText` must be omitted, not
+    /// sent as `null`, matching every other optional field's convention in
+    /// this module.
+    #[test]
+    fn tool_call_content_diff_omits_old_text_for_a_new_file() {
+        let content = ToolCallContent::Diff {
+            path: "src/new.rs".to_string(),
+            old_text: None,
+            new_text: "fresh".to_string(),
+        };
+        let value = serde_json::to_value(&content).unwrap();
+        assert_eq!(value, json!({ "type": "diff", "path": "src/new.rs", "newText": "fresh" }));
     }
 
     #[test]

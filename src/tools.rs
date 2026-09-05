@@ -1707,20 +1707,20 @@ fn edit_spans(args: EditFileArgs) -> Result<Vec<EditSpan>, String> {
     }
 }
 
-/// What a pending `write_file` or `edit_file` would do to the file on disk.
+/// The raw before/after text a pending `write_file` or `edit_file` would
+/// produce, plus the path it applies to -- shared by [`preview_change`]
+/// (which turns this into the TUI's hunked [`crate::diff::FileDiff`]) and
+/// [`preview_change_text`] (which ACP's client-rendered `diff` content wants
+/// as plain whole-file text, not hunks -- the client does its own diffing/
+/// rendering, e.g. via `vscode.changes`). One resolve-and-read, two shapes,
+/// so they can never disagree about what changed.
 ///
-/// `None` for everything else, and for a change with nothing to show: a path
-/// that does not resolve, a file that is not readable as text, an edit whose
-/// `old_string` does not match, or a write whose content is what is already
-/// there. The popup falls back to its plain rendering in those cases rather
-/// than showing an empty diff, which is the difference between "no changes"
-/// and "we could not work out the changes".
-///
-/// Reads the file. Called once, when the approval request is built -- never
-/// from the renderer, which would repeat it on every frame.
-pub fn preview_change(action: &Action, workspace_root: &Path) -> Option<crate::diff::FileDiff> {
+/// `None` for everything [`preview_change`]'s own docs already describe: a
+/// path that does not resolve, a file that is not readable as text, an edit
+/// whose `old_string` does not match.
+fn resolve_change_text(action: &Action, workspace_root: &Path) -> Option<(String, String, String)> {
     let workspace = Workspace::new(workspace_root).ok()?;
-    let changes = match action {
+    match action {
         Action::Write { path, content } => {
             let resolved = resolve_in_workspace(&workspace, path).ok()?;
             // Missing means empty, so creating a file is an all-additions diff
@@ -1732,7 +1732,7 @@ pub fn preview_change(action: &Action, workspace_root: &Path) -> Option<crate::d
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                 Err(_) => return None,
             };
-            crate::diff::diff(&before, content)
+            Some((path.clone(), before, content.clone()))
         }
         Action::Edit { path, edits } => {
             let resolved = resolve_in_workspace(&workspace, path).ok()?;
@@ -1740,11 +1740,42 @@ pub fn preview_change(action: &Action, workspace_root: &Path) -> Option<crate::d
             // The same function the runner will use, so what is approved and
             // what happens cannot be two different things.
             let (after, _) = apply_edits(&before, edits, path).ok()?;
-            crate::diff::diff(&before, &after)
+            Some((path.clone(), before, after))
         }
-        _ => return None,
-    };
+        _ => None,
+    }
+}
+
+/// What a pending `write_file` or `edit_file` would do to the file on disk.
+///
+/// `None` for everything else, and for a change with nothing to show: see
+/// [`resolve_change_text`], plus a write whose content is what is already
+/// there. The popup falls back to its plain rendering in those cases rather
+/// than showing an empty diff, which is the difference between "no changes"
+/// and "we could not work out the changes".
+///
+/// Reads the file. Called once, when the approval request is built -- never
+/// from the renderer, which would repeat it on every frame.
+pub fn preview_change(action: &Action, workspace_root: &Path) -> Option<crate::diff::FileDiff> {
+    let (_, before, after) = resolve_change_text(action, workspace_root)?;
+    let changes = crate::diff::diff(&before, &after);
     (!changes.is_empty()).then(|| changes.clipped(APPROVAL_DIFF_LINES))
+}
+
+/// The same underlying change as [`preview_change`], as raw whole-file
+/// before/after text rather than pre-computed hunks -- what ACP's
+/// `ToolCallContent::Diff` wire shape wants, so a client with its own real
+/// diff renderer (VS Code's `vscode.changes`, for one) can hunk and render
+/// it itself instead of interpreting a hunk list built for the TUI's own
+/// text rendering.
+///
+/// Unlike `preview_change`, an unchanged write/edit still returns `Some` --
+/// "here is the before and after text" is a fact independent of whether
+/// there happens to be a difference, and it is the caller's job (matching
+/// `preview_change`'s own "nothing to show" judgment) to decide whether an
+/// empty diff is worth sending at all.
+pub fn preview_change_text(action: &Action, workspace_root: &Path) -> Option<(String, String, String)> {
+    resolve_change_text(action, workspace_root)
 }
 
 /// Apply `spans` to `contents` in order, or say why they cannot be applied.

@@ -32,7 +32,7 @@ use crate::llm::{self, ApiUsage, ChatMessage, StreamEvent, Target, ToolCall};
 use crate::protocol::{
     AcpToolCall, ContentBlock, PermissionOption, PermissionOptionId, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionUpdate, StopReason,
-    ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
 };
 use crate::tools::{self, Mode};
 use crate::workspace::Workspace;
@@ -271,7 +271,7 @@ impl HeadlessSession {
                             title: None,
                             kind: None,
                             status: Some(ToolCallStatus::Failed),
-                            content: Some(reason.clone()),
+                            content: Some(ToolCallContent::Text { text: reason.clone() }),
                         }))
                         .await;
                     reason
@@ -321,12 +321,25 @@ impl HeadlessSession {
         updates: &mpsc::Sender<SessionUpdate>,
         permissions: &mpsc::Sender<PermissionAsk>,
     ) -> String {
+        // Same call, same reasoning as `App::advance_approvals`'s own
+        // `tools::preview_change(&action, ...)`: computed once, here, where
+        // the question is being asked -- not re-derived by whatever renders
+        // it. The text shape (not `preview_change`'s hunked `FileDiff`,
+        // which stays TUI-only) is what an ACP client with its own diff
+        // renderer wants; see `preview_change_text`'s own doc comment.
+        let diff_content = tools::preview_change_text(action, Path::new(self.workspace.root())).map(
+            |(path, before, after)| ToolCallContent::Diff {
+                path,
+                old_text: (!before.is_empty()).then_some(before),
+                new_text: after,
+            },
+        );
         let tool_call_update = ToolCallUpdate {
             tool_call_id: ToolCallId(call.id.clone()),
             title: Some(action.label()),
             kind: None,
             status: Some(ToolCallStatus::Pending),
-            content: None,
+            content: diff_content,
         };
         let request = RequestPermissionRequest {
             session_id: self.session_id.clone(),
@@ -364,7 +377,7 @@ impl HeadlessSession {
                     title: None,
                     kind: None,
                     status: Some(ToolCallStatus::Failed),
-                    content: Some("Refused by user.".to_string()),
+                    content: Some(ToolCallContent::Text { text: "Refused by user.".to_string() }),
                 }))
                 .await;
             "The user declined this action.".to_string()
@@ -579,5 +592,51 @@ mod tests {
         // queued response would never have been consumed and this task
         // would hang instead of returning `EndTurn`.
         let _ = dir; // kept for the tempdir's own lifetime, not asserted on
+    }
+
+    /// The actual point of wiring `tools::preview_change_text` into
+    /// `ask_permission`: a write that needs asking about carries the real
+    /// before/after text on the wire, not just a title string -- an ACP
+    /// client can show the developer what would change before they approve
+    /// it, instead of approving blind.
+    #[tokio::test]
+    async fn a_pending_write_carries_its_diff_in_the_permission_request() {
+        let (dir, ws) = workspace(); // hello.txt already contains "hi\n"
+        let endpoint = serve_rounds(vec![
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"hello.txt","content":"bye\n"}"#),
+            text_round("Updated it."),
+        ])
+        .await;
+        let mut config = config_for(&endpoint);
+        // The default policy auto-approves an ordinary write (see
+        // `an_auto_approved_read_runs_without_asking_permission`'s own
+        // sibling reasoning in app.rs's characterization tests) -- `Always`
+        // is what actually reaches the permission-asking path for a plain
+        // write, which is the path under test here.
+        config.tools.approval = crate::config::ApprovalMode::Always;
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+
+        let prompt = tokio::spawn(async move {
+            session.prompt("say hi in a different way".to_string(), &updates_tx, &permissions_tx).await
+        });
+
+        let ask = permissions_rx.recv().await.expect("a permission ask");
+        match ask.request.tool_call.content {
+            Some(ToolCallContent::Diff { path, old_text, new_text }) => {
+                assert_eq!(path, "hello.txt");
+                assert_eq!(old_text.as_deref(), Some("hi\n"));
+                assert_eq!(new_text, "bye\n");
+            }
+            other => panic!("expected a Diff, got {other:?}"),
+        }
+        let _ = ask.respond.send(RequestPermissionOutcome::Selected {
+            option_id: PermissionOptionId("allow".to_string()),
+        });
+
+        let stop = prompt.await.expect("task joins");
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "bye\n");
     }
 }
