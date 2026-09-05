@@ -409,9 +409,17 @@ pub async fn run_subagent(
             ),
         );
         let schemas = if budget_left { tools::subagent_schemas() } else { Vec::new() };
+        // Subagents never get a message with a non-empty `images` today --
+        // `subagent_schemas()` never offers `check_in_browser`, the only
+        // thing that ever populates it -- but this sums `images` anyway so
+        // this budget estimate stays correct by construction rather than
+        // by the coincidence of what subagents currently can't do.
         let request_chars: usize = history
             .iter()
-            .map(|m| m.content.as_deref().map_or(0, str::len))
+            .map(|m| {
+                m.content.as_deref().map_or(0, str::len)
+                    + m.images.iter().map(|i| i.data_base64.len()).sum::<usize>()
+            })
             .sum();
 
         let (tx, mut rx) = mpsc::channel(64);
@@ -514,6 +522,7 @@ pub async fn run_subagent(
             content: (!text.trim().is_empty()).then_some(text),
             tool_calls: calls.clone(),
             tool_call_id: None,
+            images: Vec::new(),
         });
         if !budget_left {
             overtime += 1;
@@ -573,6 +582,7 @@ pub async fn run_subagent(
                 content: Some(content),
                 tool_calls: Vec::new(),
                 tool_call_id: Some(c.id.clone()),
+                images: Vec::new(),
             });
         }
     }

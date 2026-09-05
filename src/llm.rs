@@ -79,19 +79,43 @@ impl ApiUsage {
     }
 }
 
+/// An image attached to a `ChatMessage`, carried alongside `content` rather
+/// than replacing it -- see `ChatMessage`'s own doc comment on why this is a
+/// sibling field, not a change to `content`'s type. Same shape as
+/// `protocol.rs`'s `ToolCallContent::Image`, which is the unrelated
+/// human-facing counterpart of this (that one goes out over the ACP wire to
+/// the client's UI; this one goes into the *next* request to the LLM).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ImageAttachment {
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
     /// `Option`, not `String`: an assistant message that only carries tool calls
     /// has no content, and several providers reject `""` where they expect null
     /// or an absent field.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     /// Which call a `role: "tool"` message is answering.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Images to send alongside `content` on this message's *next* trip to
+    /// the endpoint. Empty on every message this codebase constructs today
+    /// except one: the synthetic `role: "user"` message
+    /// `HeadlessSession::prompt` pushes right after a `check_in_browser`
+    /// call, and only when `config.tools.attach_browser_screenshots` is on
+    /// (see that module's own docs on why the image is evicted from history
+    /// after one round, not kept forever). Deliberately not (de)serialized
+    /// under its own JSON key -- an OpenAI-compatible vision request has no
+    /// such key, the image goes *inside* `content`'s own array form, which
+    /// is why `ChatMessage` has a hand-written `Serialize` below instead of
+    /// a derive.
+    #[serde(default)]
+    pub images: Vec<ImageAttachment>,
 }
 
 impl ChatMessage {
@@ -101,7 +125,66 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
+    }
+}
+
+/// Hand-written rather than derived, for one reason: when `images` is
+/// non-empty, `content` cannot serialize as a plain string -- OpenAI's
+/// vision format requires an array of `{type: "text"|"image_url", ...}`
+/// blocks instead. Every message this codebase constructs today has an
+/// empty `images`, and for that case this emits *exactly* the same bytes
+/// the old `#[derive(Serialize)]` did (see `chat_message_with_no_image_serializes_identically_to_the_pre_image_format`
+/// below, which is the regression test that guarantees it) -- a bug here
+/// would silently reshape every request this crate sends, not just the new
+/// image path, which is why that test is load-bearing and not optional.
+impl Serialize for ChatMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("role", &self.role)?;
+
+        if self.images.is_empty() {
+            if let Some(content) = &self.content {
+                map.serialize_entry("content", content)?;
+            }
+        } else {
+            #[derive(Serialize)]
+            #[serde(tag = "type")]
+            enum ContentBlock<'a> {
+                #[serde(rename = "text")]
+                Text { text: &'a str },
+                #[serde(rename = "image_url")]
+                ImageUrl { image_url: ImageUrlValue },
+            }
+            #[derive(Serialize)]
+            struct ImageUrlValue {
+                url: String,
+            }
+
+            let mut blocks = Vec::with_capacity(1 + self.images.len());
+            if let Some(content) = &self.content {
+                blocks.push(ContentBlock::Text { text: content });
+            }
+            for image in &self.images {
+                blocks.push(ContentBlock::ImageUrl {
+                    image_url: ImageUrlValue {
+                        url: format!("data:{};base64,{}", image.mime_type, image.data_base64),
+                    },
+                });
+            }
+            map.serialize_entry("content", &blocks)?;
+        }
+
+        if !self.tool_calls.is_empty() {
+            map.serialize_entry("tool_calls", &self.tool_calls)?;
+        }
+        if let Some(tool_call_id) = &self.tool_call_id {
+            map.serialize_entry("tool_call_id", tool_call_id)?;
+        }
+        map.end()
     }
 }
 
@@ -906,6 +989,7 @@ mod tests {
                 content: Some("hi".into()),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                images: Vec::new(),
             }],
             Vec::new(),
             1,
@@ -1108,10 +1192,53 @@ mod tests {
                 },
             }],
             tool_call_id: None,
+            images: Vec::new(),
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(!json.contains("content"), "{json}");
         assert!(json.contains(r#""tool_calls""#), "{json}");
+    }
+
+    /// A message carrying an image serializes `content` as OpenAI's vision
+    /// content-block array, not a plain string -- and the array's text
+    /// block is only present when `content` is `Some`, matching a pure
+    /// screenshot-only message (no caption) not emitting an empty one.
+    #[test]
+    fn a_message_with_images_serializes_content_as_a_block_array() {
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: Some("look at this".to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            images: vec![ImageAttachment {
+                mime_type: "image/png".to_string(),
+                data_base64: "aGVsbG8=".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            json,
+            r#"{"role":"user","content":[{"type":"text","text":"look at this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]}"#
+        );
+    }
+
+    #[test]
+    fn an_image_only_message_has_no_text_block() {
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            images: vec![ImageAttachment {
+                mime_type: "image/png".to_string(),
+                data_base64: "aGVsbG8=".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            json,
+            r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]}"#
+        );
     }
 
     #[test]
