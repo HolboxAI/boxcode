@@ -622,6 +622,31 @@ impl From<RequestPermissionOutcome> for Decision {
 }
 
 // ---------------------------------------------------------------------------
+// session/rollback -- not part of ACP's own schema, and unlike
+// session/checkInBrowser, not agent-initiated either: this is a plain
+// client-to-agent request, the same shape as session/prompt or session/new,
+// just answered synchronously (rollback::apply is local disk I/O, not an
+// LLM round trip, so none of session/prompt's own deferred-response
+// machinery is needed here -- see transport.rs's docs on why that one
+// specifically has to be deferred).
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RollbackRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RollbackResponse {
+    /// The same human-readable text `App`'s own `/rollback` shows in the
+    /// TUI transcript (`rollback::Report::summary`) -- one string a client
+    /// can show as-is rather than re-deriving its own wording from
+    /// structured fields this module doesn't otherwise need.
+    pub summary: String,
+}
+
+// ---------------------------------------------------------------------------
 // Conversions from boxcode's internal types
 // ---------------------------------------------------------------------------
 

@@ -87,11 +87,24 @@ pub struct HeadlessSession {
     messages: Vec<ChatMessage>,
     request_id: u64,
     tool_steps: usize,
+    /// The same journal `App::rollback`/`/rollback` reads and writes,
+    /// populated the identical way `App::push_tool_outcome` does (see
+    /// `decide_and_run`/`ask_permission`'s own calls to `.record(...)`) --
+    /// not a parallel reimplementation, the same mechanism reused.
+    rollback: crate::rollback::Journal,
 }
 
 impl HeadlessSession {
     pub fn new(session_id: SessionId, workspace: Workspace, config: Config) -> Self {
-        Self { session_id, workspace, config, messages: Vec::new(), request_id: 0, tool_steps: 0 }
+        Self {
+            session_id,
+            workspace,
+            config,
+            messages: Vec::new(),
+            request_id: 0,
+            tool_steps: 0,
+            rollback: crate::rollback::Journal::default(),
+        }
     }
 
     /// Handles one `session/prompt`: appends the user's message, then runs
@@ -370,7 +383,14 @@ impl HeadlessSession {
                                 status: ToolCallStatus::InProgress,
                             }))
                             .await;
-                        let outcome = tools::execute(&call, &self.workspace, &self.config.tools).await;
+                        let mut outcome = tools::execute(&call, &self.workspace, &self.config.tools).await;
+                        // Same call, same place in the flow as
+                        // `App::push_tool_outcome`'s own -- before the
+                        // outcome is taken apart, since `.content` moves out
+                        // of it just below.
+                        if let Some(record) = outcome.rollback.take() {
+                            self.rollback.record(record);
+                        }
                         let _ = updates.send(SessionUpdate::ToolCallUpdate((&outcome).into())).await;
                         outcome.content
                     }
@@ -391,7 +411,7 @@ impl HeadlessSession {
     }
 
     async fn ask_permission(
-        &self,
+        &mut self,
         call: &ToolCall,
         action: &crate::tools::Action,
         updates: &mpsc::Sender<SessionUpdate>,
@@ -443,7 +463,10 @@ impl HeadlessSession {
         };
 
         if decision.is_allowed() {
-            let outcome = tools::execute(call, &self.workspace, &self.config.tools).await;
+            let mut outcome = tools::execute(call, &self.workspace, &self.config.tools).await;
+            if let Some(record) = outcome.rollback.take() {
+                self.rollback.record(record);
+            }
             let _ = updates.send(SessionUpdate::ToolCallUpdate((&outcome).into())).await;
             outcome.content
         } else {
@@ -534,6 +557,26 @@ impl HeadlessSession {
                 (format!("Could not check {url} in the browser: {reason}"), Vec::new())
             }
         }
+    }
+
+    /// Fulfills `session/rollback` -- a plain client-initiated request, not
+    /// deferred like `session/prompt` (this is local disk I/O, not an LLM
+    /// round trip, so there's no risk of the deadlock class that made
+    /// `session/prompt`'s own response need deferring; see transport.rs's
+    /// docs on that).
+    ///
+    /// Same three steps as `App::finish_rollback`, the same order, for the
+    /// same reasons: run the plan, clear the journal (every entry has now
+    /// been acted on), and put `report.notice()` in the model's own history
+    /// so its next edit isn't reasoning about a disk that no longer
+    /// matches what it was told -- `Report::notice`'s own doc comment says
+    /// why that has to reach the wire, not just the human.
+    pub fn rollback(&mut self) -> crate::protocol::RollbackResponse {
+        let steps = self.rollback.plan();
+        let report = crate::rollback::apply(&steps);
+        self.rollback.clear();
+        self.messages.push(ChatMessage::text("user", report.notice()));
+        crate::protocol::RollbackResponse { summary: report.summary() }
     }
 }
 
@@ -850,5 +893,50 @@ mod tests {
             }
         }
         assert!(saw_image, "the screenshot must reach the client as an Image, for the human to see");
+    }
+
+    /// The actual point of wiring `Journal` into `HeadlessSession`: a write
+    /// the model made this session can be undone through the exact same
+    /// mechanism `App`'s own `/rollback` uses, not a parallel
+    /// reimplementation that could drift from it.
+    #[tokio::test]
+    async fn rollback_restores_a_file_the_session_wrote() {
+        let (dir, ws) = workspace(); // hello.txt already contains "hi\n"
+        let endpoint = serve_rounds(vec![
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"hello.txt","content":"bye\n"}"#),
+            text_round("Updated it."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+
+        // Ordinary write, default policy -- auto-approved, same as
+        // `an_auto_approved_read_runs_without_asking_permission`'s own
+        // sibling reasoning, just for a write instead of a read.
+        let stop = session
+            .prompt("say hi in a different way".to_string(), &updates_tx, &permissions_tx, &browser_tx)
+            .await;
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "bye\n");
+
+        let response = session.rollback();
+        assert!(response.summary.contains("Rolled back 1 file"), "{}", response.summary);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hi\n",
+            "rollback must put the file back to what the session found, not leave the edit"
+        );
+
+        // The journal clears once acted on -- a second rollback right after
+        // must be a genuine no-op, not undo the same write again. Both
+        // outcomes' summaries start with the literal words "Rolled back"
+        // ("Rolled back nothing -- ..." is the no-op case's own wording),
+        // so the real distinguishing check is the file count, not just
+        // whether that substring appears at all.
+        let second = session.rollback();
+        assert_eq!(second.summary, "Rolled back nothing — every file was already as the session found it.");
     }
 }
