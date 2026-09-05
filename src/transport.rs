@@ -96,7 +96,7 @@ fn classify(value: &serde_json::Value) -> Incoming {
 
 /// A message sent to one session's own task.
 enum SessionMsg {
-    Prompt { text: String, respond: oneshot::Sender<PromptResponse> },
+    Prompt { text: String, images: Vec<crate::llm::ImageAttachment>, respond: oneshot::Sender<PromptResponse> },
     /// `session/rollback`. Queued behind whatever `Prompt` this actor's
     /// task is already working through -- one message at a time, same as
     /// `Prompt` itself -- which is exactly right: rolling back files the
@@ -134,7 +134,7 @@ impl SessionActor {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    SessionMsg::Prompt { text, respond } => {
+                    SessionMsg::Prompt { text, images, respond } => {
                         // A fresh channel per prompt, not one shared for
                         // the session's whole lifetime: a session answers
                         // many `session/prompt` calls over time, and each
@@ -161,7 +161,7 @@ impl SessionActor {
                             }
                         });
                         let stop_reason =
-                            session.prompt(text, &updates_tx, &permission_relay, &browser_relay).await;
+                            session.prompt(text, images, &updates_tx, &permission_relay, &browser_relay).await;
                         drop(updates_tx); // let the drain task see the channel close
                         let _ = drain.await;
                         let _ = respond.send(PromptResponse { stop_reason });
@@ -290,7 +290,12 @@ impl Router {
                     .map_err(|e| (-32602, format!("invalid params: {e}")))?;
                 let resp = InitializeResponse {
                     protocol_version: PROTOCOL_VERSION,
-                    agent_capabilities: json!({ "session": {} }),
+                    // `promptCapabilities.image: true` is the opt-in
+                    // `ContentBlock::Image` requires per the ACP v1 schema
+                    // (protocol.rs's own doc comment on that variant) --
+                    // omitting it would leave a spec-compliant client
+                    // withholding image attachments it otherwise could send.
+                    agent_capabilities: json!({ "session": {}, "promptCapabilities": { "image": true } }),
                     auth_methods: Vec::new(),
                     agent_info: Some(Implementation {
                         name: "boxcode".to_string(),
@@ -377,17 +382,20 @@ impl Router {
             let _ = outgoing_tx.send(Outgoing::Line(line)).await;
             return;
         };
-        let text = req
-            .prompt
-            .into_iter()
-            .map(|block| match block {
-                crate::protocol::ContentBlock::Text { text } => text,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut text_parts = Vec::new();
+        let mut images = Vec::new();
+        for block in req.prompt {
+            match block {
+                crate::protocol::ContentBlock::Text { text } => text_parts.push(text),
+                crate::protocol::ContentBlock::Image { data, mime_type } => {
+                    images.push(crate::llm::ImageAttachment { mime_type, data_base64: data });
+                }
+            }
+        }
+        let text = text_parts.join("\n");
 
         let (respond, receive) = oneshot::channel();
-        if handle.send(SessionMsg::Prompt { text, respond }).await.is_err() {
+        if handle.send(SessionMsg::Prompt { text, images, respond }).await.is_err() {
             let line = error_line(id, -32002, "session actor gone".to_string());
             let _ = outgoing_tx.send(Outgoing::Line(line)).await;
             return;
@@ -574,6 +582,21 @@ mod tests {
     #[test]
     fn a_message_with_neither_id_nor_method_is_malformed_not_guessed_at() {
         assert_eq!(classify(&json!({ "jsonrpc": "2.0" })), Incoming::Malformed);
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_the_image_prompt_capability() {
+        // Real regression coverage: a spec-compliant client is only
+        // permitted to send ContentBlock::Image if this advertises support
+        // for it -- see ContentBlock::Image's own doc comment on why this
+        // is required, not optional polish.
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel(8);
+        let mut router = Router::new(Config::default(), outgoing_tx);
+        let response = router
+            .dispatch_request("initialize", json!({ "protocolVersion": 1 }))
+            .await
+            .expect("initialize always succeeds");
+        assert_eq!(response["agentCapabilities"]["promptCapabilities"]["image"], json!(true));
     }
 
     /// The actual end-to-end proof: initialize, open a session, send a

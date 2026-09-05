@@ -104,12 +104,14 @@ pub struct ChatMessage {
     #[serde(default)]
     pub tool_call_id: Option<String>,
     /// Images to send alongside `content` on this message's *next* trip to
-    /// the endpoint. Empty on every message this codebase constructs today
-    /// except one: the synthetic `role: "user"` message
-    /// `HeadlessSession::prompt` pushes right after a `check_in_browser`
-    /// call, and only when `config.tools.attach_browser_screenshots` is on
-    /// (see that module's own docs on why the image is evicted from history
-    /// after one round, not kept forever). Deliberately not (de)serialized
+    /// the endpoint. Two sources populate this today: the synthetic
+    /// `role: "user"` message `HeadlessSession::prompt` pushes right after a
+    /// `check_in_browser` call, only when `config.tools.
+    /// attach_browser_screenshots` is on (see that module's own docs on why
+    /// the image is evicted from history after one round, not kept
+    /// forever); and images a client attaches directly to a `session/prompt`
+    /// call via `ContentBlock::Image` (see `protocol.rs`), which `headless.
+    /// rs::prompt` folds into the user's own message instead. Deliberately not (de)serialized
     /// under its own JSON key -- an OpenAI-compatible vision request has no
     /// such key, the image goes *inside* `content`'s own array form, which
     /// is why `ChatMessage` has a hand-written `Serialize` below instead of

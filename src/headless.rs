@@ -113,14 +113,23 @@ impl HeadlessSession {
     /// further tool calls or a hard stop condition is hit. Blocks until
     /// done, per ACP v1's `PromptResponse` -- progress streams out via
     /// `updates` while this runs.
+    ///
+    /// `images` carries whatever `ContentBlock::Image` blocks the client
+    /// attached to this prompt (e.g. boxcode-ide's element-picker
+    /// screenshot) -- unlike `check_in_browser`'s own screenshot, these are
+    /// part of the user's own message and kept in history for the life of
+    /// the session, not evicted after one round.
     pub async fn prompt(
         &mut self,
         text: String,
+        images: Vec<crate::llm::ImageAttachment>,
         updates: &mpsc::Sender<SessionUpdate>,
         permissions: &mpsc::Sender<PermissionAsk>,
         browser: &mpsc::Sender<BrowserCheckAsk>,
     ) -> StopReason {
-        self.messages.push(ChatMessage::text("user", text));
+        let mut user_message = ChatMessage::text("user", text);
+        user_message.images = images;
+        self.messages.push(user_message);
 
         // `App`'s own welcome screen already surfaces a missing key via
         // `Config::warnings()` before the user ever types a prompt -- an ACP
@@ -702,7 +711,7 @@ mod tests {
         let (permissions_tx, _permissions_rx) = mpsc::channel(16);
         let (browser_tx, _browser_rx) = mpsc::channel(16);
 
-        let stop = session.prompt("hi".to_string(), &updates_tx, &permissions_tx, &browser_tx).await;
+        let stop = session.prompt("hi".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx).await;
 
         assert_eq!(stop, StopReason::Refusal);
         let update = updates_rx.recv().await.expect("one chunk explaining why");
@@ -728,11 +737,52 @@ mod tests {
         let (permissions_tx, _permissions_rx) = mpsc::channel(16);
         let (browser_tx, _browser_rx) = mpsc::channel(16);
 
-        let stop = session.prompt("hi".to_string(), &updates_tx, &permissions_tx, &browser_tx).await;
+        let stop = session.prompt("hi".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx).await;
 
         assert_eq!(stop, StopReason::EndTurn);
         let update = updates_rx.recv().await.expect("one chunk");
         assert!(matches!(update, SessionUpdate::AgentMessageChunk { .. }));
+    }
+
+    /// The actual end-to-end proof for `ContentBlock::Image`: an image
+    /// passed into `prompt()` must reach the real outbound LLM request as a
+    /// base64 data URL (llm.rs's `ChatMessage` vision-content-block
+    /// serialization), not just get stored somewhere internal. Doesn't use
+    /// `serve_rounds` (it discards the request body) -- captures the raw
+    /// request text directly, the same primitives that helper is built on.
+    #[tokio::test]
+    async fn an_attached_image_reaches_the_real_llm_request() {
+        let (_dir, ws) = workspace();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_request(&mut socket).await;
+            let _ = captured_tx.send(request);
+            let _ = socket.write_all(text_round("I see a red button.").as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        let config = config_for(&format!("http://{addr}"));
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let images = vec![llm::ImageAttachment {
+            mime_type: "image/png".to_string(),
+            data_base64: "aGVsbG8=".to_string(),
+        }];
+
+        let stop = session
+            .prompt("what's wrong with this button?".to_string(), images, &updates_tx, &permissions_tx, &browser_tx)
+            .await;
+
+        assert_eq!(stop, StopReason::EndTurn);
+        let request = captured_rx.await.expect("request was captured");
+        assert!(
+            request.contains("data:image/png;base64,aGVsbG8="),
+            "the image never reached the real LLM request body: {request}"
+        );
     }
 
     /// A read (auto-approved, per `verdict_for`) never reaches the
@@ -753,7 +803,7 @@ mod tests {
         let (browser_tx, _browser_rx) = mpsc::channel(16);
 
         let stop = session
-            .prompt("what does hello.txt say?".to_string(), &updates_tx, &permissions_tx, &browser_tx)
+            .prompt("what does hello.txt say?".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx)
             .await;
 
         assert_eq!(stop, StopReason::EndTurn);
@@ -787,7 +837,7 @@ mod tests {
         let (browser_tx, _browser_rx) = mpsc::channel(16);
 
         let prompt = tokio::spawn(async move {
-            session.prompt("clean the build dir".to_string(), &updates_tx, &permissions_tx, &browser_tx).await
+            session.prompt("clean the build dir".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx).await
         });
 
         let ask = permissions_rx.recv().await.expect("a permission ask");
@@ -835,7 +885,7 @@ mod tests {
         let (browser_tx, _browser_rx) = mpsc::channel(16);
 
         let prompt = tokio::spawn(async move {
-            session.prompt("say hi in a different way".to_string(), &updates_tx, &permissions_tx, &browser_tx).await
+            session.prompt("say hi in a different way".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx).await
         });
 
         let ask = permissions_rx.recv().await.expect("a permission ask");
@@ -877,7 +927,7 @@ mod tests {
 
         let prompt = tokio::spawn(async move {
             session
-                .prompt("does the homepage render?".to_string(), &updates_tx, &permissions_tx, &browser_tx)
+                .prompt("does the homepage render?".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx)
                 .await
         });
 
@@ -933,7 +983,7 @@ mod tests {
         // `an_auto_approved_read_runs_without_asking_permission`'s own
         // sibling reasoning, just for a write instead of a read.
         let stop = session
-            .prompt("say hi in a different way".to_string(), &updates_tx, &permissions_tx, &browser_tx)
+            .prompt("say hi in a different way".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx)
             .await;
         assert_eq!(stop, StopReason::EndTurn);
         assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "bye\n");
