@@ -69,6 +69,7 @@
 //!   than silently sending nothing and calling it done.
 
 use crate::approval::{ApprovalRequest, Decision};
+use crate::headless::BrowserCheckResult;
 use crate::llm::{ApiUsage, ToolCall as InternalToolCall};
 use crate::tools::{Action, ToolOutcome};
 use serde::{Deserialize, Serialize};
@@ -417,6 +418,20 @@ pub enum ToolCallContent {
         #[serde(rename = "newText")]
         new_text: String,
     },
+    /// A `check_in_browser` result -- base64-encoded image bytes for the
+    /// client to render (e.g. inline in a chat panel), not something
+    /// boxcode itself interprets. See `HeadlessSession::check_browser`'s
+    /// own doc comment for why the model's own tool-result text stays
+    /// plain confirmation rather than the image data: actually feeding an
+    /// image into the model's own context is real multimodal-message
+    /// support `llm.rs` doesn't have yet, a separate, bigger scope than
+    /// showing the human what was captured.
+    #[serde(rename = "image")]
+    Image {
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        data: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,6 +543,36 @@ pub enum RequestPermissionOutcome {
     },
 }
 
+// ---------------------------------------------------------------------------
+// session/checkInBrowser -- not part of the official ACP v1 schema (the spec
+// has no concept of a browser tab at all), but the same shape as
+// session/request_permission: boxcode sends it mid-turn, needs the client's
+// answer to continue, and the transport-level deferred-response machinery
+// that `session/request_permission` already proved out applies unchanged.
+// See `headless.rs`'s `BrowserCheckAsk`/`BrowserCheckResult` for the Rust
+// side of this.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CheckInBrowserRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+    pub url: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "outcome")]
+pub enum CheckInBrowserOutcome {
+    #[serde(rename = "screenshot")]
+    Screenshot {
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        data: String,
+    },
+    #[serde(rename = "failed")]
+    Failed { reason: String },
+}
+
 /// The two standing options `boxcode` offers on every permission request --
 /// "allow once" / "reject once" only. `allow_always`/`reject_always`
 /// (remembering the choice) aren't implemented yet; `config.tools.approval`
@@ -548,6 +593,17 @@ pub fn standard_options() -> Vec<PermissionOption> {
             kind: PermissionOptionKind::RejectOnce,
         },
     ]
+}
+
+impl From<CheckInBrowserOutcome> for BrowserCheckResult {
+    fn from(outcome: CheckInBrowserOutcome) -> Self {
+        match outcome {
+            CheckInBrowserOutcome::Screenshot { mime_type, data } => {
+                BrowserCheckResult::Screenshot { mime_type, data }
+            }
+            CheckInBrowserOutcome::Failed { reason } => BrowserCheckResult::Failed(reason),
+        }
+    }
 }
 
 impl From<RequestPermissionOutcome> for Decision {
@@ -597,7 +653,8 @@ fn tool_kind_for(action: &Action) -> ToolKind {
         | Action::DbQuery { .. }
         | Action::ListChangeRequests { .. }
         | Action::ResolveChangeRequest { .. }
-        | Action::Publish { .. } => ToolKind::Fetch,
+        | Action::Publish { .. }
+        | Action::CheckInBrowser { .. } => ToolKind::Fetch,
         Action::Plan(_) | Action::Progress { .. } | Action::Todos(_) => ToolKind::SwitchMode,
     }
 }
@@ -775,6 +832,21 @@ mod tests {
         };
         let value = serde_json::to_value(&content).unwrap();
         assert_eq!(value, json!({ "type": "diff", "path": "src/new.rs", "newText": "fresh" }));
+    }
+
+    /// `check_in_browser`'s wire shape: base64 bytes plus the MIME type the
+    /// client needs to render them, tagged the same way `Text`/`Diff` are.
+    #[test]
+    fn tool_call_content_image_serializes_with_mime_type_and_data() {
+        let content = ToolCallContent::Image {
+            mime_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        };
+        let value = serde_json::to_value(&content).unwrap();
+        assert_eq!(
+            value,
+            json!({ "type": "image", "mimeType": "image/png", "data": "aGVsbG8=" })
+        );
     }
 
     #[test]

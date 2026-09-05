@@ -1637,6 +1637,26 @@ fn tool_approval_parts(
             }
             (" Spawn a research subagent? ", "spawn", "skip")
         }
+        // Unreachable in the TUI in practice -- `schemas_for`'s `browser` flag
+        // is always `false` here, so the model is never offered this tool at
+        // all (see agent.rs's own call site) -- but the match still has to be
+        // exhaustive, and rendering something sane costs nothing.
+        Action::CheckInBrowser { url } => {
+            for wrapped in wrap(url, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            for wrapped in wrap(
+                "Only an ACP client has a browser tab to check this in -- not available here.",
+                inner,
+            ) {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            (" Check in browser? ", "check", "skip")
+        }
         // An edit shows every span, because approving a replacement you cannot
         // see is not approval. Unlike a write it does not need the whole file --
         // showing only what changes is the reason to prefer this tool. A batch

@@ -70,6 +70,7 @@ pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
 pub const PLAN_PROGRESS: &str = "plan_progress";
 pub const AGENT: &str = "agent";
 pub const UPDATE_TODOS: &str = "update_todos";
+pub const CHECK_IN_BROWSER: &str = "check_in_browser";
 
 /// Whether the model is allowed to change anything yet.
 ///
@@ -239,7 +240,14 @@ pub fn shell() -> (&'static str, &'static str) {
 /// workspace's life; this narrows the exposure window, it does not remove
 /// the underlying tradeoff.
 pub fn schemas(mode: Mode, active_plan: bool, deploy: bool, published: bool) -> Vec<Value> {
-    schemas_for(mode, active_plan, deploy, published, SchemaDiet::full())
+    // `browser` is fixed `false` here rather than threaded through this
+    // convenience wrapper's own signature: every one of this function's ~19
+    // call sites (mostly tests exercising the deploy/published/diet gates)
+    // predates `check_in_browser` and has no reason to see it. A caller that
+    // actually needs it -- `HeadlessSession`, so far the only one -- goes
+    // through `schemas_for` directly, same as it already does for the diet
+    // parameter this wrapper also hides.
+    schemas_for(mode, active_plan, deploy, published, false, SchemaDiet::full())
 }
 
 /// Which optional schemas to send. The list has to stay byte-identical
@@ -315,6 +323,7 @@ pub fn schemas_for(
     active_plan: bool,
     deploy: bool,
     published: bool,
+    browser: bool,
     diet: SchemaDiet,
 ) -> Vec<Value> {
     let (shell_name, shell_flag) = shell();
@@ -997,6 +1006,32 @@ pub fn schemas_for(
         }
     }));
 
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": CHECK_IN_BROWSER,
+            "description": "Capture a screenshot of a URL in the user's own Integrated Browser \
+                            and get it back as an image, so you can see what a change actually \
+                            rendered as instead of assuming it worked. Use this after a \
+                            frontend change, once whatever serves that URL is actually running \
+                            (start the dev server first if it is not). Read-only: nothing is \
+                            written or run, only looked at.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to open and screenshot, e.g. http://localhost:3000/about."
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    }));
+
+    if !browser {
+        schemas.retain(|schema| schema["function"]["name"] != CHECK_IN_BROWSER);
+    }
     if !deploy {
         schemas.retain(|schema| schema["function"]["name"] != DEPLOY_PROJECT);
     }
@@ -1624,6 +1659,11 @@ struct AgentArgs {
 }
 
 #[derive(Deserialize)]
+struct CheckInBrowserArgs {
+    url: String,
+}
+
+#[derive(Deserialize)]
 struct ReadFileArgs {
     path: String,
     #[serde(default)]
@@ -2035,6 +2075,18 @@ pub enum Action {
     /// `app.rs` for the same reason `Progress` is (nothing to protect, and
     /// asking permission to update a to-do list would make it unusable).
     Todos(Vec<TodoItem>),
+    /// `check_in_browser`: asks the client to capture a screenshot of `url`
+    /// -- boxcode itself has no browser tab, only an ACP client (boxcode-ide's
+    /// chat participant, for one) does, so this is fulfilled entirely on the
+    /// other side of the wire. Read-only by construction, like `Agent`:
+    /// nothing here writes to disk or runs a command, it only looks. Only
+    /// ever offered when `schemas_for`'s own `browser` flag is set, which is
+    /// `true` for `HeadlessSession` and `false` for the TUI (`App` has no
+    /// browser tab either) -- see `HeadlessSession::decide_and_run`'s own
+    /// interception of this, mirroring how `Agent` is intercepted rather
+    /// than reaching `tools::execute`, which has no local implementation for
+    /// this at all.
+    CheckInBrowser { url: String },
 }
 
 /// One replacement within an `Action::Edit` -- what `edit_file` shows the
@@ -2108,6 +2160,7 @@ impl Action {
                 let done = items.iter().filter(|t| t.status == TodoStatus::Completed).count();
                 format!("todos — {done}/{}", items.len())
             }
+            Action::CheckInBrowser { url } => format!("check in browser — {url}"),
         }
     }
 }
@@ -2174,6 +2227,9 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
         // whole tool set is the read-only slice this very function allows,
         // so there is nothing it could do that a plan-mode parent could not.
         | Action::Agent { .. }
+        // Looking at a page is exactly the kind of research plan mode exists
+        // to allow -- it changes nothing, same reasoning as `Agent`.
+        | Action::CheckInBrowser { .. }
         | Action::Plan(_)
         // Cannot arise in plan mode -- there is no approved plan to record
         // against -- but listing it keeps this match exhaustive by intent
@@ -2281,6 +2337,11 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
             let args: ReadFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
             let path = args.path.trim().to_string();
             (!path.is_empty()).then_some(Action::Read { path })
+        }
+        CHECK_IN_BROWSER => {
+            let args: CheckInBrowserArgs = serde_json::from_str(&call.function.arguments).ok()?;
+            let url = args.url.trim().to_string();
+            (!url.is_empty()).then_some(Action::CheckInBrowser { url })
         }
         WRITE_FILE => {
             let args: WriteFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
@@ -6564,6 +6625,27 @@ mod tests {
         assert_eq!(names.len(), schemas(Mode::Normal, false, true, true).len() - 1);
     }
 
+    /// `schemas()` fixes `browser` at `false` -- the TUI has no browser tab
+    /// to fulfill `check_in_browser` with, so it must never see the tool.
+    /// Only `schemas_for` (what `HeadlessSession` actually calls) can offer
+    /// it, and only when its own `browser` argument says so.
+    #[test]
+    fn the_browser_schema_is_withheld_unless_explicitly_requested() {
+        let names: Vec<String> = schemas(Mode::Normal, false, true, true)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == CHECK_IN_BROWSER), "{names:?}");
+
+        let with_browser: Vec<String> =
+            schemas_for(Mode::Normal, false, true, true, true, SchemaDiet::full())
+                .iter()
+                .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+                .collect();
+        assert!(with_browser.iter().any(|n| n == CHECK_IN_BROWSER), "{with_browser:?}");
+        assert_eq!(with_browser.len(), names.len() + 1);
+    }
+
     /// The two gates are independent and must compose: plan mode withholds
     /// deployment because it is the least reversible thing here, and
     /// `enabled = false` withholds it because the user turned it off. Neither
@@ -6703,7 +6785,7 @@ mod tests {
     }
 
     fn schema_names(diet: SchemaDiet) -> Vec<String> {
-        schemas_for(Mode::Normal, false, true, true, diet)
+        schemas_for(Mode::Normal, false, true, true, false, diet)
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
             .collect()

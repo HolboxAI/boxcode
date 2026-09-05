@@ -88,6 +88,7 @@ pub fn fire_request(
                     app.active_plan.is_some(),
                     app.config.deploy.enabled,
                     published,
+                    false, // no browser tab in the TUI to fulfill check_in_browser with
                     tools::SchemaDiet::for_workspace(ws.root()),
                 )
             } else {

@@ -32,9 +32,9 @@ use crate::llm::{self, ApiUsage, ChatMessage, StreamEvent, Target, ToolCall};
 use crate::protocol::{
     AcpToolCall, ContentBlock, PermissionOption, PermissionOptionId, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionUpdate, StopReason,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
-use crate::tools::{self, Mode};
+use crate::tools::{self, Action, Mode};
 use crate::workspace::Workspace;
 use std::path::Path;
 use tokio::sync::{mpsc, oneshot};
@@ -48,6 +48,32 @@ use tokio::sync::{mpsc, oneshot};
 pub struct PermissionAsk {
     pub request: RequestPermissionRequest,
     pub respond: oneshot::Sender<RequestPermissionOutcome>,
+}
+
+/// What a caller gets sent for each `check_in_browser` call -- same shape
+/// and same reasoning as `PermissionAsk`: paired with a `oneshot` rather
+/// than a request-id-keyed table, since a `HeadlessSession` only ever has
+/// one of these outstanding at a time (it blocks on the reply before
+/// continuing). A separate type and a separate channel from `PermissionAsk`
+/// rather than folding this into one generic "client request" concept --
+/// this codebase's own convention (see `transport.rs`'s docs) is a small,
+/// explicit type per real use, not a shared abstraction built for two data
+/// points.
+pub struct BrowserCheckAsk {
+    pub session_id: SessionId,
+    pub url: String,
+    pub respond: oneshot::Sender<BrowserCheckResult>,
+}
+
+/// What the client reports back for one `BrowserCheckAsk`. `Failed` covers
+/// everything that can go wrong on the client's side (no browser tab, CDP
+/// failed, timed out, `url` never loaded) -- boxcode has no way to tell
+/// those apart from here, only to say the check didn't happen and hand the
+/// model text it can react to, the same posture `ask_permission` already
+/// takes toward "the client disconnected."
+pub enum BrowserCheckResult {
+    Screenshot { mime_type: String, data: String },
+    Failed(String),
 }
 
 /// One ACP session's worth of state -- deliberately independent of `App`,
@@ -78,6 +104,7 @@ impl HeadlessSession {
         text: String,
         updates: &mpsc::Sender<SessionUpdate>,
         permissions: &mpsc::Sender<PermissionAsk>,
+        browser: &mpsc::Sender<BrowserCheckAsk>,
     ) -> StopReason {
         self.messages.push(ChatMessage::text("user", text));
 
@@ -116,6 +143,7 @@ impl HeadlessSession {
                     false, // no plan mode in v1 -- see module docs
                     false, // no deploy tool in v1 -- see module docs
                     false, // published-artifact detection not wired yet
+                    true, // check_in_browser -- the one action only an ACP client can fulfill
                     tools::SchemaDiet::for_workspace(self.workspace.root()),
                 )
             } else {
@@ -144,7 +172,7 @@ impl HeadlessSession {
                 }
                 RoundOutcome::ToolCalls(calls) => {
                     self.tool_steps += 1;
-                    let outcomes = self.decide_and_run(calls, updates, permissions).await;
+                    let outcomes = self.decide_and_run(calls, updates, permissions, browser).await;
                     for (call_id, content) in outcomes {
                         self.messages.push(ChatMessage {
                             role: "tool".to_string(),
@@ -253,6 +281,7 @@ impl HeadlessSession {
         calls: Vec<ToolCall>,
         updates: &mpsc::Sender<SessionUpdate>,
         permissions: &mpsc::Sender<PermissionAsk>,
+        browser: &mpsc::Sender<BrowserCheckAsk>,
     ) -> Vec<(String, String)> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
@@ -285,19 +314,30 @@ impl HeadlessSession {
                     "Noted (not tracked in this session).".to_string()
                 }
                 Verdict::AutoApprove => {
-                    let _ = updates
-                        .send(SessionUpdate::ToolCall(AcpToolCall {
-                            tool_call_id: ToolCallId(call.id.clone()),
-                            title: tools::describe_action(&call)
-                                .map(|a| a.label())
-                                .unwrap_or_else(|| call.function.name.clone()),
-                            kind: crate::protocol::ToolKind::Other,
-                            status: ToolCallStatus::InProgress,
-                        }))
-                        .await;
-                    let outcome = tools::execute(&call, &self.workspace, &self.config.tools).await;
-                    let _ = updates.send(SessionUpdate::ToolCallUpdate((&outcome).into())).await;
-                    outcome.content
+                    let action = tools::describe_action(&call);
+                    // `check_in_browser` is the one auto-approved action
+                    // `tools::execute` cannot fulfill at all -- boxcode has
+                    // no browser tab, only an ACP client does. Intercepted
+                    // here, before ever reaching the local dispatcher, the
+                    // same way `Action::Agent` is intercepted below rather
+                    // than offered to `tools::execute`.
+                    if let Some(Action::CheckInBrowser { url }) = &action {
+                        self.check_browser(&call, url, updates, browser).await
+                    } else {
+                        let _ = updates
+                            .send(SessionUpdate::ToolCall(AcpToolCall {
+                                tool_call_id: ToolCallId(call.id.clone()),
+                                title: action
+                                    .map(|a| a.label())
+                                    .unwrap_or_else(|| call.function.name.clone()),
+                                kind: ToolKind::Other,
+                                status: ToolCallStatus::InProgress,
+                            }))
+                            .await;
+                        let outcome = tools::execute(&call, &self.workspace, &self.config.tools).await;
+                        let _ = updates.send(SessionUpdate::ToolCallUpdate((&outcome).into())).await;
+                        outcome.content
+                    }
                 }
                 Verdict::Ask(action) => {
                     if action.label() == "agent" || matches!(action, crate::tools::Action::Agent { .. }) {
@@ -381,6 +421,76 @@ impl HeadlessSession {
                 }))
                 .await;
             "The user declined this action.".to_string()
+        }
+    }
+
+    /// Fulfills a `check_in_browser` call by asking the client to take the
+    /// screenshot -- boxcode itself has no browser tab, only the client
+    /// does. Mirrors `ask_permission`'s own shape (send an ask, await one
+    /// reply on a fresh `oneshot`) since a `HeadlessSession` only ever has
+    /// one of either outstanding at a time.
+    ///
+    /// The tool result text fed back to the *model* stays plain
+    /// confirmation, never the image bytes: this is evidence for the human
+    /// (rendered by the client, e.g. inline in a chat panel via the
+    /// `SessionUpdate::ToolCallUpdate` sent below), not a claim that the
+    /// model can see it too. Actually feeding an image into the model's own
+    /// context would need real multimodal message support in `llm.rs`,
+    /// which does not exist yet -- a separate, bigger scope than showing
+    /// the human what was captured.
+    async fn check_browser(
+        &self,
+        call: &ToolCall,
+        url: &str,
+        updates: &mpsc::Sender<SessionUpdate>,
+        browser: &mpsc::Sender<BrowserCheckAsk>,
+    ) -> String {
+        let _ = updates
+            .send(SessionUpdate::ToolCall(AcpToolCall {
+                tool_call_id: ToolCallId(call.id.clone()),
+                title: format!("check in browser — {url}"),
+                kind: ToolKind::Fetch,
+                status: ToolCallStatus::InProgress,
+            }))
+            .await;
+
+        let (respond, receive) = oneshot::channel();
+        let ask = BrowserCheckAsk { session_id: self.session_id.clone(), url: url.to_string(), respond };
+        if browser.send(ask).await.is_err() {
+            return "The client disconnected before taking the screenshot.".to_string();
+        }
+        let result = match receive.await {
+            Ok(result) => result,
+            Err(_) => {
+                BrowserCheckResult::Failed("The client disconnected before responding.".to_string())
+            }
+        };
+
+        match result {
+            BrowserCheckResult::Screenshot { mime_type, data } => {
+                let _ = updates
+                    .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                        tool_call_id: ToolCallId(call.id.clone()),
+                        title: None,
+                        kind: None,
+                        status: Some(ToolCallStatus::Completed),
+                        content: Some(ToolCallContent::Image { mime_type, data }),
+                    }))
+                    .await;
+                format!("Screenshot of {url} captured and shown to the user.")
+            }
+            BrowserCheckResult::Failed(reason) => {
+                let _ = updates
+                    .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                        tool_call_id: ToolCallId(call.id.clone()),
+                        title: None,
+                        kind: None,
+                        status: Some(ToolCallStatus::Failed),
+                        content: Some(ToolCallContent::Text { text: reason.clone() }),
+                    }))
+                    .await;
+                format!("Could not check {url} in the browser: {reason}")
+            }
         }
     }
 }
@@ -489,8 +599,9 @@ mod tests {
         let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
         let (updates_tx, mut updates_rx) = mpsc::channel(16);
         let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
 
-        let stop = session.prompt("hi".to_string(), &updates_tx, &permissions_tx).await;
+        let stop = session.prompt("hi".to_string(), &updates_tx, &permissions_tx, &browser_tx).await;
 
         assert_eq!(stop, StopReason::Refusal);
         let update = updates_rx.recv().await.expect("one chunk explaining why");
@@ -514,8 +625,9 @@ mod tests {
             HeadlessSession::new(SessionId("s1".to_string()), ws, config);
         let (updates_tx, mut updates_rx) = mpsc::channel(16);
         let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
 
-        let stop = session.prompt("hi".to_string(), &updates_tx, &permissions_tx).await;
+        let stop = session.prompt("hi".to_string(), &updates_tx, &permissions_tx, &browser_tx).await;
 
         assert_eq!(stop, StopReason::EndTurn);
         let update = updates_rx.recv().await.expect("one chunk");
@@ -537,9 +649,10 @@ mod tests {
         let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
         let (updates_tx, mut updates_rx) = mpsc::channel(16);
         let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
 
         let stop = session
-            .prompt("what does hello.txt say?".to_string(), &updates_tx, &permissions_tx)
+            .prompt("what does hello.txt say?".to_string(), &updates_tx, &permissions_tx, &browser_tx)
             .await;
 
         assert_eq!(stop, StopReason::EndTurn);
@@ -570,9 +683,10 @@ mod tests {
         let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
         let (updates_tx, _updates_rx) = mpsc::channel(16);
         let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
 
         let prompt = tokio::spawn(async move {
-            session.prompt("clean the build dir".to_string(), &updates_tx, &permissions_tx).await
+            session.prompt("clean the build dir".to_string(), &updates_tx, &permissions_tx, &browser_tx).await
         });
 
         let ask = permissions_rx.recv().await.expect("a permission ask");
@@ -617,9 +731,10 @@ mod tests {
         let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
         let (updates_tx, _updates_rx) = mpsc::channel(16);
         let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
 
         let prompt = tokio::spawn(async move {
-            session.prompt("say hi in a different way".to_string(), &updates_tx, &permissions_tx).await
+            session.prompt("say hi in a different way".to_string(), &updates_tx, &permissions_tx, &browser_tx).await
         });
 
         let ask = permissions_rx.recv().await.expect("a permission ask");
@@ -638,5 +753,60 @@ mod tests {
         let stop = prompt.await.expect("task joins");
         assert_eq!(stop, StopReason::EndTurn);
         assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "bye\n");
+    }
+
+    /// The actual point of `check_in_browser`: it goes out over the
+    /// `browser` channel, not `permissions` -- auto-approved like a read
+    /// (see `is_read_only_action`), and fulfilled entirely by whatever the
+    /// client sends back, since `tools::execute` has no way to take a
+    /// screenshot at all.
+    #[tokio::test]
+    async fn check_in_browser_asks_the_client_and_reports_what_it_sees() {
+        let (_dir, ws) = workspace();
+        let endpoint = serve_rounds(vec![
+            tool_call_round(tools::CHECK_IN_BROWSER, r#"{"url":"http://localhost:3000"}"#),
+            text_round("It renders correctly."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, mut updates_rx) = mpsc::channel(16);
+        let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+        let (browser_tx, mut browser_rx) = mpsc::channel(16);
+
+        let prompt = tokio::spawn(async move {
+            session
+                .prompt("does the homepage render?".to_string(), &updates_tx, &permissions_tx, &browser_tx)
+                .await
+        });
+
+        let ask = browser_rx.recv().await.expect("a browser check ask");
+        assert_eq!(ask.session_id, SessionId("s1".to_string()));
+        assert_eq!(ask.url, "http://localhost:3000");
+        assert!(
+            permissions_rx.try_recv().is_err(),
+            "check_in_browser must never ask permission -- it's read-only, like a read"
+        );
+        let _ = ask.respond.send(BrowserCheckResult::Screenshot {
+            mime_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        });
+
+        let stop = prompt.await.expect("task joins");
+        assert_eq!(stop, StopReason::EndTurn);
+
+        let mut saw_image = false;
+        while let Ok(update) = updates_rx.try_recv() {
+            if let SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                content: Some(ToolCallContent::Image { mime_type, data }),
+                ..
+            }) = update
+            {
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(data, "aGVsbG8=");
+                saw_image = true;
+            }
+        }
+        assert!(saw_image, "the screenshot must reach the client as an Image, for the human to see");
     }
 }

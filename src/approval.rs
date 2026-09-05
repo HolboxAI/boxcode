@@ -190,7 +190,8 @@ fn is_read_only_action(action: &crate::tools::Action) -> bool {
         | crate::tools::Action::Grep { .. }
         | crate::tools::Action::DesignStarter
         | crate::tools::Action::CheckContrast { .. }
-        | crate::tools::Action::Agent { .. } => true,
+        | crate::tools::Action::Agent { .. }
+        | crate::tools::Action::CheckInBrowser { .. } => true,
         crate::tools::Action::Command { command, .. } => crate::tools::is_read_only(command),
         _ => false,
     }
