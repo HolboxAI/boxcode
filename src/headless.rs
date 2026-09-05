@@ -37,6 +37,7 @@ use crate::protocol::{
 use crate::tools::{self, Action, Mode};
 use crate::workspace::Workspace;
 use std::path::Path;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 /// What a caller (the real stdio transport, or a test) gets sent for each
@@ -519,11 +520,26 @@ impl HeadlessSession {
         if browser.send(ask).await.is_err() {
             return ("The client disconnected before taking the screenshot.".to_string(), Vec::new());
         }
-        let result = match receive.await {
-            Ok(result) => result,
-            Err(_) => {
+        // Defense in depth, not the primary fix: the client's own CDP
+        // commands (extension.ts's CdpClient.send) now carry their own
+        // timeout, which is what should actually turn a stalled command
+        // (a backgrounded tab that never produces a compositor frame for
+        // Page.captureScreenshot is the real case that motivated this)
+        // into a `Failed` outcome on this same oneshot. This wrapper
+        // exists so that no misbehaving or future client implementation
+        // can ever hang a whole turn -- with nothing on either side
+        // bounding it, `receive.await` alone would wait forever, and
+        // `session/prompt` is a blocking ACP call, so that hang reaches
+        // all the way out to whatever's waiting on the turn to finish.
+        const BROWSER_CHECK_TIMEOUT: Duration = Duration::from_secs(90);
+        let result = match tokio::time::timeout(BROWSER_CHECK_TIMEOUT, receive).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
                 BrowserCheckResult::Failed("The client disconnected before responding.".to_string())
             }
+            Err(_) => BrowserCheckResult::Failed(
+                "Timed out waiting for the client to respond.".to_string(),
+            ),
         };
 
         match result {
