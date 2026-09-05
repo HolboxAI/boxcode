@@ -31,12 +31,12 @@
 //! isn't unit tested for the same reason `main`'s own top-level loop isn't.
 
 use crate::config::Config;
-use crate::headless::{HeadlessSession, PermissionAsk};
+use crate::headless::{BrowserCheckAsk, BrowserCheckResult, HeadlessSession, PermissionAsk};
 use crate::protocol::{
-    Implementation, InitializeRequest, InitializeResponse, JsonRpcVersion, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, RequestId, RequestPermissionOutcome,
-    RequestPermissionRequest, RpcError, RpcErrorObject, RpcRequest, RpcResponse, SessionId,
-    SessionNotification, PROTOCOL_VERSION,
+    CheckInBrowserOutcome, CheckInBrowserRequest, Implementation, InitializeRequest,
+    InitializeResponse, JsonRpcVersion, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest, RpcError,
+    RpcErrorObject, RpcRequest, RpcResponse, SessionId, SessionNotification, PROTOCOL_VERSION,
 };
 use crate::workspace::Workspace;
 use serde_json::json;
@@ -120,6 +120,7 @@ impl SessionActor {
         mut session: HeadlessSession,
         outgoing_tx: mpsc::Sender<Outgoing>,
         permission_relay: mpsc::Sender<PermissionAsk>,
+        browser_relay: mpsc::Sender<BrowserCheckAsk>,
         session_id: SessionId,
     ) -> mpsc::Sender<SessionMsg> {
         let (tx, mut rx) = mpsc::channel::<SessionMsg>(8);
@@ -153,7 +154,7 @@ impl SessionActor {
                             }
                         });
                         let stop_reason =
-                            session.prompt(text, &updates_tx, &permission_relay).await;
+                            session.prompt(text, &updates_tx, &permission_relay, &browser_relay).await;
                         drop(updates_tx); // let the drain task see the channel close
                         let _ = drain.await;
                         let _ = respond.send(PromptResponse { stop_reason });
@@ -166,15 +167,21 @@ impl SessionActor {
 }
 
 /// Owns everything the read loop needs across the life of the connection:
-/// active sessions, and the table correlating a `session/request_permission`
-/// response back to the specific pending ask that's waiting for it.
+/// active sessions, and the tables correlating a `session/request_permission`
+/// or `session/checkInBrowser` response back to the specific pending ask
+/// that's waiting for it. Two separate tables, not one keyed by a shared
+/// enum -- same reasoning as `headless.rs`'s own `PermissionAsk`/
+/// `BrowserCheckAsk` split: a small, explicit type (and table) per real use.
 struct Router {
     sessions: HashMap<SessionId, mpsc::Sender<SessionMsg>>,
     pending_permission_responses: HashMap<RequestId, oneshot::Sender<RequestPermissionOutcome>>,
+    pending_browser_responses: HashMap<RequestId, oneshot::Sender<BrowserCheckResult>>,
     next_outgoing_id: i64,
     outgoing_tx: mpsc::Sender<Outgoing>,
     permission_relay_in: mpsc::Receiver<PermissionAsk>,
     permission_relay_tx: mpsc::Sender<PermissionAsk>,
+    browser_relay_in: mpsc::Receiver<BrowserCheckAsk>,
+    browser_relay_tx: mpsc::Sender<BrowserCheckAsk>,
     /// The one field genuinely needed at runtime that a unit test doesn't
     /// have to fill in with anything meaningful -- see `run`'s own
     /// construction of the real `Config::load()` value.
@@ -184,13 +191,17 @@ struct Router {
 impl Router {
     fn new(config: Config, outgoing_tx: mpsc::Sender<Outgoing>) -> Self {
         let (permission_relay_tx, permission_relay_in) = mpsc::channel(64);
+        let (browser_relay_tx, browser_relay_in) = mpsc::channel(64);
         Self {
             sessions: HashMap::new(),
             pending_permission_responses: HashMap::new(),
+            pending_browser_responses: HashMap::new(),
             next_outgoing_id: 1,
             outgoing_tx,
             permission_relay_in,
             permission_relay_tx,
+            browser_relay_in,
+            browser_relay_tx,
             config,
         }
     }
@@ -237,12 +248,20 @@ impl Router {
                     if let Ok(outcome) = serde_json::from_value::<RequestPermissionOutcome>(result) {
                         let _ = respond.send(outcome);
                     }
+                } else if let Some(respond) = self.pending_browser_responses.remove(&id) {
+                    if let Ok(outcome) = serde_json::from_value::<CheckInBrowserOutcome>(result) {
+                        let _ = respond.send(outcome.into());
+                    }
                 }
                 None
             }
             Incoming::Error { id, .. } => {
                 if let Some(respond) = self.pending_permission_responses.remove(&id) {
                     let _ = respond.send(RequestPermissionOutcome::Cancelled);
+                } else if let Some(respond) = self.pending_browser_responses.remove(&id) {
+                    let _ = respond.send(BrowserCheckResult::Failed(
+                        "the client returned an error instead of a result".to_string(),
+                    ));
                 }
                 None
             }
@@ -281,6 +300,7 @@ impl Router {
                     session,
                     self.outgoing_tx.clone(),
                     self.permission_relay_tx.clone(),
+                    self.browser_relay_tx.clone(),
                     session_id.clone(),
                 );
                 self.sessions.insert(session_id.clone(), handle);
@@ -359,28 +379,65 @@ impl Router {
         });
     }
 
-    /// Pulls one queued [`PermissionAsk`] (from any session's spawned
-    /// task), assigns it a fresh outgoing request id, registers where its
-    /// eventual response should go, and returns the line to write to
-    /// stdout. `None` means the relay channel closed (every session
-    /// finished).
-    async fn next_outgoing_permission_request(&mut self) -> Option<String> {
-        let ask = self.permission_relay_in.recv().await?;
+    /// Pulls the next queued ask from *either* relay -- a [`PermissionAsk`]
+    /// or a [`BrowserCheckAsk`], whichever arrives first -- assigns it a
+    /// fresh outgoing id from one shared counter (a single id space for
+    /// everything this process sends, not two that could collide),
+    /// registers where its eventual response should go, and returns the
+    /// line to write to stdout. `None` only once *both* relays have closed
+    /// (every session finished); one relay closing while the other is
+    /// still live keeps this selecting on the live one.
+    ///
+    /// One method rather than two separate ones each taking `&mut self`:
+    /// `run`'s own `select!` cannot hold two simultaneous mutable borrows
+    /// of the same `Router`, but a single `tokio::select!` *inside* this
+    /// method can borrow `self.permission_relay_in` and
+    /// `self.browser_relay_in` disjointly, since the borrow checker sees
+    /// those as two different fields, not two calls each asking for the
+    /// whole `&mut self`.
+    async fn next_outgoing_client_request(&mut self) -> Option<String> {
+        enum Ready {
+            Permission(PermissionAsk),
+            Browser(BrowserCheckAsk),
+        }
+        let ready = tokio::select! {
+            ask = self.permission_relay_in.recv() => ask.map(Ready::Permission),
+            ask = self.browser_relay_in.recv() => ask.map(Ready::Browser),
+        }?;
         let id = RequestId::Number(self.next_outgoing_id);
         self.next_outgoing_id += 1;
-        self.pending_permission_responses.insert(id.clone(), ask.respond);
-        let request = RpcRequest {
-            jsonrpc: JsonRpcVersion,
-            id,
-            method: "session/request_permission".to_string(),
-            params: Some(
-                serde_json::to_value(RequestPermissionRequest {
-                    session_id: ask.request.session_id,
-                    tool_call: ask.request.tool_call,
-                    options: ask.request.options,
-                })
-                .expect("serializes"),
-            ),
+        let request = match ready {
+            Ready::Permission(ask) => {
+                self.pending_permission_responses.insert(id.clone(), ask.respond);
+                RpcRequest {
+                    jsonrpc: JsonRpcVersion,
+                    id,
+                    method: "session/request_permission".to_string(),
+                    params: Some(
+                        serde_json::to_value(RequestPermissionRequest {
+                            session_id: ask.request.session_id,
+                            tool_call: ask.request.tool_call,
+                            options: ask.request.options,
+                        })
+                        .expect("serializes"),
+                    ),
+                }
+            }
+            Ready::Browser(ask) => {
+                self.pending_browser_responses.insert(id.clone(), ask.respond);
+                RpcRequest {
+                    jsonrpc: JsonRpcVersion,
+                    id,
+                    method: "session/checkInBrowser".to_string(),
+                    params: Some(
+                        serde_json::to_value(CheckInBrowserRequest {
+                            session_id: ask.session_id,
+                            url: ask.url,
+                        })
+                        .expect("serializes"),
+                    ),
+                }
+            }
         };
         Some(request.to_ndjson_line())
     }
@@ -426,7 +483,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 stdout.write_all(line.as_bytes()).await?;
                 stdout.flush().await?;
             }
-            Some(out) = router.next_outgoing_permission_request() => {
+            Some(out) = router.next_outgoing_client_request() => {
                 stdout.write_all(out.as_bytes()).await?;
                 stdout.flush().await?;
             }
@@ -564,7 +621,7 @@ mod tests {
         // Drain the permission request the dangerous `rm -rf build` call
         // produces, and answer it as a rejection.
         let permission_line = router
-            .next_outgoing_permission_request()
+            .next_outgoing_client_request()
             .await
             .expect("the dangerous command asks permission");
         let permission_value: serde_json::Value =
@@ -596,6 +653,98 @@ mod tests {
         // `session/update` notifications (the tool call's pending/failed
         // status, the model's follow-up message chunk) legitimately
         // interleave ahead of it, same as a real client would see.
+        let final_line = loop {
+            match outgoing_in.recv().await.expect("the deferred response arrives") {
+                Outgoing::Line(line) => break line,
+                Outgoing::Update(_) => continue,
+            }
+        };
+        let final_value: serde_json::Value =
+            serde_json::from_str(final_line.trim()).expect("valid JSON line");
+        assert_eq!(final_value["id"], 3);
+        assert_eq!(final_value["result"]["stopReason"], "end_turn");
+    }
+
+    /// The other half of `next_outgoing_client_request`: proves the merged
+    /// select actually reaches the browser relay too, not just the
+    /// permission one it shares a method with -- and that the two relays
+    /// don't interfere (the browser ask goes out with its own real method
+    /// name and shape, is answered on the same connection, and the turn
+    /// completes normally with no permission round trip at all, since
+    /// `check_in_browser` is auto-approved).
+    #[tokio::test]
+    async fn a_check_in_browser_call_round_trips_through_the_router() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\
+                 \"type\":\"function\",\"function\":{\"name\":\"check_in_browser\",\"arguments\":\
+                 \"{\\\"url\\\":\\\"http://localhost:3000\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                 data: {\"choices\":[{\"delta\":{\"content\":\"Looks right.\"}}]}\n\ndata: [DONE]\n\n",
+            ] {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let mut config = Config::default();
+        config.llm.endpoint = format!("http://{addr}");
+        config.llm.model = "test-model".to_string();
+        config.llm.api_key = "sk-test".to_string();
+
+        let (outgoing_tx, mut outgoing_in) = mpsc::channel(64);
+        let mut router = Router::new(config, outgoing_tx);
+
+        router
+            .handle(classify(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": 1 }
+            })))
+            .await;
+        router
+            .handle(classify(&json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": { "cwd": dir.path().display().to_string(), "mcpServers": [] }
+            })))
+            .await;
+
+        let prompt_ack = router
+            .handle(classify(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                "params": { "sessionId": "sess_1", "prompt": [{ "type": "text", "text": "does it render?" }] }
+            })))
+            .await;
+        assert_eq!(prompt_ack, None);
+
+        let browser_line = router
+            .next_outgoing_client_request()
+            .await
+            .expect("check_in_browser goes out as a real request");
+        let browser_value: serde_json::Value =
+            serde_json::from_str(browser_line.trim()).expect("valid JSON line");
+        assert_eq!(browser_value["method"], "session/checkInBrowser");
+        assert_eq!(browser_value["params"]["sessionId"], "sess_1");
+        assert_eq!(browser_value["params"]["url"], "http://localhost:3000");
+        let request_id = browser_value["id"].as_i64().expect("numeric id");
+
+        let response_ack = router
+            .handle(classify(&json!({
+                "jsonrpc": "2.0", "id": request_id,
+                "result": { "outcome": "screenshot", "mimeType": "image/png", "data": "aGVsbG8=" }
+            })))
+            .await;
+        assert_eq!(response_ack, None, "a response to our own request never produces a line");
+
         let final_line = loop {
             match outgoing_in.recv().await.expect("the deferred response arrives") {
                 Outgoing::Line(line) => break line,
