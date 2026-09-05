@@ -1010,12 +1010,18 @@ pub fn schemas_for(
         "type": "function",
         "function": {
             "name": CHECK_IN_BROWSER,
-            "description": "Capture a screenshot of a URL in the user's own Integrated Browser \
-                            and get it back as an image, so you can see what a change actually \
-                            rendered as instead of assuming it worked. Use this after a \
-                            frontend change, once whatever serves that URL is actually running \
-                            (start the dev server first if it is not). Read-only: nothing is \
-                            written or run, only looked at.",
+            "description": "Open a URL in the user's own Integrated Browser and capture a \
+                            screenshot back as an image, so you can see what a change actually \
+                            rendered as instead of assuming it worked. This is the only way to \
+                            show the user a page or verify one -- always reach for this, never a \
+                            shell command like `open`/`start`/`xdg-open`, whenever the user asks \
+                            to see, open, or check something in a browser, or after a frontend \
+                            change. A shell open command launches the OS's own default browser \
+                            outside this session entirely, where the user sees it but you never \
+                            do. Needs a real http(s) URL from something actually serving it -- \
+                            start the dev server first if one is not already running; this does \
+                            not work on a bare file:// path. Read-only: nothing is written or \
+                            run, only looked at.",
             "parameters": {
                 "type": "object",
                 "properties": {
