@@ -81,6 +81,27 @@ impl HeadlessSession {
     ) -> StopReason {
         self.messages.push(ChatMessage::text("user", text));
 
+        // `App`'s own welcome screen already surfaces a missing key via
+        // `Config::warnings()` before the user ever types a prompt -- an ACP
+        // client has no equivalent surface, so without this check the exact
+        // same misconfiguration would only show up as a raw connection/HTTP
+        // failure after a real round trip to `self.config.llm.endpoint`,
+        // which is a strictly worse version of the same answer arriving
+        // slower and less clearly.
+        if self.config.llm.api_key.is_empty() {
+            let _ = updates
+                .send(SessionUpdate::AgentMessageChunk {
+                    content: ContentBlock::Text {
+                        text: "No API key set. Export BOXCODE_API_KEY or add api_key to \
+                               ~/.boxcode/config.toml."
+                            .to_string(),
+                    },
+                    message_id: None,
+                })
+                .await;
+            return StopReason::Refusal;
+        }
+
         loop {
             let budget_left = self.tool_steps < self.config.tools.max_steps;
             if !budget_left {
@@ -435,6 +456,37 @@ mod tests {
         std::fs::write(dir.path().join("hello.txt"), "hi\n").unwrap();
         let ws = Workspace::new(dir.path()).expect("workspace");
         (dir, ws)
+    }
+
+    /// A missing API key must fail fast and clearly -- before ever touching
+    /// the network -- both because that's a strictly better answer for a
+    /// real misconfiguration, and because an ACP client (unlike the TUI,
+    /// which shows this on its own welcome screen via `Config::warnings()`)
+    /// has no other way to learn about it. `config.llm.endpoint`
+    /// deliberately points nowhere real: if this check were ever skipped,
+    /// the assertion on the exact message text below would fail against
+    /// whatever generic connection error came back instead, rather than
+    /// this test simply hanging -- proving the check runs before any
+    /// network attempt, not just that *some* error eventually surfaces.
+    #[tokio::test]
+    async fn a_missing_api_key_fails_before_any_network_call() {
+        let (_dir, ws) = workspace();
+        let mut config = config_for("http://127.0.0.1:1");
+        config.llm.api_key = String::new();
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, mut updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+
+        let stop = session.prompt("hi".to_string(), &updates_tx, &permissions_tx).await;
+
+        assert_eq!(stop, StopReason::Refusal);
+        let update = updates_rx.recv().await.expect("one chunk explaining why");
+        match update {
+            SessionUpdate::AgentMessageChunk { content: ContentBlock::Text { text }, .. } => {
+                assert!(text.contains("No API key set"), "unexpected message: {text}");
+            }
+            other => panic!("expected an AgentMessageChunk, got {other:?}"),
+        }
     }
 
     /// The whole point of this module in one test: a plain answer, with no
