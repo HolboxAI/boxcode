@@ -273,18 +273,35 @@ pub struct PromptResponse {
     pub stop_reason: StopReason,
 }
 
-/// Only the `Text` variant is implemented -- the v1 schema's own baseline
+/// `Text` and `Image` are implemented -- the v1 schema's own baseline
 /// obligation is exactly this: "the Agent MUST support `ContentBlock::Text`
 /// and `ContentBlock::ResourceLink`, while other variants are optionally
-/// enabled via `PromptCapabilities`." `ResourceLink` isn't implemented yet
-/// either (no client-side file-reference flow exists in `boxcode-ide` yet
-/// to produce one) -- deserializing an unrecognized variant should fail
-/// loudly rather than silently drop content, hence no catch-all arm.
+/// enabled via `PromptCapabilities`." `Image` is one of those opt-in
+/// variants, advertised via `InitializeResponse.agent_capabilities.
+/// promptCapabilities.image` (see `transport.rs`'s `initialize` handler).
+/// `ResourceLink` isn't implemented yet either (no client-side
+/// file-reference flow exists in `boxcode-ide` yet to produce one) --
+/// deserializing an unrecognized variant should fail loudly rather than
+/// silently drop content, hence no catch-all arm.
+///
+/// `Image`'s two fields (`data`, `mime_type`) are exactly the ACP schema's
+/// required `ImageContent` fields -- `annotations`/`uri`/`_meta` are all
+/// optional on the wire and unused here, same minimalism as this module's
+/// existing `ToolCallContent::Image` (the unrelated outbound counterpart:
+/// that one goes from boxcode to the client's UI for a human to look at;
+/// this one comes from the client into a prompt boxcode is about to send
+/// to the model).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "image")]
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,12 +437,13 @@ pub enum ToolCallContent {
     },
     /// A `check_in_browser` result -- base64-encoded image bytes for the
     /// client to render (e.g. inline in a chat panel), not something
-    /// boxcode itself interprets. See `HeadlessSession::check_browser`'s
-    /// own doc comment for why the model's own tool-result text stays
-    /// plain confirmation rather than the image data: actually feeding an
-    /// image into the model's own context is real multimodal-message
-    /// support `llm.rs` doesn't have yet, a separate, bigger scope than
-    /// showing the human what was captured.
+    /// boxcode itself interprets. Correction to an earlier version of this
+    /// comment: `llm.rs`'s `ChatMessage.images` already feeds the same
+    /// screenshot to the model separately (see that field's own doc
+    /// comment), and `ContentBlock::Image` above now does the same for
+    /// client-attached images arriving via `session/prompt` -- this variant
+    /// stays purely the human-facing rendering path; it is not, and was
+    /// never meant to become, boxcode's only multimodal path.
     #[serde(rename = "image")]
     Image {
         #[serde(rename = "mimeType")]
@@ -797,6 +815,28 @@ mod tests {
             json!({
                 "sessionId": "sess_1",
                 "prompt": [{ "type": "text", "text": "start a new webapp project" }]
+            })
+        );
+    }
+
+    #[test]
+    fn a_prompt_request_with_an_image_block_matches_the_documented_v1_shape() {
+        let req = PromptRequest {
+            session_id: SessionId("sess_1".to_string()),
+            prompt: vec![
+                ContentBlock::Text { text: "what's wrong with this button?".to_string() },
+                ContentBlock::Image { data: "aGVsbG8=".to_string(), mime_type: "image/png".to_string() },
+            ],
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "sessionId": "sess_1",
+                "prompt": [
+                    { "type": "text", "text": "what's wrong with this button?" },
+                    { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" }
+                ]
             })
         );
     }
