@@ -3091,12 +3091,14 @@ impl App {
                         .map(crate::tools::stub_heavy_tool_args)
                         .collect(),
                     tool_call_id: None,
+                    images: Vec::new(),
                 }),
                 Role::Tool => out.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(self.wire_tool_content(message, &keep_ids)),
                     tool_calls: Vec::new(),
                     tool_call_id: message.tool_call_id.clone(),
+                    images: Vec::new(),
                 }),
                 // Sent as `system`, not `assistant`: it is context the model
                 // already has, not something it said, and framing it as a

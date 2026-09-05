@@ -173,13 +173,43 @@ impl HeadlessSession {
                 RoundOutcome::ToolCalls(calls) => {
                     self.tool_steps += 1;
                     let outcomes = self.decide_and_run(calls, updates, permissions, browser).await;
-                    for (call_id, content) in outcomes {
+                    // An image attached below rides in `self.messages` for
+                    // exactly one round: it needs to be there for the very
+                    // next `run_one_round` call so the model can react to
+                    // it, but `self.messages` has no other trimming or
+                    // compaction at all (this module's own doc comment),
+                    // so without this it would get resent -- and rebilled
+                    // as real image tokens -- on every request for the rest
+                    // of the session. Evicting anything left over from an
+                    // earlier round, right before this round's own results
+                    // land, is what bounds that to one round.
+                    for message in &mut self.messages {
+                        message.images.clear();
+                    }
+                    for (call_id, content, images) in outcomes {
                         self.messages.push(ChatMessage {
                             role: "tool".to_string(),
                             content: Some(content),
                             tool_calls: Vec::new(),
                             tool_call_id: Some(call_id),
+                            images: Vec::new(),
                         });
+                        // A vision content-block array is only valid on a
+                        // `user`/`assistant` message for every
+                        // OpenAI-compatible endpoint this codebase targets
+                        // -- a `role: "tool"` message carrying one is
+                        // rejected outright by real endpoints, which is why
+                        // this is a second, separate message rather than
+                        // attached to the tool result above.
+                        if !images.is_empty() {
+                            self.messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: Some("Screenshot from the browser check above:".to_string()),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                images,
+                            });
+                        }
                     }
                     if !budget_left {
                         return StopReason::MaxTurnRequests;
@@ -262,6 +292,7 @@ impl HeadlessSession {
                 content: (!text.trim().is_empty()).then_some(text),
                 tool_calls: calls.clone(),
                 tool_call_id: None,
+                images: Vec::new(),
             });
             return RoundOutcome::ToolCalls(calls);
         }
@@ -274,15 +305,17 @@ impl HeadlessSession {
 
     /// Applies `verdict_for` to each queued call -- the one piece of logic
     /// this module shares with `App` rather than reimplementing, per
-    /// `approval::Verdict`'s own docs. Returns `(call_id, content)` pairs
-    /// ready to become `tool` messages.
+    /// `approval::Verdict`'s own docs. Returns `(call_id, content, images)`
+    /// triples ready to become `tool` (and, when `images` is non-empty, a
+    /// following `user`) messages -- only `check_in_browser` ever produces
+    /// a non-empty `images`, every other verdict returns an empty one.
     async fn decide_and_run(
         &mut self,
         calls: Vec<ToolCall>,
         updates: &mpsc::Sender<SessionUpdate>,
         permissions: &mpsc::Sender<PermissionAsk>,
         browser: &mpsc::Sender<BrowserCheckAsk>,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<(String, String, Vec<llm::ImageAttachment>)> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
             let verdict = verdict_for(
@@ -292,6 +325,7 @@ impl HeadlessSession {
                 self.config.tools.approval,
             );
 
+            let mut images = Vec::new();
             let content = match verdict {
                 Verdict::Blocked(reason) => {
                     let _ = updates
@@ -322,7 +356,9 @@ impl HeadlessSession {
                     // same way `Action::Agent` is intercepted below rather
                     // than offered to `tools::execute`.
                     if let Some(Action::CheckInBrowser { url }) = &action {
-                        self.check_browser(&call, url, updates, browser).await
+                        let (text, screenshot_images) = self.check_browser(&call, url, updates, browser).await;
+                        images = screenshot_images;
+                        text
                     } else {
                         let _ = updates
                             .send(SessionUpdate::ToolCall(AcpToolCall {
@@ -349,7 +385,7 @@ impl HeadlessSession {
                 }
             };
 
-            results.push((call.id.clone(), content));
+            results.push((call.id.clone(), content, images));
         }
         results
     }
@@ -430,21 +466,22 @@ impl HeadlessSession {
     /// reply on a fresh `oneshot`) since a `HeadlessSession` only ever has
     /// one of either outstanding at a time.
     ///
-    /// The tool result text fed back to the *model* stays plain
-    /// confirmation, never the image bytes: this is evidence for the human
-    /// (rendered by the client, e.g. inline in a chat panel via the
-    /// `SessionUpdate::ToolCallUpdate` sent below), not a claim that the
-    /// model can see it too. Actually feeding an image into the model's own
-    /// context would need real multimodal message support in `llm.rs`,
-    /// which does not exist yet -- a separate, bigger scope than showing
-    /// the human what was captured.
+    /// The returned image is only ever non-empty when
+    /// `config.tools.attach_browser_screenshots` is on -- off by default,
+    /// since this is real image-token cost on every check, not something
+    /// to silently start charging for. The tool result *text* always
+    /// describes what happened either way; that text alone is what a human
+    /// sees rendered (via the `SessionUpdate::ToolCallUpdate` sent below),
+    /// same as before this setting existed. See `prompt`'s own doc comment
+    /// on where the returned image actually goes and why it's evicted from
+    /// history after one round rather than kept forever.
     async fn check_browser(
         &self,
         call: &ToolCall,
         url: &str,
         updates: &mpsc::Sender<SessionUpdate>,
         browser: &mpsc::Sender<BrowserCheckAsk>,
-    ) -> String {
+    ) -> (String, Vec<llm::ImageAttachment>) {
         let _ = updates
             .send(SessionUpdate::ToolCall(AcpToolCall {
                 tool_call_id: ToolCallId(call.id.clone()),
@@ -457,7 +494,7 @@ impl HeadlessSession {
         let (respond, receive) = oneshot::channel();
         let ask = BrowserCheckAsk { session_id: self.session_id.clone(), url: url.to_string(), respond };
         if browser.send(ask).await.is_err() {
-            return "The client disconnected before taking the screenshot.".to_string();
+            return ("The client disconnected before taking the screenshot.".to_string(), Vec::new());
         }
         let result = match receive.await {
             Ok(result) => result,
@@ -474,10 +511,15 @@ impl HeadlessSession {
                         title: None,
                         kind: None,
                         status: Some(ToolCallStatus::Completed),
-                        content: Some(ToolCallContent::Image { mime_type, data }),
+                        content: Some(ToolCallContent::Image { mime_type: mime_type.clone(), data: data.clone() }),
                     }))
                     .await;
-                format!("Screenshot of {url} captured and shown to the user.")
+                let images = if self.config.tools.attach_browser_screenshots {
+                    vec![llm::ImageAttachment { mime_type, data_base64: data }]
+                } else {
+                    Vec::new()
+                };
+                (format!("Screenshot of {url} captured and shown to the user."), images)
             }
             BrowserCheckResult::Failed(reason) => {
                 let _ = updates
@@ -489,7 +531,7 @@ impl HeadlessSession {
                         content: Some(ToolCallContent::Text { text: reason.clone() }),
                     }))
                     .await;
-                format!("Could not check {url} in the browser: {reason}")
+                (format!("Could not check {url} in the browser: {reason}"), Vec::new())
             }
         }
     }

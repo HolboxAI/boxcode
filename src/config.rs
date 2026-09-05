@@ -446,6 +446,18 @@ pub struct ToolsConfig {
     /// it, fifteen rounds over a growing transcript is an unbounded bill.
     #[serde(default = "default_subagent_token_budget")]
     pub subagent_token_budget: usize,
+    /// Attach `check_in_browser`'s screenshot to the model's own next
+    /// request as real image input, not just show it to the human. Off by
+    /// default: this costs real image tokens on every check, and only
+    /// works at all if the configured endpoint's model accepts vision
+    /// input -- keyed off the provider id would be a trap here, since a
+    /// custom OpenAI-compatible endpoint (the common way this app is
+    /// actually configured) leaves `provider` empty, which would make a
+    /// provider-keyed capability check permanently false for exactly the
+    /// people most likely to turn this on. A plain opt-in avoids guessing
+    /// either way.
+    #[serde(default)]
+    pub attach_browser_screenshots: bool,
 }
 
 fn yes() -> bool {
@@ -557,6 +569,7 @@ impl Default for ToolsConfig {
             requests_endpoint: default_requests_endpoint(),
             subagent_max_steps: default_subagent_max_steps(),
             subagent_token_budget: default_subagent_token_budget(),
+            attach_browser_screenshots: false,
         }
     }
 }
