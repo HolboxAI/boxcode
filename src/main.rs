@@ -11,6 +11,7 @@ mod dateutil;
 mod db;
 mod deploy;
 mod diff;
+mod errors;
 mod headless;
 mod llm;
 mod notice;
@@ -244,6 +245,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
                          list_change_requests to see them.",
                         requests.len(),
                         if requests.len() == 1 { "" } else { "s" }
+                    ));
+                }
+            }
+        }
+    }
+    // Unlike the /pull-only check above, this runs on every ordinary
+    // launch -- deliberately, since "opens with what broke" is the entire
+    // point of the reported-errors feature (there is no other moment boxcode
+    // is spawned that isn't already mid-conversation, see the delivery
+    // design in errors.rs/docs). Two guards keep this from repeating the
+    // cost the /pull check was written to avoid:
+    //   - gated on `any_published_under`, a local, synchronous registry
+    //     read -- the common case (an unpublished project) pays no network
+    //     cost at all, not even a fast one.
+    //   - a short, separate timeout, well under `errors::list_pending`'s own
+    //     30s client timeout (sized for an explicit tool call the user is
+    //     already waiting on). A slow or unreachable errors service must
+    //     delay the terminal coming up by a bounded couple of seconds at
+    //     most, never by 30.
+    if let Some(ws) = workspace.as_ref() {
+        if artifacts::any_published_under(ws.root()) {
+            let check = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                errors::list_pending(ws.root(), &app.config.tools.errors_endpoint),
+            )
+            .await;
+            if let Ok(Ok(reported)) = check {
+                if !reported.is_empty() {
+                    let total: u64 = reported.iter().map(|e| e.count).sum();
+                    app.startup_notices.push(format!(
+                        "{} runtime error{} reported for this project ({total} occurrence{}) -- \
+                         call list_change_requests to see them.",
+                        reported.len(),
+                        if reported.len() == 1 { "" } else { "s" },
+                        if total == 1 { "" } else { "s" }
                     ));
                 }
             }

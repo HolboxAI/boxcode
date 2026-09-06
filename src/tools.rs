@@ -861,19 +861,28 @@ pub fn schemas_for(
             "type": "function",
             "function": {
                 "name": LIST_CHANGE_REQUESTS,
-                "description": "Check an already-published project's change-request mailbox for \
-                                pending requests left by whoever is looking at the live page --\
-                                typically the developer themselves, from a phone, hours after \
-                                publishing. Requires the path to have been published with \
-                                publish_artifact first, same as enable_auth/db_query. To let \
-                                visitors leave requests in the first place, add this exact tag to \
-                                the published HTML with edit_file, then publish_artifact again: \
-                                <script src=\"https://auth.boxcode.sh/requests-widget.js\" \
-                                data-project=\"<the artifact id>\"></script> -- there is no \
-                                separate 'enable' tool for that, it is just a script tag like any \
-                                other. Each result has an id, the request text, and when it was \
-                                submitted. After acting on one (or deciding not to), call \
-                                resolve_change_request with its id so it does not keep showing up.",
+                "description": "Check an already-published project's mailbox for pending change \
+                                requests AND reported runtime errors. Change requests are left by \
+                                whoever is looking at the live page -- typically the developer \
+                                themselves, from a phone, hours after publishing. Reported errors \
+                                are automatic: a real visitor's browser hit a JS error and it was \
+                                beaconed back, unprompted. Requires the path to have been published \
+                                with publish_artifact first, same as enable_auth/db_query. To let \
+                                visitors leave requests, add this exact tag to the published HTML \
+                                with edit_file, then publish_artifact again: <script \
+                                src=\"https://auth.boxcode.sh/requests-widget.js\" \
+                                data-project=\"<the artifact id>\"></script>. To start receiving \
+                                error reports, add this one instead: <script \
+                                src=\"https://auth.boxcode.sh/errors-beacon.js\" \
+                                data-project=\"<the artifact id>\"></script>. Neither needs a \
+                                separate 'enable' tool -- they are just script tags like any other, \
+                                and both can be present at once. Each result has an id and, for a \
+                                change request, its text and when it was submitted; a reported \
+                                error is prefixed \"[runtime error]\" (or \"[runtime error \
+                                (×N)]\" if it has recurred) and names the message, file, line and \
+                                column. After acting on one (or deciding not to), call \
+                                resolve_change_request with its id so it does not keep showing up \
+                                -- the same tool resolves either kind.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -890,10 +899,13 @@ pub fn schemas_for(
             "type": "function",
             "function": {
                 "name": RESOLVE_CHANGE_REQUEST,
-                "description": "Mark one change request from list_change_requests as handled, so \
-                                it stops showing up as pending. Call this once you have made the \
-                                change it asked for (or decided not to) -- it does not undo or \
-                                re-apply anything by itself, it only clears the mailbox.",
+                "description": "Mark one change request OR reported error from \
+                                list_change_requests as handled, so it stops showing up as \
+                                pending. Call this once you have made the change it asked for (or \
+                                fixed the reported error, or decided not to) -- it does not undo \
+                                or re-apply anything by itself, it only clears the mailbox. Works \
+                                for either kind of entry; which mailbox it routes to is decided by \
+                                the id itself, not by anything you need to specify.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -903,7 +915,7 @@ pub fn schemas_for(
                         },
                         "id": {
                             "type": "string",
-                            "description": "The request's id, from list_change_requests."
+                            "description": "The id of the change request or reported error, from list_change_requests."
                         }
                     },
                     "required": ["path", "id"]
@@ -4048,32 +4060,56 @@ async fn execute_list_change_requests(
         }
     };
 
-    match crate::requests::list_pending(&resolved, &config.requests_endpoint).await {
-        Ok(requests) if requests.is_empty() => outcome(
+    // Both mailboxes belong to the same published project and the model
+    // reads them as one merged list (see the tool description) -- but they
+    // are two independent services, so one being unreachable must not hide
+    // the other. A hard failure is only reported for the mailbox the caller
+    // actually configured; an unconfigured `errors_endpoint` (the common
+    // case today, since most projects have not added the errors beacon)
+    // is treated the same as "zero pending errors", not an error, exactly
+    // like an unconfigured `requests_endpoint` already behaves for /pull's
+    // startup check in main.rs.
+    let requests_result = crate::requests::list_pending(&resolved, &config.requests_endpoint).await;
+    let errors_result = crate::errors::list_pending(&resolved, &config.errors_endpoint).await;
+
+    let requests = match requests_result {
+        Ok(requests) => requests,
+        Err(e) if errors_result.is_err() => {
+            // Both failed: say so, rather than silently reporting "none
+            // pending" when neither mailbox could actually be checked.
+            return outcome(
+                &call.id,
+                format!("\u{1F4E8} requests {} \u{2014} failed", clip(&path, 40)),
+                format!("Error: {e}"),
+            );
+        }
+        Err(_) => Vec::new(),
+    };
+    let errors = errors_result.unwrap_or_default();
+
+    if requests.is_empty() && errors.is_empty() {
+        return outcome(
             &call.id,
             "\u{1F4E8} requests \u{2014} none pending".to_string(),
-            "No pending change requests.".to_string(),
-        ),
-        Ok(requests) => {
-            let count = requests.len();
-            let json = serde_json::to_string_pretty(&requests).unwrap_or_default();
-            outcome(
-                &call.id,
-                format!(
-                    "\u{1F4E8} requests \u{2014} {count} pending",
-                ),
-                format!(
-                    "{json}\n\nCall {RESOLVE_CHANGE_REQUEST} with an id once you have acted on \
-                     it (or decided not to)."
-                ),
-            )
-        }
-        Err(e) => outcome(
-            &call.id,
-            format!("\u{1F4E8} requests {} \u{2014} failed", clip(&path, 40)),
-            format!("Error: {e}"),
-        ),
+            "No pending change requests or reported errors.".to_string(),
+        );
     }
+
+    let count = requests.len() + errors.len();
+    let mut lines: Vec<String> = requests
+        .iter()
+        .map(|r| format!("{}  ({})  \"{}\"", r.id, r.created_at, r.text))
+        .collect();
+    lines.extend(errors.iter().map(|e| format!("{}  {}", e.id, crate::errors::describe(e))));
+    outcome(
+        &call.id,
+        format!("\u{1F4E8} requests \u{2014} {count} pending"),
+        format!(
+            "{}\n\nCall {RESOLVE_CHANGE_REQUEST} with an id once you have acted on it (or \
+             decided not to).",
+            lines.join("\n")
+        ),
+    )
 }
 
 /// Mark one change request handled.
@@ -4100,11 +4136,20 @@ async fn execute_resolve_change_request(
         }
     };
 
-    match crate::requests::resolve(&resolved, &config.requests_endpoint, &id).await {
+    // Which mailbox a given id belongs to is decided by the id itself
+    // (`errors::ID_PREFIX`), not by a `kind` argument the model would have
+    // to remember to pass -- see the doc comment on `errors.rs`.
+    let (label, result) = if id.starts_with(crate::errors::ID_PREFIX) {
+        ("Reported error", crate::errors::resolve(&resolved, &config.errors_endpoint, &id).await)
+    } else {
+        ("Request", crate::requests::resolve(&resolved, &config.requests_endpoint, &id).await)
+    };
+
+    match result {
         Ok(()) => outcome(
             &call.id,
             format!("\u{1F4E8} requests \u{2014} #{id} resolved"),
-            format!("Request {id} marked resolved."),
+            format!("{label} {id} marked resolved."),
         ),
         Err(e) => outcome(
             &call.id,
@@ -7085,6 +7130,128 @@ mod tests {
     fn resolve_change_request_with_no_id_does_not_parse() {
         let call = tool_call(RESOLVE_CHANGE_REQUEST, json!({ "path": "dist", "id": "" }));
         assert!(describe_action(&call).is_none());
+    }
+
+    /// Same minimal-HTTP-server pattern `db.rs`'s tests use, one instance
+    /// per mailbox so the two can be told apart by which one actually
+    /// received a connection.
+    async fn serve_once_and_capture_body(
+        response_json: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut content_length = None;
+            loop {
+                let n = socket.read(&mut chunk).await.expect("read");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    if content_length.is_none() {
+                        let headers = String::from_utf8_lossy(&buf[..header_end]);
+                        content_length = headers.lines().find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        });
+                    }
+                    // `None` here means no Content-Length header was present
+                    // (a bodyless request, e.g. a GET) -- that means the
+                    // body is already complete, not "keep waiting."
+                    let body_so_far = buf.len() - (header_end + 4);
+                    if content_length.map(|cl| body_so_far >= cl).unwrap_or(true) {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("headers");
+            let body = String::from_utf8_lossy(&buf[header_end + 4..]).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_json.len(),
+                response_json
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+            socket.shutdown().await.ok();
+            body
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Same helper `db.rs`'s and `errors.rs`'s own test modules each keep a
+    /// private copy of, since `artifacts::remember` is private to that module.
+    fn fake_publish(fake_home: &Path, project_dir: &Path, id: &str) {
+        let key = project_dir.canonicalize().expect("canonicalize").to_string_lossy().into_owned();
+        let registry_path = fake_home.join(".boxcode").join("artifacts.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).expect("mkdir");
+        let published_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let map = serde_json::json!({ key: { "id": id, "published_at": published_at } });
+        std::fs::write(registry_path, serde_json::to_string_pretty(&map).unwrap()).expect("write registry");
+    }
+
+    /// The core proof for the merged mailbox: an id starting with
+    /// `errors::ID_PREFIX` must resolve against `errors_endpoint`, and any
+    /// other id must resolve against `requests_endpoint` -- checked by
+    /// pointing the two at two different local servers and confirming each
+    /// received exactly the request meant for it.
+    #[tokio::test]
+    async fn resolve_change_request_routes_by_id_prefix() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-routing");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        // Branch 1: a plain id must hit requests_endpoint, not errors_endpoint.
+        let (requests_endpoint, requests_handle) = serve_once_and_capture_body("{}").await;
+        let (errors_endpoint, _errors_handle_unused) = serve_once_and_capture_body("{}").await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = requests_endpoint;
+        config.errors_endpoint = errors_endpoint;
+        let call = tool_call(
+            RESOLVE_CHANGE_REQUEST,
+            json!({ "path": ".", "id": "plain123" }),
+        );
+        let out = execute_resolve_change_request(&call, &ws, &config).await;
+        assert!(out.content.contains("resolved"), "{}", out.content);
+        let body = requests_handle.await.expect("requests server task");
+        assert!(body.contains("\"project_id\":\"proj-routing\""), "{body}");
+
+        // Branch 2: an err_-prefixed id must hit errors_endpoint instead.
+        let (requests_endpoint2, _requests_handle2_unused) = serve_once_and_capture_body("{}").await;
+        let (errors_endpoint2, errors_handle2) = serve_once_and_capture_body("{}").await;
+        let mut config2 = ToolsConfig::default();
+        config2.requests_endpoint = requests_endpoint2;
+        config2.errors_endpoint = errors_endpoint2;
+        let call2 = tool_call(
+            RESOLVE_CHANGE_REQUEST,
+            json!({ "path": ".", "id": "err_1" }),
+        );
+        let out2 = execute_resolve_change_request(&call2, &ws, &config2).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out2.content.contains("resolved"), "{}", out2.content);
+        let body2 = errors_handle2.await.expect("errors server task");
+        assert!(body2.contains("\"project_id\":\"proj-routing\""), "{body2}");
     }
 
     // ---- enable_auth ---------------------------------------------------------

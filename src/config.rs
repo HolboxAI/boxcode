@@ -433,6 +433,13 @@ pub struct ToolsConfig {
     /// `artifact_endpoint`/`auth_endpoint`/`db_endpoint`.
     #[serde(default = "default_requests_endpoint")]
     pub requests_endpoint: String,
+    /// Where the same two tools read and consume a project's reported
+    /// runtime errors. A separate endpoint from `requests_endpoint` (its own
+    /// control-plane, its own dedup/rate-limiting story -- errors arrive at
+    /// a very different volume than a human typing a change request), but
+    /// the same reasoning otherwise.
+    #[serde(default = "default_errors_endpoint")]
+    pub errors_endpoint: String,
     /// How many request rounds one subagent may take before its schemas are
     /// withheld and it is made to answer. Separate from `max_steps`: a child
     /// exists to answer one focused question, so its budget is deliberately
@@ -531,6 +538,11 @@ fn default_requests_endpoint() -> String {
     "https://auth.boxcode.sh/requests".to_string()
 }
 
+fn default_errors_endpoint() -> String {
+    // Same box, same vhost and cert as auth/db/requests -- see infra/errors/README.md.
+    "https://auth.boxcode.sh/errors".to_string()
+}
+
 fn default_search_timeout() -> u64 {
     20
 }
@@ -567,6 +579,7 @@ impl Default for ToolsConfig {
             auth_endpoint: default_auth_endpoint(),
             db_endpoint: default_db_endpoint(),
             requests_endpoint: default_requests_endpoint(),
+            errors_endpoint: default_errors_endpoint(),
             subagent_max_steps: default_subagent_max_steps(),
             subagent_token_budget: default_subagent_token_budget(),
             attach_browser_screenshots: false,
