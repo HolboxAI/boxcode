@@ -69,6 +69,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("boxcode {VERSION}");
                 return Ok(());
             }
+            // An ACP client (boxcode-ide) shells out to this to build its own
+            // provider picker from the same registry `/provider` uses in the
+            // TUI, rather than hand-copying the table into TypeScript.
+            "--providers-json" => {
+                println!(
+                    "{}",
+                    serde_json::to_string(providers::PROVIDERS)
+                        .expect("PROVIDERS must serialize")
+                );
+                return Ok(());
+            }
             "-h" | "--help" => {
                 print_help();
                 return Ok(());

@@ -617,6 +617,13 @@ impl Config {
         if let Some(v) = env_var("BOXCODE_API_KEY") {
             config.llm.api_key = v;
         }
+        // Registry id (e.g. "deepseek"), same meaning as the `/provider`
+        // overlay's own write to this field -- without it, a session started
+        // this way (an ACP client setting env vars, not the TUI) never gets a
+        // provider's `default_temperature()` (see `LlmConfig::effective_temperature`).
+        if let Some(v) = env_var("BOXCODE_PROVIDER") {
+            config.llm.provider = v;
+        }
         if let Some(v) = env_var("BOXCODE_WORKSPACE") {
             config.tools.workspace = v;
         }
@@ -1037,6 +1044,30 @@ mod tests {
         });
     }
 
+    /// An ACP client (boxcode-ide) sets env vars, not config.toml -- without
+    /// this, a session it spawns never gets `config.llm.provider` populated,
+    /// which silently drops DeepSeek's `default_temperature()` (see
+    /// `LlmConfig::effective_temperature`) for every IDE-started session.
+    #[test]
+    fn boxcode_provider_env_var_sets_config_llm_provider() {
+        with_isolated_home(|| {
+            for key in ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY", "BOXCODE_PROVIDER"] {
+                std::env::remove_var(key);
+            }
+            std::env::set_var("BOXCODE_PROVIDER", "deepseek");
+
+            let loaded = Config::load().expect("load should succeed");
+            assert_eq!(loaded.llm.provider, "deepseek");
+            assert_eq!(
+                loaded.llm.effective_temperature(),
+                Some(0.0),
+                "provider set via env var must still pick up its default_temperature"
+            );
+
+            std::env::remove_var("BOXCODE_PROVIDER");
+        });
+    }
+
     #[test]
     fn save_then_load_round_trips_all_llm_fields_including_provider() {
         with_isolated_home(|| {
@@ -1044,7 +1075,7 @@ mod tests {
             // machine that happens to have one exported must not leak into this
             // assertion.
             let saved_env: Vec<(&str, Option<String>)> =
-                ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY"]
+                ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY", "BOXCODE_PROVIDER"]
                     .iter()
                     .map(|&k| (k, std::env::var(k).ok()))
                     .collect();
