@@ -126,12 +126,22 @@ same reasoning as `infra/requests/`'s equivalent endpoints.
 ## Known limitations
 
 - No auth on submission beyond `project_id` naming a real, live artifact --
-  anyone who knows (or guesses) a project id, and can reach a page that
-  publishes to it, could in principle submit fabricated error reports
-  against it up to the rate limit. Bounded by the rate limit and dedup, and
-  by the fact a wrong report just wastes a developer's own attention rather
-  than doing anything worse -- but worth knowing, especially since (unlike
-  `infra/requests/`) these reports are read automatically.
+  and, sharper than that sounds: `artifactExists()` only proves the artifact
+  is live, not that a given POST actually came from that artifact's own
+  page. There is no Origin/Referer check anywhere in this file, and CORS
+  constrains browser JS, not a direct `curl`/`sendBeacon`-equivalent call --
+  so anyone who knows (or guesses, `PROJECT_ID_RE` is only 4-16
+  lowercase-alnum chars) a project's PUBLIC artifact id can submit arbitrary
+  `message` text against it directly, with no need to ever touch the real
+  page. Bounded by the rate limit, dedup, and the fixed field allowlist (no
+  stack, no arbitrary properties), but this is a real, open gap, not a
+  theoretical one: unlike `infra/requests/` (a human reads a request before
+  acting on it), `src/errors.rs` folds pending error reports straight into
+  the model's context automatically the next time a boxcode session opens
+  that project -- so this is a live prompt-injection channel, gated only by
+  guessing a public id. Real authentication (a per-project submission token
+  minted at publish time, say) is future work, deliberately not attempted in
+  this pass.
 - Published artifacts expire 48 hours after `publish_artifact`
   (`EXPIRY_HOURS` in `src/artifacts.rs`) unless republished. Error
   reporting only has a real window on artifacts the developer keeps
@@ -145,3 +155,23 @@ same reasoning as `infra/requests/`'s equivalent endpoints.
   reasoning as `infra/auth/`'s in-memory attempt counters: a file write on
   every submission attempt, including ones about to be rejected, would
   itself be a thing to abuse.
+- The per-project rate limit is not itself hardened against the same
+  no-real-auth gap above: since verification only proves a project id is
+  real and live, not that the caller is the project's own page, anyone who
+  knows a project's public artifact id (visible in its page URL) can submit
+  enough distinct-looking junk to exhaust that project's rate-limit budget
+  before its real errors arrive -- and, given `pruneIfNeeded` evicts the
+  lowest-`count` records first, can eventually evict genuine one-off error
+  reports too. Same root cause and same future fix (real per-project
+  submission auth) as the injection gap above, not a separate problem.
+- The store is now an in-memory cache flushed to disk at most once every
+  `FLUSH_INTERVAL_MS` (default 1s), not written on every mutation -- added
+  specifically so a flood of *repeated* identical reports (which cost
+  nothing against the rate limit, by design) cannot each also force a full
+  disk read+write inside the lock every other project's submissions queue
+  behind. A mutation can be lost if the process is killed (not merely
+  restarted -- shutdown handlers flush on `SIGTERM`/`SIGINT`) within that
+  window. Accepted for the same reason as the in-memory rate-limit
+  counters above: this is a mailbox for automatically-regenerated error
+  reports, not a system of record -- a lost mutation just means the
+  browser reports the same error again if the bug recurs.
