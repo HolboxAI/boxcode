@@ -4061,31 +4061,65 @@ async fn execute_list_change_requests(
     };
 
     // Both mailboxes belong to the same published project and the model
-    // reads them as one merged list (see the tool description) -- but they
-    // are two independent services, so one being unreachable must not hide
-    // the other. A hard failure is only reported for the mailbox the caller
-    // actually configured; an unconfigured `errors_endpoint` (the common
-    // case today, since most projects have not added the errors beacon)
-    // is treated the same as "zero pending errors", not an error, exactly
-    // like an unconfigured `requests_endpoint` already behaves for /pull's
-    // startup check in main.rs.
-    let requests_result = crate::requests::list_pending(&resolved, &config.requests_endpoint).await;
-    let errors_result = crate::errors::list_pending(&resolved, &config.errors_endpoint).await;
+    // reads them as one merged list (see the tool description), but they are
+    // two independent services -- checked BEFORE calling either, not
+    // inferred from the Err afterward, so "not configured" (skip the call
+    // entirely, treated as zero pending) is never confused with "configured
+    // but the call actually failed" (a real network/service problem, which
+    // must always be surfaced loudly, regardless of what the other mailbox
+    // did). Both `requests_endpoint`/`errors_endpoint` default to a real URL
+    // (`config.rs`'s `default_requests_endpoint`/`default_errors_endpoint`),
+    // so "unconfigured" only happens if a user deliberately blanks it out --
+    // the common real case is "configured via default, service may or may
+    // not be reachable yet," which is exactly the case a silent swallow
+    // would hide.
+    let requests_configured = !config.requests_endpoint.trim().is_empty();
+    let errors_configured = !config.errors_endpoint.trim().is_empty();
 
-    let requests = match requests_result {
-        Ok(requests) => requests,
-        Err(e) if errors_result.is_err() => {
-            // Both failed: say so, rather than silently reporting "none
-            // pending" when neither mailbox could actually be checked.
-            return outcome(
-                &call.id,
-                format!("\u{1F4E8} requests {} \u{2014} failed", clip(&path, 40)),
-                format!("Error: {e}"),
-            );
+    // Run both checks concurrently, not sequentially -- each has its own 30s
+    // client timeout, so one after the other made the worst case ~60s for a
+    // single tool call. `tokio::join!` still never makes a network call for
+    // a mailbox that isn't configured: the `if` inside each arm resolves
+    // before either `.await`s anything.
+    let (requests_result, errors_result) = tokio::join!(
+        async {
+            if requests_configured {
+                Some(crate::requests::list_pending(&resolved, &config.requests_endpoint).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if errors_configured {
+                Some(crate::errors::list_pending(&resolved, &config.errors_endpoint).await)
+            } else {
+                None
+            }
         }
-        Err(_) => Vec::new(),
-    };
-    let errors = errors_result.unwrap_or_default();
+    );
+
+    // A failure on either configured mailbox is always reported, and both
+    // are named if both failed -- previously only the requests-mailbox
+    // error message survived even when both had failed.
+    let mut failures = Vec::new();
+    if let Some(Err(e)) = &requests_result {
+        failures.push(format!("requests: {e}"));
+    }
+    if let Some(Err(e)) = &errors_result {
+        failures.push(format!("errors: {e}"));
+    }
+    if !failures.is_empty() {
+        return outcome(
+            &call.id,
+            format!("\u{1F4E8} requests {} \u{2014} failed", clip(&path, 40)),
+            format!("Error: {}", failures.join("; ")),
+        );
+    }
+
+    // Only `None` (not configured) or `Some(Ok(_))` can reach here -- any
+    // `Some(Err(_))` already returned above.
+    let requests = requests_result.and_then(|r| r.ok()).unwrap_or_default();
+    let errors = errors_result.and_then(|r| r.ok()).unwrap_or_default();
 
     if requests.is_empty() && errors.is_empty() {
         return outcome(
@@ -7233,14 +7267,20 @@ mod tests {
         assert!(body.contains("\"project_id\":\"proj-routing\""), "{body}");
 
         // Branch 2: an err_-prefixed id must hit errors_endpoint instead.
+        // Shaped like what the real control-plane actually generates
+        // (`err_` + a UUID, see infra/errors/control-plane/index.mjs), not
+        // the literal "err_1" -- a hand-typed id that merely satisfies
+        // `starts_with` would make this test tautological about the one
+        // thing it exists to prove.
         let (requests_endpoint2, _requests_handle2_unused) = serve_once_and_capture_body("{}").await;
         let (errors_endpoint2, errors_handle2) = serve_once_and_capture_body("{}").await;
         let mut config2 = ToolsConfig::default();
         config2.requests_endpoint = requests_endpoint2;
         config2.errors_endpoint = errors_endpoint2;
+        let real_shaped_error_id = "err_9ce2bbf4-4b5f-487a-99d9-4da582c9bbc1";
         let call2 = tool_call(
             RESOLVE_CHANGE_REQUEST,
-            json!({ "path": ".", "id": "err_1" }),
+            json!({ "path": ".", "id": real_shaped_error_id }),
         );
         let out2 = execute_resolve_change_request(&call2, &ws, &config2).await;
 
@@ -7252,6 +7292,244 @@ mod tests {
         assert!(out2.content.contains("resolved"), "{}", out2.content);
         let body2 = errors_handle2.await.expect("errors server task");
         assert!(body2.contains("\"project_id\":\"proj-routing\""), "{body2}");
+    }
+
+    /// A blank `errors_endpoint` means "not configured" -- the common case
+    /// before a project has added the errors beacon -- and must be treated
+    /// as zero pending errors without ever attempting a network call, not
+    /// surfaced as a failure. `requests_endpoint` stays pointed at a real
+    /// server with zero pending, so the assertion is specifically about the
+    /// errors side, not a side effect of both being empty.
+    #[tokio::test]
+    async fn list_change_requests_treats_unconfigured_errors_endpoint_as_zero_pending() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-no-errors-endpoint");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let (requests_endpoint, _handle) = serve_once_and_capture_body("[]").await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = requests_endpoint;
+        config.errors_endpoint = String::new();
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.contains("No pending"), "{}", out.content);
+        assert!(!out.content.to_lowercase().contains("error:"), "{}", out.content);
+    }
+
+    /// A blank `requests_endpoint` gets the same treatment, checked
+    /// independently of the errors side.
+    #[tokio::test]
+    async fn list_change_requests_treats_unconfigured_requests_endpoint_as_zero_pending() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-no-requests-endpoint");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let (errors_endpoint, _handle) = serve_once_and_capture_body("[]").await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = String::new();
+        config.errors_endpoint = errors_endpoint;
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.contains("No pending"), "{}", out.content);
+        assert!(!out.content.to_lowercase().contains("error:"), "{}", out.content);
+    }
+
+    /// The actual regression this fix closes: before it, a *configured but
+    /// unreachable* `requests_endpoint` was silently reported as "no pending
+    /// change requests or reported errors" the moment `errors_endpoint`
+    /// succeeded (or was also unconfigured) -- indistinguishable from there
+    /// really being nothing pending. It must fail loudly instead.
+    #[tokio::test]
+    async fn list_change_requests_surfaces_a_genuine_requests_service_failure_loudly() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-requests-down");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let (errors_endpoint, _handle) = serve_once_and_capture_body("[]").await;
+        let mut config = ToolsConfig::default();
+        // A connection to a closed port fails fast (refused), unlike a
+        // black-holed address that would wait out the full 30s timeout.
+        config.requests_endpoint = "http://127.0.0.1:1".to_string();
+        config.errors_endpoint = errors_endpoint;
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.to_lowercase().contains("error:"), "{}", out.content);
+        assert!(out.content.contains("requests:"), "{}", out.content);
+        assert!(!out.content.contains("No pending"), "{}", out.content);
+    }
+
+    /// Same proof, mirrored for the errors mailbox: previously an errors
+    /// failure was *always* swallowed via a bare `unwrap_or_default()`,
+    /// regardless of whether requests succeeded -- there was no path to a
+    /// loud failure for this side at all.
+    #[tokio::test]
+    async fn list_change_requests_surfaces_a_genuine_errors_service_failure_loudly() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-errors-down");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let (requests_endpoint, _handle) = serve_once_and_capture_body("[]").await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = requests_endpoint;
+        config.errors_endpoint = "http://127.0.0.1:1".to_string();
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.to_lowercase().contains("error:"), "{}", out.content);
+        assert!(out.content.contains("errors:"), "{}", out.content);
+        assert!(!out.content.contains("No pending"), "{}", out.content);
+    }
+
+    /// Both mailboxes down at once must still name both failures, not just
+    /// the first one checked.
+    #[tokio::test]
+    async fn list_change_requests_names_both_failures_when_both_mailboxes_are_down() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-both-down");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = "http://127.0.0.1:1".to_string();
+        config.errors_endpoint = "http://127.0.0.1:1".to_string();
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.contains("requests:"), "{}", out.content);
+        assert!(out.content.contains("errors:"), "{}", out.content);
+    }
+
+    /// Both checks actually run concurrently, not one after the other: two
+    /// servers that each hold the connection open past a plain sequential
+    /// budget would blow a strict wall-clock bound if awaited in sequence,
+    /// but comfortably fit it when joined. This doesn't reproduce the full
+    /// 30s client timeout (too slow for a test suite) -- it proves the
+    /// *shape* (concurrent, not additive) with short, deterministic delays.
+    #[tokio::test]
+    async fn list_change_requests_checks_both_mailboxes_concurrently() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn serve_after_delay(delay_ms: u64) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = socket.read(&mut chunk).await.expect("read");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") || n == 0 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let body = "[]";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.expect("write");
+                socket.shutdown().await.ok();
+            });
+            format!("http://{addr}")
+        }
+
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-concurrent");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let requests_endpoint = serve_after_delay(300).await;
+        let errors_endpoint = serve_after_delay(300).await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = requests_endpoint;
+        config.errors_endpoint = errors_endpoint;
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let started = std::time::Instant::now();
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+        let elapsed = started.elapsed();
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.contains("No pending"), "{}", out.content);
+        // Sequential would be >=600ms; concurrent should land close to
+        // 300ms. 500ms leaves real headroom for CI scheduling jitter while
+        // still failing if this regresses back to sequential.
+        assert!(elapsed.as_millis() < 500, "took {elapsed:?}, looks sequential not concurrent");
     }
 
     // ---- enable_auth ---------------------------------------------------------

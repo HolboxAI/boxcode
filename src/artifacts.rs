@@ -309,6 +309,33 @@ pub(crate) fn any_published_under(root: &Path) -> bool {
     load_registry().keys().any(|key| Path::new(key).starts_with(&root))
 }
 
+/// The artifact id(s) published at or under `root`, sorted for determinism
+/// (a `HashMap`'s own iteration order is not stable across runs).
+///
+/// Same prefix-matching as `any_published_under` -- this exists because
+/// `remembered_id`'s exact-key match is the *wrong* tool for a caller that
+/// only has a *workspace* root, not a specific published path: a project
+/// published as a single file registers under that file's own path, never
+/// equal to the directory `Workspace::new` resolves it to (see
+/// `any_published_under`'s doc comment). A caller that called
+/// `remembered_id(workspace_root)` directly would silently get `None` for
+/// exactly the single-file-published projects that are the common case --
+/// this was a real bug (a startup check paying the cost of a network call on
+/// every launch for such a project while never being able to find its id) --
+/// use this instead whenever the input is a workspace root, not a path a
+/// human or the model supplied for a specific artifact.
+pub(crate) fn ids_published_under(root: &Path) -> Vec<String> {
+    let Ok(root) = root.canonicalize() else { return Vec::new() };
+    let mut ids: Vec<String> = load_registry()
+        .into_iter()
+        .filter(|(key, _)| Path::new(key).starts_with(&root))
+        .map(|(_, entry)| entry.id)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// Projects this machine has published within the last `EXPIRY_HOURS` --
 /// path (already canonicalized, since that is how the registry keys it)
 /// paired with its artifact id, newest first. Bounded to the link's own
@@ -1491,6 +1518,53 @@ h1{background:url(logo.png)}"#;
             remember(&file, "hs3c6cb7");
             assert!(any_published_under(&dir), "todo.html is published, root should see it");
             assert!(any_published_under(&file), "the exact published path itself still counts");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The exact regression this function exists to fix: a single-file
+    /// publish's registry key is the file, not the workspace directory, so
+    /// a caller with only the workspace root (e.g. a startup check) needs
+    /// `ids_published_under`, not `remembered_id`, to actually find it.
+    #[test]
+    fn ids_published_under_finds_a_single_file_publish_from_the_workspace_root() {
+        crate::config::test_support::with_isolated_home(|| {
+            let dir = temp("ids-published-under-single-file");
+            let file = dir.join("todo.html");
+            write(&dir, "todo.html", "hi");
+
+            assert!(ids_published_under(&dir).is_empty(), "nothing published yet");
+            assert!(remembered_id(&dir).is_none(), "exact match on the dir must fail too -- sanity check");
+
+            remember(&file, "hs3c6cb7");
+
+            // The bug: remembered_id on the workspace root itself never
+            // finds it, because the registry key is the file, not the dir.
+            assert!(remembered_id(&dir).is_none(), "exact match still fails after publishing");
+            // The fix: ids_published_under sees through that the same way
+            // any_published_under already does.
+            assert_eq!(ids_published_under(&dir), vec!["hs3c6cb7".to_string()]);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn ids_published_under_dedupes_and_sorts_multiple_publishes() {
+        crate::config::test_support::with_isolated_home(|| {
+            let dir = temp("ids-published-under-multi");
+            write(&dir, "a.html", "a");
+            write(&dir, "b.html", "b");
+
+            remember(&dir.join("a.html"), "zzz22222");
+            remember(&dir.join("b.html"), "aaa11111");
+
+            assert_eq!(
+                ids_published_under(&dir),
+                vec!["aaa11111".to_string(), "zzz22222".to_string()],
+                "sorted, and stable regardless of registry iteration order"
+            );
 
             let _ = std::fs::remove_dir_all(&dir);
         });

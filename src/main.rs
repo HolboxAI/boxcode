@@ -256,19 +256,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // is spawned that isn't already mid-conversation, see the delivery
     // design in errors.rs/docs). Two guards keep this from repeating the
     // cost the /pull check was written to avoid:
-    //   - gated on `any_published_under`, a local, synchronous registry
-    //     read -- the common case (an unpublished project) pays no network
-    //     cost at all, not even a fast one.
+    //   - gated on (and now resolved via) `ids_published_under`, a local,
+    //     synchronous registry read -- the common case (an unpublished
+    //     project) pays no network cost at all, not even a fast one.
     //   - a short, separate timeout, well under `errors::list_pending`'s own
     //     30s client timeout (sized for an explicit tool call the user is
     //     already waiting on). A slow or unreachable errors service must
     //     delay the terminal coming up by a bounded couple of seconds at
     //     most, never by 30.
+    //
+    // Deliberately `ids_published_under`, not `any_published_under` +
+    // `errors::list_pending(ws.root(), ...)`: the latter pairing was a real
+    // bug -- `any_published_under` prefix-matches (so it correctly says
+    // "yes" for a project published as one file, whose registry key is the
+    // *file*, not the workspace directory), but `list_pending`'s own lookup
+    // is an exact match on whatever path it's given. Passing it the
+    // workspace root directly meant the gate said yes and the lookup then
+    // always failed for exactly that (common) case -- paying this check's
+    // network cost on every single launch, forever, while never being able
+    // to deliver a notice, with nothing visible to say so. Resolving the id
+    // once via `ids_published_under` and calling `list_pending_for_id`
+    // (which needs no path at all) closes that gap. Only the first id is
+    // checked when a workspace has published more than one artifact --
+    // deliberately not fanned out to all of them here, to keep this bounded
+    // at one 3s check per launch rather than one per artifact.
     if let Some(ws) = workspace.as_ref() {
-        if artifacts::any_published_under(ws.root()) {
+        if let Some(project_id) = artifacts::ids_published_under(ws.root()).into_iter().next() {
             let check = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
-                errors::list_pending(ws.root(), &app.config.tools.errors_endpoint),
+                errors::list_pending_for_id(&project_id, &app.config.tools.errors_endpoint),
             )
             .await;
             if let Ok(Ok(reported)) = check {

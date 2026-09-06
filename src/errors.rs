@@ -77,14 +77,34 @@ fn require_published(path: &Path) -> Result<String, String> {
 
 /// The pending reported errors waiting for the project published at `path`.
 /// `endpoint` is the control-plane's `/errors` URL.
+///
+/// `path` must be the exact artifact path (a specific file, or a directory
+/// published as a whole) -- this does an exact-key lookup via
+/// `artifacts::remembered_id`. A caller that only has a *workspace* root
+/// (which does not equal a single-file publish's own registry key -- see
+/// `artifacts::ids_published_under`'s doc comment) should resolve the id
+/// itself with `artifacts::ids_published_under` and call
+/// `list_pending_for_id` directly instead of this function.
 pub async fn list_pending(path: &Path, endpoint: &str) -> Result<Vec<ReportedError>, String> {
+    // Same check order as before this was split out (endpoint before
+    // publish-state), preserved deliberately: `an_unconfigured_endpoint_-
+    // explains_itself` below asserts specifically on which message wins
+    // when both are wrong.
     require_endpoint(endpoint)?;
     let project_id = require_published(path)?;
+    list_pending_for_id(&project_id, endpoint).await
+}
+
+/// Same as `list_pending`, but for a caller that has already resolved the
+/// project id itself -- see `list_pending`'s doc comment for when to use
+/// this instead.
+pub async fn list_pending_for_id(project_id: &str, endpoint: &str) -> Result<Vec<ReportedError>, String> {
+    require_endpoint(endpoint)?;
 
     let client = http_client()?;
     let response = client
         .get(endpoint)
-        .query(&[("project_id", project_id.as_str())])
+        .query(&[("project_id", project_id)])
         .send()
         .await
         .map_err(|e| format!("could not reach the errors service: {e}"))?;
@@ -329,6 +349,20 @@ mod tests {
             describe(&repeated),
             "[runtime error (×7)] TypeError: x is undefined — /checkout.js:12:4"
         );
+    }
+
+    /// The seam `main.rs`'s startup check actually uses now (via
+    /// `artifacts::ids_published_under`, which returns a resolved id
+    /// directly): no path resolution at all, just the id straight to the
+    /// service.
+    #[tokio::test]
+    async fn list_pending_for_id_skips_path_resolution_entirely() {
+        let response = r#"[{"id":"err_1","message":"boom","file":"/a.js","line":1,"col":1,"count":1,"first_seen_at":"t0","last_seen_at":"t0"}]"#;
+        let (endpoint, handle) = serve_once_and_capture_body(response).await;
+        let result = list_pending_for_id("proj-direct-id", &endpoint).await;
+        let _ = handle.await.expect("server task");
+        let errors = result.expect("should parse");
+        assert_eq!(errors.len(), 1);
     }
 
     #[test]
