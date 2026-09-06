@@ -4075,6 +4075,7 @@ async fn execute_list_change_requests(
     // would hide.
     let requests_configured = !config.requests_endpoint.trim().is_empty();
     let errors_configured = !config.errors_endpoint.trim().is_empty();
+    let configured_count = usize::from(requests_configured) + usize::from(errors_configured);
 
     // Run both checks concurrently, not sequentially -- each has its own 30s
     // client timeout, so one after the other made the worst case ~60s for a
@@ -4098,34 +4099,57 @@ async fn execute_list_change_requests(
         }
     );
 
-    // A failure on either configured mailbox is always reported, and both
-    // are named if both failed -- previously only the requests-mailbox
-    // error message survived even when both had failed.
-    let mut failures = Vec::new();
+    let mut failures: Vec<(&str, String)> = Vec::new();
     if let Some(Err(e)) = &requests_result {
-        failures.push(format!("requests: {e}"));
+        failures.push(("requests", e.clone()));
     }
     if let Some(Err(e)) = &errors_result {
-        failures.push(format!("errors: {e}"));
+        failures.push(("errors", e.clone()));
     }
-    if !failures.is_empty() {
+
+    // Hard-fail only when *every* configured mailbox failed -- there is
+    // nothing left to show. Both `requests_endpoint`/`errors_endpoint`
+    // default to a real URL (`config.rs`'s
+    // `default_requests_endpoint`/`default_errors_endpoint`), so "errors is
+    // configured" is true for every user today whether or not
+    // `infra/errors/` has actually been deployed to that URL yet -- if a
+    // still-working requests mailbox got discarded here just because the
+    // errors mailbox (often unreachable simply because nobody has run
+    // `infra/errors/setup.sh` in production yet) failed, this tool would
+    // regress from "occasionally silently swallows a failure" to "loses
+    // every real user's real pending requests the moment this ships." See
+    // the soft-degrade note appended below instead for a failure that
+    // isn't total.
+    if !failures.is_empty() && failures.len() == configured_count {
+        let message =
+            failures.iter().map(|(name, e)| format!("{name}: {e}")).collect::<Vec<_>>().join("; ");
         return outcome(
             &call.id,
             format!("\u{1F4E8} requests {} \u{2014} failed", clip(&path, 40)),
-            format!("Error: {}", failures.join("; ")),
+            format!("Error: {message}"),
         );
     }
 
-    // Only `None` (not configured) or `Some(Ok(_))` can reach here -- any
-    // `Some(Err(_))` already returned above.
+    // Only `None` (not configured) or `Some(Ok(_))` can reach here for a
+    // mailbox that isn't in `failures` -- a `Some(Err(_))` on its own
+    // (i.e. a *partial* failure) still needs to fall through to the
+    // rendering below, so whatever DID succeed is not thrown away.
     let requests = requests_result.and_then(|r| r.ok()).unwrap_or_default();
     let errors = errors_result.and_then(|r| r.ok()).unwrap_or_default();
+
+    // A partial failure is a note attached to real output, not a reason to
+    // discard it -- the model (and Dhruv) should see both what's pending
+    // AND that one mailbox couldn't be reached, not one or the other.
+    let notes: String = failures
+        .iter()
+        .map(|(name, e)| format!("\n\n(note: the {name} mailbox could not be reached: {e})"))
+        .collect();
 
     if requests.is_empty() && errors.is_empty() {
         return outcome(
             &call.id,
             "\u{1F4E8} requests \u{2014} none pending".to_string(),
-            "No pending change requests or reported errors.".to_string(),
+            format!("No pending change requests or reported errors.{notes}"),
         );
     }
 
@@ -4140,7 +4164,7 @@ async fn execute_list_change_requests(
         format!("\u{1F4E8} requests \u{2014} {count} pending"),
         format!(
             "{}\n\nCall {RESOLVE_CHANGE_REQUEST} with an id once you have acted on it (or \
-             decided not to).",
+             decided not to).{notes}",
             lines.join("\n")
         ),
     )
@@ -7360,13 +7384,20 @@ mod tests {
         assert!(!out.content.to_lowercase().contains("error:"), "{}", out.content);
     }
 
-    /// The actual regression this fix closes: before it, a *configured but
-    /// unreachable* `requests_endpoint` was silently reported as "no pending
-    /// change requests or reported errors" the moment `errors_endpoint`
-    /// succeeded (or was also unconfigured) -- indistinguishable from there
-    /// really being nothing pending. It must fail loudly instead.
+    /// Corrected shape: a *configured but unreachable* `requests_endpoint`
+    /// must never be silently indistinguishable from "nothing pending" --
+    /// but with `errors_endpoint` genuinely configured and reachable (even
+    /// if it has zero pending items), this is a *partial* failure, not a
+    /// total one, so it degrades to a soft note rather than discarding a
+    /// mailbox that actually works. (A previous version of this fix
+    /// over-corrected the other direction: it hard-failed on ANY configured
+    /// mailbox erroring, which meant `errors_endpoint`'s real shipped
+    /// default -- a URL that may not have `infra/errors/` deployed to it
+    /// yet -- could make every user's `list_change_requests` call fail
+    /// outright and lose their real, working requests mailbox. See the
+    /// "both mailboxes down" test below for the actual hard-fail case.)
     #[tokio::test]
-    async fn list_change_requests_surfaces_a_genuine_requests_service_failure_loudly() {
+    async fn list_change_requests_softens_a_requests_failure_when_errors_still_works() {
         let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fake_home = tempfile::tempdir().expect("temp home");
         let prev_home = std::env::var("HOME").ok();
@@ -7392,17 +7423,18 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
 
-        assert!(out.content.to_lowercase().contains("error:"), "{}", out.content);
-        assert!(out.content.contains("requests:"), "{}", out.content);
-        assert!(!out.content.contains("No pending"), "{}", out.content);
+        // Not a hard failure -- errors genuinely succeeded (with zero
+        // items), so the tool reports "no pending" plus a note, never a
+        // bare "Error:".
+        assert!(!out.content.to_lowercase().starts_with("error:"), "{}", out.content);
+        assert!(out.content.contains("No pending"), "{}", out.content);
+        assert!(out.content.contains("note:"), "{}", out.content);
+        assert!(out.content.contains("requests"), "{}", out.content);
     }
 
-    /// Same proof, mirrored for the errors mailbox: previously an errors
-    /// failure was *always* swallowed via a bare `unwrap_or_default()`,
-    /// regardless of whether requests succeeded -- there was no path to a
-    /// loud failure for this side at all.
+    /// Same proof, mirrored for the errors mailbox.
     #[tokio::test]
-    async fn list_change_requests_surfaces_a_genuine_errors_service_failure_loudly() {
+    async fn list_change_requests_softens_an_errors_failure_when_requests_still_works() {
         let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fake_home = tempfile::tempdir().expect("temp home");
         let prev_home = std::env::var("HOME").ok();
@@ -7426,9 +7458,57 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
 
-        assert!(out.content.to_lowercase().contains("error:"), "{}", out.content);
-        assert!(out.content.contains("errors:"), "{}", out.content);
-        assert!(!out.content.contains("No pending"), "{}", out.content);
+        assert!(!out.content.to_lowercase().starts_with("error:"), "{}", out.content);
+        assert!(out.content.contains("No pending"), "{}", out.content);
+        assert!(out.content.contains("note:"), "{}", out.content);
+        assert!(out.content.contains("errors"), "{}", out.content);
+    }
+
+    /// The exact scenario a live-production review caught: a real, working
+    /// requests mailbox with a genuine pending request, alongside an
+    /// `errors_endpoint` that is configured (its shipped default, pointing
+    /// at a real host) but not yet actually reachable there because
+    /// `infra/errors/setup.sh` hasn't been run in production yet. The real
+    /// pending request must still show up -- not get thrown away just
+    /// because an unrelated, not-yet-deployed mailbox failed.
+    #[tokio::test]
+    async fn list_change_requests_still_shows_real_pending_items_despite_a_partial_failure() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-partial-failure");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let pending_request = r#"[{"id":"req_real123","text":"move the search button right","created_at":"2026-01-01T00:00:00Z"}]"#;
+        let (requests_endpoint, _handle) = serve_once_and_capture_body(pending_request).await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = requests_endpoint;
+        // Simulates the real shipped default pointing at a host where
+        // infra/errors/ has not been deployed yet: configured, but the
+        // service isn't actually there.
+        config.errors_endpoint = "http://127.0.0.1:1".to_string();
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            out.content.contains("move the search button right"),
+            "the real pending request must not be discarded: {}",
+            out.content
+        );
+        assert!(out.content.contains("req_real123"), "{}", out.content);
+        assert!(out.content.contains("note:"), "{}", out.content);
+        assert!(out.content.contains("errors"), "{}", out.content);
+        assert!(!out.content.to_lowercase().starts_with("error:"), "{}", out.content);
     }
 
     /// Both mailboxes down at once must still name both failures, not just
