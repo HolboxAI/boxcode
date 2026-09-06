@@ -1,0 +1,23 @@
+[Unit]
+Description=boxcode runtime-error control-plane
+After=network.target
+
+[Service]
+# System node is fine here -- unlike infra/db, nothing in this service needs
+# node:sqlite or any other recent-Node feature.
+ExecStart=/usr/bin/node /opt/boxcode-errors/control-plane/index.mjs
+Restart=on-failure
+RestartSec=2
+Environment=STORE_PATH=/opt/boxcode-errors/errors.json
+Environment=PORT=8083
+Environment=ALLOWED_ORIGIN=https://boxcode.sh
+Environment=SITE_BASE=https://boxcode.sh
+# Root only because /opt/boxcode-errors needs creating on first run, same
+# reasoning as the auth/db/requests control-planes -- this service shells out
+# to nothing and touches no other system state, so root is a wider grant than
+# it actually needs. A dedicated non-root service user is the first thing to
+# add if this box stops being single-tenant-per-project-trusted.
+User=root
+
+[Install]
+WantedBy=multi-user.target
