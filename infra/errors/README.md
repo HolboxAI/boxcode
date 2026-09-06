@@ -155,3 +155,23 @@ same reasoning as `infra/requests/`'s equivalent endpoints.
   reasoning as `infra/auth/`'s in-memory attempt counters: a file write on
   every submission attempt, including ones about to be rejected, would
   itself be a thing to abuse.
+- The per-project rate limit is not itself hardened against the same
+  no-real-auth gap above: since verification only proves a project id is
+  real and live, not that the caller is the project's own page, anyone who
+  knows a project's public artifact id (visible in its page URL) can submit
+  enough distinct-looking junk to exhaust that project's rate-limit budget
+  before its real errors arrive -- and, given `pruneIfNeeded` evicts the
+  lowest-`count` records first, can eventually evict genuine one-off error
+  reports too. Same root cause and same future fix (real per-project
+  submission auth) as the injection gap above, not a separate problem.
+- The store is now an in-memory cache flushed to disk at most once every
+  `FLUSH_INTERVAL_MS` (default 1s), not written on every mutation -- added
+  specifically so a flood of *repeated* identical reports (which cost
+  nothing against the rate limit, by design) cannot each also force a full
+  disk read+write inside the lock every other project's submissions queue
+  behind. A mutation can be lost if the process is killed (not merely
+  restarted -- shutdown handlers flush on `SIGTERM`/`SIGINT`) within that
+  window. Accepted for the same reason as the in-memory rate-limit
+  counters above: this is a mailbox for automatically-regenerated error
+  reports, not a system of record -- a lost mutation just means the
+  browser reports the same error again if the bug recurs.
