@@ -26,7 +26,7 @@
 // `node:http`/`node:crypto`/`node:fs` are all this needs.
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
-import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod, rename } from "node:fs/promises";
 import path from "node:path";
 
 const STORE_PATH = process.env.STORE_PATH || "/opt/boxcode-errors/errors.json";
@@ -96,6 +96,34 @@ function fail(res, code, message, extraHeaders = {}) {
   res.end(JSON.stringify({ error: message }));
 }
 
+// The submitting beacon is fire-and-forget (sendBeacon never sees the
+// response) and artifact verification fails closed, so a silently-broken
+// dependency (the artifact service down, say) would otherwise drop every
+// submission from every project with nothing anywhere to notice by. This is
+// deliberately not a metrics/logging library -- a periodic summary line on
+// this process's own stdout, which is all a zero-dependency service like
+// this one needs to make an extended outage visible instead of invisible.
+const rejectionCounts = { badRequest: 0, notFound: 0, rateLimited: 0 };
+function trackRejection(kind) {
+  rejectionCounts[kind] = (rejectionCounts[kind] || 0) + 1;
+}
+const REJECTION_LOG_INTERVAL_MS = 5 * 60 * 1000;
+setInterval(() => {
+  const { badRequest, notFound, rateLimited } = rejectionCounts;
+  const total = badRequest + notFound + rateLimited;
+  if (total === 0) return;
+  console.log(
+    `[errors] rejected ${total} submission(s) in the last ` +
+      `${Math.round(REJECTION_LOG_INTERVAL_MS / 60000)}m ` +
+      `(400:${badRequest} 404:${notFound} 429:${rateLimited})`
+  );
+  rejectionCounts.badRequest = 0;
+  rejectionCounts.notFound = 0;
+  rejectionCounts.rateLimited = 0;
+  // unref() so this interval alone can never keep the process alive -- it's
+  // an observability aid, not a reason to stay up.
+}, REJECTION_LOG_INTERVAL_MS).unref();
+
 function corsHeaders() {
   return {
     "access-control-allow-origin": ALLOWED_ORIGIN,
@@ -112,14 +140,167 @@ async function loadStore() {
   }
 }
 
+// In-memory cache of the store, kept warm for the process lifetime, plus a
+// dirty flag and a periodic flush (below) instead of a disk write on every
+// mutation. Added because the dedup path -- the one this whole file exists
+// to make cheap -- still did a full disk read+write per repeat even after
+// dedup stopped charging the rate limit: proven the hard way, a flood of 500
+// identical submissions from one project (all accepted, since repeats are
+// free) each did a full loadStore/JSON.stringify(whole store)/writeFile/
+// rename inside the SAME global withStoreLock every other project's
+// submissions queue behind, and a concurrent, unrelated project's single
+// genuine error sat blocked for 12+ seconds behind that queue. Real bugs
+// don't repeat identically thousands of times a minute; a broken render
+// loop does, and that is exactly the traffic this coalesces.
+//
+// Correctness still comes from withStoreLock, unchanged: every mutation
+// below still runs inside it, so the "read, decide, mutate" sequence for two
+// concurrent submissions can never interleave (proven: two concurrent
+// submissions of the same new error produce count 2, never 1, across every
+// probe). What changed is what happens to disk, not who is allowed to touch
+// `cachedStore` at once -- mutations flip a dirty flag instead of writing,
+// and a single periodic timer (also inside the lock, so it can never race a
+// mutation either) does the actual write, at most once per FLUSH_INTERVAL_MS
+// regardless of how many mutations happened in between.
+//
+// Tradeoff, stated plainly: a mutation can be lost if the process is killed
+// (not merely restarted -- see the SIGTERM/SIGINT flush below) between the
+// mutation and the next flush, a window of at most FLUSH_INTERVAL_MS. For an
+// automatically-regenerated error report (the browser will just report it
+// again if the bug recurs) this is the same "a restart clears it, worst case
+// one project gets a fresh window early" tradeoff this file already accepts
+// for the in-memory rate-limiter state above -- not a new risk class.
+let cachedStore = null;
+let loadPromise = null;
+let storeDirty = false;
+
+// Guards against two concurrent callers both missing the cache before either
+// has finished the first load and each independently loading (and one
+// silently clobbering the other's reference). Reachable even though
+// submit()/resolveError() already serialize via withStoreLock, because
+// listPending() (a plain GET) reads the cache WITHOUT the lock -- a GET
+// racing the very first POST/resolve at process startup is the case this
+// closes.
+async function getStore() {
+  if (cachedStore) return cachedStore;
+  if (!loadPromise) {
+    loadPromise = loadStore().then((s) => {
+      cachedStore = s;
+      return s;
+    });
+  }
+  return loadPromise;
+}
+
+function markDirty() {
+  storeDirty = true;
+}
+
+// Persists `cachedStore` if (and only if) something has mutated it since the
+// last flush. Clears the dirty flag BEFORE writing, not after: any mutation
+// that lands during the write's own awaits (mkdir/writeFile/rename) sets the
+// flag true again on its own, synchronously, before this function's `await
+// saveStore` resumes -- so a write-in-flight never causes a later mutation
+// to be silently skipped, it just waits for the next tick. If the write
+// itself fails, the flag is restored so the next periodic tick retries
+// rather than treating a failed persist as done.
+async function flushIfDirty() {
+  if (!storeDirty) return;
+  storeDirty = false;
+  try {
+    await saveStore(cachedStore);
+  } catch (err) {
+    storeDirty = true;
+    throw err;
+  }
+}
+
+// Bounds how stale the on-disk copy can be, independent of submission
+// volume -- the entire point of decoupling persistence from the request
+// path. Runs inside withStoreLock so it can never race a mutation's own
+// read-modify-write against the same `cachedStore` object.
+const FLUSH_INTERVAL_MS = Number(process.env.FLUSH_INTERVAL_MS || 1000);
+setInterval(() => {
+  withStoreLock(flushIfDirty).catch((err) => {
+    console.error("[errors] periodic flush failed:", err && err.message);
+  });
+}, FLUSH_INTERVAL_MS).unref();
+
+// pruneExpired used to run inside submit() on every single call -- a full
+// O(store size) scan of every record for every project, paid by every
+// submission including dedup hits that otherwise cost nothing. Harmless
+// against a small store, but it was the next bottleneck uncovered once the
+// per-submission disk write above was removed: a flood of 500 identical
+// submissions against a realistic 10k-record store dropped from 12s (disk
+// I/O in the lock) to ~1.25s (this scan, still in the lock) before moving it
+// here. Expiry does not need per-request precision -- a record that is 30
+// days old does not meaningfully change if it is actually pruned this
+// second or up to a minute from now -- so it runs on its own, much less
+// frequent timer instead, still inside withStoreLock so it can never race a
+// submission's own read-modify-write.
+const PRUNE_INTERVAL_MS = Number(process.env.PRUNE_INTERVAL_MS || 60 * 1000);
+setInterval(() => {
+  withStoreLock(async () => {
+    const store = await getStore();
+    const before = Object.keys(store).length;
+    pruneExpired(store);
+    if (Object.keys(store).length !== before) markDirty();
+  }).catch((err) => {
+    console.error("[errors] periodic prune failed:", err && err.message);
+  });
+}, PRUNE_INTERVAL_MS).unref();
+
+// Best-effort final flush on an ordinary shutdown (not a crash -- nothing
+// can catch that) so a plain restart/redeploy does not lose whatever landed
+// in the last FLUSH_INTERVAL_MS.
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    withStoreLock(flushIfDirty)
+      .catch((err) => console.error("[errors] shutdown flush failed:", err && err.message))
+      .finally(() => process.exit(0));
+  });
+}
+
+// Writes are atomic (write to a sibling temp file, then rename() over the
+// real path -- rename is atomic on the same filesystem, a direct overwrite is
+// not) AND serialized (see withStoreLock below). Atomicity alone is not
+// enough: two concurrent load-modify-save cycles can still race each other
+// and each overwrite the other's changes even if each individual save() is
+// itself atomic. Both together are what a concurrent flood of distinct
+// submissions actually needs -- proven the hard way: an earlier version of
+// this file did a bare `writeFile` with no rename and no lock, and 40
+// concurrent distinct submissions corrupted the store file entirely (the
+// interleaved writes produced unparseable JSON), which loadStore's `catch`
+// then silently treated as an empty store on the very next write, destroying
+// every previously-stored report for every project on the host.
 async function saveStore(store) {
-  await mkdir(path.dirname(STORE_PATH), { recursive: true });
-  await writeFile(STORE_PATH, JSON.stringify(store, null, 2), { mode: 0o600 });
+  const dir = path.dirname(STORE_PATH);
+  await mkdir(dir, { recursive: true });
+  const tmpPath = path.join(dir, `.errors.json.tmp.${process.pid}.${randomUUID()}`);
+  await writeFile(tmpPath, JSON.stringify(store, null, 2), { mode: 0o600 });
   // See infra/requests/'s saveStore for why this chmod is needed even though
   // `mode` is also passed above: it only applies when writeFile creates the
   // file, not when it overwrites one that already existed under wider
   // permissions.
-  await chmod(STORE_PATH, 0o600);
+  await chmod(tmpPath, 0o600);
+  await rename(tmpPath, STORE_PATH);
+}
+
+// Serializes every load-modify-save cycle against the store file so
+// concurrent requests never interleave. A single in-process promise chain is
+// enough for a single-process Node service -- no external lock or database
+// needed. `withStoreLock` always advances the queue (via `.catch(() => {})`)
+// even when `fn` throws, so one failed operation can never wedge every
+// operation after it; the caller still sees the real rejection via the
+// returned promise, only the internal queue-advancement swallows it.
+let storeQueue = Promise.resolve();
+function withStoreLock(fn) {
+  const result = storeQueue.then(fn, fn);
+  storeQueue = result.then(
+    () => {},
+    () => {}
+  );
+  return result;
 }
 
 // True when `id` names an artifact that is actually published and serving.
@@ -210,42 +391,67 @@ function pruneExpired(store) {
   }
 }
 
+// Returns `{ id, deduped }` on success or `{ rateLimited: true }` if a
+// genuinely new record was refused for exceeding the per-project budget.
+//
+// Dedup runs BEFORE the rate-limit check, and only a genuinely-new record
+// charges the rate limit -- deliberately, not incidentally. Repeated reports
+// of the exact same bug (the traffic pattern this service exists to absorb)
+// collapse into one record's count and cost nothing against the budget, so
+// they can never crowd out a later, genuinely distinct error from the same
+// project. The whole load-dedup-ratelimit-mutate sequence runs inside
+// withStoreLock so a burst of concurrent identical submissions cannot each
+// see "no existing record yet" and each create their own. Persistence is
+// separate (see getStore/markDirty/flushIfDirty above): a mutation here
+// marks the in-memory store dirty rather than writing it, so a flood of
+// dedup hits costs no disk I/O at all, only the periodic flush does.
 async function submit(projectId, message, file, line, col) {
-  const store = await loadStore();
-  pruneExpired(store);
+  return withStoreLock(async () => {
+    const store = await getStore();
 
-  const key = dedupeKey({ message, file, line, col });
-  const existing = Object.values(store).find(
-    (r) => r.project_id === projectId && r.status === "pending" && dedupeKey(r) === key
-  );
-  if (existing) {
-    existing.count += 1;
-    existing.last_seen_at = new Date().toISOString();
-    await saveStore(store);
-    return { id: existing.id, deduped: true };
-  }
+    const key = dedupeKey({ message, file, line, col });
+    const existing = Object.values(store).find(
+      (r) => r.project_id === projectId && r.status === "pending" && dedupeKey(r) === key
+    );
+    if (existing) {
+      existing.count += 1;
+      existing.last_seen_at = new Date().toISOString();
+      markDirty();
+      return { id: existing.id, deduped: true };
+    }
 
-  const id = randomUUID();
-  const now = new Date().toISOString();
-  store[id] = {
-    id,
-    project_id: projectId,
-    message,
-    file,
-    line,
-    col,
-    count: 1,
-    status: "pending",
-    first_seen_at: now,
-    last_seen_at: now,
-  };
-  await pruneIfNeeded(store, projectId);
-  await saveStore(store);
-  return { id, deduped: false };
+    if (rateLimited(projectId)) {
+      return { rateLimited: true };
+    }
+
+    const id = `err_${randomUUID()}`;
+    const now = new Date().toISOString();
+    store[id] = {
+      id,
+      project_id: projectId,
+      message,
+      file,
+      line,
+      col,
+      count: 1,
+      status: "pending",
+      first_seen_at: now,
+      last_seen_at: now,
+    };
+    await pruneIfNeeded(store, projectId);
+    markDirty();
+    return { id, deduped: false };
+  });
 }
 
+// Reads the same in-memory cache submit()/resolveError() mutate, not a fresh
+// disk load -- so a GET reflects the latest count/status even when it
+// hasn't been flushed to disk yet. Deliberately not wrapped in
+// withStoreLock: this only reads (filter/sort/map, no mutation), and every
+// mutation elsewhere is itself synchronous once it has the store reference,
+// so there is no half-mutated state for a concurrent read to observe.
 async function listPending(projectId, includeAll) {
-  const store = await loadStore();
+  const store = await getStore();
   return Object.values(store)
     .filter((r) => r.project_id === projectId && (includeAll || r.status === "pending"))
     .sort((a, b) => a.first_seen_at.localeCompare(b.first_seen_at))
@@ -261,18 +467,29 @@ async function listPending(projectId, includeAll) {
     }));
 }
 
-// Returns "resolved" | "not-found" | "wrong-project".
+// Returns "resolved" | "not-found" | "wrong-project". Goes through the same
+// withStoreLock as submit() -- both mutate the same in-memory store, and a
+// resolve racing a submit (or another resolve) is exactly the interleaving
+// that made the store corruptible before the lock existed. Marks dirty
+// rather than saving immediately, same reasoning as submit() -- resolve is
+// inherently low-frequency (a human action), so this isn't where the
+// flood-of-writes problem lives, and giving it a separate immediate-save
+// path would only add a second persistence mechanism to reason about for no
+// real benefit: it is still bounded by the same FLUSH_INTERVAL_MS, and a
+// graceful shutdown flushes it same as any other pending mutation.
 async function resolveError(id, projectId) {
-  const store = await loadStore();
-  const entry = store[id];
-  if (!entry) return "not-found";
-  if (entry.project_id !== projectId) return "wrong-project";
-  if (entry.status !== "resolved") {
-    entry.status = "resolved";
-    entry.resolved_at = new Date().toISOString();
-    await saveStore(store);
-  }
-  return "resolved";
+  return withStoreLock(async () => {
+    const store = await getStore();
+    const entry = store[id];
+    if (!entry) return "not-found";
+    if (entry.project_id !== projectId) return "wrong-project";
+    if (entry.status !== "resolved") {
+      entry.status = "resolved";
+      entry.resolved_at = new Date().toISOString();
+      markDirty();
+    }
+    return "resolved";
+  });
 }
 
 // The beacon is generic and dependency-free on purpose, same stance as
@@ -338,7 +555,28 @@ function beaconScript() {
 `;
 }
 
+// The whole body runs inside one try/catch: an uncaught exception in an
+// async request listener (a disk I/O failure from saveStore's
+// mkdir/writeFile/rename, say -- disk full, a permissions change, the store
+// directory removed out from under it) would otherwise be an unhandled
+// promise rejection that crashes the entire process, taking down every
+// other project's requests along with the one that failed. A submission
+// failing with a clean 500 is recoverable (the beacon gets no response
+// either way, fire-and-forget); the whole service going down is not.
 const server = createServer(async (req, res) => {
+  try {
+    await handleRequest(req, res);
+  } catch (err) {
+    console.error("[errors] request handler threw:", err && err.message);
+    if (!res.headersSent) {
+      fail(res, 500, "internal error", corsHeaders());
+    } else {
+      res.end();
+    }
+  }
+});
+
+async function handleRequest(req, res) {
   const url = new URL(req.url, "http://localhost");
 
   if (req.method === "GET" && url.pathname === "/errors-beacon.js") {
@@ -363,44 +601,64 @@ const server = createServer(async (req, res) => {
     try {
       parsed = JSON.parse(body || "{}");
     } catch {
+      trackRejection("badRequest");
       return fail(res, 400, "body is not JSON", corsHeaders());
     }
 
     const projectId = parsed.project_id;
     if (typeof projectId !== "string" || !PROJECT_ID_RE.test(projectId)) {
+      trackRejection("badRequest");
       return fail(res, 400, "project_id must look like a boxcode artifact id", corsHeaders());
     }
     const message = typeof parsed.message === "string" ? parsed.message.trim() : "";
     if (!message) {
+      trackRejection("badRequest");
       return fail(res, 400, "message must be a non-empty string", corsHeaders());
     }
     const file = typeof parsed.file === "string" ? stripQuery(parsed.file.trim()) : "";
-    const line = Number.isFinite(parsed.line) ? Math.trunc(parsed.line) : 0;
-    const col = Number.isFinite(parsed.col) ? Math.trunc(parsed.col) : 0;
+    // Clamped non-negative: the Rust side (src/errors.rs) declares line/col
+    // as unsigned, so a negative value here would fail to deserialize on
+    // that end -- silently, since an unconfigured-vs-unreachable distinction
+    // swallows the resulting error. Clamp rather than reject outright: a
+    // malformed line/col from a weird browser is still a real error worth
+    // recording, just not at a nonsensical position.
+    const line = Number.isFinite(parsed.line) ? Math.max(0, Math.trunc(parsed.line)) : 0;
+    const col = Number.isFinite(parsed.col) ? Math.max(0, Math.trunc(parsed.col)) : 0;
 
-    if (rateLimited(projectId)) {
-      return fail(
-        res,
-        429,
-        `this project is reporting errors faster than ${RATE_LIMIT_PER_PROJECT} per ` +
-          `${Math.round(RATE_WINDOW_MS / 60000)} minutes; likely a loop, not distinct bugs`,
-        corsHeaders()
-      );
-    }
-
+    // Artifact verification runs before anything that touches the rate
+    // limiter or the store, deliberately: rate-limiting first (as an earlier
+    // version of this file did) let anyone who knows a victim's PUBLIC
+    // artifact id (it's in the page URL) burn that project's rate-limit
+    // budget with junk POSTs before its real errors ever arrive, without
+    // needing to pass verification at all -- a cross-project DoS costing the
+    // attacker nothing. Checking verification first means an attacker still
+    // needs a real, live artifact id to affect anything.
     if (!(await artifactExists(projectId))) {
+      trackRejection("notFound");
       return fail(res, 404, `no artifact is published at ${SITE_BASE}/artifacts/${projectId}`, corsHeaders());
     }
 
-    const { id, deduped } = await submit(
+    const result = await submit(
       projectId,
       truncate(message, MAX_MESSAGE_LENGTH),
       truncate(file, MAX_FILE_LENGTH),
       line,
       col
     );
+    if (result.rateLimited) {
+      trackRejection("rateLimited");
+      return fail(
+        res,
+        429,
+        `this project is reporting genuinely new-looking errors faster than ` +
+          `${RATE_LIMIT_PER_PROJECT} per ${Math.round(RATE_WINDOW_MS / 60000)} minutes; ` +
+          `likely a loop, not distinct bugs (exact repeats of an already-seen error are ` +
+          `deduped and never count against this)`,
+        corsHeaders()
+      );
+    }
     res.writeHead(200, { "content-type": "application/json", ...corsHeaders() });
-    res.end(JSON.stringify({ ok: true, id, deduped }));
+    res.end(JSON.stringify({ ok: true, id: result.id, deduped: result.deduped }));
     return;
   }
 
@@ -443,7 +701,7 @@ const server = createServer(async (req, res) => {
   }
 
   fail(res, 404, "no such route");
-});
+}
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`boxcode errors control-plane listening on 127.0.0.1:${PORT}`);
