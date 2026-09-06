@@ -126,12 +126,22 @@ same reasoning as `infra/requests/`'s equivalent endpoints.
 ## Known limitations
 
 - No auth on submission beyond `project_id` naming a real, live artifact --
-  anyone who knows (or guesses) a project id, and can reach a page that
-  publishes to it, could in principle submit fabricated error reports
-  against it up to the rate limit. Bounded by the rate limit and dedup, and
-  by the fact a wrong report just wastes a developer's own attention rather
-  than doing anything worse -- but worth knowing, especially since (unlike
-  `infra/requests/`) these reports are read automatically.
+  and, sharper than that sounds: `artifactExists()` only proves the artifact
+  is live, not that a given POST actually came from that artifact's own
+  page. There is no Origin/Referer check anywhere in this file, and CORS
+  constrains browser JS, not a direct `curl`/`sendBeacon`-equivalent call --
+  so anyone who knows (or guesses, `PROJECT_ID_RE` is only 4-16
+  lowercase-alnum chars) a project's PUBLIC artifact id can submit arbitrary
+  `message` text against it directly, with no need to ever touch the real
+  page. Bounded by the rate limit, dedup, and the fixed field allowlist (no
+  stack, no arbitrary properties), but this is a real, open gap, not a
+  theoretical one: unlike `infra/requests/` (a human reads a request before
+  acting on it), `src/errors.rs` folds pending error reports straight into
+  the model's context automatically the next time a boxcode session opens
+  that project -- so this is a live prompt-injection channel, gated only by
+  guessing a public id. Real authentication (a per-project submission token
+  minted at publish time, say) is future work, deliberately not attempted in
+  this pass.
 - Published artifacts expire 48 hours after `publish_artifact`
   (`EXPIRY_HOURS` in `src/artifacts.rs`) unless republished. Error
   reporting only has a real window on artifacts the developer keeps
