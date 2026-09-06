@@ -861,19 +861,28 @@ pub fn schemas_for(
             "type": "function",
             "function": {
                 "name": LIST_CHANGE_REQUESTS,
-                "description": "Check an already-published project's change-request mailbox for \
-                                pending requests left by whoever is looking at the live page --\
-                                typically the developer themselves, from a phone, hours after \
-                                publishing. Requires the path to have been published with \
-                                publish_artifact first, same as enable_auth/db_query. To let \
-                                visitors leave requests in the first place, add this exact tag to \
-                                the published HTML with edit_file, then publish_artifact again: \
-                                <script src=\"https://auth.boxcode.sh/requests-widget.js\" \
-                                data-project=\"<the artifact id>\"></script> -- there is no \
-                                separate 'enable' tool for that, it is just a script tag like any \
-                                other. Each result has an id, the request text, and when it was \
-                                submitted. After acting on one (or deciding not to), call \
-                                resolve_change_request with its id so it does not keep showing up.",
+                "description": "Check an already-published project's mailbox for pending change \
+                                requests AND reported runtime errors. Change requests are left by \
+                                whoever is looking at the live page -- typically the developer \
+                                themselves, from a phone, hours after publishing. Reported errors \
+                                are automatic: a real visitor's browser hit a JS error and it was \
+                                beaconed back, unprompted. Requires the path to have been published \
+                                with publish_artifact first, same as enable_auth/db_query. To let \
+                                visitors leave requests, add this exact tag to the published HTML \
+                                with edit_file, then publish_artifact again: <script \
+                                src=\"https://auth.boxcode.sh/requests-widget.js\" \
+                                data-project=\"<the artifact id>\"></script>. To start receiving \
+                                error reports, add this one instead: <script \
+                                src=\"https://auth.boxcode.sh/errors-beacon.js\" \
+                                data-project=\"<the artifact id>\"></script>. Neither needs a \
+                                separate 'enable' tool -- they are just script tags like any other, \
+                                and both can be present at once. Each result has an id and, for a \
+                                change request, its text and when it was submitted; a reported \
+                                error is prefixed \"[runtime error]\" (or \"[runtime error \
+                                (×N)]\" if it has recurred) and names the message, file, line and \
+                                column. After acting on one (or deciding not to), call \
+                                resolve_change_request with its id so it does not keep showing up \
+                                -- the same tool resolves either kind.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -890,10 +899,13 @@ pub fn schemas_for(
             "type": "function",
             "function": {
                 "name": RESOLVE_CHANGE_REQUEST,
-                "description": "Mark one change request from list_change_requests as handled, so \
-                                it stops showing up as pending. Call this once you have made the \
-                                change it asked for (or decided not to) -- it does not undo or \
-                                re-apply anything by itself, it only clears the mailbox.",
+                "description": "Mark one change request OR reported error from \
+                                list_change_requests as handled, so it stops showing up as \
+                                pending. Call this once you have made the change it asked for (or \
+                                fixed the reported error, or decided not to) -- it does not undo \
+                                or re-apply anything by itself, it only clears the mailbox. Works \
+                                for either kind of entry; which mailbox it routes to is decided by \
+                                the id itself, not by anything you need to specify.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -903,7 +915,7 @@ pub fn schemas_for(
                         },
                         "id": {
                             "type": "string",
-                            "description": "The request's id, from list_change_requests."
+                            "description": "The id of the change request or reported error, from list_change_requests."
                         }
                     },
                     "required": ["path", "id"]
@@ -4048,32 +4060,114 @@ async fn execute_list_change_requests(
         }
     };
 
-    match crate::requests::list_pending(&resolved, &config.requests_endpoint).await {
-        Ok(requests) if requests.is_empty() => outcome(
-            &call.id,
-            "\u{1F4E8} requests \u{2014} none pending".to_string(),
-            "No pending change requests.".to_string(),
-        ),
-        Ok(requests) => {
-            let count = requests.len();
-            let json = serde_json::to_string_pretty(&requests).unwrap_or_default();
-            outcome(
-                &call.id,
-                format!(
-                    "\u{1F4E8} requests \u{2014} {count} pending",
-                ),
-                format!(
-                    "{json}\n\nCall {RESOLVE_CHANGE_REQUEST} with an id once you have acted on \
-                     it (or decided not to)."
-                ),
-            )
+    // Both mailboxes belong to the same published project and the model
+    // reads them as one merged list (see the tool description), but they are
+    // two independent services -- checked BEFORE calling either, not
+    // inferred from the Err afterward, so "not configured" (skip the call
+    // entirely, treated as zero pending) is never confused with "configured
+    // but the call actually failed" (a real network/service problem, which
+    // must always be surfaced loudly, regardless of what the other mailbox
+    // did). Both `requests_endpoint`/`errors_endpoint` default to a real URL
+    // (`config.rs`'s `default_requests_endpoint`/`default_errors_endpoint`),
+    // so "unconfigured" only happens if a user deliberately blanks it out --
+    // the common real case is "configured via default, service may or may
+    // not be reachable yet," which is exactly the case a silent swallow
+    // would hide.
+    let requests_configured = !config.requests_endpoint.trim().is_empty();
+    let errors_configured = !config.errors_endpoint.trim().is_empty();
+    let configured_count = usize::from(requests_configured) + usize::from(errors_configured);
+
+    // Run both checks concurrently, not sequentially -- each has its own 30s
+    // client timeout, so one after the other made the worst case ~60s for a
+    // single tool call. `tokio::join!` still never makes a network call for
+    // a mailbox that isn't configured: the `if` inside each arm resolves
+    // before either `.await`s anything.
+    let (requests_result, errors_result) = tokio::join!(
+        async {
+            if requests_configured {
+                Some(crate::requests::list_pending(&resolved, &config.requests_endpoint).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if errors_configured {
+                Some(crate::errors::list_pending(&resolved, &config.errors_endpoint).await)
+            } else {
+                None
+            }
         }
-        Err(e) => outcome(
+    );
+
+    let mut failures: Vec<(&str, String)> = Vec::new();
+    if let Some(Err(e)) = &requests_result {
+        failures.push(("requests", e.clone()));
+    }
+    if let Some(Err(e)) = &errors_result {
+        failures.push(("errors", e.clone()));
+    }
+
+    // Hard-fail only when *every* configured mailbox failed -- there is
+    // nothing left to show. Both `requests_endpoint`/`errors_endpoint`
+    // default to a real URL (`config.rs`'s
+    // `default_requests_endpoint`/`default_errors_endpoint`), so "errors is
+    // configured" is true for every user today whether or not
+    // `infra/errors/` has actually been deployed to that URL yet -- if a
+    // still-working requests mailbox got discarded here just because the
+    // errors mailbox (often unreachable simply because nobody has run
+    // `infra/errors/setup.sh` in production yet) failed, this tool would
+    // regress from "occasionally silently swallows a failure" to "loses
+    // every real user's real pending requests the moment this ships." See
+    // the soft-degrade note appended below instead for a failure that
+    // isn't total.
+    if !failures.is_empty() && failures.len() == configured_count {
+        let message =
+            failures.iter().map(|(name, e)| format!("{name}: {e}")).collect::<Vec<_>>().join("; ");
+        return outcome(
             &call.id,
             format!("\u{1F4E8} requests {} \u{2014} failed", clip(&path, 40)),
-            format!("Error: {e}"),
-        ),
+            format!("Error: {message}"),
+        );
     }
+
+    // Only `None` (not configured) or `Some(Ok(_))` can reach here for a
+    // mailbox that isn't in `failures` -- a `Some(Err(_))` on its own
+    // (i.e. a *partial* failure) still needs to fall through to the
+    // rendering below, so whatever DID succeed is not thrown away.
+    let requests = requests_result.and_then(|r| r.ok()).unwrap_or_default();
+    let errors = errors_result.and_then(|r| r.ok()).unwrap_or_default();
+
+    // A partial failure is a note attached to real output, not a reason to
+    // discard it -- the model (and Dhruv) should see both what's pending
+    // AND that one mailbox couldn't be reached, not one or the other.
+    let notes: String = failures
+        .iter()
+        .map(|(name, e)| format!("\n\n(note: the {name} mailbox could not be reached: {e})"))
+        .collect();
+
+    if requests.is_empty() && errors.is_empty() {
+        return outcome(
+            &call.id,
+            "\u{1F4E8} requests \u{2014} none pending".to_string(),
+            format!("No pending change requests or reported errors.{notes}"),
+        );
+    }
+
+    let count = requests.len() + errors.len();
+    let mut lines: Vec<String> = requests
+        .iter()
+        .map(|r| format!("{}  ({})  \"{}\"", r.id, r.created_at, r.text))
+        .collect();
+    lines.extend(errors.iter().map(|e| format!("{}  {}", e.id, crate::errors::describe(e))));
+    outcome(
+        &call.id,
+        format!("\u{1F4E8} requests \u{2014} {count} pending"),
+        format!(
+            "{}\n\nCall {RESOLVE_CHANGE_REQUEST} with an id once you have acted on it (or \
+             decided not to).{notes}",
+            lines.join("\n")
+        ),
+    )
 }
 
 /// Mark one change request handled.
@@ -4100,11 +4194,20 @@ async fn execute_resolve_change_request(
         }
     };
 
-    match crate::requests::resolve(&resolved, &config.requests_endpoint, &id).await {
+    // Which mailbox a given id belongs to is decided by the id itself
+    // (`errors::ID_PREFIX`), not by a `kind` argument the model would have
+    // to remember to pass -- see the doc comment on `errors.rs`.
+    let (label, result) = if id.starts_with(crate::errors::ID_PREFIX) {
+        ("Reported error", crate::errors::resolve(&resolved, &config.errors_endpoint, &id).await)
+    } else {
+        ("Request", crate::requests::resolve(&resolved, &config.requests_endpoint, &id).await)
+    };
+
+    match result {
         Ok(()) => outcome(
             &call.id,
             format!("\u{1F4E8} requests \u{2014} #{id} resolved"),
-            format!("Request {id} marked resolved."),
+            format!("{label} {id} marked resolved."),
         ),
         Err(e) => outcome(
             &call.id,
@@ -7085,6 +7188,428 @@ mod tests {
     fn resolve_change_request_with_no_id_does_not_parse() {
         let call = tool_call(RESOLVE_CHANGE_REQUEST, json!({ "path": "dist", "id": "" }));
         assert!(describe_action(&call).is_none());
+    }
+
+    /// Same minimal-HTTP-server pattern `db.rs`'s tests use, one instance
+    /// per mailbox so the two can be told apart by which one actually
+    /// received a connection.
+    async fn serve_once_and_capture_body(
+        response_json: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut content_length = None;
+            loop {
+                let n = socket.read(&mut chunk).await.expect("read");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    if content_length.is_none() {
+                        let headers = String::from_utf8_lossy(&buf[..header_end]);
+                        content_length = headers.lines().find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        });
+                    }
+                    // `None` here means no Content-Length header was present
+                    // (a bodyless request, e.g. a GET) -- that means the
+                    // body is already complete, not "keep waiting."
+                    let body_so_far = buf.len() - (header_end + 4);
+                    if content_length.map(|cl| body_so_far >= cl).unwrap_or(true) {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("headers");
+            let body = String::from_utf8_lossy(&buf[header_end + 4..]).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_json.len(),
+                response_json
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+            socket.shutdown().await.ok();
+            body
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Same helper `db.rs`'s and `errors.rs`'s own test modules each keep a
+    /// private copy of, since `artifacts::remember` is private to that module.
+    fn fake_publish(fake_home: &Path, project_dir: &Path, id: &str) {
+        let key = project_dir.canonicalize().expect("canonicalize").to_string_lossy().into_owned();
+        let registry_path = fake_home.join(".boxcode").join("artifacts.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).expect("mkdir");
+        let published_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let map = serde_json::json!({ key: { "id": id, "published_at": published_at } });
+        std::fs::write(registry_path, serde_json::to_string_pretty(&map).unwrap()).expect("write registry");
+    }
+
+    /// The core proof for the merged mailbox: an id starting with
+    /// `errors::ID_PREFIX` must resolve against `errors_endpoint`, and any
+    /// other id must resolve against `requests_endpoint` -- checked by
+    /// pointing the two at two different local servers and confirming each
+    /// received exactly the request meant for it.
+    #[tokio::test]
+    async fn resolve_change_request_routes_by_id_prefix() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-routing");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        // Branch 1: a plain id must hit requests_endpoint, not errors_endpoint.
+        let (requests_endpoint, requests_handle) = serve_once_and_capture_body("{}").await;
+        let (errors_endpoint, _errors_handle_unused) = serve_once_and_capture_body("{}").await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = requests_endpoint;
+        config.errors_endpoint = errors_endpoint;
+        let call = tool_call(
+            RESOLVE_CHANGE_REQUEST,
+            json!({ "path": ".", "id": "plain123" }),
+        );
+        let out = execute_resolve_change_request(&call, &ws, &config).await;
+        assert!(out.content.contains("resolved"), "{}", out.content);
+        let body = requests_handle.await.expect("requests server task");
+        assert!(body.contains("\"project_id\":\"proj-routing\""), "{body}");
+
+        // Branch 2: an err_-prefixed id must hit errors_endpoint instead.
+        // Shaped like what the real control-plane actually generates
+        // (`err_` + a UUID, see infra/errors/control-plane/index.mjs), not
+        // the literal "err_1" -- a hand-typed id that merely satisfies
+        // `starts_with` would make this test tautological about the one
+        // thing it exists to prove.
+        let (requests_endpoint2, _requests_handle2_unused) = serve_once_and_capture_body("{}").await;
+        let (errors_endpoint2, errors_handle2) = serve_once_and_capture_body("{}").await;
+        let mut config2 = ToolsConfig::default();
+        config2.requests_endpoint = requests_endpoint2;
+        config2.errors_endpoint = errors_endpoint2;
+        let real_shaped_error_id = "err_9ce2bbf4-4b5f-487a-99d9-4da582c9bbc1";
+        let call2 = tool_call(
+            RESOLVE_CHANGE_REQUEST,
+            json!({ "path": ".", "id": real_shaped_error_id }),
+        );
+        let out2 = execute_resolve_change_request(&call2, &ws, &config2).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out2.content.contains("resolved"), "{}", out2.content);
+        let body2 = errors_handle2.await.expect("errors server task");
+        assert!(body2.contains("\"project_id\":\"proj-routing\""), "{body2}");
+    }
+
+    /// A blank `errors_endpoint` means "not configured" -- the common case
+    /// before a project has added the errors beacon -- and must be treated
+    /// as zero pending errors without ever attempting a network call, not
+    /// surfaced as a failure. `requests_endpoint` stays pointed at a real
+    /// server with zero pending, so the assertion is specifically about the
+    /// errors side, not a side effect of both being empty.
+    #[tokio::test]
+    async fn list_change_requests_treats_unconfigured_errors_endpoint_as_zero_pending() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-no-errors-endpoint");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let (requests_endpoint, _handle) = serve_once_and_capture_body("[]").await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = requests_endpoint;
+        config.errors_endpoint = String::new();
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.contains("No pending"), "{}", out.content);
+        assert!(!out.content.to_lowercase().contains("error:"), "{}", out.content);
+    }
+
+    /// A blank `requests_endpoint` gets the same treatment, checked
+    /// independently of the errors side.
+    #[tokio::test]
+    async fn list_change_requests_treats_unconfigured_requests_endpoint_as_zero_pending() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-no-requests-endpoint");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let (errors_endpoint, _handle) = serve_once_and_capture_body("[]").await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = String::new();
+        config.errors_endpoint = errors_endpoint;
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.contains("No pending"), "{}", out.content);
+        assert!(!out.content.to_lowercase().contains("error:"), "{}", out.content);
+    }
+
+    /// Corrected shape: a *configured but unreachable* `requests_endpoint`
+    /// must never be silently indistinguishable from "nothing pending" --
+    /// but with `errors_endpoint` genuinely configured and reachable (even
+    /// if it has zero pending items), this is a *partial* failure, not a
+    /// total one, so it degrades to a soft note rather than discarding a
+    /// mailbox that actually works. (A previous version of this fix
+    /// over-corrected the other direction: it hard-failed on ANY configured
+    /// mailbox erroring, which meant `errors_endpoint`'s real shipped
+    /// default -- a URL that may not have `infra/errors/` deployed to it
+    /// yet -- could make every user's `list_change_requests` call fail
+    /// outright and lose their real, working requests mailbox. See the
+    /// "both mailboxes down" test below for the actual hard-fail case.)
+    #[tokio::test]
+    async fn list_change_requests_softens_a_requests_failure_when_errors_still_works() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-requests-down");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let (errors_endpoint, _handle) = serve_once_and_capture_body("[]").await;
+        let mut config = ToolsConfig::default();
+        // A connection to a closed port fails fast (refused), unlike a
+        // black-holed address that would wait out the full 30s timeout.
+        config.requests_endpoint = "http://127.0.0.1:1".to_string();
+        config.errors_endpoint = errors_endpoint;
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        // Not a hard failure -- errors genuinely succeeded (with zero
+        // items), so the tool reports "no pending" plus a note, never a
+        // bare "Error:".
+        assert!(!out.content.to_lowercase().starts_with("error:"), "{}", out.content);
+        assert!(out.content.contains("No pending"), "{}", out.content);
+        assert!(out.content.contains("note:"), "{}", out.content);
+        assert!(out.content.contains("requests"), "{}", out.content);
+    }
+
+    /// Same proof, mirrored for the errors mailbox.
+    #[tokio::test]
+    async fn list_change_requests_softens_an_errors_failure_when_requests_still_works() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-errors-down");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let (requests_endpoint, _handle) = serve_once_and_capture_body("[]").await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = requests_endpoint;
+        config.errors_endpoint = "http://127.0.0.1:1".to_string();
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(!out.content.to_lowercase().starts_with("error:"), "{}", out.content);
+        assert!(out.content.contains("No pending"), "{}", out.content);
+        assert!(out.content.contains("note:"), "{}", out.content);
+        assert!(out.content.contains("errors"), "{}", out.content);
+    }
+
+    /// The exact scenario a live-production review caught: a real, working
+    /// requests mailbox with a genuine pending request, alongside an
+    /// `errors_endpoint` that is configured (its shipped default, pointing
+    /// at a real host) but not yet actually reachable there because
+    /// `infra/errors/setup.sh` hasn't been run in production yet. The real
+    /// pending request must still show up -- not get thrown away just
+    /// because an unrelated, not-yet-deployed mailbox failed.
+    #[tokio::test]
+    async fn list_change_requests_still_shows_real_pending_items_despite_a_partial_failure() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-partial-failure");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let pending_request = r#"[{"id":"req_real123","text":"move the search button right","created_at":"2026-01-01T00:00:00Z"}]"#;
+        let (requests_endpoint, _handle) = serve_once_and_capture_body(pending_request).await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = requests_endpoint;
+        // Simulates the real shipped default pointing at a host where
+        // infra/errors/ has not been deployed yet: configured, but the
+        // service isn't actually there.
+        config.errors_endpoint = "http://127.0.0.1:1".to_string();
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            out.content.contains("move the search button right"),
+            "the real pending request must not be discarded: {}",
+            out.content
+        );
+        assert!(out.content.contains("req_real123"), "{}", out.content);
+        assert!(out.content.contains("note:"), "{}", out.content);
+        assert!(out.content.contains("errors"), "{}", out.content);
+        assert!(!out.content.to_lowercase().starts_with("error:"), "{}", out.content);
+    }
+
+    /// Both mailboxes down at once must still name both failures, not just
+    /// the first one checked.
+    #[tokio::test]
+    async fn list_change_requests_names_both_failures_when_both_mailboxes_are_down() {
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-both-down");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = "http://127.0.0.1:1".to_string();
+        config.errors_endpoint = "http://127.0.0.1:1".to_string();
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.contains("requests:"), "{}", out.content);
+        assert!(out.content.contains("errors:"), "{}", out.content);
+    }
+
+    /// Both checks actually run concurrently, not one after the other: two
+    /// servers that each hold the connection open past a plain sequential
+    /// budget would blow a strict wall-clock bound if awaited in sequence,
+    /// but comfortably fit it when joined. This doesn't reproduce the full
+    /// 30s client timeout (too slow for a test suite) -- it proves the
+    /// *shape* (concurrent, not additive) with short, deterministic delays.
+    #[tokio::test]
+    async fn list_change_requests_checks_both_mailboxes_concurrently() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn serve_after_delay(delay_ms: u64) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = socket.read(&mut chunk).await.expect("read");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") || n == 0 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let body = "[]";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.expect("write");
+                socket.shutdown().await.ok();
+            });
+            format!("http://{addr}")
+        }
+
+        let _guard = crate::config::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(project.path().join("index.html"), "hi").expect("write");
+        fake_publish(fake_home.path(), project.path(), "proj-concurrent");
+        let ws = Workspace::new(project.path()).expect("workspace");
+
+        let requests_endpoint = serve_after_delay(300).await;
+        let errors_endpoint = serve_after_delay(300).await;
+        let mut config = ToolsConfig::default();
+        config.requests_endpoint = requests_endpoint;
+        config.errors_endpoint = errors_endpoint;
+
+        let call = tool_call(LIST_CHANGE_REQUESTS, json!({ "path": "." }));
+        let started = std::time::Instant::now();
+        let out = execute_list_change_requests(&call, &ws, &config).await;
+        let elapsed = started.elapsed();
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(out.content.contains("No pending"), "{}", out.content);
+        // Sequential would be >=600ms; concurrent should land close to
+        // 300ms. 500ms leaves real headroom for CI scheduling jitter while
+        // still failing if this regresses back to sequential.
+        assert!(elapsed.as_millis() < 500, "took {elapsed:?}, looks sequential not concurrent");
     }
 
     // ---- enable_auth ---------------------------------------------------------
