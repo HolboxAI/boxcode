@@ -69,9 +69,9 @@
 //!   than silently sending nothing and calling it done.
 
 use crate::approval::{ApprovalRequest, Decision};
-use crate::headless::BrowserCheckResult;
+use crate::headless::{BrowserCheckResult, BrowserInteractResult};
 use crate::llm::{ApiUsage, ToolCall as InternalToolCall};
-use crate::tools::{Action, ToolOutcome};
+use crate::tools::{Action, BrowserInteraction, ToolOutcome};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -624,6 +624,48 @@ impl From<CheckInBrowserOutcome> for BrowserCheckResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// session/interactInBrowser -- same non-ACP-spec shape and reasoning as
+// session/checkInBrowser directly above: boxcode sends it mid-turn, needs
+// the client's answer to continue. A separate request/outcome pair and a
+// separate relay (see `headless.rs`'s `BrowserInteractAsk`/
+// `BrowserInteractResult` and `transport.rs`'s `Router`), not folded into
+// `CheckInBrowserRequest`, per this codebase's own stated convention: a
+// small, explicit type per real use rather than one shared, growing shape.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct InteractInBrowserRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+    pub url: String,
+    pub interaction: BrowserInteraction,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "outcome")]
+pub enum InteractInBrowserOutcome {
+    #[serde(rename = "screenshot")]
+    Screenshot {
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        data: String,
+    },
+    #[serde(rename = "failed")]
+    Failed { reason: String },
+}
+
+impl From<InteractInBrowserOutcome> for BrowserInteractResult {
+    fn from(outcome: InteractInBrowserOutcome) -> Self {
+        match outcome {
+            InteractInBrowserOutcome::Screenshot { mime_type, data } => {
+                BrowserInteractResult::Screenshot { mime_type, data }
+            }
+            InteractInBrowserOutcome::Failed { reason } => BrowserInteractResult::Failed(reason),
+        }
+    }
+}
+
 impl From<RequestPermissionOutcome> for Decision {
     fn from(outcome: RequestPermissionOutcome) -> Self {
         match outcome {
@@ -697,7 +739,8 @@ fn tool_kind_for(action: &Action) -> ToolKind {
         | Action::ListChangeRequests { .. }
         | Action::ResolveChangeRequest { .. }
         | Action::Publish { .. }
-        | Action::CheckInBrowser { .. } => ToolKind::Fetch,
+        | Action::CheckInBrowser { .. }
+        | Action::InteractInBrowser { .. } => ToolKind::Fetch,
         Action::Plan(_) | Action::Progress { .. } | Action::Todos(_) => ToolKind::SwitchMode,
     }
 }
