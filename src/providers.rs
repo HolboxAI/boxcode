@@ -1,6 +1,12 @@
 /// Static registry backing the `/provider` and `/model` overlays. A "Custom
 /// endpoint..." escape hatch lives alongside this list in app.rs so the tool's
 /// "any OpenAI-compatible endpoint" generality is never limited to this table.
+///
+/// `Serialize` backs `boxcode --providers-json` (see main.rs), so an ACP
+/// client (boxcode-ide) can build its own provider picker from this same
+/// registry instead of hand-copying it into TypeScript, where it would rot
+/// exactly like the old `deepseek-chat` placeholder already did once.
+#[derive(serde::Serialize)]
 pub struct Provider {
     pub id: &'static str,
     pub label: &'static str,
@@ -76,6 +82,25 @@ mod tests {
     fn env_var_name_uppercases_the_id() {
         assert_eq!(env_var_name("deepseek"), "DEEPSEEK_API_KEY");
         assert_eq!(env_var_name("openai"), "OPENAI_API_KEY");
+    }
+
+    /// `boxcode --providers-json`'s whole reason to exist: an ACP client reads
+    /// this instead of hand-copying the table, so it must actually round-trip
+    /// as valid, structured JSON with the fields a picker needs.
+    #[test]
+    fn the_registry_serializes_to_valid_parseable_json() {
+        let json = serde_json::to_string(PROVIDERS).expect("PROVIDERS must serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+        let arr = parsed.as_array().expect("top level must be an array");
+        assert_eq!(arr.len(), PROVIDERS.len());
+
+        let deepseek = arr
+            .iter()
+            .find(|p| p["id"] == "deepseek")
+            .expect("deepseek must be present");
+        assert_eq!(deepseek["label"], "DeepSeek");
+        assert_eq!(deepseek["endpoint"], "https://api.deepseek.com");
+        assert!(deepseek["models"].as_array().unwrap().contains(&serde_json::json!("deepseek-v4-pro")));
     }
 
     /// DeepSeek is the one provider with a specific, on-record reason to
