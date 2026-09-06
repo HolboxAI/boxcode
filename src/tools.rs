@@ -43,7 +43,7 @@ use crate::config::ToolsConfig;
 use crate::danger;
 use crate::llm::ToolCall;
 use crate::workspace::Workspace;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -71,6 +71,7 @@ pub const PLAN_PROGRESS: &str = "plan_progress";
 pub const AGENT: &str = "agent";
 pub const UPDATE_TODOS: &str = "update_todos";
 pub const CHECK_IN_BROWSER: &str = "check_in_browser";
+pub const INTERACT_IN_BROWSER: &str = "interact_in_browser";
 
 /// Whether the model is allowed to change anything yet.
 ///
@@ -1047,8 +1048,53 @@ pub fn schemas_for(
         }
     }));
 
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": INTERACT_IN_BROWSER,
+            "description": "Click or type into the SAME tab check_in_browser just looked at, \
+                            then get a screenshot back so you can see the result. Use this to \
+                            actually verify a flow (fill a form and submit it, click a button and \
+                            see what happens) instead of guessing from source alone. This is NOT \
+                            read-only -- it acts inside whatever session/login state is already \
+                            in that tab, so the user is always asked before it runs, even with \
+                            approval otherwise relaxed. Needs a URL already opened via \
+                            check_in_browser in this turn or a recent one.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL of the tab to act in, same one you already checked."
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["click", "type"],
+                        "description": "'click' needs x/y. 'type' needs text -- it inserts at whatever element currently has focus, so click into a field first if one needs it."
+                    },
+                    "x": {
+                        "type": "number",
+                        "description": "Pixel X coordinate to click, from the last screenshot. Required when action is 'click'."
+                    },
+                    "y": {
+                        "type": "number",
+                        "description": "Pixel Y coordinate to click, from the last screenshot. Required when action is 'click'."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to type into whatever element currently has focus. Required when action is 'type'."
+                    }
+                },
+                "required": ["url", "action"]
+            }
+        }
+    }));
+
     if !browser {
-        schemas.retain(|schema| schema["function"]["name"] != CHECK_IN_BROWSER);
+        schemas.retain(|schema| {
+            schema["function"]["name"] != CHECK_IN_BROWSER
+                && schema["function"]["name"] != INTERACT_IN_BROWSER
+        });
     }
     if !deploy {
         schemas.retain(|schema| schema["function"]["name"] != DEPLOY_PROJECT);
@@ -1681,6 +1727,34 @@ struct CheckInBrowserArgs {
     url: String,
 }
 
+/// One interaction `interact_in_browser` can perform, tagged by the
+/// `action` field so the tool-call JSON stays flat (`{"action": "click",
+/// "x": ..., "y": ...}`) rather than nesting a sub-object -- friendlier for
+/// a model to emit correctly than a nested shape would be.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum BrowserInteraction {
+    Click { x: f64, y: f64 },
+    Type { text: String },
+}
+
+impl BrowserInteraction {
+    /// One short phrase for `Action::label`'s transcript line.
+    pub fn describe(&self) -> String {
+        match self {
+            BrowserInteraction::Click { x, y } => format!("click ({x:.0}, {y:.0})"),
+            BrowserInteraction::Type { text } => format!("type \"{}\"", clip(text, 40)),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct InteractInBrowserArgs {
+    url: String,
+    #[serde(flatten)]
+    interaction: BrowserInteraction,
+}
+
 #[derive(Deserialize)]
 struct ReadFileArgs {
     path: String,
@@ -2105,6 +2179,18 @@ pub enum Action {
     /// than reaching `tools::execute`, which has no local implementation for
     /// this at all.
     CheckInBrowser { url: String },
+    /// `interact_in_browser`: clicks or types into the same live tab
+    /// `check_in_browser` looks at -- fulfilled the same way, entirely on
+    /// the client side of the wire (see `headless.rs`'s `check_browser`,
+    /// which this reuses rather than duplicating the relay/timeout
+    /// machinery for).
+    ///
+    /// Deliberately NOT read-only like `CheckInBrowser`: this acts inside
+    /// whatever session/cookies/login state is already in that tab -- a
+    /// click can submit a real form, `Type` can fill a real password field
+    /// -- so unlike `CheckInBrowser` it is `Risk::Dangerous` (always asks,
+    /// see `action_risk`) and blocked in plan mode (see `plan_mode_block`).
+    InteractInBrowser { url: String, interaction: BrowserInteraction },
 }
 
 /// One replacement within an `Action::Edit` -- what `edit_file` shows the
@@ -2179,6 +2265,9 @@ impl Action {
                 format!("todos — {done}/{}", items.len())
             }
             Action::CheckInBrowser { url } => format!("check in browser — {url}"),
+            Action::InteractInBrowser { url, interaction } => {
+                format!("interact in browser — {url} ({})", interaction.describe())
+            }
         }
     }
 }
@@ -2213,6 +2302,17 @@ pub fn action_risk(action: &Action, workspace_root: &Path) -> danger::Risk {
         ),
         Action::Deploy { .. } => danger::Risk::Dangerous(
             "uploads this project to a third-party host and puts it on the public internet"
+                .to_string(),
+        ),
+        // Unlike `CheckInBrowser`, this acts inside the tab's real
+        // session/cookies/login state -- a click can submit a real form, a
+        // typed string can fill a real password field -- so, same reasoning
+        // as `Publish`/`Deploy` above, it always asks, even with approval
+        // switched off entirely.
+        Action::InteractInBrowser { .. } => danger::Risk::Dangerous(
+            "acts inside the browser tab's current session -- a click or typed text uses \
+             whatever login/cookie state is already there, and boxcode cannot see what it will \
+             actually do until after it happens"
                 .to_string(),
         ),
         // Reads and writes are already confined to the workspace by
@@ -2313,6 +2413,13 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
              the internet, so it was not run. Make the deployment a step in your plan and call \
              {EXIT_PLAN_MODE}."
         )),
+        // Unlike `CheckInBrowser` (read-only, allowed above), this acts
+        // inside the tab's real session state -- not something plan mode's
+        // "nothing changes" promise can cover.
+        Action::InteractInBrowser { url, .. } => Some(format!(
+            "Plan mode is read-only, so nothing was clicked or typed in {url}. Describe the \
+             interaction in your plan, then call {EXIT_PLAN_MODE}."
+        )),
     }
 }
 
@@ -2360,6 +2467,13 @@ pub fn describe_action(call: &ToolCall) -> Option<Action> {
             let args: CheckInBrowserArgs = serde_json::from_str(&call.function.arguments).ok()?;
             let url = args.url.trim().to_string();
             (!url.is_empty()).then_some(Action::CheckInBrowser { url })
+        }
+        INTERACT_IN_BROWSER => {
+            let args: InteractInBrowserArgs =
+                serde_json::from_str(&call.function.arguments).ok()?;
+            let url = args.url.trim().to_string();
+            (!url.is_empty())
+                .then_some(Action::InteractInBrowser { url, interaction: args.interaction })
         }
         WRITE_FILE => {
             let args: WriteFileArgs = serde_json::from_str(&call.function.arguments).ok()?;
@@ -6745,6 +6859,7 @@ mod tests {
             .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
             .collect();
         assert!(!names.iter().any(|n| n == CHECK_IN_BROWSER), "{names:?}");
+        assert!(!names.iter().any(|n| n == INTERACT_IN_BROWSER), "{names:?}");
 
         let with_browser: Vec<String> =
             schemas_for(Mode::Normal, false, true, true, true, SchemaDiet::full())
@@ -6752,7 +6867,61 @@ mod tests {
                 .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
                 .collect();
         assert!(with_browser.iter().any(|n| n == CHECK_IN_BROWSER), "{with_browser:?}");
-        assert_eq!(with_browser.len(), names.len() + 1);
+        assert!(with_browser.iter().any(|n| n == INTERACT_IN_BROWSER), "{with_browser:?}");
+        assert_eq!(with_browser.len(), names.len() + 2);
+    }
+
+    /// `interact_in_browser` is not read-only like `check_in_browser` --
+    /// it must always ask, regardless of approval mode, and must be blocked
+    /// outright in plan mode rather than merely offered-but-refused.
+    #[test]
+    fn interact_in_browser_is_always_dangerous_and_blocked_in_plan_mode() {
+        let action = Action::InteractInBrowser {
+            url: "http://localhost:3000".to_string(),
+            interaction: BrowserInteraction::Click { x: 10.0, y: 20.0 },
+        };
+        let risk = action_risk(&action, Path::new("/workspace"));
+        assert!(matches!(risk, danger::Risk::Dangerous(_)), "{risk:?}");
+
+        let blocked = plan_mode_block(&action);
+        assert!(blocked.is_some(), "must be blocked in plan mode, got {blocked:?}");
+    }
+
+    #[test]
+    fn interact_in_browser_parses_click_and_type_from_tool_call_json() {
+        let click_call = ToolCall {
+            function: crate::llm::FunctionCall {
+                name: INTERACT_IN_BROWSER.to_string(),
+                arguments: r#"{"url":"http://localhost:3000","action":"click","x":42,"y":7}"#
+                    .to_string(),
+            },
+            ..Default::default()
+        };
+        let action = describe_action(&click_call).expect("parses");
+        assert_eq!(
+            action,
+            Action::InteractInBrowser {
+                url: "http://localhost:3000".to_string(),
+                interaction: BrowserInteraction::Click { x: 42.0, y: 7.0 },
+            }
+        );
+
+        let type_call = ToolCall {
+            function: crate::llm::FunctionCall {
+                name: INTERACT_IN_BROWSER.to_string(),
+                arguments: r#"{"url":"http://localhost:3000","action":"type","text":"hello"}"#
+                    .to_string(),
+            },
+            ..Default::default()
+        };
+        let action = describe_action(&type_call).expect("parses");
+        assert_eq!(
+            action,
+            Action::InteractInBrowser {
+                url: "http://localhost:3000".to_string(),
+                interaction: BrowserInteraction::Type { text: "hello".to_string() },
+            }
+        );
     }
 
     /// The two gates are independent and must compose: plan mode withholds

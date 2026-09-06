@@ -1657,6 +1657,27 @@ fn tool_approval_parts(
             }
             (" Check in browser? ", "check", "skip")
         }
+        // Unreachable in the TUI in practice, same reasoning as
+        // `Action::CheckInBrowser` immediately above.
+        Action::InteractInBrowser { url, interaction } => {
+            for wrapped in wrap(url, inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            for wrapped in
+                wrap("Only an ACP client has a browser tab to act in -- not available here.", inner)
+            {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            let verb = match interaction {
+                crate::tools::BrowserInteraction::Click { .. } => "click",
+                crate::tools::BrowserInteraction::Type { .. } => "type",
+            };
+            (" Interact in browser? ", verb, "skip")
+        }
         // An edit shows every span, because approving a replacement you cannot
         // see is not approval. Unlike a write it does not need the whole file --
         // showing only what changes is the reason to prefer this tool. A batch

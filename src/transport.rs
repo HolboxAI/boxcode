@@ -31,13 +31,16 @@
 //! isn't unit tested for the same reason `main`'s own top-level loop isn't.
 
 use crate::config::Config;
-use crate::headless::{BrowserCheckAsk, BrowserCheckResult, HeadlessSession, PermissionAsk};
+use crate::headless::{
+    BrowserCheckAsk, BrowserCheckResult, BrowserInteractAsk, BrowserInteractResult, HeadlessSession,
+    PermissionAsk,
+};
 use crate::protocol::{
     CheckInBrowserOutcome, CheckInBrowserRequest, Implementation, InitializeRequest,
-    InitializeResponse, JsonRpcVersion, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
-    RollbackRequest, RollbackResponse, RpcError, RpcErrorObject, RpcRequest, RpcResponse,
-    SessionId, SessionNotification, PROTOCOL_VERSION,
+    InitializeResponse, InteractInBrowserOutcome, InteractInBrowserRequest, JsonRpcVersion,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, RequestId,
+    RequestPermissionOutcome, RequestPermissionRequest, RollbackRequest, RollbackResponse, RpcError,
+    RpcErrorObject, RpcRequest, RpcResponse, SessionId, SessionNotification, PROTOCOL_VERSION,
 };
 use crate::workspace::Workspace;
 use serde_json::json;
@@ -128,6 +131,7 @@ impl SessionActor {
         outgoing_tx: mpsc::Sender<Outgoing>,
         permission_relay: mpsc::Sender<PermissionAsk>,
         browser_relay: mpsc::Sender<BrowserCheckAsk>,
+        browser_interact_relay: mpsc::Sender<BrowserInteractAsk>,
         session_id: SessionId,
     ) -> mpsc::Sender<SessionMsg> {
         let (tx, mut rx) = mpsc::channel::<SessionMsg>(8);
@@ -160,8 +164,9 @@ impl SessionActor {
                                     .await;
                             }
                         });
-                        let stop_reason =
-                            session.prompt(text, images, &updates_tx, &permission_relay, &browser_relay).await;
+                        let stop_reason = session
+                            .prompt(text, images, &updates_tx, &permission_relay, &browser_relay, &browser_interact_relay)
+                            .await;
                         drop(updates_tx); // let the drain task see the channel close
                         let _ = drain.await;
                         let _ = respond.send(PromptResponse { stop_reason });
@@ -177,21 +182,25 @@ impl SessionActor {
 }
 
 /// Owns everything the read loop needs across the life of the connection:
-/// active sessions, and the tables correlating a `session/request_permission`
-/// or `session/checkInBrowser` response back to the specific pending ask
-/// that's waiting for it. Two separate tables, not one keyed by a shared
-/// enum -- same reasoning as `headless.rs`'s own `PermissionAsk`/
-/// `BrowserCheckAsk` split: a small, explicit type (and table) per real use.
+/// active sessions, and the tables correlating a `session/request_permission`,
+/// `session/checkInBrowser` or `session/interactInBrowser` response back to
+/// the specific pending ask that's waiting for it. Three separate tables,
+/// not one keyed by a shared enum -- same reasoning as `headless.rs`'s own
+/// `PermissionAsk`/`BrowserCheckAsk`/`BrowserInteractAsk` split: a small,
+/// explicit type (and table) per real use.
 struct Router {
     sessions: HashMap<SessionId, mpsc::Sender<SessionMsg>>,
     pending_permission_responses: HashMap<RequestId, oneshot::Sender<RequestPermissionOutcome>>,
     pending_browser_responses: HashMap<RequestId, oneshot::Sender<BrowserCheckResult>>,
+    pending_browser_interact_responses: HashMap<RequestId, oneshot::Sender<BrowserInteractResult>>,
     next_outgoing_id: i64,
     outgoing_tx: mpsc::Sender<Outgoing>,
     permission_relay_in: mpsc::Receiver<PermissionAsk>,
     permission_relay_tx: mpsc::Sender<PermissionAsk>,
     browser_relay_in: mpsc::Receiver<BrowserCheckAsk>,
     browser_relay_tx: mpsc::Sender<BrowserCheckAsk>,
+    browser_interact_relay_in: mpsc::Receiver<BrowserInteractAsk>,
+    browser_interact_relay_tx: mpsc::Sender<BrowserInteractAsk>,
     /// The one field genuinely needed at runtime that a unit test doesn't
     /// have to fill in with anything meaningful -- see `run`'s own
     /// construction of the real `Config::load()` value.
@@ -202,16 +211,20 @@ impl Router {
     fn new(config: Config, outgoing_tx: mpsc::Sender<Outgoing>) -> Self {
         let (permission_relay_tx, permission_relay_in) = mpsc::channel(64);
         let (browser_relay_tx, browser_relay_in) = mpsc::channel(64);
+        let (browser_interact_relay_tx, browser_interact_relay_in) = mpsc::channel(64);
         Self {
             sessions: HashMap::new(),
             pending_permission_responses: HashMap::new(),
             pending_browser_responses: HashMap::new(),
+            pending_browser_interact_responses: HashMap::new(),
             next_outgoing_id: 1,
             outgoing_tx,
             permission_relay_in,
             permission_relay_tx,
             browser_relay_in,
             browser_relay_tx,
+            browser_interact_relay_in,
+            browser_interact_relay_tx,
             config,
         }
     }
@@ -262,6 +275,10 @@ impl Router {
                     if let Ok(outcome) = serde_json::from_value::<CheckInBrowserOutcome>(result) {
                         let _ = respond.send(outcome.into());
                     }
+                } else if let Some(respond) = self.pending_browser_interact_responses.remove(&id) {
+                    if let Ok(outcome) = serde_json::from_value::<InteractInBrowserOutcome>(result) {
+                        let _ = respond.send(outcome.into());
+                    }
                 }
                 None
             }
@@ -270,6 +287,10 @@ impl Router {
                     let _ = respond.send(RequestPermissionOutcome::Cancelled);
                 } else if let Some(respond) = self.pending_browser_responses.remove(&id) {
                     let _ = respond.send(BrowserCheckResult::Failed(
+                        "the client returned an error instead of a result".to_string(),
+                    ));
+                } else if let Some(respond) = self.pending_browser_interact_responses.remove(&id) {
+                    let _ = respond.send(BrowserInteractResult::Failed(
                         "the client returned an error instead of a result".to_string(),
                     ));
                 }
@@ -316,6 +337,7 @@ impl Router {
                     self.outgoing_tx.clone(),
                     self.permission_relay_tx.clone(),
                     self.browser_relay_tx.clone(),
+                    self.browser_interact_relay_tx.clone(),
                     session_id.clone(),
                 );
                 self.sessions.insert(session_id.clone(), handle);
@@ -418,30 +440,33 @@ impl Router {
         });
     }
 
-    /// Pulls the next queued ask from *either* relay -- a [`PermissionAsk`]
-    /// or a [`BrowserCheckAsk`], whichever arrives first -- assigns it a
-    /// fresh outgoing id from one shared counter (a single id space for
-    /// everything this process sends, not two that could collide),
-    /// registers where its eventual response should go, and returns the
-    /// line to write to stdout. `None` only once *both* relays have closed
-    /// (every session finished); one relay closing while the other is
-    /// still live keeps this selecting on the live one.
+    /// Pulls the next queued ask from *any* of the three relays -- a
+    /// [`PermissionAsk`], a [`BrowserCheckAsk`] or a [`BrowserInteractAsk`],
+    /// whichever arrives first -- assigns it a fresh outgoing id from one
+    /// shared counter (a single id space for everything this process sends,
+    /// not three that could collide), registers where its eventual response
+    /// should go, and returns the line to write to stdout. `None` only once
+    /// *all three* relays have closed (every session finished); one relay
+    /// closing while the others are still live keeps this selecting on the
+    /// live ones.
     ///
-    /// One method rather than two separate ones each taking `&mut self`:
-    /// `run`'s own `select!` cannot hold two simultaneous mutable borrows
+    /// One method rather than three separate ones each taking `&mut self`:
+    /// `run`'s own `select!` cannot hold three simultaneous mutable borrows
     /// of the same `Router`, but a single `tokio::select!` *inside* this
-    /// method can borrow `self.permission_relay_in` and
-    /// `self.browser_relay_in` disjointly, since the borrow checker sees
-    /// those as two different fields, not two calls each asking for the
-    /// whole `&mut self`.
+    /// method can borrow `self.permission_relay_in`, `self.browser_relay_in`
+    /// and `self.browser_interact_relay_in` disjointly, since the borrow
+    /// checker sees those as three different fields, not three calls each
+    /// asking for the whole `&mut self`.
     async fn next_outgoing_client_request(&mut self) -> Option<String> {
         enum Ready {
             Permission(PermissionAsk),
             Browser(BrowserCheckAsk),
+            BrowserInteract(BrowserInteractAsk),
         }
         let ready = tokio::select! {
             ask = self.permission_relay_in.recv() => ask.map(Ready::Permission),
             ask = self.browser_relay_in.recv() => ask.map(Ready::Browser),
+            ask = self.browser_interact_relay_in.recv() => ask.map(Ready::BrowserInteract),
         }?;
         let id = RequestId::Number(self.next_outgoing_id);
         self.next_outgoing_id += 1;
@@ -472,6 +497,22 @@ impl Router {
                         serde_json::to_value(CheckInBrowserRequest {
                             session_id: ask.session_id,
                             url: ask.url,
+                        })
+                        .expect("serializes"),
+                    ),
+                }
+            }
+            Ready::BrowserInteract(ask) => {
+                self.pending_browser_interact_responses.insert(id.clone(), ask.respond);
+                RpcRequest {
+                    jsonrpc: JsonRpcVersion,
+                    id,
+                    method: "session/interactInBrowser".to_string(),
+                    params: Some(
+                        serde_json::to_value(InteractInBrowserRequest {
+                            session_id: ask.session_id,
+                            url: ask.url,
+                            interaction: ask.interaction,
                         })
                         .expect("serializes"),
                     ),

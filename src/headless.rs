@@ -34,7 +34,7 @@ use crate::protocol::{
     RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionUpdate, StopReason,
     ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
-use crate::tools::{self, Action, Mode};
+use crate::tools::{self, Action, BrowserInteraction, Mode};
 use crate::workspace::Workspace;
 use std::path::Path;
 use std::time::Duration;
@@ -73,6 +73,26 @@ pub struct BrowserCheckAsk {
 /// model text it can react to, the same posture `ask_permission` already
 /// takes toward "the client disconnected."
 pub enum BrowserCheckResult {
+    Screenshot { mime_type: String, data: String },
+    Failed(String),
+}
+
+/// One `interact_in_browser` call awaiting the client's answer -- same
+/// shape and reasoning as `BrowserCheckAsk` immediately above (a small,
+/// explicit type per real use, not a shared abstraction), except this one
+/// also carries the interaction to perform before the client screenshots.
+pub struct BrowserInteractAsk {
+    pub session_id: SessionId,
+    pub url: String,
+    pub interaction: BrowserInteraction,
+    pub respond: oneshot::Sender<BrowserInteractResult>,
+}
+
+/// What the client reports back for one `BrowserInteractAsk`. Same
+/// `Screenshot`/`Failed` shape as `BrowserCheckResult` -- a successful
+/// interaction still ends in a screenshot, the same proof-of-result
+/// `check_in_browser` already gives the model.
+pub enum BrowserInteractResult {
     Screenshot { mime_type: String, data: String },
     Failed(String),
 }
@@ -126,6 +146,7 @@ impl HeadlessSession {
         updates: &mpsc::Sender<SessionUpdate>,
         permissions: &mpsc::Sender<PermissionAsk>,
         browser: &mpsc::Sender<BrowserCheckAsk>,
+        browser_interact: &mpsc::Sender<BrowserInteractAsk>,
     ) -> StopReason {
         let mut user_message = ChatMessage::text("user", text);
         user_message.images = images;
@@ -195,7 +216,8 @@ impl HeadlessSession {
                 }
                 RoundOutcome::ToolCalls(calls) => {
                     self.tool_steps += 1;
-                    let outcomes = self.decide_and_run(calls, updates, permissions, browser).await;
+                    let outcomes =
+                        self.decide_and_run(calls, updates, permissions, browser, browser_interact).await;
                     // An image attached below rides in `self.messages` for
                     // exactly one round: it needs to be there for the very
                     // next `run_one_round` call so the model can react to
@@ -338,6 +360,7 @@ impl HeadlessSession {
         updates: &mpsc::Sender<SessionUpdate>,
         permissions: &mpsc::Sender<PermissionAsk>,
         browser: &mpsc::Sender<BrowserCheckAsk>,
+        browser_interact: &mpsc::Sender<BrowserInteractAsk>,
     ) -> Vec<(String, String, Vec<llm::ImageAttachment>)> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
@@ -410,7 +433,11 @@ impl HeadlessSession {
                         // No subagents in v1 -- see module docs.
                         "Subagents aren't supported in this session yet.".to_string()
                     } else {
-                        self.ask_permission(&call, &action, updates, permissions).await
+                        let (text, interact_images) = self
+                            .ask_permission(&call, &action, updates, permissions, browser_interact)
+                            .await;
+                        images = interact_images;
+                        text
                     }
                 }
             };
@@ -426,7 +453,8 @@ impl HeadlessSession {
         action: &crate::tools::Action,
         updates: &mpsc::Sender<SessionUpdate>,
         permissions: &mpsc::Sender<PermissionAsk>,
-    ) -> String {
+        browser_interact: &mpsc::Sender<BrowserInteractAsk>,
+    ) -> (String, Vec<llm::ImageAttachment>) {
         // Same call, same reasoning as `App::advance_approvals`'s own
         // `tools::preview_change(&action, ...)`: computed once, here, where
         // the question is being asked -- not re-derived by whatever renders
@@ -465,7 +493,7 @@ impl HeadlessSession {
         };
         let (respond, receive) = oneshot::channel();
         if permissions.send(PermissionAsk { request, respond }).await.is_err() {
-            return "The client disconnected before answering.".to_string();
+            return ("The client disconnected before answering.".to_string(), Vec::new());
         }
         let decision: Decision = match receive.await {
             Ok(outcome) => outcome.into(),
@@ -473,12 +501,24 @@ impl HeadlessSession {
         };
 
         if decision.is_allowed() {
+            // `interact_in_browser`, like `check_in_browser`, has no local
+            // implementation `tools::execute` can run -- boxcode has no
+            // browser tab, only the client does. Intercepted here, after
+            // approval, rather than reaching `tools::execute` -- the
+            // `AutoApprove` branch above intercepts `CheckInBrowser` at the
+            // equivalent point in its own flow, before execution, for the
+            // same reason.
+            if let Action::InteractInBrowser { url, interaction } = action {
+                return self
+                    .interact_browser(call, url, interaction, updates, browser_interact)
+                    .await;
+            }
             let mut outcome = tools::execute(call, &self.workspace, &self.config.tools).await;
             if let Some(record) = outcome.rollback.take() {
                 self.rollback.record(record);
             }
             let _ = updates.send(SessionUpdate::ToolCallUpdate((&outcome).into())).await;
-            outcome.content
+            (outcome.content, Vec::new())
         } else {
             let _ = updates
                 .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
@@ -489,7 +529,7 @@ impl HeadlessSession {
                     content: Some(ToolCallContent::Text { text: "Refused by user.".to_string() }),
                 }))
                 .await;
-            "The user declined this action.".to_string()
+            ("The user declined this action.".to_string(), Vec::new())
         }
     }
 
@@ -580,6 +620,92 @@ impl HeadlessSession {
                     }))
                     .await;
                 (format!("Could not check {url} in the browser: {reason}"), Vec::new())
+            }
+        }
+    }
+
+    /// Fulfills an `interact_in_browser` call by asking the client to click
+    /// or type into the tab, then screenshot the result -- boxcode itself
+    /// has no browser tab, only the client does. Mirrors `check_browser`'s
+    /// own shape exactly (send an ask, await one reply on a fresh
+    /// `oneshot`) rather than duplicating the timeout/relay reasoning
+    /// documented on that method -- read its doc comment for why the 90s
+    /// bound exists, it applies here unchanged.
+    async fn interact_browser(
+        &self,
+        call: &ToolCall,
+        url: &str,
+        interaction: &BrowserInteraction,
+        updates: &mpsc::Sender<SessionUpdate>,
+        browser_interact: &mpsc::Sender<BrowserInteractAsk>,
+    ) -> (String, Vec<llm::ImageAttachment>) {
+        let _ = updates
+            .send(SessionUpdate::ToolCall(AcpToolCall {
+                tool_call_id: ToolCallId(call.id.clone()),
+                title: format!("interact in browser — {url} ({})", interaction.describe()),
+                kind: ToolKind::Fetch,
+                status: ToolCallStatus::InProgress,
+            }))
+            .await;
+
+        let (respond, receive) = oneshot::channel();
+        let ask = BrowserInteractAsk {
+            session_id: self.session_id.clone(),
+            url: url.to_string(),
+            interaction: interaction.clone(),
+            respond,
+        };
+        if browser_interact.send(ask).await.is_err() {
+            return ("The client disconnected before performing the interaction.".to_string(), Vec::new());
+        }
+        // Same 90s bound as `check_browser`, same reasoning -- see that
+        // method's own doc comment.
+        const BROWSER_INTERACT_TIMEOUT: Duration = Duration::from_secs(90);
+        let result = match tokio::time::timeout(BROWSER_INTERACT_TIMEOUT, receive).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                BrowserInteractResult::Failed("The client disconnected before responding.".to_string())
+            }
+            Err(_) => BrowserInteractResult::Failed(
+                "Timed out waiting for the client to respond.".to_string(),
+            ),
+        };
+
+        match result {
+            BrowserInteractResult::Screenshot { mime_type, data } => {
+                let _ = updates
+                    .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                        tool_call_id: ToolCallId(call.id.clone()),
+                        title: None,
+                        kind: None,
+                        status: Some(ToolCallStatus::Completed),
+                        content: Some(ToolCallContent::Image { mime_type: mime_type.clone(), data: data.clone() }),
+                    }))
+                    .await;
+                let images = if self.config.tools.attach_browser_screenshots {
+                    vec![llm::ImageAttachment { mime_type, data_base64: data }]
+                } else {
+                    Vec::new()
+                };
+                (
+                    format!(
+                        "{} in {url}, then screenshot captured and shown to the user.",
+                        interaction.describe()
+                    ),
+                    images,
+                )
+            }
+            BrowserInteractResult::Failed(reason) => {
+                let _ = updates
+                    .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                        tool_call_id: ToolCallId(call.id.clone()),
+                        title: None,
+                        kind: None,
+                        status: Some(ToolCallStatus::Failed),
+                        content: Some(ToolCallContent::Text { text: reason.clone() }),
+                    }))
+                    .await;
+                (format!("Could not {} in {url}: {reason}", interaction.describe()), Vec::new())
             }
         }
     }
@@ -710,8 +836,9 @@ mod tests {
         let (updates_tx, mut updates_rx) = mpsc::channel(16);
         let (permissions_tx, _permissions_rx) = mpsc::channel(16);
         let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
-        let stop = session.prompt("hi".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx).await;
+        let stop = session.prompt("hi".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await;
 
         assert_eq!(stop, StopReason::Refusal);
         let update = updates_rx.recv().await.expect("one chunk explaining why");
@@ -736,8 +863,9 @@ mod tests {
         let (updates_tx, mut updates_rx) = mpsc::channel(16);
         let (permissions_tx, _permissions_rx) = mpsc::channel(16);
         let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
-        let stop = session.prompt("hi".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx).await;
+        let stop = session.prompt("hi".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await;
 
         assert_eq!(stop, StopReason::EndTurn);
         let update = updates_rx.recv().await.expect("one chunk");
@@ -768,13 +896,21 @@ mod tests {
         let (updates_tx, _updates_rx) = mpsc::channel(16);
         let (permissions_tx, _permissions_rx) = mpsc::channel(16);
         let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
         let images = vec![llm::ImageAttachment {
             mime_type: "image/png".to_string(),
             data_base64: "aGVsbG8=".to_string(),
         }];
 
         let stop = session
-            .prompt("what's wrong with this button?".to_string(), images, &updates_tx, &permissions_tx, &browser_tx)
+            .prompt(
+                "what's wrong with this button?".to_string(),
+                images,
+                &updates_tx,
+                &permissions_tx,
+                &browser_tx,
+                &browser_interact_tx,
+            )
             .await;
 
         assert_eq!(stop, StopReason::EndTurn);
@@ -801,9 +937,10 @@ mod tests {
         let (updates_tx, mut updates_rx) = mpsc::channel(16);
         let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
         let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
         let stop = session
-            .prompt("what does hello.txt say?".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx)
+            .prompt("what does hello.txt say?".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx)
             .await;
 
         assert_eq!(stop, StopReason::EndTurn);
@@ -835,9 +972,10 @@ mod tests {
         let (updates_tx, _updates_rx) = mpsc::channel(16);
         let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
         let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
         let prompt = tokio::spawn(async move {
-            session.prompt("clean the build dir".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx).await
+            session.prompt("clean the build dir".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await
         });
 
         let ask = permissions_rx.recv().await.expect("a permission ask");
@@ -883,9 +1021,10 @@ mod tests {
         let (updates_tx, _updates_rx) = mpsc::channel(16);
         let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
         let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
         let prompt = tokio::spawn(async move {
-            session.prompt("say hi in a different way".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx).await
+            session.prompt("say hi in a different way".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await
         });
 
         let ask = permissions_rx.recv().await.expect("a permission ask");
@@ -924,10 +1063,11 @@ mod tests {
         let (updates_tx, mut updates_rx) = mpsc::channel(16);
         let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
         let (browser_tx, mut browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
         let prompt = tokio::spawn(async move {
             session
-                .prompt("does the homepage render?".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx)
+                .prompt("does the homepage render?".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx)
                 .await
         });
 
@@ -961,6 +1101,128 @@ mod tests {
         assert!(saw_image, "the screenshot must reach the client as an Image, for the human to see");
     }
 
+    /// Unlike `check_in_browser`, `interact_in_browser` is `Risk::Dangerous`
+    /// -- it must go over `permissions` first, and only after an explicit
+    /// "allow" does it go out over `browser_interact` (not `browser`, and
+    /// not `tools::execute`, which has no local implementation for it).
+    #[tokio::test]
+    async fn interact_in_browser_asks_permission_then_the_client_before_running() {
+        let (_dir, ws) = workspace();
+        let endpoint = serve_rounds(vec![
+            tool_call_round(
+                tools::INTERACT_IN_BROWSER,
+                r#"{"url":"http://localhost:3000","action":"click","x":10,"y":20}"#,
+            ),
+            text_round("Clicked it."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, mut updates_rx) = mpsc::channel(16);
+        let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+        let (browser_tx, mut browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, mut browser_interact_rx) = mpsc::channel(16);
+
+        let prompt = tokio::spawn(async move {
+            session
+                .prompt(
+                    "click the login button".to_string(),
+                    Vec::new(),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await
+        });
+
+        let permission_ask = permissions_rx.recv().await.expect("a permission ask, unlike check_in_browser");
+        assert_eq!(permission_ask.request.session_id, SessionId("s1".to_string()));
+        assert!(
+            browser_interact_rx.try_recv().is_err(),
+            "must not act before the user answers the permission ask"
+        );
+        let _ = permission_ask
+            .respond
+            .send(RequestPermissionOutcome::Selected { option_id: PermissionOptionId("allow".to_string()) });
+
+        let interact_ask = browser_interact_rx.recv().await.expect("an interact ask, after approval");
+        assert_eq!(interact_ask.session_id, SessionId("s1".to_string()));
+        assert_eq!(interact_ask.url, "http://localhost:3000");
+        assert_eq!(interact_ask.interaction, BrowserInteraction::Click { x: 10.0, y: 20.0 });
+        assert!(
+            browser_rx.try_recv().is_err(),
+            "an interaction must go out over browser_interact, not the plain check_in_browser relay"
+        );
+        let _ = interact_ask.respond.send(BrowserInteractResult::Screenshot {
+            mime_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        });
+
+        let stop = prompt.await.expect("task joins");
+        assert_eq!(stop, StopReason::EndTurn);
+
+        let mut saw_image = false;
+        while let Ok(update) = updates_rx.try_recv() {
+            if let SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                content: Some(ToolCallContent::Image { mime_type, data }),
+                ..
+            }) = update
+            {
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(data, "aGVsbG8=");
+                saw_image = true;
+            }
+        }
+        assert!(saw_image, "the post-interaction screenshot must reach the client as an Image");
+    }
+
+    /// A refused `interact_in_browser` must never reach `browser_interact` at
+    /// all -- same posture as any other refused dangerous action.
+    #[tokio::test]
+    async fn a_refused_interact_in_browser_never_reaches_the_client() {
+        let (_dir, ws) = workspace();
+        let endpoint = serve_rounds(vec![
+            tool_call_round(
+                tools::INTERACT_IN_BROWSER,
+                r#"{"url":"http://localhost:3000","action":"type","text":"hunter2"}"#,
+            ),
+            text_round("Understood, not typing that."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, mut browser_interact_rx) = mpsc::channel(16);
+
+        let prompt = tokio::spawn(async move {
+            session
+                .prompt(
+                    "type the password into the login form".to_string(),
+                    Vec::new(),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await
+        });
+
+        let permission_ask = permissions_rx.recv().await.expect("a permission ask");
+        let _ = permission_ask
+            .respond
+            .send(RequestPermissionOutcome::Selected { option_id: PermissionOptionId("reject".to_string()) });
+
+        let stop = prompt.await.expect("task joins");
+        assert_eq!(stop, StopReason::EndTurn);
+        assert!(
+            browser_interact_rx.try_recv().is_err(),
+            "a refused interaction must never reach the client at all"
+        );
+    }
+
     /// The actual point of wiring `Journal` into `HeadlessSession`: a write
     /// the model made this session can be undone through the exact same
     /// mechanism `App`'s own `/rollback` uses, not a parallel
@@ -978,12 +1240,13 @@ mod tests {
         let (updates_tx, _updates_rx) = mpsc::channel(16);
         let (permissions_tx, _permissions_rx) = mpsc::channel(16);
         let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
         // Ordinary write, default policy -- auto-approved, same as
         // `an_auto_approved_read_runs_without_asking_permission`'s own
         // sibling reasoning, just for a write instead of a read.
         let stop = session
-            .prompt("say hi in a different way".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx)
+            .prompt("say hi in a different way".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx)
             .await;
         assert_eq!(stop, StopReason::EndTurn);
         assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "bye\n");
