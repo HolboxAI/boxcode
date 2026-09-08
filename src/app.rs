@@ -5,7 +5,7 @@ use crate::llm::{ChatMessage, ToolCall};
 use crate::providers;
 use crate::tools::{self, Mode, ToolOutcome};
 use crate::usage;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
@@ -180,6 +180,15 @@ pub enum Overlay {
         /// away, so a reflexive Enter must be the harmless answer.
         confirmed: bool,
     },
+    /// Ctrl+P command palette: every `/` command, filterable by name or
+    /// description. Unlike the slash-autocomplete menu (which only appears
+    /// while a bare `/word` is being typed), this is reachable at any idle
+    /// moment and runs the chosen command directly. `filter` is the text
+    /// typed so far; empty shows every command in `COMMANDS` order.
+    CommandPalette {
+        filter: String,
+        selected: usize,
+    },
 }
 
 /// Sequential manual entry used when the user picks "Custom endpoint..." instead
@@ -192,11 +201,11 @@ pub enum CustomStep {
     ApiKey { endpoint: String, model: String },
 }
 
-/// Every slash command, in one place -- the single source of truth for both
-/// dispatch (`App::selected_command`) and what the autocomplete menu /
-/// welcome screen list. Adding a command means adding it here and to the
-/// `match` in `selected_command`'s caller; nowhere else should name a
-/// command as a string literal.
+/// Every slash command, in one place -- the single source of truth for
+/// dispatch (`App::run_command`) and what the `/` autocomplete menu and the
+/// Ctrl+P palette list. Adding a command means adding it here and to the
+/// `match` in `run_command`; nowhere else should name a command as a string
+/// literal.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/plan", "research first, change nothing until you approve"),
     ("/provider", "switch provider or endpoint"),
@@ -760,6 +769,60 @@ impl App {
         Some(matches[index].0)
     }
 
+    /// Every command whose name *or* description contains the palette filter,
+    /// in `COMMANDS` order. An empty filter shows all of them. Case-insensitive
+    /// on both fields, unlike the slash menu's prefix match: the palette is for
+    /// finding a command you half-remember, so "switch" matches `/pull`'s
+    /// "switch to a different local project" even though the name says no such
+    /// thing.
+    pub fn filtered_commands(&self, filter: &str) -> Vec<(&'static str, &'static str)> {
+        let needle = filter.to_lowercase();
+        self.available_commands()
+            .into_iter()
+            .filter(|(name, desc)| {
+                needle.is_empty()
+                    || name.to_lowercase().contains(&needle)
+                    || desc.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    /// Run a slash command by name. The single dispatch point for both the
+    /// slash-autocomplete Enter path and the Ctrl+P palette, so a command added
+    /// to `COMMANDS` only needs wiring here once.
+    fn run_command(&mut self, cmd: &str) {
+        match cmd {
+            "/plan" => self.toggle_plan_mode(),
+            "/provider" => self.open_provider_picker(),
+            "/model" => self.open_model_picker_from_config(),
+            "/init" => self.start_init(),
+            "/resume" => self.resume_latest(),
+            "/pull" => self.open_pull_picker(),
+            "/new" => self.start_new_conversation(),
+            "/compact" => self.start_compaction(),
+            "/usage" => self.show_usage(),
+            "/quota" => self.show_quota(),
+            "/subagents" => self.show_subagents(),
+            "/hosted" => self.start_hosted(),
+            "/rollback" => self.start_rollback(),
+            "/diff" => self.show_diff(),
+            other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
+        }
+    }
+
+    /// Open the Ctrl+P palette, when idle. Commands never run mid-turn (the
+    /// slash menu carries the same restriction), so a busy app silently ignores
+    /// the chord rather than presenting a list it could not act on.
+    fn open_command_palette(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        self.overlay = Some(Overlay::CommandPalette {
+            filter: String::new(),
+            selected: 0,
+        });
+    }
+
     /// Ctrl-C. Returns `true` when the app should actually quit.
     ///
     /// Deliberately not a plain `should_exit = true`: see `quit_armed`. Kept
@@ -773,6 +836,29 @@ impl App {
         }
         self.quit_armed = true;
         false
+    }
+
+    /// The mouse wheel scrolls the transcript the same way PgUp/PgDn do. The
+    /// wheel is what a terminal user reaches for first, and the full screen has
+    /// no native scrollback for it to act on instead, so it has to map to the
+    /// same in-viewport offset.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self.follow_tail {
+                    self.scroll = 0;
+                }
+                self.follow_tail = false;
+                self.scroll = self.scroll.saturating_add(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll = self.scroll.saturating_sub(3);
+                if self.scroll == 0 {
+                    self.follow_tail = true;
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -820,23 +906,7 @@ impl App {
                     self.input_buffer.clear();
                     self.cursor = 0;
                     self.command_menu_selected = 0;
-                    match cmd {
-                        "/plan" => self.toggle_plan_mode(),
-                        "/provider" => self.open_provider_picker(),
-                        "/model" => self.open_model_picker_from_config(),
-                        "/init" => self.start_init(),
-                        "/resume" => self.resume_latest(),
-                        "/pull" => self.open_pull_picker(),
-                        "/new" => self.start_new_conversation(),
-                        "/compact" => self.start_compaction(),
-                        "/usage" => self.show_usage(),
-                        "/quota" => self.show_quota(),
-                        "/subagents" => self.show_subagents(),
-                        "/hosted" => self.start_hosted(),
-                        "/rollback" => self.start_rollback(),
-                        "/diff" => self.show_diff(),
-                        other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
-                    }
+                    self.run_command(cmd);
                 } else {
                     self.submit();
                 }
@@ -853,6 +923,14 @@ impl App {
             KeyCode::Char('a') if ctrl => self.cursor = self.line_start(),
             KeyCode::Char('e') if ctrl => self.cursor = self.line_end(),
             KeyCode::Char('j') if ctrl => self.insert_str("\n"),
+            // The command palette: every `/` command, filterable, at any idle
+            // moment -- not just while typing a bare `/word`.
+            KeyCode::Char('p') if ctrl => self.open_command_palette(),
+            // Ctrl+R picks up this directory's last session. A deliberate chord
+            // rather than a bare Enter -- a stray Enter on a blank prompt used
+            // to resume, which is exactly the kind of one-key accident worth
+            // avoiding.
+            KeyCode::Char('r') if ctrl => self.resume_latest(),
 
             // Any other Ctrl-chord is a command, not text: never let it reach the buffer.
             KeyCode::Char(_) if ctrl => {}
@@ -904,8 +982,11 @@ impl App {
                 }
             }
             KeyCode::PageUp => {
+                if self.follow_tail {
+                    self.scroll = 0;
+                }
                 self.follow_tail = false;
-                self.scroll = self.scroll.saturating_sub(10);
+                self.scroll = self.scroll.saturating_add(10);
             }
             KeyCode::Down => {
                 let matches = self.matching_commands();
@@ -918,7 +999,10 @@ impl App {
                 }
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_add(10);
+                self.scroll = self.scroll.saturating_sub(10);
+                if self.scroll == 0 {
+                    self.follow_tail = true;
+                }
             }
 
             // Esc interrupts a running turn, but asks twice: the first press
@@ -3662,6 +3746,9 @@ impl App {
             Overlay::ArtifactPicker { items, selected } => {
                 self.handle_artifact_picker_key(key, items, selected)
             }
+            Overlay::CommandPalette { filter, selected } => {
+                self.handle_command_palette_key(key, filter, selected)
+            }
             // Put back first: an unrecognised key must leave the prompt standing
             // rather than silently dismissing it, and `handle_overlay_key` took
             // the overlay before dispatching here.
@@ -3679,6 +3766,60 @@ impl App {
             Overlay::Deploy => {
                 self.overlay = Some(Overlay::Deploy);
                 self.handle_deploy_key(key);
+            }
+        }
+    }
+
+    fn handle_command_palette_key(&mut self, key: KeyEvent, mut filter: String, selected: usize) {
+        // The matches correspond to `filter` as it stands *before* this key,
+        // so Enter and Up/Down index into the list currently on screen. A
+        // filter change (Backspace/Char) recomputes on the next render and
+        // resets the selection to the top, so a stale index can never point
+        // past the shrunk list.
+        let matches = self.filtered_commands(&filter);
+        match key.code {
+            KeyCode::Esc => {} // close, run nothing
+            KeyCode::Up => {
+                let next = if matches.is_empty() {
+                    0
+                } else if selected == 0 {
+                    matches.len() - 1
+                } else {
+                    selected - 1
+                };
+                self.overlay = Some(Overlay::CommandPalette { filter, selected: next });
+            }
+            KeyCode::Down => {
+                let next = if matches.is_empty() {
+                    0
+                } else {
+                    (selected + 1).min(matches.len() - 1)
+                };
+                self.overlay = Some(Overlay::CommandPalette { filter, selected: next });
+            }
+            KeyCode::Enter => {
+                if let Some(cmd) = matches.get(selected) {
+                    let cmd = cmd.0;
+                    self.overlay = None;
+                    self.run_command(cmd);
+                }
+            }
+            KeyCode::Backspace => {
+                filter.pop();
+                self.overlay = Some(Overlay::CommandPalette { filter, selected: 0 });
+            }
+            // A Ctrl-chord is a command, not filter text -- same rule the
+            // ordinary input path applies -- so it falls through to the arm
+            // below and leaves the palette untouched.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                filter.push(c);
+                self.overlay = Some(Overlay::CommandPalette { filter, selected: 0 });
+            }
+            // Any other key leaves the palette exactly as it was: the overlay
+            // has intercepted the input, so doing nothing here is what keeps
+            // an unrelated key from silently dismissing it.
+            _ => {
+                self.overlay = Some(Overlay::CommandPalette { filter, selected });
             }
         }
     }
@@ -5363,6 +5504,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::NONE }
+    }
+
     fn type_str(app: &mut App, s: &str) {
         for c in s.chars() {
             app.handle_key(key(KeyCode::Char(c)));
@@ -5985,6 +6130,57 @@ mod tests {
         let mut a = app();
         type_str(&mut a, "/xyz");
         assert!(a.matching_commands().is_empty());
+    }
+
+    // ---- Ctrl+P palette -----------------------------------------------------
+
+    #[test]
+    fn the_palette_filter_matches_name_or_description_case_insensitively() {
+        let a = app();
+
+        // Empty filter shows everything.
+        assert_eq!(a.filtered_commands("").len(), COMMANDS.len());
+
+        // "switch" appears in three *descriptions* (/provider, /model, /pull),
+        // not just names -- the palette matches on what a command does, not
+        // only what it is called.
+        let names: Vec<&str> = a
+            .filtered_commands("switch")
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(names, vec!["/provider", "/model", "/pull"]);
+
+        // Case-insensitive on the needle.
+        assert_eq!(a.filtered_commands("SWITCH").len(), 3);
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_palette_and_enter_runs_the_selection() {
+        let mut a = app();
+        a.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(matches!(a.overlay, Some(Overlay::CommandPalette { .. })));
+
+        // Down moves to the second command (/provider), Enter runs it and the
+        // palette closes into that command's own picker.
+        a.handle_key(key(KeyCode::Down));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(matches!(a.overlay, Some(Overlay::ProviderPicker { .. })));
+    }
+
+    #[test]
+    fn ctrl_p_typing_filters_and_esc_closes_without_running() {
+        let mut a = app();
+        a.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        type_str(&mut a, "usage");
+        match &a.overlay {
+            Some(Overlay::CommandPalette { filter, .. }) => assert_eq!(filter, "usage"),
+            other => panic!("palette should still be open, got {other:?}"),
+        }
+
+        a.handle_key(key(KeyCode::Esc));
+        assert!(a.overlay.is_none(), "Esc closes without running anything");
     }
 
     /// Once a space is typed, the "/word" is finished -- what follows is an
@@ -7848,14 +8044,34 @@ mod tests {
     }
 
     #[test]
-    fn page_up_and_page_down_still_scroll_the_transcript() {
+    fn page_up_and_page_down_scroll_the_transcript() {
         let mut a = app();
-        a.scroll = 20;
         a.handle_key(key(KeyCode::PageUp));
         assert_eq!(a.scroll, 10);
         assert!(!a.follow_tail);
-        a.handle_key(key(KeyCode::PageDown));
+        a.handle_key(key(KeyCode::PageUp));
         assert_eq!(a.scroll, 20);
+        a.handle_key(key(KeyCode::PageDown));
+        assert_eq!(a.scroll, 10);
+        a.handle_key(key(KeyCode::PageDown));
+        assert_eq!(a.scroll, 0);
+        assert!(a.follow_tail, "reaching the bottom resumes tail-following");
+    }
+
+    /// The wheel scrolls three lines at a time and, like PgDn, hands back to
+    /// tail-following once it reaches the newest message.
+    #[test]
+    fn the_wheel_scrolls_the_transcript_too() {
+        let mut a = app();
+        a.handle_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(a.scroll, 3);
+        assert!(!a.follow_tail);
+        a.handle_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(a.scroll, 6);
+        a.handle_mouse(mouse(MouseEventKind::ScrollDown));
+        a.handle_mouse(mouse(MouseEventKind::ScrollDown));
+        assert_eq!(a.scroll, 0);
+        assert!(a.follow_tail);
     }
 
     /// Pressing Enter twice on the same prompt should not mean pressing Up
