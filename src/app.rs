@@ -5,7 +5,7 @@ use crate::llm::{ChatMessage, ToolCall};
 use crate::providers;
 use crate::tools::{self, Mode, ToolOutcome};
 use crate::usage;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
@@ -836,29 +836,6 @@ impl App {
         }
         self.quit_armed = true;
         false
-    }
-
-    /// The mouse wheel scrolls the transcript the same way PgUp/PgDn do. The
-    /// wheel is what a terminal user reaches for first, and the full screen has
-    /// no native scrollback for it to act on instead, so it has to map to the
-    /// same in-viewport offset.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                if self.follow_tail {
-                    self.scroll = 0;
-                }
-                self.follow_tail = false;
-                self.scroll = self.scroll.saturating_add(3);
-            }
-            MouseEventKind::ScrollDown => {
-                self.scroll = self.scroll.saturating_sub(3);
-                if self.scroll == 0 {
-                    self.follow_tail = true;
-                }
-            }
-            _ => {}
-        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -5504,10 +5481,6 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn mouse(kind: MouseEventKind) -> MouseEvent {
-        MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::NONE }
-    }
-
     fn type_str(app: &mut App, s: &str) {
         for c in s.chars() {
             app.handle_key(key(KeyCode::Char(c)));
@@ -8056,22 +8029,6 @@ mod tests {
         a.handle_key(key(KeyCode::PageDown));
         assert_eq!(a.scroll, 0);
         assert!(a.follow_tail, "reaching the bottom resumes tail-following");
-    }
-
-    /// The wheel scrolls three lines at a time and, like PgDn, hands back to
-    /// tail-following once it reaches the newest message.
-    #[test]
-    fn the_wheel_scrolls_the_transcript_too() {
-        let mut a = app();
-        a.handle_mouse(mouse(MouseEventKind::ScrollUp));
-        assert_eq!(a.scroll, 3);
-        assert!(!a.follow_tail);
-        a.handle_mouse(mouse(MouseEventKind::ScrollUp));
-        assert_eq!(a.scroll, 6);
-        a.handle_mouse(mouse(MouseEventKind::ScrollDown));
-        a.handle_mouse(mouse(MouseEventKind::ScrollDown));
-        assert_eq!(a.scroll, 0);
-        assert!(a.follow_tail);
     }
 
     /// Pressing Enter twice on the same prompt should not mean pressing Up

@@ -489,18 +489,10 @@ fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
 
     {
-        if app.messages.is_empty() {
-            // The welcome panel has nowhere else to live: on the full screen
-            // there is no scrollback above the viewport to print it into, so
-            // it is drawn here until the first prompt.
-            lines.extend(welcome_lines(app, width));
-        } else {
-            // Everything the flush loop has not taken. On the full screen that
-            // is all of it, since nothing is handed to the terminal mid-turn;
-            // `flushed` stays zero and the whole transcript draws here.
-            for msg in app.messages.iter().skip(app.flushed) {
-                lines.extend(message_lines(msg, width));
-            }
+        // Messages the flush loop has not taken yet -- during a turn that is
+        // everything it produced, since flushing waits for the turn to end.
+        for msg in app.messages.iter().skip(app.flushed) {
+            lines.extend(message_lines(msg, width));
         }
         if app.state == AppState::ExecutingTools {
             // A tool that is still running gets the spinner where a finished
@@ -552,14 +544,10 @@ fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    // The transcript is taller than the pane. `scroll` counts lines up from
-    // the newest message, and `follow_tail` pins the view back to the bottom
-    // whenever the user has not deliberately scrolled away; when it is false
-    // the wheel / PgUp / PgDn have set an offset to honour instead.
+    // Only the tail fits, and the tail is the part that is still arriving --
+    // the rest is a moment away from being printed above anyway.
     let height = area.height as usize;
-    let max_scroll = lines.len().saturating_sub(height);
-    let scroll = if app.follow_tail { 0 } else { (app.scroll as usize).min(max_scroll) };
-    let skip = (lines.len() - scroll).saturating_sub(height);
+    let skip = lines.len().saturating_sub(height);
     let shown: Vec<Line> = lines.into_iter().skip(skip).collect();
 
     f.render_widget(
@@ -2270,8 +2258,8 @@ fn deployment_lines(app: &App, inner: usize) -> Vec<Line<'static>> {
 /// The panel's content, split into a body that may scroll and a footer that
 /// never does.
 ///
-/// A panel taller than the region it is drawn into would be clipped from the
-/// bottom -- taking the spinner and
+/// The viewport is a fixed strip (`VIEWPORT_ROWS` in `main.rs`), so a panel
+/// that simply grew would be clipped from the bottom -- taking the spinner and
 /// the keys with it, which is exactly the half you need while something is
 /// running. So the status line and the keys are pinned, and the checklist and
 /// log scroll behind them. Same shape, and the same reasoning, as
@@ -5757,10 +5745,10 @@ mod tests {
         );
     }
 
-    /// The panel cannot grow its way out of a short region: anything past the
-    /// bottom is simply not drawn. The status line and the keys are pinned for
-    /// exactly that reason -- they are the half you need while something is
-    /// running.
+    /// The viewport is a fixed strip (`VIEWPORT_ROWS` in `main.rs`), so the
+    /// panel cannot grow its way out of trouble: anything past the bottom is
+    /// simply not drawn. The status line and the keys are pinned for exactly
+    /// that reason -- they are the half you need while something is running.
     #[test]
     fn the_deployment_panel_keeps_its_status_line_inside_a_short_viewport() {
         use crate::deploy::service::{tests_support, Step, StepLine};
@@ -5782,7 +5770,7 @@ mod tests {
         app.deploy = Some(session);
         app.overlay = Some(Overlay::Deploy);
 
-        // A short viewport, as on a small terminal.
+        // The height `main.rs` actually gives it.
         let mut terminal = Terminal::with_options(
             TestBackend::new(76, 12),
             ratatui::TerminalOptions {
