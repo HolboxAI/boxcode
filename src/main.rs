@@ -35,8 +35,9 @@ use app::App;
 use config::{ApprovalMode, Config};
 use workspace::Workspace;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
@@ -46,7 +47,7 @@ use llm::StreamEvent;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::Terminal;
 use std::error::Error;
 use std::io;
 use std::time::Duration;
@@ -165,36 +166,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let enhanced = setup_terminal()?;
 
     let backend = CrosstermBackend::new(io::stdout());
-    // An inline viewport owns only the bottom strip; everything above it is
-    // ordinary terminal output. `VIEWPORT_ROWS` is fixed because ratatui takes
-    // the inline height at construction -- which is workable precisely because
-    // the approval prompt scrolls inside its own box rather than growing.
-    const VIEWPORT_ROWS: u16 = 12;
-    // Setting up an inline viewport asks the terminal where the cursor is and
-    // waits for the answer. Practically every terminal replies -- it is a far
-    // older and better-supported query than the OSC background one that had to
-    // be removed for hanging -- but "practically every" is not "every", and a
-    // terminal that stays silent must not leave the app unable to start at all.
+    // A full-height right-hand panel needs the whole screen: an inline viewport
+    // owns only the bottom strip, so any panel laid out inside it is clipped to
+    // that strip no matter how the rest of the layout asks for full height.
     //
-    // So: fall back to the full screen. That loses the scrollback this whole
-    // change exists to provide, which is worth saying out loud rather than
-    // failing silently, but it does start.
-    let (mut terminal, alternate_screen) = match Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT_ROWS),
-        },
-    ) {
-        Ok(terminal) => (terminal, false),
-        Err(e) => {
-            eprintln!(
-                "Note: this terminal did not report its cursor position ({e}), so session \
-                 history will not go to its scrollback."
-            );
-            crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
-            (Terminal::new(backend)?, true)
-        }
-    };
+    // The full screen has no terminal scrollback of its own, so the app keeps
+    // the history reachable in two places instead of one:
+    //   * in-viewport -- PgUp/PgDn and the mouse wheel scroll the transcript,
+    //     and
+    //   * on exit -- a clean quit with `clear_on_exit = false` prints the whole
+    //     conversation to the terminal, so its scrollback, selection and search
+    //     still have it after the fact.
+    crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(backend)?;
+    let alternate_screen = true;
     install_panic_hook(enhanced, alternate_screen);
 
     let mut app = App::new(config);
@@ -346,38 +331,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await;
 
-    // Erase the inline viewport before the terminal goes back to normal.
-    //
-    // The viewport is a strip ratatui owns at the bottom of the real
-    // terminal; leaving raw mode does not remove what was drawn there. So
-    // "Goodbye!" and then the shell prompt were printed straight over the
-    // still-visible input box, producing the overlapped mess of a half prompt
-    // box with text through it. Clearing first, then leaving one blank line,
-    // means the shell comes back to a clean row.
-    let _ = terminal.clear();
-    if !alternate_screen {
-        println!();
-    }
+    // Leaving the full screen hands the terminal straight back to the user --
+    // the alternate screen is discarded and their own buffer (prompt,
+    // scrollback, whatever was there before boxcode) is exactly as it was. So
+    // unlike the inline viewport there is nothing drawn on it to erase, or to
+    // leave a blank line over, before "Goodbye!".
     restore_terminal(enhanced, alternate_screen)?;
 
-    // Then, on a clean exit, take the conversation off the terminal entirely.
-    //
-    // Three conditions, and each one is a case where wiping the screen would
-    // destroy something worth more than the tidiness:
-    //
-    //   * `result.is_ok()` -- an error is printed just below, and an error
-    //     that erased itself is worse than no error at all.
-    //   * `!alternate_screen` -- that fallback has already restored whatever
-    //     was on screen before boxcode started. Clearing on top of it would
-    //     wipe the user's own terminal rather than ours.
-    //   * the setting -- see `UiConfig::clear_on_exit` for the trade.
-    //
-    // Nothing is lost that was not already on screen: the session is on disk
-    // either way, and `--resume` picks it up.
-    let wiped = should_clear_on_exit(&app.config.ui, alternate_screen, result.is_ok());
-    if wiped {
-        clear_scrollback();
+    // The full screen never touched the terminal's scrollback, so a clean exit
+    // that asked to keep the history (`clear_on_exit = false`) has to hand the
+    // conversation over as plain text -- the same place the inline viewport
+    // used to leave it. The default (`clear_on_exit = true`) leaves nothing,
+    // which the alternate screen already did on its own.
+    if result.is_ok() && !app.config.ui.clear_on_exit {
+        dump_transcript(&app);
     }
+
     // `/pull` set this instead of just exiting -- checked only after the
     // terminal is back to normal (raw mode and the alternate screen both
     // released), since the relaunched process needs the real terminal to set
@@ -393,60 +362,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Err(e) = &result {
         eprintln!("Error: {e}");
     }
-    // Skipped when the screen was wiped: "Goodbye!" alone at the top of a
-    // blank terminal is the one thing left of a session that was supposed to
-    // leave nothing. The shell prompt coming back says it exited.
-    if !wiped {
-        println!("Goodbye!");
-    }
+    println!("Goodbye!");
     result
 }
 
-/// Clear the screen *and* the scrollback, leaving the terminal as it was
-/// found.
+/// Print the whole session to the terminal as plain text, on the way out.
 ///
-/// `\x1b[3J` is the part that matters and the part that is easy to leave out:
-/// `[2J` alone clears what is visible, so the whole conversation is still
-/// there one scroll up, which is not what "close it" means to anyone. This is
-/// byte for byte what `clear(1)` emits on a terminal that supports it.
-///
-/// Written straight to stdout rather than through crossterm: `Clear` has no
-/// variant for the saved-lines buffer, and a terminal that does not understand
-/// the sequence ignores it, which is the correct outcome anyway.
-fn clear_scrollback() {
+/// The full screen never wrote to the terminal's scrollback, so this is the
+/// one place a `clear_on_exit = false` user's history still lands: once the
+/// alternate screen is gone, the conversation goes to the normal buffer where
+/// the wheel, text selection and the terminal's own search can reach it.
+/// Styles are dropped on purpose -- scrollback is text, and colour there would
+/// only differ from what was on screen.
+fn dump_transcript(app: &App) {
     use std::io::Write;
-    let mut stdout = io::stdout();
-    let _ = stdout.write_all(CLEAR_SCROLLBACK);
-    let _ = stdout.flush();
+    let width = crossterm::terminal::size()
+        .map(|(w, _)| w.saturating_sub(3).max(1) as usize)
+        .unwrap_or(80);
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for line in ui::welcome_lines(app, width) {
+        let _ = writeln!(out, "{}", line_text(&line));
+    }
+    for msg in &app.messages {
+        for line in ui::message_lines(msg, width) {
+            let _ = writeln!(out, "{}", line_text(&line));
+        }
+    }
+    let _ = out.flush();
 }
 
-/// Erase saved lines, home the cursor, erase the screen -- byte for byte what
-/// `clear(1)` emits.
-///
-/// A named constant so the `[3J` cannot be quietly dropped: without it this
-/// clears only what is visible and the conversation is one scroll away, which
-/// is the bug rather than the fix. There is a test.
-const CLEAR_SCROLLBACK: &[u8] = b"\x1b[3J\x1b[H\x1b[2J";
-
-/// Whether quitting should take the conversation off the terminal.
-///
-/// Split out of `main` because each `false` here is a case where tidiness
-/// would destroy something worth more, and a condition like that is worth
-/// being able to test rather than read.
-fn should_clear_on_exit(ui: &config::UiConfig, alternate_screen: bool, ok: bool) -> bool {
-    // An error is printed immediately after this, and one that erased itself
-    // would be worse than none -- at least a missing message leaves an exit
-    // code to go on.
-    if !ok {
-        return false;
-    }
-    // The alternate-screen fallback has already put back whatever was on
-    // screen before boxcode started. Clearing on top of that would wipe the
-    // user's own terminal rather than ours.
-    if alternate_screen {
-        return false;
-    }
-    ui.clear_on_exit
+/// A rendered line's spans joined back into plain text, colour dropped.
+fn line_text(line: &ratatui::text::Line) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
 /// Re-launches the boxcode binary rooted at `dir`, in place of this process
@@ -611,13 +559,16 @@ async fn run_app<B: ratatui::backend::Backend>(
     alternate_screen: bool,
 ) -> Result<(), Box<dyn Error>> {
     loop {
-        // Hand finished messages to the terminal before drawing. Once printed
-        // they are the terminal's -- its scrollback, its selection, its search
-        // -- and this loop never touches them again.
-        flush_to_scrollback(terminal, app)?;
+        // Hand finished messages to the terminal before drawing -- but only on
+        // the normal buffer. The full screen has no scrollback above the
+        // viewport, so there is nothing to hand over and `ui::render` draws the
+        // whole transcript itself.
+        if !alternate_screen {
+            flush_to_scrollback(terminal, app)?;
+        }
         terminal.draw(|f| ui::render(f, app))?;
 
-        // Keyboard / paste input.
+        // Keyboard / paste / mouse input.
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -636,6 +587,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 Event::Paste(text) => app.handle_paste(text),
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => {}
             }
         }
@@ -966,12 +918,10 @@ KEYS:
 fn setup_terminal() -> Result<bool, Box<dyn Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Deliberately no alternate screen. That buffer has no scrollback of its
-    // own, so everything the session had ever printed became unreachable the
-    // moment it left the viewport -- and vanished entirely on exit. Staying on
-    // the normal buffer hands the history to the terminal, where the wheel,
-    // text selection and the terminal's own search already work.
-    crossterm::execute!(stdout, EnableBracketedPaste)?;
+    // The alternate screen is entered in `main`; this only flips the switches a
+    // full-screen app needs. Mouse capture is what turns the wheel into
+    // transcript scroll events rather than terminal scrollback.
+    crossterm::execute!(stdout, EnableBracketedPaste, EnableMouseCapture)?;
 
     // Optional: lets terminals that support it distinguish Shift/Ctrl-Enter.
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
@@ -989,7 +939,7 @@ fn restore_terminal(enhanced: bool, alternate_screen: bool) -> Result<(), Box<dy
     if enhanced {
         let _ = crossterm::execute!(stdout, PopKeyboardEnhancementFlags);
     }
-    crossterm::execute!(stdout, DisableBracketedPaste)?;
+    crossterm::execute!(stdout, DisableBracketedPaste, DisableMouseCapture)?;
     if alternate_screen {
         crossterm::execute!(stdout, LeaveAlternateScreen)?;
     }
@@ -1010,37 +960,6 @@ fn install_panic_hook(enhanced: bool, alternate_screen: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The conversation has to be gone, not one scroll away. `[2J` alone
-    /// clears the visible screen and leaves the whole session in the
-    /// scrollback, which is the complaint this exists to answer.
-    #[test]
-    fn clearing_erases_the_scrollback_not_just_the_screen() {
-        let sequence = String::from_utf8(CLEAR_SCROLLBACK.to_vec()).expect("ascii");
-        assert!(sequence.contains("\u{1b}[3J"), "missing the saved-lines erase: {sequence:?}");
-        assert!(sequence.contains("\u{1b}[2J"), "missing the screen erase: {sequence:?}");
-        assert!(sequence.contains("\u{1b}[H"), "missing the cursor home: {sequence:?}");
-    }
-
-    /// Every case where wiping the screen would cost more than it is worth.
-    #[test]
-    fn nothing_is_wiped_when_something_is_worth_keeping() {
-        let on = config::UiConfig::default();
-        let off = config::UiConfig { clear_on_exit: false, ..Default::default() };
-
-        // The ordinary quit.
-        assert!(should_clear_on_exit(&on, false, true));
-
-        // A failure: the error is printed right after, and must survive.
-        assert!(!should_clear_on_exit(&on, false, false));
-
-        // The alternate-screen fallback already restored the terminal; this
-        // would wipe what was there before boxcode started.
-        assert!(!should_clear_on_exit(&on, true, true));
-
-        // And the setting is the last word.
-        assert!(!should_clear_on_exit(&off, false, true));
-    }
 
     /// The default is on, which is the whole point -- and it is the kind of
     /// default that is easy to flip by accident when the struct grows.

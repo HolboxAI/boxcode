@@ -26,6 +26,14 @@ const MAX_COMMAND_MENU_HEIGHT: u16 = 16;
 const MAX_DEPLOY_HEIGHT: u16 = 28;
 const MIN_POPUP_WIDTH: u16 = 40;
 const MIN_POPUP_HEIGHT: u16 = 6;
+/// Width of the live to-do panel on the right edge. Wide enough for a
+/// checklist item plus its marker, narrow enough that a normal terminal still
+/// leaves the transcript most of the width.
+const TODO_PANEL_WIDTH: u16 = 34;
+/// Below this total width the to-do panel is suppressed rather than squashing
+/// the transcript against the right edge -- the footer's one-line summary
+/// carries the same information there.
+const MIN_SIDE_PANEL_SPLIT_WIDTH: u16 = 84;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let size = f.size();
@@ -78,6 +86,23 @@ pub fn render(f: &mut Frame, app: &mut App) {
         (command_matches.len() as u16 + 2).min(MAX_COMMAND_MENU_HEIGHT)
     };
 
+    // A live to-do list reserves a full-height column on the right edge, so the
+    // panel spans the whole terminal rather than hugging the transcript's
+    // bottom corner. Only when there is both a list to show and enough width
+    // to show it without starving the transcript -- on a narrow terminal the
+    // list stays in the footer's one-line summary instead.
+    let show_todo = !app.todos.is_empty()
+        && size.width > TODO_PANEL_WIDTH + MIN_SIDE_PANEL_SPLIT_WIDTH;
+    let (main_area, todo_area) = if show_todo {
+        let side = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(TODO_PANEL_WIDTH)])
+            .split(size);
+        (side[0], Some(side[1]))
+    } else {
+        (size, None)
+    };
+
     // The viewport is a strip at the bottom of the real terminal, not a whole
     // screen: finished messages have already been printed above it and belong
     // to the terminal's scrollback now. What is left here is the turn in
@@ -90,7 +115,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Constraint::Length(bottom_height),
             Constraint::Length(1),
         ])
-        .split(size);
+        .split(main_area);
 
     render_live(f, chunks[0], app);
     if !command_matches.is_empty() {
@@ -105,6 +130,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
         }
     }
     render_footer(f, chunks[3], app);
+
+    // The to-do panel is drawn over its own full-height column after the left
+    // side, so the two never overlap even when the transcript is empty.
+    if let Some(area) = todo_area {
+        render_todo_panel(f, area, app);
+    }
 
     // Everything else here (pickers, text prompts) is a one-shot choice made
     // before a turn even starts, with no transcript underneath it yet to stay
@@ -458,10 +489,18 @@ fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
 
     {
-        // Messages the flush loop has not taken yet -- during a turn that is
-        // everything it produced, since flushing waits for the turn to end.
-        for msg in app.messages.iter().skip(app.flushed) {
-            lines.extend(message_lines(msg, width));
+        if app.messages.is_empty() {
+            // The welcome panel has nowhere else to live: on the full screen
+            // there is no scrollback above the viewport to print it into, so
+            // it is drawn here until the first prompt.
+            lines.extend(welcome_lines(app, width));
+        } else {
+            // Everything the flush loop has not taken. On the full screen that
+            // is all of it, since nothing is handed to the terminal mid-turn;
+            // `flushed` stays zero and the whole transcript draws here.
+            for msg in app.messages.iter().skip(app.flushed) {
+                lines.extend(message_lines(msg, width));
+            }
         }
         if app.state == AppState::ExecutingTools {
             // A tool that is still running gets the spinner where a finished
@@ -513,10 +552,14 @@ fn render_live(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    // Only the tail fits, and the tail is the part that is still arriving --
-    // the rest is a moment away from being printed above anyway.
+    // The transcript is taller than the pane. `scroll` counts lines up from
+    // the newest message, and `follow_tail` pins the view back to the bottom
+    // whenever the user has not deliberately scrolled away; when it is false
+    // the wheel / PgUp / PgDn have set an offset to honour instead.
     let height = area.height as usize;
-    let skip = lines.len().saturating_sub(height);
+    let max_scroll = lines.len().saturating_sub(height);
+    let scroll = if app.follow_tail { 0 } else { (app.scroll as usize).min(max_scroll) };
+    let skip = (lines.len() - scroll).saturating_sub(height);
     let shown: Vec<Line> = lines.into_iter().skip(skip).collect();
 
     f.render_widget(
@@ -614,14 +657,18 @@ fn activity_line(app: &App) -> Option<Line<'static>> {
     } else {
         " · esc to interrupt"
     };
-    Some(Line::from(vec![
-        Span::styled(format!("{frame} "), theme::accent()),
-        Span::styled(format!("{verb}… "), Style::default().fg(theme::p().accent_soft)),
-        Span::styled(
-            format!("({secs}s{detail}{turn_note}{interrupt_hint})"),
-            theme::faint(),
-        ),
-    ]))
+    // The verb gets the glossy glint rather than a flat colour: "Thinking…"
+    // sweeps a sheen like light over a sign, so a long reasoning stretch reads
+    // as alive instead of a static label. The clock is the same one the
+    // spinner uses, so the two move together.
+    let mut spans = vec![Span::styled(format!("{frame} "), theme::accent())];
+    spans.extend(theme::shine(&format!("{verb}…"), request.unwrap_or_default()));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        format!("({secs}s{detail}{turn_note}{interrupt_hint})"),
+        theme::faint(),
+    ));
+    Some(Line::from(spans))
 }
 
 /// The greeting shown until the first prompt.
@@ -757,13 +804,73 @@ pub fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
     }
 
-    lines.push(Line::from(""));
-    for (name, desc) in app.available_commands() {
+    // A past session to pick up, when one exists. Prominent rather than buried
+    // in `/resume`'s description because resuming is the single most common
+    // first action. Resumed with Ctrl+R -- a deliberate chord, not a stray
+    // Enter -- or `/resume`.
+    let resumable = !app.workspace_root.is_empty()
+        && crate::session::latest_for(&app.workspace_root).is_some();
+    if resumable {
+        lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled(format!("{name:<13}"), theme::key()),
-            Span::styled(desc, theme::muted()),
+            Span::styled("^r ", theme::key()),
+            Span::styled(
+                "resume your last session",
+                Style::default()
+                    .fg(theme::p().accent_soft)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  —  Ctrl+R, or /resume", theme::faint()),
         ]));
     }
+
+    // Starter prompts fill the space the command list used to occupy. They are
+    // suggestions, not bindings: reading one into the prompt is the whole
+    // interaction, since the welcome panel is scrollback rather than a live
+    // surface. Picked to cover the four moves that dominate a first session --
+    // understand the repo, add something, fix something, tidy something.
+    let starters: [&str; 4] = [
+        "Explain what's in this repo",
+        "Add a feature and its tests",
+        "Find and fix a bug",
+        "Refactor this module",
+    ];
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Start somewhere",
+        Style::default()
+            .fg(theme::p().accent_soft)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for s in starters {
+        lines.push(Line::from(vec![
+            Span::styled("▸ ", theme::accent()),
+            Span::styled(s, theme::text()),
+        ]));
+    }
+
+    // Commands deliberately no longer listed here: they live behind Ctrl+P now,
+    // and a wall of fourteen rows was the very clutter that moved them. The
+    // shortcut row below is the pointer to them instead.
+    //
+    // The keys that matter on a fresh screen, now that commands live behind
+    // Ctrl+P and not only the `/` autocomplete. A cheat-sheet row rather than
+    // prose, so it scans in one pass.
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("keys", theme::faint()),
+        Span::styled("   ", theme::faint()),
+        Span::styled("^p", theme::key()),
+        Span::styled(" commands  ", theme::faint()),
+        Span::styled("^c", theme::key()),
+        Span::styled(" exit  ", theme::faint()),
+        Span::styled("tab", theme::key()),
+        Span::styled(" complete  ", theme::faint()),
+        Span::styled("↑↓", theme::key()),
+        Span::styled(" history  ", theme::faint()),
+        Span::styled("esc", theme::key()),
+        Span::styled(" interrupt", theme::faint()),
+    ]));
 
     // `startup_notices` is also where a stale, finished, or unreadable plan
     // lands -- see `App::adopt_plan`. None of them are fatal, but they are all
@@ -808,6 +915,7 @@ pub fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     for tip in [
         "Ask about this project — it can read files and run commands.",
         approval_tip,
+        "Ctrl+P for every command · the model's to-do list appears on the right as it works.",
     ] {
         for part in wrap(tip, width) {
             lines.push(Line::from(Span::styled(part, theme::faint())));
@@ -1043,6 +1151,94 @@ fn render_input(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// The live to-do panel on the right edge: the model's `update_todos`
+/// checklist, one item per row with a status marker, the in-progress item
+/// highlighted. Deliberately a *read-only* mirror of `app.todos` -- the model
+/// is the only writer; this just makes what it is doing visible while the turn
+/// runs rather than collapsing it into the footer's one-line count.
+fn render_todo_panel(f: &mut Frame, area: Rect, app: &App) {
+    let total = app.todos.len();
+    let done = app
+        .todos
+        .iter()
+        .filter(|t| t.status == crate::tools::TodoStatus::Completed)
+        .count();
+
+    // A full-height column separated from the transcript by a left border, with
+    // the checklist at the top and the working directory pinned to the bottom.
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme::p().border))
+        .title(Span::styled(
+            format!(" Todo {done}/{total} "),
+            theme::accent_bold(),
+        ))
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let width = inner.width.saturating_sub(2).max(1) as usize;
+
+    // opencode's exact todo markers, adapted to the boxcode palette: a bracketed
+    // glyph per row -- `[✓]` done, `[•]` in flight, `[ ]` pending -- with the
+    // in-flight row picked out in the warning colour and the rest muted, exactly
+    // how opencode's `todo-item` styles them.
+    let mut lines: Vec<Line> = Vec::new();
+    for item in &app.todos {
+        let (glyph, style) = match item.status {
+            crate::tools::TodoStatus::Completed => ("✓", theme::muted()),
+            crate::tools::TodoStatus::InProgress => (
+                "•",
+                Style::default()
+                    .fg(theme::p().warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            crate::tools::TodoStatus::Pending => (" ", theme::muted()),
+        };
+        let marker = format!("[{glyph}] ");
+        // The marker sits on the first line only; wrapped continuations indent
+        // to line up under the text, so a long item reads as one entry.
+        for (i, part) in wrap(&item.content, width.saturating_sub(4))
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if i == 0 {
+                marker.clone()
+            } else {
+                "    ".to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(part, style),
+            ]));
+        }
+    }
+
+    // The directory the model is acting on, pinned to the bottom of the panel
+    // the way opencode pins its footer.
+    let cwd_text = if app.workspace_root.is_empty() {
+        "(no workspace)".to_string()
+    } else {
+        shorten_home(&app.workspace_root)
+    };
+    let cwd_lines: Vec<Line> = wrap(&cwd_text, width)
+        .into_iter()
+        .map(|part| Line::from(Span::styled(part, theme::faint())))
+        .collect();
+
+    // Pad between the list and the footer so the cwd sits at the very bottom;
+    // if the list outgrows the column it clips under the title instead.
+    let available = inner.height as usize;
+    let cwd_height = cwd_lines.len().min(available);
+    let body_height = lines.len().min(available.saturating_sub(cwd_height));
+    let pad = available.saturating_sub(cwd_height).saturating_sub(body_height);
+
+    let mut out: Vec<Line> = lines.into_iter().take(body_height).collect();
+    out.extend(std::iter::repeat(Line::from("")).take(pad));
+    out.extend(cwd_lines);
+    f.render_widget(Paragraph::new(out), inner);
+}
+
 /// A dim key bar under the prompt. What the app is *doing* is on the spinner
 /// line in the transcript instead -- next to the work, not stranded at the
 /// bottom of the screen.
@@ -1230,6 +1426,9 @@ fn render_overlay(f: &mut Frame, area: Rect, app: &App) {
             warning,
             confirmed,
         }) => render_rollback_confirm(f, area, steps, warning.as_deref(), *confirmed),
+        Some(Overlay::CommandPalette { filter, selected }) => {
+            render_command_palette(f, area, app, filter, *selected)
+        }
         // Drawn inline at the bottom of the frame by `render`, not as a
         // floating overlay -- see the comment there.
         Some(Overlay::ToolApproval { .. }) | Some(Overlay::Deploy) => {}
@@ -2071,8 +2270,8 @@ fn deployment_lines(app: &App, inner: usize) -> Vec<Line<'static>> {
 /// The panel's content, split into a body that may scroll and a footer that
 /// never does.
 ///
-/// The viewport is a fixed strip (`VIEWPORT_ROWS` in `main.rs`), so a panel
-/// that simply grew would be clipped from the bottom -- taking the spinner and
+/// A panel taller than the region it is drawn into would be clipped from the
+/// bottom -- taking the spinner and
 /// the keys with it, which is exactly the half you need while something is
 /// running. So the status line and the keys are pinned, and the checklist and
 /// log scroll behind them. Same shape, and the same reasoning, as
@@ -2424,6 +2623,134 @@ fn render_picker(f: &mut Frame, area: Rect, title: &str, items: &[String], selec
     let mut state = ListState::default();
     state.select(Some(selected));
     f.render_stateful_widget(list, popup, &mut state);
+}
+
+/// The Ctrl+P palette: every command, name next to its description, with the
+/// typed filter echoed in the title and a hint below for the keys. Wider than
+/// `render_picker` because a command's description is the half that tells the
+/// user what it does; the name alone is not enough to choose by.
+fn render_command_palette(f: &mut Frame, area: Rect, app: &App, filter: &str, selected: usize) {
+    let matches = app.filtered_commands(filter);
+    let rows: Vec<String> = matches
+        .iter()
+        .map(|(name, desc)| format!("{name:<13}  {desc}"))
+        .collect();
+
+    let height = (rows.len() as u16 + 3).clamp(MIN_POPUP_HEIGHT, MAX_COMMAND_MENU_HEIGHT + 2);
+    let popup = centered_rect(72, height, area);
+    f.render_widget(Clear, popup);
+
+    let title = if filter.is_empty() {
+        " Commands ".to_string()
+    } else {
+        format!(" Commands — {filter} ")
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::p().accent))
+        .title(Span::styled(title, theme::accent_bold()));
+
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    // The filter + key hint line sits above the list so the list itself can
+    // scroll, and the hint survives an empty (no-match) result.
+    let hint = Line::from(vec![
+        Span::styled("type to filter  ", theme::faint()),
+        Span::styled("↑↓", theme::key()),
+        Span::styled(" move  ", theme::faint()),
+        Span::styled("↵", theme::key()),
+        Span::styled(" run  ", theme::faint()),
+        Span::styled("esc", theme::key()),
+        Span::styled(" close", theme::faint()),
+    ]);
+    f.render_widget(Paragraph::new(hint), inner);
+
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y + 1,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
+
+    // The list scrolls to keep the selection visible when the palette is
+    // shorter than the command list (a small terminal, or more commands added
+    // later), and a scrollbar on the right edge shows where the selection is.
+    let visible = list_area.height as usize;
+    let content_length = rows.len();
+    let start = if visible == 0 {
+        0
+    } else {
+        selected
+            .saturating_sub(visible - 1)
+            .min(content_length.saturating_sub(visible))
+    };
+
+    let list_items: Vec<ListItem> = rows.iter().map(|r| ListItem::new(r.clone())).collect();
+    let list = List::new(list_items)
+        .style(theme::text())
+        .highlight_style(
+            Style::default()
+                .fg(theme::p().accent)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("❯ ");
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    *state.offset_mut() = start;
+
+    // Leave the last column for the scrollbar, so a full row is never clipped
+    // by it mid-word.
+    let list_rect = Rect {
+        x: list_area.x,
+        y: list_area.y,
+        width: list_area.width.saturating_sub(1),
+        height: list_area.height,
+    };
+    f.render_stateful_widget(list, list_rect, &mut state);
+
+    let scrollbar_rect = Rect {
+        x: list_area.x + list_area.width.saturating_sub(1),
+        y: list_area.y,
+        width: 1,
+        height: list_area.height,
+    };
+
+    // The scrollbar is drawn by hand rather than with ratatui's `Scrollbar`
+    // widget. That widget models scrolling as "the last item can reach the
+    // *top* of the viewport", so for a `List` -- where the last item only
+    // reaches the *bottom* -- its thumb stops short of the end of the track.
+    // Computing the thumb here guarantees it always spans the full track and
+    // touches both ends.
+    let track = list_area.height as usize;
+    let thumb = if content_length == 0 || visible >= content_length {
+        track
+    } else {
+        (((visible as f64 / content_length as f64) * track as f64).round() as usize)
+            .clamp(1, track)
+    };
+    let max_scroll = content_length.saturating_sub(visible);
+    let thumb_top = if max_scroll == 0 {
+        0
+    } else {
+        (((start as f64 / max_scroll as f64) * (track - thumb) as f64).round() as usize)
+            .min(track - thumb)
+    };
+    let thumb_style = Style::default().fg(theme::p().accent);
+    let track_style = Style::default().fg(theme::p().border);
+    let bar: Vec<Line> = (0..track)
+        .map(|row| {
+            let in_thumb = row >= thumb_top && row < thumb_top + thumb;
+            let (symbol, style) = if in_thumb {
+                ("┃", thumb_style)
+            } else {
+                ("│", track_style)
+            };
+            Line::from(Span::styled(symbol, style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(bar), scrollbar_rect);
 }
 
 /// Single-line text entry (masked or plain). The cursor always sits at the end
@@ -5430,10 +5757,10 @@ mod tests {
         );
     }
 
-    /// The viewport is a fixed strip (`VIEWPORT_ROWS` in `main.rs`), so the
-    /// panel cannot grow its way out of trouble: anything past the bottom is
-    /// simply not drawn. The status line and the keys are pinned for exactly
-    /// that reason -- they are the half you need while something is running.
+    /// The panel cannot grow its way out of a short region: anything past the
+    /// bottom is simply not drawn. The status line and the keys are pinned for
+    /// exactly that reason -- they are the half you need while something is
+    /// running.
     #[test]
     fn the_deployment_panel_keeps_its_status_line_inside_a_short_viewport() {
         use crate::deploy::service::{tests_support, Step, StepLine};
@@ -5455,7 +5782,7 @@ mod tests {
         app.deploy = Some(session);
         app.overlay = Some(Overlay::Deploy);
 
-        // The height `main.rs` actually gives it.
+        // A short viewport, as on a small terminal.
         let mut terminal = Terminal::with_options(
             TestBackend::new(76, 12),
             ratatui::TerminalOptions {

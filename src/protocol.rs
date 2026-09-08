@@ -318,6 +318,10 @@ pub enum StopReason {
 // session/cancel
 // ---------------------------------------------------------------------------
 
+// Defined for the ACP wire surface but not yet sent: boxcode cancels a turn
+// in-process rather than announcing it, so no `session/cancel` is emitted. The
+// type is kept to match the spec until a client asks for the path.
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct CancelNotification {
     #[serde(rename = "sessionId")]
@@ -524,6 +528,10 @@ pub struct RequestPermissionRequest {
     pub options: Vec<PermissionOption>,
 }
 
+// The client's half of `session/request_permission`. boxcode is the server, so
+// it would *receive* this rather than send it, and the transport does not yet
+// read a permission decision back over the wire.
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct RequestPermissionResponse {
     pub outcome: RequestPermissionOutcome,
@@ -749,6 +757,10 @@ impl AcpToolCall {
     /// The initial, `pending` announcement of a call awaiting a decision --
     /// built from a [`Verdict::Ask`]'s carried [`Action`], the same
     /// interpreted value [`ApprovalRequest`] already carries.
+    // The wire announcement is defined but not yet emitted: a permission
+    // request carries its own `pending` tool call, so this constructor has no
+    // caller until a bare `session/update` tool-call path is added.
+    #[allow(dead_code)]
     pub fn pending(call: &InternalToolCall, action: &Action) -> Self {
         Self {
             tool_call_id: call.into(),
@@ -806,6 +818,7 @@ impl From<ApiUsage> for SessionUpdate {
 /// Builds the two [`SessionUpdate`]s a resolved [`Verdict::Progress`] or
 /// [`Verdict::Todos`] becomes -- see [`Plan`]'s own docs for why only one
 /// of these should actually be wired into a live session today.
+#[allow(dead_code)] // the second of those two updates; kept ready, not yet wired
 pub fn plan_for_todos(items: &[crate::tools::TodoItem]) -> Plan {
     Plan {
         entries: items
