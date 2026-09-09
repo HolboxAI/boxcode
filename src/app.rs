@@ -1,7 +1,7 @@
 use crate::config::{ApprovalMode, Config};
 use crate::danger;
 use crate::deploy::{self, DeployAction, DeployEvent, DeploySession, Stage};
-use crate::llm::{ChatMessage, ToolCall};
+use crate::llm::{ChatMessage, ImageAttachment, ToolCall};
 use crate::providers;
 use crate::tools::{self, Mode, ToolOutcome};
 use crate::usage;
@@ -89,6 +89,13 @@ pub struct Message {
     /// written before this existed still loads.
     #[serde(default)]
     pub diff: Option<crate::diff::FileDiff>,
+    /// Images attached to a `Role::User` message (Ctrl+V clipboard paste, or a
+    /// pasted/dropped image path). `#[serde(skip)]`: these are transient — they
+    /// ride the message's *next* trip to the LLM and then the message is
+    /// evicted from `history()` (see `history`), so persisting base64 blobs into
+    /// the session file would bloat it with data that can never be replayed.
+    #[serde(skip)]
+    pub images: Vec<ImageAttachment>,
 }
 
 impl Message {
@@ -100,6 +107,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             diff: None,
+            images: Vec::new(),
         }
     }
 
@@ -242,6 +250,39 @@ pub const CHARS_PER_TOKEN: usize = 4;
 /// round trip that fails for a reason the error will describe in the
 /// provider's words instead of theirs.
 const MAX_PASTE_CHARS: usize = 200_000;
+
+/// Largest image we will base64 and send. Vision endpoints bill by the pixel
+/// and a screenshot comfortably fits in a fraction of this; anything larger
+/// was almost certainly a file the user did not mean to attach, and the
+/// request would be rejected or silently truncated by most providers anyway.
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The MIME type for an image file, keyed by its extension, or `None` when the
+/// path does not end in a known image extension.
+fn mime_for_path(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        _ => return None,
+    })
+}
+
+/// `84 KB` / `1.2 MB` — a size for an attachment notice: one decimal for MB,
+/// none for KB, since "843 KB" is more readable than "0.82 MB" at that scale.
+fn human_size(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = KB * 1024;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{} KB", bytes / KB)
+    }
+}
 
 /// What `/compact` asks the model for.
 ///
@@ -406,6 +447,11 @@ pub struct App {
     pub hosted_request: Option<Vec<crate::backend::Mine>>,
     pub session_reset: bool,
     pub messages: Vec<Message>,
+    /// Images attached but not yet sent: each Ctrl+V (or a pasted/dropped image
+    /// path) appends one, and `submit` folds the whole set into the outgoing
+    /// user message, then clears it. Kept on `App` rather than on `input_buffer`
+    /// so an image can be staged before any prompt text is typed.
+    pub pending_images: Vec<ImageAttachment>,
     /// Raw text of the prompt box. May contain '\n' (Alt/Shift-Enter inserts one).
     pub input_buffer: String,
     /// Cursor position as a *byte* index into `input_buffer`. Always on a char boundary.
@@ -658,6 +704,7 @@ impl App {
             plan_dirty: false,
             session_reset: false,
             messages: Vec::new(),
+            pending_images: Vec::new(),
             input_buffer: String::new(),
             hosted_request: None,
             cursor: 0,
@@ -908,6 +955,9 @@ impl App {
             // to resume, which is exactly the kind of one-key accident worth
             // avoiding.
             KeyCode::Char('r') if ctrl => self.resume_latest(),
+            // Ctrl+V reads an image from the OS clipboard. (Cmd+V / Shift+Insert
+            // are *text* paste and never carry image bytes -- see `clipboard.rs`.)
+            KeyCode::Char('v') if ctrl => self.attach_clipboard_image(),
 
             // Any other Ctrl-chord is a command, not text: never let it reach the buffer.
             KeyCode::Char(_) if ctrl => {}
@@ -1004,6 +1054,13 @@ impl App {
     /// the realistic common case), and ignored while a list-picker overlay is
     /// active (nothing to paste into).
     pub fn handle_paste(&mut self, text: String) {
+        // A file dragged into the terminal (or a copied image path) arrives as
+        // text. If it names an image on disk, treat it as an attachment, not as
+        // text to insert. Only in the normal input state -- never while an
+        // overlay's text field has focus.
+        if self.overlay.is_none() && self.attach_image_from_path(&text) {
+            return;
+        }
         let cleaned = text.replace("\r\n", "\n").replace('\r', "\n");
 
         // A paste this size is not a prompt, whatever it was meant to be.
@@ -1043,6 +1100,119 @@ impl App {
             Some(_) => {}
             None => self.insert_str(&cleaned),
         }
+    }
+
+    /// The current model cannot read images; say so once, pointing at the fix.
+    fn explain_no_vision(&mut self) {
+        self.messages.push(Message::new(
+            Role::System,
+            format!(
+                "The current model ({}) can't read images. Switch to an OpenAI model with \
+                 /model, then try again.",
+                self.config.llm.model
+            ),
+        ));
+    }
+
+    /// Bound to Ctrl+V: read the OS clipboard as an image and stage it for the
+    /// next prompt. Says so either way -- a silent no-op on "no image" would
+    /// read as the key being dead.
+    fn attach_clipboard_image(&mut self) {
+        if !providers::supports_images(&self.config.llm.provider) {
+            self.explain_no_vision();
+            return;
+        }
+        match crate::clipboard::read_image() {
+            Some(image) => {
+                // Base64 is 4 chars per 3 bytes, so `len / 4 * 3` is the decoded
+                // size to within a byte or two -- close enough for a "~KB" note.
+                let bytes = image.data_base64.len() / 4 * 3;
+                let size = human_size(bytes);
+                self.pending_images.push(image);
+                let n = self.pending_images.len();
+                self.messages.push(Message::new(
+                    Role::System,
+                    format!(
+                        "Attached image #{n} from the clipboard (~{size}). It will be sent \
+                         with your next prompt; press Ctrl+V again for more."
+                    ),
+                ));
+            }
+            None => {
+                self.messages.push(Message::new(
+                    Role::System,
+                    "No image on the clipboard. Copy or screenshot an image first, then press \
+                     Ctrl+V again -- or drag an image file into the terminal.",
+                ));
+            }
+        }
+    }
+
+    /// If `text` is a path to an image file on disk (a file dragged into the
+    /// terminal, or a copied path), read it and stage it as an attachment.
+    /// Returns `true` when it did, so `handle_paste` can skip inserting text.
+    fn attach_image_from_path(&mut self, text: &str) -> bool {
+        let mut candidate = text.trim().to_string();
+        // Drag-and-drop from Finder and most file managers lands as `file:///…`.
+        if let Some(rest) = candidate.strip_prefix("file://") {
+            candidate = rest.to_string();
+        }
+        // Some terminals quote a path that contains spaces.
+        if candidate.len() >= 2
+            && ((candidate.starts_with('"') && candidate.ends_with('"'))
+                || (candidate.starts_with('\'') && candidate.ends_with('\'')))
+        {
+            candidate = candidate[1..candidate.len() - 1].to_string();
+        }
+        // A single path only: anything with a newline is not a drop.
+        if candidate.contains('\n') {
+            return false;
+        }
+        let Some(mime) = mime_for_path(&candidate) else {
+            return false;
+        };
+        if !providers::supports_images(&self.config.llm.provider) {
+            self.explain_no_vision();
+            // Consume the path -- inserting it as text would be the *worse*
+            // fallback: it would look like a prompt about a file the model
+            // cannot see.
+            return true;
+        }
+        let Ok(bytes) = std::fs::read(&candidate) else {
+            return false;
+        };
+        if bytes.is_empty() {
+            return false;
+        }
+        if bytes.len() > MAX_IMAGE_BYTES {
+            self.messages.push(Message::new(
+                Role::System,
+                format!(
+                    "{} is {} -- larger than the {}-MB image limit, so it was not attached.",
+                    candidate,
+                    human_size(bytes.len()),
+                    MAX_IMAGE_BYTES / (1024 * 1024),
+                ),
+            ));
+            return true;
+        }
+        let name = Path::new(&candidate)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| candidate.clone());
+        self.pending_images.push(ImageAttachment {
+            mime_type: mime.to_string(),
+            data_base64: crate::backend::base64_encode(&bytes),
+        });
+        self.messages.push(Message::new(
+            Role::System,
+            format!(
+                "Attached {name} ({}, {}). It will be sent with your next prompt.",
+                human_size(bytes.len()),
+                mime,
+            ),
+        ));
+        true
     }
 
     fn submit(&mut self) {
@@ -1134,7 +1304,9 @@ impl App {
         self.history_index = None;
         self.history_draft.clear();
 
-        self.messages.push(Message::new(Role::User, prompt));
+        let mut user = Message::new(Role::User, prompt);
+        user.images = std::mem::take(&mut self.pending_images);
+        self.messages.push(user);
         self.state = AppState::Sending;
     }
 
@@ -1272,6 +1444,7 @@ impl App {
             tool_calls: calls.clone(),
             tool_call_id: None,
             diff: None,
+            images: Vec::new(),
         });
         self.pending_tools = calls.into();
         self.tool_steps += 1;
@@ -1820,6 +1993,7 @@ impl App {
             tool_calls: Vec::new(),
             tool_call_id: None,
             diff: None,
+            images: Vec::new(),
         });
         // That figure described the conversation this just replaced; carrying
         // it forward would report the old context's size as the new one's.
@@ -2858,6 +3032,7 @@ impl App {
             tool_calls: Vec::new(),
             tool_call_id: Some(outcome.call_id),
             diff: outcome.diff,
+            images: Vec::new(),
         });
     }
 
@@ -3141,7 +3316,23 @@ impl App {
         }
         for message in &self.messages {
             match message.role {
-                Role::User => out.push(ChatMessage::text("user", message.content.clone())),
+                Role::User => out.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(message.content.clone()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    // Belt-and-suspenders: attach time already refuses to stage
+                    // for a text-only model, but a model can be switched after
+                    // an image is staged. Dropping here, at the single point
+                    // where the wire message is built, is the real guarantee
+                    // that a base64 image never reaches an endpoint that would
+                    // garble it.
+                    images: if providers::supports_images(&self.config.llm.provider) {
+                        message.images.clone()
+                    } else {
+                        Vec::new()
+                    },
+                }),
                 Role::Assistant => out.push(ChatMessage {
                     role: "assistant".to_string(),
                     // None rather than "" when the model only asked for tools.
@@ -6543,6 +6734,114 @@ mod tests {
         let history = a.history(Some("you are a robot"));
         assert_eq!(history[0], ChatMessage::text("system", "you are a robot"));
         assert_eq!(history[1].role, "user");
+    }
+
+    // ---- image attachments ---------------------------------------------------
+
+    #[test]
+    fn mime_is_detected_from_the_extension() {
+        assert_eq!(mime_for_path("shot.png"), Some("image/png"));
+        assert_eq!(mime_for_path("shot.JPG"), Some("image/jpeg"));
+        assert_eq!(mime_for_path("a/b/c.webp"), Some("image/webp"));
+        assert_eq!(mime_for_path("shot.tiff"), Some("image/tiff"));
+        assert_eq!(mime_for_path("notes.md"), None);
+        assert_eq!(mime_for_path("no_extension"), None);
+    }
+
+    #[test]
+    fn pasting_an_image_path_attaches_it_instead_of_inserting_text() {
+        let mut a = app();
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("screenshot.png");
+        let bytes = b"\x89PNG not really a png";
+        std::fs::write(&img, bytes).unwrap();
+
+        a.handle_paste(img.to_string_lossy().into_owned());
+
+        assert!(a.input_buffer.is_empty(), "the path must not become text");
+        assert_eq!(a.pending_images.len(), 1);
+        assert_eq!(a.pending_images[0].mime_type, "image/png");
+        assert_eq!(
+            a.pending_images[0].data_base64,
+            crate::backend::base64_encode(bytes)
+        );
+    }
+
+    #[test]
+    fn pasting_a_non_image_path_is_still_text() {
+        let mut a = app();
+        a.handle_paste("README.md".to_string());
+        assert_eq!(a.input_buffer, "README.md");
+        assert!(a.pending_images.is_empty());
+    }
+
+    #[test]
+    fn submit_folds_pending_images_into_the_user_message_and_clears_them() {
+        let mut a = app();
+        a.pending_images.push(ImageAttachment {
+            mime_type: "image/png".to_string(),
+            data_base64: "AAAA".to_string(),
+        });
+        type_str(&mut a, "what is this?");
+        a.handle_key(key(KeyCode::Enter));
+
+        let user = &a.messages[0];
+        assert!(matches!(user.role, Role::User));
+        assert_eq!(user.images.len(), 1);
+        assert_eq!(user.images[0].mime_type, "image/png");
+        assert!(a.pending_images.is_empty(), "staged images are consumed by submit");
+    }
+
+    #[test]
+    fn history_sends_images_on_the_user_message() {
+        let mut a = app();
+        a.pending_images.push(ImageAttachment {
+            mime_type: "image/png".to_string(),
+            data_base64: "AAAA".to_string(),
+        });
+        type_str(&mut a, "look");
+        a.handle_key(key(KeyCode::Enter));
+
+        let history = a.history(None);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].images.len(), 1);
+        assert_eq!(history[0].images[0].mime_type, "image/png");
+    }
+
+    #[test]
+    fn a_text_only_model_refuses_to_stage_an_image_path() {
+        let mut a = app();
+        a.config.llm.provider = "deepseek".to_string();
+        a.config.llm.model = "deepseek-v4-pro".to_string();
+
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("shot.png");
+        std::fs::write(&img, b"\x89PNG").unwrap();
+        a.handle_paste(img.to_string_lossy().into_owned());
+
+        assert!(a.pending_images.is_empty(), "text-only model must not stage an image");
+        assert!(a.input_buffer.is_empty(), "the path is consumed, not inserted as text");
+        let said = a.messages.last().expect("an explanation");
+        assert!(said.content.contains("can't read images"), "{}", said.content);
+    }
+
+    #[test]
+    fn history_drops_images_for_a_text_only_model() {
+        let mut a = app();
+        a.config.llm.provider = "deepseek".to_string();
+        a.config.llm.model = "deepseek-v4-pro".to_string();
+        // Stage directly, bypassing the attach-time gate, to prove the wire
+        // guard stands on its own.
+        a.pending_images.push(ImageAttachment {
+            mime_type: "image/png".to_string(),
+            data_base64: "AAAA".to_string(),
+        });
+        type_str(&mut a, "look");
+        a.handle_key(key(KeyCode::Enter));
+
+        let history = a.history(None);
+        assert_eq!(history.len(), 1);
+        assert!(history[0].images.is_empty(), "a base64 image must never reach DeepSeek");
     }
 
     // ---- commands and approval -----------------------------------------------
