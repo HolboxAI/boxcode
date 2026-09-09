@@ -4,6 +4,7 @@ mod approval;
 mod artifacts;
 mod backend;
 mod auth;
+mod clipboard;
 mod config;
 mod contrast;
 mod danger;

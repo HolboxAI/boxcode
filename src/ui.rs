@@ -1265,6 +1265,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             ("↵", "send"),
             ("⌥↵", "newline"),
             ("↑↓", "history"),
+            ("^v", "image"),
             ("^c", "exit"),
         ],
     };
@@ -1331,6 +1332,21 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             }
             spans.push(Span::styled("  ·  ", theme::faint()));
         }
+    }
+
+    // Staged image attachments — a persistent reminder until the next prompt
+    // sends them, so "did Ctrl+V do anything?" never means scrolling back to
+    // the System line that said so. Independent of the plan/todo indicators
+    // above, which are mutually exclusive; this one is not.
+    if !app.pending_images.is_empty() {
+        let n = app.pending_images.len();
+        spans.push(Span::styled(
+            format!("▸ {n} image{}", if n == 1 { "" } else { "s" }),
+            Style::default()
+                .fg(theme::p().accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("  ·  ", theme::faint()));
     }
 
     for (i, (key, label)) in keys.iter().enumerate() {
@@ -3888,6 +3904,7 @@ mod tests {
             tool_calls: Vec::new(),
             tool_call_id: Some("call_1".into()),
             diff: None,
+            images: Vec::new(),
         };
         let line = &message_lines(&done, 60)[0];
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -4105,6 +4122,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 diff: Some(d),
+                images: Vec::new(),
             };
             let rendered = text_of(&message_lines(&msg, 60));
             assert!(rendered[0].contains("1 addition and 1 removal"), "{rendered:?}");
@@ -4122,6 +4140,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 diff: None,
+                images: Vec::new(),
             };
             assert_eq!(text_of(&message_lines(&msg, 60)), vec!["· list ."]);
         }

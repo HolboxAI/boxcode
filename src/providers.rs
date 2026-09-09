@@ -12,6 +12,12 @@ pub struct Provider {
     pub label: &'static str,
     pub endpoint: &'static str,
     pub models: &'static [&'static str],
+    /// Whether this provider's models accept image attachments (OpenAI vision
+    /// content blocks). DeepSeek's current lineup is text-only; sending an
+    /// image to it is not "unsupported but harmless" -- the endpoint accepts
+    /// the request and the model answers as though the image were text it
+    /// cannot read, which surfaces to the user as a garbled line.
+    pub vision: bool,
 }
 
 pub const PROVIDERS: &[Provider] = &[
@@ -22,6 +28,7 @@ pub const PROVIDERS: &[Provider] = &[
         // deepseek-chat / deepseek-reasoner were retired 2026-07-24; current
         // lineup is v4-pro (flagship) / v4-flash (faster, cheaper).
         models: &["deepseek-v4-pro", "deepseek-v4-flash"],
+        vision: false,
     },
     Provider {
         id: "openai",
@@ -30,11 +37,20 @@ pub const PROVIDERS: &[Provider] = &[
         // gpt-4o / gpt-4-turbo / gpt-3.5-turbo are deprecated; current lineup
         // is the GPT-5.6 family: sol (frontier), terra (balanced), luna (cost).
         models: &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        vision: true,
     },
 ];
 
 pub fn find_provider(id: &str) -> Option<&'static Provider> {
     PROVIDERS.iter().find(|p| p.id == id)
+}
+
+/// Whether the active provider can read images. Unknown/custom endpoints are
+/// assumed capable: the user opted into "any OpenAI-compatible endpoint", which
+/// may well be a multimodal server, and guessing wrong on the pessimistic side
+/// would silently strip an image a real model could read.
+pub fn supports_images(provider_id: &str) -> bool {
+    find_provider(provider_id).map_or(true, |p| p.vision)
 }
 
 /// The conventional env var a user is likely to already have exported for this
@@ -113,5 +129,15 @@ mod tests {
         assert_eq!(default_temperature("openai"), None);
         assert_eq!(default_temperature(""), None);
         assert_eq!(default_temperature("some-custom-endpoint"), None);
+    }
+
+    #[test]
+    fn deepseek_is_text_only_and_openai_reads_images() {
+        assert!(!supports_images("deepseek"));
+        assert!(supports_images("openai"));
+        // Unknown/custom endpoints are assumed capable rather than silently
+        // stripped of a possibly-valid image.
+        assert!(supports_images(""));
+        assert!(supports_images("some-custom-endpoint"));
     }
 }
