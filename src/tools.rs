@@ -2878,6 +2878,33 @@ fn gh_api_is_read_only(args: &[&str]) -> bool {
     true
 }
 
+/// Run a disk-bound tool on tokio's blocking pool instead of the async worker
+/// threads. `execute_list_dir`, `execute_glob` and `execute_grep_search` are
+/// plain sync `fn`s doing `std::fs` inline; leaving them on the worker thread
+/// meant one call blocked the entire worker it landed on, so the read
+/// fan-out in `agent::run_calls` could occupy every worker and stall
+/// token streaming and the UI rather than overlapping. Offloading them here
+/// is what makes that fan-out genuinely concurrent: the blocking I/O lives on
+/// the blocking pool, the async workers keep driving the stream and the event
+/// loop.
+async fn run_blocking(
+    call: &ToolCall,
+    workspace: &Workspace,
+    run: fn(&ToolCall, &Workspace) -> ToolOutcome,
+) -> ToolOutcome {
+    let call = call.clone();
+    let ws = workspace.clone();
+    let id = call.id.clone();
+    match tokio::task::spawn_blocking(move || run(&call, &ws)).await {
+        Ok(outcome) => outcome,
+        Err(e) => outcome(
+            &id,
+            "tool did not finish".to_string(),
+            format!("Error: the tool failed to run to completion: {e}"),
+        ),
+    }
+}
+
 pub async fn execute(call: &ToolCall, workspace: &Workspace, config: &ToolsConfig) -> ToolOutcome {
     execute_truncated(call, workspace, config, false).await
 }
@@ -2910,9 +2937,9 @@ pub async fn execute_truncated(
         RUN_COMMAND => execute_run_command(call, workspace, config).await,
         READ_FILE => execute_read_file(call, workspace, config).await,
         WRITE_FILE => execute_write_file(call, workspace, truncated).await,
-        LIST_DIR => execute_list_dir(call, workspace),
-        GLOB => execute_glob(call, workspace),
-        GREP_SEARCH => execute_grep_search(call, workspace),
+        LIST_DIR => run_blocking(call, workspace, execute_list_dir).await,
+        GLOB => run_blocking(call, workspace, execute_glob).await,
+        GREP_SEARCH => run_blocking(call, workspace, execute_grep_search).await,
         EDIT_FILE => execute_edit_file(call, workspace, truncated),
         GET_DESIGN_STARTER => execute_get_design_starter(call),
         CHECK_CONTRAST => execute_check_contrast(call),
