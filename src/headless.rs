@@ -363,13 +363,81 @@ impl HeadlessSession {
         browser_interact: &mpsc::Sender<BrowserInteractAsk>,
     ) -> Vec<(String, String, Vec<llm::ImageAttachment>)> {
         let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
+        let mut i = 0;
+        while i < calls.len() {
             let verdict = verdict_for(
-                &call,
+                &calls[i],
                 Path::new(self.workspace.root()),
                 Mode::Normal,
                 self.config.tools.approval,
             );
+
+            // A contiguous run of auto-approved pure reads is fanned out
+            // concurrently -- the same fence and split `agent::run_calls`
+            // uses for `App`, so the two paths agree on what is safe to
+            // overlap. Everything else stays one-at-a-time below.
+            if matches!(&verdict, Verdict::AutoApprove)
+                && crate::agent::is_pure_read_call(&calls[i])
+            {
+                let start = i;
+                i += 1;
+                while i < calls.len()
+                    && matches!(
+                        verdict_for(
+                            &calls[i],
+                            Path::new(self.workspace.root()),
+                            Mode::Normal,
+                            self.config.tools.approval,
+                        ),
+                        Verdict::AutoApprove
+                    )
+                    && crate::agent::is_pure_read_call(&calls[i])
+                {
+                    i += 1;
+                }
+                let run = &calls[start..i];
+
+                // Light the reads up in order before any of them finishes,
+                // so the client sees the batch begin as a batch.
+                for call in run {
+                    let action = tools::describe_action(call);
+                    let _ = updates
+                        .send(SessionUpdate::ToolCall(AcpToolCall {
+                            tool_call_id: ToolCallId(call.id.clone()),
+                            title: action
+                                .map(|a| a.label())
+                                .unwrap_or_else(|| call.function.name.clone()),
+                            kind: ToolKind::Other,
+                            status: ToolCallStatus::InProgress,
+                        }))
+                        .await;
+                }
+
+                // `join_all` (not `buffer_unordered`): each future owns its
+                // cloned args, and results come back in submission order, so
+                // the transcript order below needs no re-sorting.
+                let futures = run.iter().map(|call| {
+                    let call = call.clone();
+                    let workspace = self.workspace.clone();
+                    let tools_config = self.config.tools.clone();
+                    async move { tools::execute(&call, &workspace, &tools_config).await }
+                });
+                let outcomes = futures::future::join_all(futures).await;
+
+                for (call, mut outcome) in run.iter().zip(outcomes) {
+                    if let Some(record) = outcome.rollback.take() {
+                        self.rollback.record(record);
+                    }
+                    let _ = updates
+                        .send(SessionUpdate::ToolCallUpdate((&outcome).into()))
+                        .await;
+                    results.push((call.id.clone(), outcome.content, Vec::new()));
+                }
+                continue;
+            }
+
+            let call = &calls[i];
+            i += 1;
 
             let mut images = Vec::new();
             let content = match verdict {
@@ -394,7 +462,7 @@ impl HeadlessSession {
                     "Noted (not tracked in this session).".to_string()
                 }
                 Verdict::AutoApprove => {
-                    let action = tools::describe_action(&call);
+                    let action = tools::describe_action(call);
                     // `check_in_browser` is the one auto-approved action
                     // `tools::execute` cannot fulfill at all -- boxcode has
                     // no browser tab, only an ACP client does. Intercepted
@@ -402,7 +470,7 @@ impl HeadlessSession {
                     // same way `Action::Agent` is intercepted below rather
                     // than offered to `tools::execute`.
                     if let Some(Action::CheckInBrowser { url }) = &action {
-                        let (text, screenshot_images) = self.check_browser(&call, url, updates, browser).await;
+                        let (text, screenshot_images) = self.check_browser(call, url, updates, browser).await;
                         images = screenshot_images;
                         text
                     } else {
@@ -416,7 +484,7 @@ impl HeadlessSession {
                                 status: ToolCallStatus::InProgress,
                             }))
                             .await;
-                        let mut outcome = tools::execute(&call, &self.workspace, &self.config.tools).await;
+                        let mut outcome = tools::execute(call, &self.workspace, &self.config.tools).await;
                         // Same call, same place in the flow as
                         // `App::push_tool_outcome`'s own -- before the
                         // outcome is taken apart, since `.content` moves out
@@ -434,7 +502,7 @@ impl HeadlessSession {
                         "Subagents aren't supported in this session yet.".to_string()
                     } else {
                         let (text, interact_images) = self
-                            .ask_permission(&call, &action, updates, permissions, browser_interact)
+                            .ask_permission(call, &action, updates, permissions, browser_interact)
                             .await;
                         images = interact_images;
                         text

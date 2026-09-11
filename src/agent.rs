@@ -223,7 +223,7 @@ pub fn execute_approved(
 /// over a big tree); without a cap that opens dozens of file handles or
 /// spawns dozens of `run_command` processes in one instant. Same cap
 /// `artifacts.rs` uses for its own bounded upload fan-out.
-const MAX_CONCURRENT_READS: usize = 8;
+const MAX_CONCURRENT_READS: usize = 16;
 
 /// Whether `call` is a pure read: touches no file, no rollback journal, no
 /// process state that a concurrent sibling could race with. The whitelist is
@@ -240,7 +240,7 @@ const MAX_CONCURRENT_READS: usize = 8;
 /// all: both do unlocked read-then-write on a path, so two calls to the same
 /// file racing would corrupt it, and both leave a first-record-wins entry in
 /// `rollback.rs`'s journal that depends on the order calls actually ran in.
-fn is_pure_read_call(call: &ToolCall) -> bool {
+pub(crate) fn is_pure_read_call(call: &ToolCall) -> bool {
     match call.function.name.as_str() {
         tools::READ_FILE | tools::LIST_DIR | tools::GLOB | tools::GREP_SEARCH => true,
         tools::RUN_COMMAND => matches!(
