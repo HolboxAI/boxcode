@@ -972,6 +972,17 @@ fn setup_terminal() -> Result<bool, Box<dyn Error>> {
     // moment it left the viewport -- and vanished entirely on exit. Staying on
     // the normal buffer hands the history to the terminal, where the wheel,
     // text selection and the terminal's own search already work.
+    //
+    // Bracketed paste is turned on only on Unix, where crossterm parses the
+    // `\x1b[200~`…`\x1b[201~` wrapper into an `Event::Paste`. Its Windows
+    // backend has no such parser (it reads `INPUT_RECORD`s, not raw VT), so
+    // enabling it there only makes the terminal wrap every paste in a
+    // sequence that leaks into the input as a stray `Esc` — which dismisses
+    // an open overlay like the API-key prompt — followed by literal `[200~` /
+    // `[201~` characters. Left off, a Windows paste arrives as ordinary `Char`
+    // key events, which the text fields already accept one character at a
+    // time.
+    #[cfg(unix)]
     crossterm::execute!(stdout, EnableBracketedPaste)?;
 
     // Optional: lets terminals that support it distinguish Shift/Ctrl-Enter.
