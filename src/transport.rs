@@ -38,9 +38,10 @@ use crate::headless::{
 use crate::protocol::{
     CheckInBrowserOutcome, CheckInBrowserRequest, Implementation, InitializeRequest,
     InitializeResponse, InteractInBrowserOutcome, InteractInBrowserRequest, JsonRpcVersion,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, RequestId,
-    RequestPermissionOutcome, RequestPermissionRequest, RollbackRequest, RollbackResponse, RpcError,
-    RpcErrorObject, RpcRequest, RpcResponse, SessionId, SessionNotification, PROTOCOL_VERSION,
+    ListChangesRequest, ListChangesResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest, RollbackRequest,
+    RollbackResponse, RpcError, RpcErrorObject, RpcRequest, RpcResponse, SessionId,
+    SessionNotification, PROTOCOL_VERSION,
 };
 use crate::workspace::Workspace;
 use serde_json::json;
@@ -104,8 +105,12 @@ enum SessionMsg {
     /// task is already working through -- one message at a time, same as
     /// `Prompt` itself -- which is exactly right: rolling back files the
     /// model might still be mid-turn writing to would be undoing work out
-    /// from under it, not after it.
-    Rollback { respond: oneshot::Sender<RollbackResponse> },
+    /// from under it, not after it. Carries the request (with its optional
+    /// `files`/`turn` filters) through to the session.
+    Rollback { req: RollbackRequest, respond: oneshot::Sender<RollbackResponse> },
+    /// `session/list_changes` -- a read-only peek at the journal, answered
+    /// synchronously like `Rollback`.
+    ListChanges { respond: oneshot::Sender<ListChangesResponse> },
 }
 
 /// Everything a spawned task can produce for the outgoing stdout stream,
@@ -169,10 +174,13 @@ impl SessionActor {
                             .await;
                         drop(updates_tx); // let the drain task see the channel close
                         let _ = drain.await;
-                        let _ = respond.send(PromptResponse { stop_reason });
+                        let _ = respond.send(PromptResponse { stop_reason, turn: session.current_turn() });
                     }
-                    SessionMsg::Rollback { respond } => {
-                        let _ = respond.send(session.rollback());
+                    SessionMsg::Rollback { req, respond } => {
+                        let _ = respond.send(session.rollback(&req));
+                    }
+                    SessionMsg::ListChanges { respond } => {
+                        let _ = respond.send(session.list_changes());
                     }
                 }
             }
@@ -358,7 +366,26 @@ impl Router {
                     .clone();
                 let (respond, receive) = oneshot::channel();
                 handle
-                    .send(SessionMsg::Rollback { respond })
+                    .send(SessionMsg::Rollback { req, respond })
+                    .await
+                    .map_err(|_| (-32002, "session actor gone".to_string()))?;
+                let response = receive.await.map_err(|_| (-32002, "session actor gone".to_string()))?;
+                Ok(serde_json::to_value(response).expect("serializes"))
+            }
+            // Same synchronous, local-read shape as session/rollback: a peek
+            // at in-memory journal state, never an LLM round trip, so it can
+            // be answered right here rather than deferred like session/prompt.
+            "session/list_changes" => {
+                let req: ListChangesRequest = serde_json::from_value(params)
+                    .map_err(|e| (-32602, format!("invalid params: {e}")))?;
+                let handle = self
+                    .sessions
+                    .get(&req.session_id)
+                    .ok_or_else(|| (-32001, "no such session".to_string()))?
+                    .clone();
+                let (respond, receive) = oneshot::channel();
+                handle
+                    .send(SessionMsg::ListChanges { respond })
                     .await
                     .map_err(|_| (-32002, "session actor gone".to_string()))?;
                 let response = receive.await.map_err(|_| (-32002, "session actor gone".to_string()))?;
@@ -758,6 +785,7 @@ mod tests {
             serde_json::from_str(final_line.trim()).expect("valid JSON line");
         assert_eq!(final_value["id"], 3);
         assert_eq!(final_value["result"]["stopReason"], "end_turn");
+        assert_eq!(final_value["result"]["turn"], 1);
     }
 
     /// The other half of `next_outgoing_client_request`: proves the merged
@@ -850,6 +878,7 @@ mod tests {
             serde_json::from_str(final_line.trim()).expect("valid JSON line");
         assert_eq!(final_value["id"], 3);
         assert_eq!(final_value["result"]["stopReason"], "end_turn");
+        assert_eq!(final_value["result"]["turn"], 1);
     }
 
     /// `session/rollback` is a plain, synchronous request -- unlike

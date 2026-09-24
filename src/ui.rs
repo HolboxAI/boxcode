@@ -3748,6 +3748,7 @@ mod tests {
                 display: format!("src/module_{i}.rs"),
                 path: std::path::PathBuf::from(format!("/tmp/module_{i}.rs")),
                 touches: 1,
+                turn: 0,
                 action: if i % 2 == 0 {
                     crate::rollback::Action::Delete
                 } else {

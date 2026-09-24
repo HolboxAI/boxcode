@@ -30,9 +30,10 @@ use crate::approval::{verdict_for, Decision, Verdict};
 use crate::config::Config;
 use crate::llm::{self, ApiUsage, ChatMessage, StreamEvent, Target, ToolCall};
 use crate::protocol::{
-    AcpToolCall, ContentBlock, PermissionOption, PermissionOptionId, PermissionOptionKind,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionUpdate, StopReason,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
+    AcpToolCall, ChangeEntry, ContentBlock, ListChangesResponse, PermissionOption,
+    PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    RollbackRequest, SessionId, SessionUpdate, StopReason, ToolCallContent, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use crate::tools::{self, Action, BrowserInteraction, Mode};
 use crate::workspace::Workspace;
@@ -108,6 +109,18 @@ pub struct HeadlessSession {
     messages: Vec<ChatMessage>,
     request_id: u64,
     tool_steps: usize,
+    /// The 1-based turn counter, incremented once per `session/prompt`. It
+    /// is the "turn" the rollback journal attributes each file to, so a
+    /// client can ask to undo a specific turn's changes.
+    turn: u64,
+    /// The `messages` index each turn's user message starts at, parallel to
+    /// `turn` (entry 0 is turn 1's message, and so on). Lets a
+    /// `restoreBeforeTurn` rollback also cut the conversation back to that
+    /// turn -- the chat window drops the later turns, so the model's history
+    /// must too, or the next prompt would still "remember" work the user just
+    /// undid. Recorded before the user message is pushed, so a turn boundary
+    /// is always `messages.len()` at that moment.
+    turn_starts: Vec<usize>,
     /// The same journal `App::rollback`/`/rollback` reads and writes,
     /// populated the identical way `App::push_tool_outcome` does (see
     /// `decide_and_run`/`ask_permission`'s own calls to `.record(...)`) --
@@ -124,8 +137,18 @@ impl HeadlessSession {
             messages: Vec::new(),
             request_id: 0,
             tool_steps: 0,
+            turn: 0,
+            turn_starts: Vec::new(),
             rollback: crate::rollback::Journal::default(),
         }
+    }
+
+    /// The turn this session is currently on (1-based, incremented at the
+    /// top of each `prompt`). Read after a `prompt` returns to learn which
+    /// turn that response belongs to -- `transport.rs` folds it into the
+    /// `PromptResponse` so the client can scope rollbacks by turn.
+    pub fn current_turn(&self) -> u64 {
+        self.turn
     }
 
     /// Handles one `session/prompt`: appends the user's message, then runs
@@ -148,6 +171,12 @@ impl HeadlessSession {
         browser: &mpsc::Sender<BrowserCheckAsk>,
         browser_interact: &mpsc::Sender<BrowserInteractAsk>,
     ) -> StopReason {
+        // One `session/prompt` = one turn, numbered from 1 so a client's
+        // first prompt maps to "turn 1". The rollback journal records files
+        // against this value (see `record_turn` below).
+        self.turn += 1;
+        self.turn_starts.push(self.messages.len());
+
         let mut user_message = ChatMessage::text("user", text);
         user_message.images = images;
         self.messages.push(user_message);
@@ -426,7 +455,7 @@ impl HeadlessSession {
 
                 for (call, mut outcome) in run.iter().zip(outcomes) {
                     if let Some(record) = outcome.rollback.take() {
-                        self.rollback.record(record);
+                        self.rollback.record_turn(record, self.turn);
                     }
                     let _ = updates
                         .send(SessionUpdate::ToolCallUpdate((&outcome).into()))
@@ -490,7 +519,7 @@ impl HeadlessSession {
                         // outcome is taken apart, since `.content` moves out
                         // of it just below.
                         if let Some(record) = outcome.rollback.take() {
-                            self.rollback.record(record);
+                            self.rollback.record_turn(record, self.turn);
                         }
                         let _ = updates.send(SessionUpdate::ToolCallUpdate((&outcome).into())).await;
                         outcome.content
@@ -583,7 +612,7 @@ impl HeadlessSession {
             }
             let mut outcome = tools::execute(call, &self.workspace, &self.config.tools).await;
             if let Some(record) = outcome.rollback.take() {
-                self.rollback.record(record);
+                self.rollback.record_turn(record, self.turn);
             }
             let _ = updates.send(SessionUpdate::ToolCallUpdate((&outcome).into())).await;
             (outcome.content, Vec::new())
@@ -785,17 +814,78 @@ impl HeadlessSession {
     /// docs on that).
     ///
     /// Same three steps as `App::finish_rollback`, the same order, for the
-    /// same reasons: run the plan, clear the journal (every entry has now
+    /// same reasons -- run the plan, clear the journal (every entry has now
     /// been acted on), and put `report.notice()` in the model's own history
-    /// so its next edit isn't reasoning about a disk that no longer
-    /// matches what it was told -- `Report::notice`'s own doc comment says
-    /// why that has to reach the wire, not just the human.
-    pub fn rollback(&mut self) -> crate::protocol::RollbackResponse {
-        let steps = self.rollback.plan();
+    /// so its next edit isn't reasoning about a disk that no longer matches
+    /// what it was told. The one difference: the plan is narrowed by `req`'s
+    /// `files`/`turn` filters when present, and only the *selected* entries
+    /// are spent (`Journal::remove`), so a later full `/rollback` still
+    /// offers the files this call left alone.
+    pub fn rollback(&mut self, req: &RollbackRequest) -> crate::protocol::RollbackResponse {
+        let steps = match req.restore_before_turn {
+            // "Restore to before this turn" reaches the per-turn before-states
+            // (see rollback::plan_before_turn), unlike the plain `turn` filter
+            // which only matches files *first* touched in one turn.
+            Some(turn) => self.rollback.plan_before_turn(turn),
+            None => self.rollback.plan_filtered(req.files.as_deref(), req.turn),
+        };
         let report = crate::rollback::apply(&steps);
-        self.rollback.clear();
+        self.rollback.remove(&steps);
+
+        // A checkpoint restore ("restore before turn N") also drops the chat's
+        // later turns, so keep the model's history and turn counter in step
+        // with what the client is about to show: truncate everything from turn
+        // N+1 on, and rewind `turn` to N so the next prompt is turn N+1 and
+        // stays aligned with the client's request indices. The plain
+        // `files`/`turn` filters are selective file undos and leave the
+        // conversation alone.
+        if let Some(turn) = req.restore_before_turn {
+            if turn <= self.turn {
+                let keep = self
+                    .turn_starts
+                    .get(turn as usize)
+                    .copied()
+                    .unwrap_or(self.messages.len());
+                self.messages.truncate(keep);
+                self.turn_starts.truncate(turn as usize);
+                self.turn = turn;
+            }
+        }
+
         self.messages.push(ChatMessage::text("user", report.notice()));
         crate::protocol::RollbackResponse { summary: report.summary() }
+    }
+
+    /// `session/list_changes` -- a read-only peek at what `/rollback` would
+    /// do, in the structured shape a client's list UI needs (one entry per
+    /// undoable file, plus the shell-command warning). Pure: it reads no
+    /// disk and mutates nothing.
+    pub fn list_changes(&self) -> ListChangesResponse {
+        let changes = self
+            .rollback
+            .plan()
+            .into_iter()
+            .map(|step| {
+                let (action, reason) = match &step.action {
+                    crate::rollback::Action::Restore(_) => ("restore".to_string(), None),
+                    crate::rollback::Action::Delete => ("delete".to_string(), None),
+                    crate::rollback::Action::Blocked(why) => {
+                        ("blocked".to_string(), Some(why.clone()))
+                    }
+                };
+                ChangeEntry {
+                    path: step.display,
+                    turn: step.turn,
+                    touches: step.touches,
+                    action,
+                    reason,
+                }
+            })
+            .collect();
+        ListChangesResponse {
+            changes,
+            shell_warning: self.rollback.shell_warning(),
+        }
     }
 }
 
@@ -1319,7 +1409,12 @@ mod tests {
         assert_eq!(stop, StopReason::EndTurn);
         assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "bye\n");
 
-        let response = session.rollback();
+        let response = session.rollback(&RollbackRequest {
+            session_id: SessionId("s1".to_string()),
+            files: None,
+            turn: None,
+            restore_before_turn: None,
+        });
         assert!(response.summary.contains("Rolled back 1 file"), "{}", response.summary);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
@@ -1333,7 +1428,340 @@ mod tests {
         // ("Rolled back nothing -- ..." is the no-op case's own wording),
         // so the real distinguishing check is the file count, not just
         // whether that substring appears at all.
-        let second = session.rollback();
+        let second = session.rollback(&RollbackRequest {
+            session_id: SessionId("s1".to_string()),
+            files: None,
+            turn: None,
+            restore_before_turn: None,
+        });
         assert_eq!(second.summary, "Rolled back nothing — every file was already as the session found it.");
+    }
+
+    /// The selective-rollback half of the feature end to end: two turns each
+    /// write one new file, `list_changes` reports both with their turn
+    /// numbers, and a turn-filtered rollback undoes only the turn named --
+    /// leaving the other file for a later full rollback.
+    #[tokio::test]
+    async fn selective_rollback_undoes_only_the_requested_turn() {
+        let (dir, ws) = workspace();
+        let endpoint = serve_rounds(vec![
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"a.txt","content":"A\n"}"#),
+            text_round("Wrote A."),
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"b.txt","content":"B\n"}"#),
+            text_round("Wrote B."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
+
+        assert_eq!(
+            session
+                .prompt(
+                    "write A".to_string(),
+                    Vec::new(),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await,
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            session
+                .prompt(
+                    "write B".to_string(),
+                    Vec::new(),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await,
+            StopReason::EndTurn
+        );
+
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "A\n");
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "B\n");
+
+        // Both files are undoable, each attributed to its own turn.
+        let changes = session.list_changes();
+        assert_eq!(changes.changes.len(), 2);
+        let by_name = |p: &str| changes.changes.iter().find(|c| c.path == p).expect("listed");
+        assert_eq!(by_name("a.txt").turn, 1);
+        assert_eq!(by_name("b.txt").turn, 2);
+        assert_eq!(by_name("a.txt").action, "delete");
+        assert_eq!(by_name("b.txt").action, "delete");
+
+        // Undo turn 2 only: b.txt goes, a.txt survives.
+        let response = session.rollback(&RollbackRequest {
+            session_id: SessionId("s1".to_string()),
+            files: None,
+            turn: Some(2),
+            restore_before_turn: None,
+        });
+        assert!(response.summary.contains("Rolled back 1 file"), "{}", response.summary);
+        assert!(dir.path().join("a.txt").exists(), "turn 1's file must survive a turn-2 rollback");
+        assert!(!dir.path().join("b.txt").exists(), "turn 2's file must be undone");
+
+        // A later full rollback still offers the surviving file.
+        let rest = session.list_changes();
+        assert_eq!(rest.changes.len(), 1);
+        assert_eq!(rest.changes[0].path, "a.txt");
+
+        let full = session.rollback(&RollbackRequest {
+            session_id: SessionId("s1".to_string()),
+            files: None,
+            turn: None,
+            restore_before_turn: None,
+        });
+        assert!(full.summary.contains("Rolled back 1 file"), "{}", full.summary);
+        assert!(!dir.path().join("a.txt").exists(), "the full rollback finishes the job");
+    }
+
+    /// The restore-checkpoint button's exact scenario end to end: turn 1 adds a
+    /// line, turn 2 adds another, "restore before turn 2" keeps turn 1 and
+    /// drops turn 2, a later turn re-adds that same line, and "restore before
+    /// turn 3" drops it again -- never a no-op.
+    #[tokio::test]
+    async fn restore_checkpoint_then_reedit_then_restore_again() {
+        let (dir, ws) = workspace(); // hello.txt already contains "hi\n"
+        let endpoint = serve_rounds(vec![
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"hello.txt","content":"hi\nline1\n"}"#),
+            text_round("Added line 1."),
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"hello.txt","content":"hi\nline1\nline2\n"}"#),
+            text_round("Added line 2."),
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"hello.txt","content":"hi\nline1\nline2\n"}"#),
+            text_round("Re-added line 2."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
+
+        assert_eq!(
+            session
+                .prompt(
+                    "add line 1".to_string(),
+                    Vec::new(),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await,
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            session
+                .prompt(
+                    "add line 2".to_string(),
+                    Vec::new(),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await,
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hi\nline1\nline2\n"
+        );
+
+        // Restore before turn 2: drop line 2, keep line 1.
+        let r2 = session.rollback(&RollbackRequest {
+            session_id: SessionId("s1".to_string()),
+            files: None,
+            turn: None,
+            restore_before_turn: Some(2),
+        });
+        assert!(r2.summary.contains("Rolled back 1 file"), "{}", r2.summary);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hi\nline1\n"
+        );
+
+        // Turn 3 re-adds line 2.
+        assert_eq!(
+            session
+                .prompt(
+                    "add line 2 again".to_string(),
+                    Vec::new(),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await,
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hi\nline1\nline2\n"
+        );
+
+        // Restore before turn 3: line 2 comes off again.
+        let r3 = session.rollback(&RollbackRequest {
+            session_id: SessionId("s1".to_string()),
+            files: None,
+            turn: None,
+            restore_before_turn: Some(3),
+        });
+        assert!(r3.summary.contains("Rolled back 1 file"), "{}", r3.summary);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hi\nline1\n"
+        );
+    }
+
+    /// The native "Start Over" button (shown on the first request) maps to
+    /// `restoreBeforeTurn: 1`: after two turns each edited the same file, it
+    /// must undo *both*, back to the session-start content -- not just the
+    /// last turn.
+    #[tokio::test]
+    async fn start_over_restores_before_turn_one() {
+        let (dir, ws) = workspace(); // hello.txt already contains "hi\n"
+        let endpoint = serve_rounds(vec![
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"hello.txt","content":"hi\nline1\n"}"#),
+            text_round("Added line 1."),
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"hello.txt","content":"hi\nline1\nline2\n"}"#),
+            text_round("Added line 2."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
+
+        for text in ["add line 1", "add line 2"] {
+            assert_eq!(
+                session
+                    .prompt(
+                        text.to_string(),
+                        Vec::new(),
+                        &updates_tx,
+                        &permissions_tx,
+                        &browser_tx,
+                        &browser_interact_tx,
+                    )
+                    .await,
+                StopReason::EndTurn
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hi\nline1\nline2\n"
+        );
+
+        let response = session.rollback(&RollbackRequest {
+            session_id: SessionId("s1".to_string()),
+            files: None,
+            turn: None,
+            restore_before_turn: Some(1),
+        });
+        assert!(response.summary.contains("Rolled back 1 file"), "{}", response.summary);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hi\n",
+            "Start Over must undo turn 1's line too, back to the session-start content"
+        );
+    }
+
+    /// A checkpoint restore must also rewind the conversation and turn counter:
+    /// the chat window drops the later turns, so the model's history has to too,
+    /// and the next prompt must be numbered consistently with the shortened chat.
+    #[tokio::test]
+    async fn restore_checkpoint_rewinds_conversation_and_turn() {
+        let (dir, ws) = workspace(); // hello.txt already contains "hi\n"
+        let endpoint = serve_rounds(vec![
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"hello.txt","content":"hi\nline1\n"}"#),
+            text_round("Added line 1."),
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"hello.txt","content":"hi\nline1\nline2\n"}"#),
+            text_round("Added line 2."),
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"hello.txt","content":"hi\nline1\nline2\nline3\n"}"#),
+            text_round("Added line 3."),
+            text_round("Done."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
+
+        for text in ["add line 1", "add line 2", "add line 3"] {
+            assert_eq!(
+                session
+                    .prompt(
+                        text.to_string(),
+                        Vec::new(),
+                        &updates_tx,
+                        &permissions_tx,
+                        &browser_tx,
+                        &browser_interact_tx,
+                    )
+                    .await,
+                StopReason::EndTurn
+            );
+        }
+        assert_eq!(session.current_turn(), 3);
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|m| m.role == "user" && m.content.as_deref() == Some("add line 3")),
+            "turn 3's prompt should be in history before the restore"
+        );
+
+        // Restore before turn 2: undo turns 2 and 3, and cut history back to
+        // turn 2's own user message (turn 3 drops out entirely).
+        let response = session.rollback(&RollbackRequest {
+            session_id: SessionId("s1".to_string()),
+            files: None,
+            turn: None,
+            restore_before_turn: Some(2),
+        });
+        assert!(response.summary.contains("Rolled back 1 file"), "{}", response.summary);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hi\nline1\n"
+        );
+        assert_eq!(session.current_turn(), 2, "turn counter must rewind to the restored turn");
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|m| m.role == "user" && m.content.as_deref() == Some("add line 3")),
+            "restore must drop turn 3 from the conversation, not just its files"
+        );
+
+        // A follow-up prompt is turn 3 again, staying aligned with the shortened
+        // chat window (which now shows turns 1, 2, and this new one).
+        assert_eq!(
+            session
+                .prompt(
+                    "add line 4".to_string(),
+                    Vec::new(),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await,
+            StopReason::EndTurn
+        );
+        assert_eq!(session.current_turn(), 3);
     }
 }

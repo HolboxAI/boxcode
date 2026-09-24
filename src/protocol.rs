@@ -271,6 +271,11 @@ pub struct PromptRequest {
 pub struct PromptResponse {
     #[serde(rename = "stopReason")]
     pub stop_reason: StopReason,
+    /// The 1-based turn number this response belongs to (incremented at the
+    /// top of each `prompt`). Lets a client scope a selective rollback to
+    /// "everything from this turn onward" without tracking turns itself.
+    #[serde(rename = "turn")]
+    pub turn: u64,
 }
 
 /// `Text` and `Image` are implemented -- the v1 schema's own baseline
@@ -703,6 +708,23 @@ impl From<RequestPermissionOutcome> for Decision {
 pub struct RollbackRequest {
     #[serde(rename = "sessionId")]
     pub session_id: SessionId,
+    /// Optional per-file filter: only roll back files whose `display` path or
+    /// resolved path matches one of these (exact, case-sensitive). Omitted or
+    /// `null` rolls back every file.
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
+    /// Optional per-turn filter: only roll back files *first* touched in this
+    /// 1-based turn. Omitted or `null` rolls back every turn.
+    #[serde(default)]
+    pub turn: Option<u64>,
+    /// Optional "restore to before this turn": put every file touched at this
+    /// turn or later back to the state it held just before this turn began --
+    /// its per-turn before-state, not the session-start state. Stronger than
+    /// `turn` (which only matches files *first* touched in one turn): a file
+    /// edited in turns 1 and 3 can here be restored to its after-turn-1 state.
+    /// When both are set, this one wins (see `HeadlessSession::rollback`).
+    #[serde(default, rename = "restoreBeforeTurn")]
+    pub restore_before_turn: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -712,6 +734,44 @@ pub struct RollbackResponse {
     /// can show as-is rather than re-deriving its own wording from
     /// structured fields this module doesn't otherwise need.
     pub summary: String,
+}
+
+// ---------------------------------------------------------------------------
+// session/list_changes -- a read-only peek at the rollback journal, so a
+// client can enumerate what's undoable and offer per-file/per-turn undo
+// without having to guess. Answered synchronously like session/rollback (a
+// read of in-memory state, no disk I/O, no LLM round trip).
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ListChangesRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+}
+
+/// One undoable file, in the shape a client's list UI needs.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ChangeEntry {
+    /// The path as the model asked for it -- the same string the client
+    /// showed in the permission dialog and diff.
+    pub path: String,
+    /// The 1-based turn that first touched this file (`0` when untracked).
+    pub turn: u64,
+    /// How many calls touched it.
+    pub touches: usize,
+    /// What an undo would do: `"restore"`, `"delete"`, or `"blocked"`.
+    pub action: String,
+    /// Why a blocked entry can't be undone, otherwise absent.
+    pub reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ListChangesResponse {
+    pub changes: Vec<ChangeEntry>,
+    /// The same shell-command warning `/rollback` shows, if any commands ran
+    /// -- commands are never undone, only named.
+    #[serde(rename = "shellWarning")]
+    pub shell_warning: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -899,9 +959,9 @@ mod tests {
 
     #[test]
     fn a_prompt_response_carries_the_stop_reason_snake_case() {
-        let resp = PromptResponse { stop_reason: StopReason::EndTurn };
+        let resp = PromptResponse { stop_reason: StopReason::EndTurn, turn: 1 };
         let value = serde_json::to_value(&resp).unwrap();
-        assert_eq!(value, json!({ "stopReason": "end_turn" }));
+        assert_eq!(value, json!({ "stopReason": "end_turn", "turn": 1 }));
     }
 
     #[test]

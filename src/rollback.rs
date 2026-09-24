@@ -29,6 +29,21 @@
 //! Empty directories a write created are left behind. Removing them would mean
 //! guessing which of the parents existed beforehand, and an empty directory is
 //! never destructive; a wrongly-removed one could be.
+//!
+//! ## Selective rollback
+//!
+//! `/rollback` is all-or-nothing by default, but the same journal also backs
+//! *selective* undo over the ACP wire: each file record remembers the 1-based
+//! turn that first touched it, so `plan_filtered` can narrow the plan to one
+//! file or one turn, and `remove` spends only the entries actually undone.
+//!
+//! The first-touch turn alone is not enough for "restore to before turn N",
+//! which a chat's Restore Checkpoint button wants: a file edited in turns 1
+//! and 3 must undo only turn 3's change and keep turn 1's. So each file record
+//! also keeps the before-state of its *first touch in each later turn*
+//! (`snapshots`), and `plan_before_turn` restores to the one at or just before
+//! the requested turn. The ordinary `plan`/`plan_filtered` undo is still "back
+//! to the session start"; only `plan_before_turn` reaches intermediate states.
 
 use std::path::{Path, PathBuf};
 
@@ -119,6 +134,10 @@ pub struct Step {
     /// How many calls touched this file. Shown, not used -- the undo is to the
     /// state before the first of them however many there were.
     pub touches: usize,
+    /// The 1-based turn that *first* touched this file, for selective
+    /// per-turn undo. `0` when the caller isn't tracking turns (the TUI,
+    /// whose `/rollback` is all-or-nothing).
+    pub turn: u64,
     pub action: Action,
 }
 
@@ -146,8 +165,17 @@ impl Step {
 struct FileRecord {
     display: String,
     path: PathBuf,
+    /// The state before the *first* touch -- what the ordinary `/rollback`
+    /// restores, and what the session started from.
     before: Before,
     touches: usize,
+    /// The 1-based turn that first touched this file (`0` when untracked).
+    turn: u64,
+    /// The state before the *first touch of each later turn*, in order --
+    /// `(turn, before)` pairs, one per turn beyond the first that touched the
+    /// file. Backs `plan_before_turn`; empty when the file was only ever
+    /// touched in a single turn.
+    snapshots: Vec<(u64, Before)>,
 }
 
 /// Everything this run has done that `/rollback` reasons about.
@@ -165,7 +193,21 @@ pub struct Journal {
 }
 
 impl Journal {
+    /// Record a change with no turn attribution -- the TUI's own path, whose
+    /// `/rollback` is all-or-nothing and never filters by turn. Every record
+    /// here lands with `turn` 0, so a `plan_filtered(.., Some(n))` call
+    /// simply won't match it (which is fine: the TUI never filters).
     pub fn record(&mut self, record: Record) {
+        self.record_turn(record, 0);
+    }
+
+    /// Record a change as belonging to a specific 1-based turn (one
+    /// `session/prompt` in ACP terms). The first touch of a file owns its
+    /// `turn`/`before` fields (the session-start state); the first touch of
+    /// each *later* turn also keeps that turn's before-state in `snapshots`,
+    /// so `plan_before_turn` can restore to before any turn without
+    /// half-undoing a file edited across turns.
+    pub fn record_turn(&mut self, record: Record, turn: u64) {
         match record {
             Record::Shell { command } => {
                 let command = command.trim().to_string();
@@ -178,34 +220,58 @@ impl Journal {
                 path,
                 before,
             } => {
-                // Second and later touches of the same file only raise the
-                // count. Their before-states are ones this run created, and
-                // restoring one would half-undo the file -- see the module
-                // comment.
-                if let Some(existing) = self.files.iter_mut().find(|f| f.path == path) {
-                    existing.touches += 1;
-                    return;
-                }
-                let before = match &before {
-                    Before::Text(t) if self.held + t.len() > SNAPSHOT_BUDGET => {
-                        Before::Unknown(format!(
-                            "this run has already kept {} of undo history, its limit",
-                            bytes(SNAPSHOT_BUDGET)
-                        ))
+                // Find the existing entry (if any) and whether this touch
+                // starts a *new* turn -- the only case that stores a fresh
+                // before-state. Decided before charging the budget so a
+                // repeat touch within one turn never spends memory.
+                let existing = self.files.iter().position(|f| f.path == path);
+                let is_new_turn = match existing {
+                    Some(i) => {
+                        let f = &self.files[i];
+                        turn != f.snapshots.last().map(|(t, _)| *t).unwrap_or(f.turn)
                     }
-                    _ => before,
+                    None => false,
                 };
-                if let Before::Text(t) = &before {
-                    self.held += t.len();
+
+                match existing {
+                    Some(i) => {
+                        if is_new_turn {
+                            let charged = self.charge(before);
+                            self.files[i].snapshots.push((turn, charged));
+                        }
+                        self.files[i].touches += 1;
+                    }
+                    None => {
+                        let charged = self.charge(before);
+                        self.files.push(FileRecord {
+                            display,
+                            path,
+                            before: charged,
+                            touches: 1,
+                            turn,
+                            snapshots: Vec::new(),
+                        });
+                    }
                 }
-                self.files.push(FileRecord {
-                    display,
-                    path,
-                    before,
-                    touches: 1,
-                });
             }
         }
+    }
+
+    /// Charge a `Before::Text` snapshot against the memory budget, downgrading
+    /// it to `Unknown` when the run has already kept its limit. Returns the
+    /// (possibly downgraded) `Before` to store.
+    fn charge(&mut self, before: Before) -> Before {
+        let before = match &before {
+            Before::Text(t) if self.held + t.len() > SNAPSHOT_BUDGET => Before::Unknown(format!(
+                "this run has already kept {} of undo history, its limit",
+                bytes(SNAPSHOT_BUDGET)
+            )),
+            _ => before,
+        };
+        if let Before::Text(t) = &before {
+            self.held += t.len();
+        }
+        before
     }
 
     /// What `/rollback` would do, in the order the files were first touched.
@@ -215,12 +281,40 @@ impl Journal {
     /// question belongs to [`apply`], which answers it once rather than
     /// letting the preview and the execution disagree.
     pub fn plan(&self) -> Vec<Step> {
+        self.plan_filtered(None, None)
+    }
+
+    /// The same plan, narrowed to a *selected* subset. Both filters are
+    /// optional; when both are given they AND (a file must satisfy both to
+    /// be included).
+    ///
+    /// * `files` matches against either the `display` path (the name the
+    ///   model asked for, which is also what the IDE shows) or the resolved
+    ///   `path` string -- both are exact, case-sensitive matches.
+    /// * `turn` matches the turn that *first* touched the file (see
+    ///   [`record_turn`]), so "undo turn N" means "undo the files whose first
+    ///   change happened in turn N" -- never a half-undone intermediate.
+    pub fn plan_filtered(&self, files: Option<&[String]>, turn: Option<u64>) -> Vec<Step> {
         self.files
             .iter()
+            .filter(|f| {
+                let file_ok = match files {
+                    Some(paths) => paths
+                        .iter()
+                        .any(|p| *p == f.display || *p == f.path.to_string_lossy()),
+                    None => true,
+                };
+                let turn_ok = match turn {
+                    Some(t) => f.turn == t,
+                    None => true,
+                };
+                file_ok && turn_ok
+            })
             .map(|f| Step {
                 display: f.display.clone(),
                 path: f.path.clone(),
                 touches: f.touches,
+                turn: f.turn,
                 action: match &f.before {
                     Before::Text(t) => Action::Restore(t.clone()),
                     Before::Absent => Action::Delete,
@@ -228,6 +322,65 @@ impl Journal {
                 },
             })
             .collect()
+    }
+
+    /// The plan for "restore to before turn N": every file touched at turn N
+    /// or later is put back to the state it held just before turn N began.
+    /// A file first touched *after* N is skipped (turn N changed nothing of
+    /// it); a file first touched at or before N is restored to the snapshot
+    /// taken at the earliest touch of turn >= N -- the session-start state
+    /// when N predates the file's first touch, otherwise that turn's own
+    /// before-state. This is the one place the journal reaches intermediate
+    /// states; `plan` and `plan_filtered` still undo to the session start.
+    pub fn plan_before_turn(&self, turn: u64) -> Vec<Step> {
+        self.files
+            .iter()
+            .filter_map(|f| {
+                let before = if turn <= f.turn {
+                    &f.before
+                } else {
+                    f.snapshots
+                        .iter()
+                        .find(|(t, _)| *t >= turn)
+                        .map(|(_, b)| b)?
+                };
+                Some(Step {
+                    display: f.display.clone(),
+                    path: f.path.clone(),
+                    touches: f.touches,
+                    turn: f.turn,
+                    action: match before {
+                        Before::Text(t) => Action::Restore(t.clone()),
+                        Before::Absent => Action::Delete,
+                        Before::Unknown(why) => Action::Blocked(why.clone()),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Drop the file records named by `steps` (matched by path), returning
+    /// their snapshot bytes to the budget. Used after a *selective* rollback
+    /// so a later full `/rollback` no longer offers the files already undone
+    /// -- the counterpart of [`clear`], but only for the acted-on subset.
+    /// Shell records are left alone (they are warnings, never undone).
+    pub fn remove(&mut self, steps: &[Step]) {
+        let paths: Vec<PathBuf> = steps.iter().map(|s| s.path.clone()).collect();
+        self.files.retain(|f| {
+            if paths.iter().any(|p| *p == f.path) {
+                if let Before::Text(t) = &f.before {
+                    self.held = self.held.saturating_sub(t.len());
+                }
+                for (_, before) in &f.snapshots {
+                    if let Before::Text(t) = before {
+                        self.held = self.held.saturating_sub(t.len());
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// The commands whose effects the plan above does not cover, if any ran.
@@ -612,12 +765,14 @@ mod tests {
                 // A path whose parent is a *file*, so creating it must fail.
                 path: good.join("impossible.rs"),
                 touches: 1,
+                turn: 0,
                 action: Action::Restore("x".to_string()),
             },
             Step {
                 display: "good.rs".to_string(),
                 path: good.clone(),
                 touches: 1,
+                turn: 0,
                 action: Action::Restore("before\n".to_string()),
             },
         ];
@@ -645,5 +800,162 @@ mod tests {
         assert!(journal.is_empty());
         assert!(journal.plan().is_empty());
         assert!(journal.shell_warning().is_none());
+    }
+
+    /// A file touched across two turns is attributed to the turn that first
+    /// touched it, so "undo turn 2" does not half-undo it -- the same
+    /// first-touch-wins rule that already governs the snapshot.
+    #[test]
+    fn a_file_is_attributed_to_its_first_touching_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+
+        let mut journal = Journal::default();
+        journal.record_turn(wrote("a.rs", &path, Before::Text("v0\n".to_string())), 1);
+        journal.record_turn(wrote("a.rs", &path, Before::Text("v1\n".to_string())), 2);
+
+        let steps = journal.plan_filtered(None, Some(1));
+        assert_eq!(steps.len(), 1, "the first-touch turn is what counts");
+        assert_eq!(steps[0].turn, 1);
+        assert_eq!(steps[0].touches, 2);
+
+        assert!(
+            journal.plan_filtered(None, Some(2)).is_empty(),
+            "a file first touched in turn 1 is not turn 2's to undo"
+        );
+    }
+
+    /// `files` matches either the display name or the resolved path string,
+    /// so a client can ask by whichever it already has.
+    #[test]
+    fn plan_filtered_by_files_matches_display_or_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+
+        let mut journal = Journal::default();
+        journal.record_turn(wrote("src/a.rs", &a, Before::Absent), 1);
+        journal.record_turn(wrote("src/b.rs", &b, Before::Absent), 1);
+
+        let by_display = journal.plan_filtered(Some(&["src/a.rs".to_string()]), None);
+        assert_eq!(by_display.len(), 1);
+        assert_eq!(by_display[0].display, "src/a.rs");
+
+        let by_path = journal.plan_filtered(Some(&[b.to_string_lossy().to_string()]), None);
+        assert_eq!(by_path.len(), 1);
+        assert_eq!(by_path[0].display, "src/b.rs");
+
+        assert!(journal
+            .plan_filtered(Some(&["nope.rs".to_string()]), None)
+            .is_empty());
+    }
+
+    /// Removing the acted-on subset leaves the rest undoable, and a later
+    /// full rollback only touches what remains.
+    #[test]
+    fn remove_spends_only_the_selected_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+
+        let mut journal = Journal::default();
+        journal.record_turn(wrote("a.rs", &a, Before::Absent), 1);
+        journal.record_turn(wrote("b.rs", &b, Before::Absent), 1);
+
+        let selected = journal.plan_filtered(Some(&["a.rs".to_string()]), None);
+        journal.remove(&selected);
+
+        let remaining = journal.plan();
+        assert_eq!(remaining.len(), 1, "only b.rs remains undoable");
+        assert_eq!(remaining[0].display, "b.rs");
+        assert!(!journal.is_empty());
+    }
+
+    /// "Restore to before turn N" undoes only turn N's edit, keeping earlier
+    /// turns': a file edited in turns 1 and 2 is put back to its after-turn-1
+    /// state, not to the session start.
+    #[test]
+    fn plan_before_turn_restores_to_that_turns_before_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "v2\n").unwrap();
+
+        let mut journal = Journal::default();
+        journal.record_turn(wrote("test.txt", &path, Before::Text("orig\n".to_string())), 1);
+        journal.record_turn(wrote("test.txt", &path, Before::Text("v1\n".to_string())), 2);
+
+        let steps = journal.plan_before_turn(2);
+        assert_eq!(steps.len(), 1);
+        apply(&steps);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1\n");
+
+        // Restoring before turn 1 undoes both edits back to the session start.
+        let steps = journal.plan_before_turn(1);
+        apply(&steps);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "orig\n");
+    }
+
+    /// A turn that touched nothing restores nothing, and a file created in a
+    /// later turn is deleted when restoring to before that turn -- while a
+    /// file first touched earlier is left alone.
+    #[test]
+    fn plan_before_turn_skips_untouched_files_and_deletes_later_creations() {
+        let dir = tempfile::tempdir().unwrap();
+        let edited = dir.path().join("edited.txt");
+        let made = dir.path().join("made.txt");
+        std::fs::write(&edited, "v1\n").unwrap();
+        std::fs::write(&made, "new\n").unwrap();
+
+        let mut journal = Journal::default();
+        journal.record_turn(wrote("edited.txt", &edited, Before::Text("orig\n".to_string())), 1);
+        journal.record_turn(wrote("made.txt", &made, Before::Absent), 2);
+
+        // Turn 3 touched nothing.
+        assert!(journal.plan_before_turn(3).is_empty());
+
+        // Restoring before turn 2 keeps turn 1's edit and deletes the file
+        // turn 2 created.
+        let steps = journal.plan_before_turn(2);
+        assert_eq!(steps.len(), 1, "only made.txt was first touched at turn 2");
+        apply(&steps);
+        assert_eq!(std::fs::read_to_string(&edited).unwrap(), "v1\n");
+        assert!(!made.exists(), "the turn-2 creation is deleted");
+    }
+
+    /// The full "restore a checkpoint, then re-edit the same file, then restore
+    /// again" flow. Restoring before turn 2 undoes turn 2's edit (keeping turn
+    /// 1's), a later turn re-adds it, and restoring *that* turn undoes it again
+    /// -- never "nothing".
+    #[test]
+    fn restore_then_reedit_then_restore_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "base\n").unwrap();
+
+        let mut journal = Journal::default();
+        // Turn 1 adds line 1.
+        journal.record_turn(wrote("f.txt", &path, Before::Text("base\n".to_string())), 1);
+        std::fs::write(&path, "base\nline1\n").unwrap();
+        // Turn 2 adds line 2.
+        journal.record_turn(wrote("f.txt", &path, Before::Text("base\nline1\n".to_string())), 2);
+        std::fs::write(&path, "base\nline1\nline2\n").unwrap();
+
+        // Restore before turn 2: undo line 2, keep line 1, then spend the entry.
+        let steps = journal.plan_before_turn(2);
+        assert_eq!(steps.len(), 1);
+        apply(&steps);
+        journal.remove(&steps);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "base\nline1\n");
+
+        // Turn 3 re-adds line 2.
+        journal.record_turn(wrote("f.txt", &path, Before::Text("base\nline1\n".to_string())), 3);
+        std::fs::write(&path, "base\nline1\nline2\n").unwrap();
+
+        // Restore before turn 3: line 2 comes off again.
+        let steps = journal.plan_before_turn(3);
+        assert_eq!(steps.len(), 1, "turn 3's re-edit must still be undoable");
+        let report = apply(&steps);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "base\nline1\n");
+        assert!(!report.restored.is_empty(), "expected a restore, not 'nothing': {report:?}");
     }
 }
