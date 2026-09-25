@@ -15,6 +15,7 @@ mod diff;
 mod errors;
 mod headless;
 mod llm;
+mod login;
 mod notice;
 mod plan;
 mod protocol;
@@ -64,6 +65,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut plan = false;
     let mut resume = false;
     let mut acp = false;
+    let mut do_login = false;
+    let mut do_logout = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-V" | "--version" => {
@@ -90,12 +93,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "-p" | "--plan" => plan = true,
             "-r" | "--resume" => resume = true,
             "--acp" => acp = true,
+            "login" => do_login = true,
+            "logout" => do_logout = true,
             other => {
                 eprintln!("Unknown argument: {other}\n");
                 print_help();
                 std::process::exit(2);
             }
         }
+    }
+
+    if do_login {
+        if let Err(e) = login::login().await {
+            eprintln!("✗ Login failed: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if do_logout {
+        if let Err(e) = login::logout().await {
+            eprintln!("✗ Logout failed: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     if upgrade {
@@ -162,6 +182,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // no-op until a real endpoint is configured, and every failure inside it
     // is already silent.
     tokio::spawn(telemetry::ping_active_if_new_day(VERSION));
+    login::spawn_heartbeat_loop();
 
     let enhanced = setup_terminal()?;
 
@@ -879,6 +900,8 @@ Terminal UI for an OpenAI-compatible LLM endpoint.
 
 USAGE:
     boxcode [FLAGS]
+    boxcode login
+    boxcode logout
 
 FLAGS:
     -V, --version    Print version and exit
@@ -897,10 +920,19 @@ FLAGS:
                        ~/.boxcode/sessions/. Also available mid-session
                        as /resume.
 
+
+COMMANDS:
+    login            Sign in with Google in the browser. Writes
+                       llm.boxcode.sh credentials to ~/.boxcode/config.toml —
+                       the IDE reads the same file.
+    logout           Clear the local account session (and promo proxy key if
+                       pointed at llm.boxcode.sh).
+
 CONFIG (environment overrides ~/.boxcode/config.toml):
-    BOXCODE_ENDPOINT    Base URL, e.g. https://llm.internal:8443
+    BOXCODE_ENDPOINT    Base URL, e.g. https://llm.boxcode.sh/v1
     BOXCODE_MODEL       Model name
     BOXCODE_API_KEY     Bearer token
+    BOXCODE_AUTH_URL    Website for device login (default https://boxcode.sh)
 
 TOOLS (read_file, write_file, run_command; writes and commands need your
        approval each time -- see the [tools] table in config.toml):
