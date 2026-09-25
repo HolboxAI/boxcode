@@ -958,6 +958,8 @@ UPGRADE:
                           check_on_start = false in the [update] table.
 
 COMMANDS (type in the input box, press Enter):
+    /login                Show whether this machine is linked to boxcode.sh
+    /logout               Clear the local boxcode.sh session and promo key
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider
     /new                  Forget the conversation and start fresh

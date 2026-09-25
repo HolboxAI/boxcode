@@ -16,12 +16,107 @@ fn auth_base() -> String {
         .to_string()
 }
 
-fn account_token_path() -> PathBuf {
+fn boxcode_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".boxcode").join("account.token")
+    home.join(".boxcode")
+}
+
+fn account_token_path() -> PathBuf {
+    boxcode_dir().join("account.token")
+}
+
+fn account_email_path() -> PathBuf {
+    boxcode_dir().join("account.email")
+}
+
+/// Snapshot of the local boxcode.sh device-login session (no network).
+pub struct LoginStatus {
+    pub has_session_token: bool,
+    pub email: Option<String>,
+    pub endpoint: String,
+    pub model: String,
+    pub key_prefix: String,
+    pub via_boxcode_proxy: bool,
+}
+
+impl LoginStatus {
+    pub fn load(config: &Config) -> Self {
+        let email = std::fs::read_to_string(account_email_path())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let key = config.llm.api_key.trim();
+        let key_prefix = if key.is_empty() {
+            String::new()
+        } else if key.len() > 12 {
+            format!("{}…", &key[..12])
+        } else {
+            key.to_string()
+        };
+        let endpoint = config.llm.endpoint.trim().to_string();
+        let via_boxcode_proxy = endpoint.to_lowercase().contains("llm.boxcode.sh");
+        Self {
+            has_session_token: account_token_path().is_file(),
+            email,
+            endpoint,
+            model: config.llm.model.clone(),
+            key_prefix,
+            via_boxcode_proxy,
+        }
+    }
+
+    /// Human-readable status for `/login` in the TUI.
+    pub fn readout(&self) -> String {
+        if self.has_session_token && self.via_boxcode_proxy && !self.key_prefix.is_empty() {
+            let who = self.email.as_deref().unwrap_or("(email on next login)");
+            format!(
+                "Signed in via boxcode.sh\n\n\
+                 Account:  {who}\n\
+                 Endpoint: {}\n\
+                 Model:    {}\n\
+                 Key:      {}\n\n\
+                 Session:  ~/.boxcode/account.token\n\
+                 Proof:    heartbeat hits https://boxcode.sh/api/heartbeat\n\n\
+                 To link another machine: exit (^c) then run `boxcode login`\n\
+                 and confirm the Device ID on https://boxcode.sh/login/device.",
+                self.endpoint, self.model, self.key_prefix
+            )
+        } else if self.via_boxcode_proxy && !self.key_prefix.is_empty() {
+            format!(
+                "Using llm.boxcode.sh, but no device session yet.\n\n\
+                 Endpoint: {}\n\
+                 Key:      {}\n\n\
+                 Exit (^c) and run:\n\
+                   boxcode login\n\n\
+                 That signs in with Google on boxcode.sh and links this machine.",
+                self.endpoint, self.key_prefix
+            )
+        } else {
+            "Not signed in via boxcode.sh.\n\n\
+             Exit (^c) and run:\n\
+               boxcode login\n\n\
+             Browser opens https://boxcode.sh — Google sign-in, then this CLI\n\
+             receives your promo key. Same file the IDE reads:\n\
+               ~/.boxcode/config.toml"
+                .to_string()
+        }
+    }
+}
+
+fn write_account_email(email: &str) {
+    let path = account_email_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, email.trim());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,10 +174,11 @@ pub async fn login() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("boxcode login");
     println!();
-    println!("  Code:  {}", start.user_code);
-    println!("  Open:  {verify}");
+    println!("  Device ID:  {}", start.user_code);
+    println!("  Open:       {verify}");
     println!();
     println!("Sign in with Google in the browser, then approve this device.");
+    println!("The website will show the same Device ID — confirm it matches.");
     print!("Waiting");
     let _ = io::stdout().flush();
     open_browser(&verify);
@@ -132,6 +228,9 @@ pub async fn login() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
                 }
             }
+            if let Some(ref email) = body.email {
+                write_account_email(email);
+            }
 
             println!(
                 "✓ Signed in as {}. Credentials saved to ~/.boxcode/config.toml",
@@ -163,20 +262,31 @@ pub async fn login() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub async fn logout() -> Result<(), Box<dyn std::error::Error>> {
+    let msg = logout_local()?;
+    println!("{msg}");
+    Ok(())
+}
+
+/// Clear device session (+ promo key when pointed at llm.boxcode.sh). Used by
+/// both `boxcode logout` and the `/logout` slash command.
+pub fn logout_local() -> Result<String, Box<dyn std::error::Error>> {
     let token_path = account_token_path();
     if token_path.exists() {
         let _ = std::fs::remove_file(&token_path);
+    }
+    let email_path = account_email_path();
+    if email_path.exists() {
+        let _ = std::fs::remove_file(&email_path);
     }
     let mut config = Config::load().unwrap_or_default();
     let endpoint = config.llm.endpoint.to_lowercase();
     if endpoint.contains("llm.boxcode.sh") {
         config.llm.api_key.clear();
         config.save()?;
-        println!("✓ Cleared llm.boxcode.sh credentials from ~/.boxcode/config.toml");
+        Ok("✓ Cleared llm.boxcode.sh credentials from ~/.boxcode/config.toml".into())
     } else {
-        println!("✓ Cleared local session token (left custom endpoint/api_key untouched)");
+        Ok("✓ Cleared local session token (left custom endpoint/api_key untouched)".into())
     }
-    Ok(())
 }
 
 /// Fire-and-forget heartbeat while the TUI is running.
