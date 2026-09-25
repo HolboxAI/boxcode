@@ -443,6 +443,13 @@ pub enum ToolCallContent {
         old_text: Option<String>,
         #[serde(rename = "newText")]
         new_text: String,
+        /// Pre-computed hunks so the client can offer per-hunk accept/reject
+        /// without reimplementing boxcode's own diff. `None` when whole-file
+        /// review is the right call instead (CRLF line endings, or a change
+        /// too large to review in full without clipping) -- the client then
+        /// falls back to the whole-file `oldText`/`newText` above.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hunks: Option<Vec<DiffHunk>>,
     },
     /// A `check_in_browser` result -- base64-encoded image bytes for the
     /// client to render (e.g. inline in a chat panel), not something
@@ -459,6 +466,38 @@ pub enum ToolCallContent {
         mime_type: String,
         data: String,
     },
+}
+
+/// The three kinds a diff line can be -- a re-declaration of
+/// `crate::diff::Change` on the ACP side, so the wire shape does not depend on
+/// the TUI's own diff module (and serializes snake_case as ACP expects, rather
+/// than the TUI's own PascalCase, which a client never sees).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffLineChange {
+    Context,
+    Added,
+    Removed,
+}
+
+/// One line of a [`DiffHunk`], already carrying the line numbers it displays.
+/// Mirrors `crate::diff::DiffLine`; `old_no`/`new_no` are 1-based and absent on
+/// the side the line does not exist on (an added line has no `old_no`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DiffHunkLine {
+    pub change: DiffLineChange,
+    #[serde(rename = "oldNo", default, skip_serializing_if = "Option::is_none")]
+    pub old_no: Option<usize>,
+    #[serde(rename = "newNo", default, skip_serializing_if = "Option::is_none")]
+    pub new_no: Option<usize>,
+    pub text: String,
+}
+
+/// A run of changed lines plus the unchanged lines framing it -- a mirror of
+/// `crate::diff::Hunk`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DiffHunk {
+    pub lines: Vec<DiffHunkLine>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,6 +610,17 @@ pub enum RequestPermissionOutcome {
     Selected {
         #[serde(rename = "optionId")]
         option_id: PermissionOptionId,
+    },
+    /// The client reviewed the change hunk-by-hunk and wants only the accepted
+    /// hunks applied. `new_text` is the exact file content to write (the
+    /// client's reconstruction from `ToolCallContent::Diff`'s hunks); boxcode
+    /// writes it instead of executing the original `write_file`/`edit_file`
+    /// call, so rollback and the transcript still describe what actually
+    /// landed rather than the model's full intent.
+    #[serde(rename = "partial")]
+    Partial {
+        #[serde(rename = "newText")]
+        new_text: String,
     },
 }
 
@@ -690,6 +740,10 @@ impl From<RequestPermissionOutcome> for Decision {
                     Decision::Refused
                 }
             }
+            // `Partial` is handled by `HeadlessSession::ask_permission` before
+            // it ever reaches this conversion; reaching here means a malformed
+            // or legacy caller sent it where a binary decision was expected.
+            RequestPermissionOutcome::Partial { .. } => Decision::Refused,
         }
     }
 }
@@ -993,6 +1047,7 @@ mod tests {
             path: "src/app.rs".to_string(),
             old_text: Some("before".to_string()),
             new_text: "after".to_string(),
+            hunks: None,
         };
         let value = serde_json::to_value(&content).unwrap();
         assert_eq!(
@@ -1010,9 +1065,61 @@ mod tests {
             path: "src/new.rs".to_string(),
             old_text: None,
             new_text: "fresh".to_string(),
+            hunks: None,
         };
         let value = serde_json::to_value(&content).unwrap();
         assert_eq!(value, json!({ "type": "diff", "path": "src/new.rs", "newText": "fresh" }));
+    }
+
+    /// Per-hunk review ships the same hunk split `headless.rs` builds, with
+    /// line numbers as 1-based `oldNo`/`newNo` and the change as the three
+    /// `snake_case` variants ACP's own `content` tag is flattened beside.
+    #[test]
+    fn tool_call_content_diff_serializes_hunks_for_per_hunk_review() {
+        let content = ToolCallContent::Diff {
+            path: "src/app.rs".to_string(),
+            old_text: Some("a\nb\n".to_string()),
+            new_text: "a\nB\n".to_string(),
+            hunks: Some(vec![DiffHunk {
+                lines: vec![
+                    DiffHunkLine {
+                        change: DiffLineChange::Context,
+                        old_no: Some(1),
+                        new_no: Some(1),
+                        text: "a".to_string(),
+                    },
+                    DiffHunkLine {
+                        change: DiffLineChange::Removed,
+                        old_no: Some(2),
+                        new_no: None,
+                        text: "b".to_string(),
+                    },
+                    DiffHunkLine {
+                        change: DiffLineChange::Added,
+                        old_no: None,
+                        new_no: Some(2),
+                        text: "B".to_string(),
+                    },
+                ],
+            }]),
+        };
+        let value = serde_json::to_value(&content).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "diff",
+                "path": "src/app.rs",
+                "oldText": "a\nb\n",
+                "newText": "a\nB\n",
+                "hunks": [{
+                    "lines": [
+                        { "change": "context", "oldNo": 1, "newNo": 1, "text": "a" },
+                        { "change": "removed", "oldNo": 2, "text": "b" },
+                        { "change": "added", "newNo": 2, "text": "B" }
+                    ]
+                }]
+            })
+        );
     }
 
     /// `check_in_browser`'s wire shape: base64 bytes plus the MIME type the

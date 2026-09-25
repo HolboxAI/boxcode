@@ -30,10 +30,10 @@ use crate::approval::{verdict_for, Decision, Verdict};
 use crate::config::Config;
 use crate::llm::{self, ApiUsage, ChatMessage, StreamEvent, Target, ToolCall};
 use crate::protocol::{
-    AcpToolCall, ChangeEntry, ContentBlock, ListChangesResponse, PermissionOption,
-    PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    RollbackRequest, SessionId, SessionUpdate, StopReason, ToolCallContent, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolKind,
+    AcpToolCall, ChangeEntry, ContentBlock, DiffHunk, DiffHunkLine, DiffLineChange,
+    ListChangesResponse, PermissionOption, PermissionOptionId, PermissionOptionKind,
+    RequestPermissionOutcome, RequestPermissionRequest, RollbackRequest, SessionId, SessionUpdate,
+    StopReason, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use crate::tools::{self, Action, BrowserInteraction, Mode};
 use crate::workspace::Workspace;
@@ -96,6 +96,50 @@ pub struct BrowserInteractAsk {
 pub enum BrowserInteractResult {
     Screenshot { mime_type: String, data: String },
     Failed(String),
+}
+
+/// The per-hunk split of a pending write/edit, ready for the ACP wire -- or
+/// `None` when whole-file review is the right call instead.
+///
+/// Returns `None` for three distinct reasons, deliberately not conflated:
+/// - **CRLF line endings**: boxcode's diff runs over `str::lines()`, which
+///   drops `\r`, so a hunk list cannot be spliced back onto `\r\n` text
+///   faithfully. The client's whole-file `oldText`/`newText` path handles
+///   those.
+/// - **An empty diff**: there are no hunks to review.
+/// - **A diff larger than `APPROVAL_DIFF_LINES`**: offering per-hunk review
+///   on a *clipped* hunk list would silently hide hunks, so it is withheld
+///   and the client falls back to the whole-file path rather than being
+///   shown a partial diff as if it were the whole one.
+fn diff_hunks_for_review(before: &str, after: &str) -> Option<Vec<DiffHunk>> {
+    if before.contains("\r\n") || after.contains("\r\n") {
+        return None;
+    }
+    let diff = crate::diff::diff(before, after);
+    if diff.is_empty() || diff.line_count() > crate::tools::APPROVAL_DIFF_LINES {
+        return None;
+    }
+    Some(
+        diff.hunks
+            .iter()
+            .map(|hunk| DiffHunk {
+                lines: hunk
+                    .lines
+                    .iter()
+                    .map(|line| DiffHunkLine {
+                        change: match line.change {
+                            crate::diff::Change::Context => DiffLineChange::Context,
+                            crate::diff::Change::Added => DiffLineChange::Added,
+                            crate::diff::Change::Removed => DiffLineChange::Removed,
+                        },
+                        old_no: line.old_no,
+                        new_no: line.new_no,
+                        text: line.text.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    )
 }
 
 /// One ACP session's worth of state -- deliberately independent of `App`,
@@ -554,17 +598,22 @@ impl HeadlessSession {
     ) -> (String, Vec<llm::ImageAttachment>) {
         // Same call, same reasoning as `App::advance_approvals`'s own
         // `tools::preview_change(&action, ...)`: computed once, here, where
-        // the question is being asked -- not re-derived by whatever renders
-        // it. The text shape (not `preview_change`'s hunked `FileDiff`,
-        // which stays TUI-only) is what an ACP client with its own diff
-        // renderer wants; see `preview_change_text`'s own doc comment.
-        let diff_content = tools::preview_change_text(action, Path::new(self.workspace.root())).map(
-            |(path, before, after)| ToolCallContent::Diff {
+        // the question is being asked. The whole-file before/after text is
+        // what ACP's `Diff` wire shape wants; `diff_hunks_for_review` adds the
+        // pre-computed hunk split so a client can offer per-hunk accept/reject
+        // without reimplementing boxcode's diff (see its own doc comment for
+        // why the hunks are `None` for CRLF or oversized changes).
+        let preview = tools::preview_change_text(action, Path::new(self.workspace.root()));
+        let partial_path = preview.as_ref().map(|(path, _, _)| path.clone());
+        let diff_content = preview.map(|(path, before, after)| {
+            let hunks = diff_hunks_for_review(&before, &after);
+            ToolCallContent::Diff {
                 path,
                 old_text: (!before.is_empty()).then_some(before),
                 new_text: after,
-            },
-        );
+                hunks,
+            }
+        });
         let tool_call_update = ToolCallUpdate {
             tool_call_id: ToolCallId(call.id.clone()),
             title: Some(action.label()),
@@ -592,8 +641,39 @@ impl HeadlessSession {
         if permissions.send(PermissionAsk { request, respond }).await.is_err() {
             return ("The client disconnected before answering.".to_string(), Vec::new());
         }
-        let decision: Decision = match receive.await {
-            Ok(outcome) => outcome.into(),
+        let outcome = receive.await;
+
+        // Per-hunk review: the client accepted some hunks and returned the
+        // merged file text. `Partial` never reaches the `Decision` mapping
+        // below -- it is applied here as an ordinary `write_file`, exactly as
+        // if the model had issued it, and the pending `call` is marked
+        // completed (not re-executed: its content was the diff the client
+        // just edited). Without a `partial_path` (the call previewed no file
+        // diff) the client sent a shape it has no business sending, so fall
+        // through to the binary decision instead of writing to nowhere.
+        if let (Ok(RequestPermissionOutcome::Partial { new_text }), Some(path)) =
+            (&outcome, partial_path.as_ref())
+        {
+            let synthetic = ToolCall {
+                id: call.id.clone(),
+                kind: "function".to_string(),
+                function: llm::FunctionCall {
+                    name: crate::tools::WRITE_FILE.to_string(),
+                    arguments: serde_json::json!({ "path": path.as_str(), "content": new_text.as_str() }).to_string(),
+                },
+            };
+            let mut applied = tools::execute(&synthetic, &self.workspace, &self.config.tools).await;
+            if let Some(record) = applied.rollback.take() {
+                self.rollback.record_turn(record, self.turn);
+            }
+            let _ = updates
+                .send(SessionUpdate::ToolCallUpdate((&applied).into()))
+                .await;
+            return (applied.content, Vec::new());
+        }
+
+        let decision: Decision = match outcome {
+            Ok(o) => o.into(),
             Err(_) => Decision::Refused,
         };
 
@@ -1187,10 +1267,12 @@ mod tests {
 
         let ask = permissions_rx.recv().await.expect("a permission ask");
         match ask.request.tool_call.content {
-            Some(ToolCallContent::Diff { path, old_text, new_text }) => {
+            Some(ToolCallContent::Diff { path, old_text, new_text, hunks }) => {
                 assert_eq!(path, "hello.txt");
                 assert_eq!(old_text.as_deref(), Some("hi\n"));
                 assert_eq!(new_text, "bye\n");
+                // A small, LF-only change carries per-hunk review data too.
+                assert!(hunks.is_some());
             }
             other => panic!("expected a Diff, got {other:?}"),
         }
