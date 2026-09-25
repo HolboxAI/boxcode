@@ -324,7 +324,15 @@ impl Router {
                     // (protocol.rs's own doc comment on that variant) --
                     // omitting it would leave a spec-compliant client
                     // withholding image attachments it otherwise could send.
-                    agent_capabilities: json!({ "session": {}, "promptCapabilities": { "image": true } }),
+                    // `mcp` is not part of the ACP v1 schema, which is exactly
+                    // why it has to be advertised explicitly: the schema makes
+                    // `mcpServers` a required field on `session/new`, so a build
+                    // that does not understand it still accepts the field and
+                    // returns a session id while connecting nothing. A client
+                    // cannot tell that apart from real support. This capability
+                    // is the positive signal to gate on -- absent it, a client
+                    // should refuse to send servers rather than report success.
+                    agent_capabilities: json!({ "session": {}, "mcp": true, "promptCapabilities": { "image": true } }),
                     auth_methods: Vec::new(),
                     agent_info: Some(Implementation {
                         name: "boxcode".to_string(),
