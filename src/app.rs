@@ -218,6 +218,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/plan", "research first, change nothing until you approve"),
     ("/provider", "switch provider or endpoint"),
     ("/model", "switch model"),
+    ("/login", "show boxcode.sh sign-in status (run boxcode login to link)"),
+    ("/logout", "clear the local boxcode.sh session and promo key"),
     ("/init", "write a BOXCODE.md the model reads every session"),
     ("/resume", "pick up this directory's last session"),
     ("/pull", "switch to a different local project"),
@@ -842,6 +844,8 @@ impl App {
             "/plan" => self.toggle_plan_mode(),
             "/provider" => self.open_provider_picker(),
             "/model" => self.open_model_picker_from_config(),
+            "/login" => self.show_login_status(),
+            "/logout" => self.run_logout(),
             "/init" => self.start_init(),
             "/resume" => self.resume_latest(),
             "/pull" => self.open_pull_picker(),
@@ -854,6 +858,34 @@ impl App {
             "/rollback" => self.start_rollback(),
             "/diff" => self.show_diff(),
             other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
+        }
+    }
+
+    /// `/login` — show whether this machine is linked to boxcode.sh. The
+    /// browser device flow needs a free terminal, so linking happens via
+    /// `boxcode login` outside the TUI.
+    fn show_login_status(&mut self) {
+        self.follow_tail = true;
+        let status = crate::login::LoginStatus::load(&self.config);
+        self.messages
+            .push(Message::new(Role::System, status.readout()));
+    }
+
+    /// `/logout` — clear the device session and promo key locally.
+    fn run_logout(&mut self) {
+        self.follow_tail = true;
+        match crate::login::logout_local() {
+            Ok(msg) => {
+                // Reload so the TUI stops using the cleared key mid-session.
+                if let Ok(cfg) = crate::config::Config::load() {
+                    self.config = cfg;
+                }
+                self.messages.push(Message::new(Role::System, msg));
+            }
+            Err(e) => {
+                self.messages
+                    .push(Message::new(Role::Error, format!("Logout failed: {e}")));
+            }
         }
     }
 
