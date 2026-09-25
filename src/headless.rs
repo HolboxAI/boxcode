@@ -6,7 +6,12 @@
 //!
 //! Deliberately narrower than `App` for a first working version, matching
 //! an independent review's explicit recommendation (see `approval.rs`):
-//! - No plan mode. `mode` is fixed at `Mode::Normal`.
+//! - Plan mode is supported. A `session/prompt` may carry `mode: "plan"`,
+//!   which runs the turn read-only (`verdict_for` refuses writes with
+//!   "describe it in your plan"); the model proposes via `exit_plan_mode`,
+//!   and the usual `session/request_permission` flow either approves it
+//!   (→ `plan.md` written, `mode` flips back to `Normal`, implementation
+//!   proceeds) or declines it (→ stay in plan mode, revise).
 //! - No deploy tool. `Action::Deploy` needs `deploy_takes_over`'s real
 //!   terminal-based OAuth flow (`app.rs`'s own doc comment: deployment "may
 //!   need... the terminal itself for a browser login"), which a headless
@@ -30,10 +35,10 @@ use crate::approval::{verdict_for, Decision, Verdict};
 use crate::config::Config;
 use crate::llm::{self, ApiUsage, ChatMessage, StreamEvent, Target, ToolCall};
 use crate::protocol::{
-    AcpToolCall, ChangeEntry, ContentBlock, ListChangesResponse, PermissionOption,
-    PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    RollbackRequest, SessionId, SessionUpdate, StopReason, ToolCallContent, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolKind,
+    AcpToolCall, ChangeEntry, ContentBlock, DiffHunk, DiffHunkLine, DiffLineChange,
+    ListChangesResponse, PermissionOption, PermissionOptionId, PermissionOptionKind,
+    RequestPermissionOutcome, RequestPermissionRequest, RollbackRequest, SessionId, SessionUpdate,
+    StopReason, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use crate::tools::{self, Action, BrowserInteraction, Mode};
 use crate::workspace::Workspace;
@@ -98,6 +103,50 @@ pub enum BrowserInteractResult {
     Failed(String),
 }
 
+/// The per-hunk split of a pending write/edit, ready for the ACP wire -- or
+/// `None` when whole-file review is the right call instead.
+///
+/// Returns `None` for three distinct reasons, deliberately not conflated:
+/// - **CRLF line endings**: boxcode's diff runs over `str::lines()`, which
+///   drops `\r`, so a hunk list cannot be spliced back onto `\r\n` text
+///   faithfully. The client's whole-file `oldText`/`newText` path handles
+///   those.
+/// - **An empty diff**: there are no hunks to review.
+/// - **A diff larger than `APPROVAL_DIFF_LINES`**: offering per-hunk review
+///   on a *clipped* hunk list would silently hide hunks, so it is withheld
+///   and the client falls back to the whole-file path rather than being
+///   shown a partial diff as if it were the whole one.
+fn diff_hunks_for_review(before: &str, after: &str) -> Option<Vec<DiffHunk>> {
+    if before.contains("\r\n") || after.contains("\r\n") {
+        return None;
+    }
+    let diff = crate::diff::diff(before, after);
+    if diff.is_empty() || diff.line_count() > crate::tools::APPROVAL_DIFF_LINES {
+        return None;
+    }
+    Some(
+        diff.hunks
+            .iter()
+            .map(|hunk| DiffHunk {
+                lines: hunk
+                    .lines
+                    .iter()
+                    .map(|line| DiffHunkLine {
+                        change: match line.change {
+                            crate::diff::Change::Context => DiffLineChange::Context,
+                            crate::diff::Change::Added => DiffLineChange::Added,
+                            crate::diff::Change::Removed => DiffLineChange::Removed,
+                        },
+                        old_no: line.old_no,
+                        new_no: line.new_no,
+                        text: line.text.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    )
+}
+
 /// One ACP session's worth of state -- deliberately independent of `App`,
 /// not extracted from it. See this module's own docs for the narrower
 /// scope (no plan mode, no deploy, no subagents, no compaction) that keeps
@@ -113,6 +162,13 @@ pub struct HeadlessSession {
     /// is the "turn" the rollback journal attributes each file to, so a
     /// client can ask to undo a specific turn's changes.
     turn: u64,
+    /// `Normal` by default, set from `PromptRequest.mode` at the top of each
+    /// `prompt`. `Plan` keeps the turn read-only until a proposed plan is
+    /// approved (see `ask_plan_approval`).
+    mode: Mode,
+    /// The approved plan, while one is being implemented. Set on approval,
+    /// so `plan_progress` calls land against the file the user agreed to.
+    active_plan: Option<crate::plan::Plan>,
     /// The `messages` index each turn's user message starts at, parallel to
     /// `turn` (entry 0 is turn 1's message, and so on). Lets a
     /// `restoreBeforeTurn` rollback also cut the conversation back to that
@@ -138,6 +194,8 @@ impl HeadlessSession {
             request_id: 0,
             tool_steps: 0,
             turn: 0,
+            mode: Mode::Normal,
+            active_plan: None,
             turn_starts: Vec::new(),
             rollback: crate::rollback::Journal::default(),
         }
@@ -166,11 +224,18 @@ impl HeadlessSession {
         &mut self,
         text: String,
         images: Vec<crate::llm::ImageAttachment>,
+        mode: Option<Mode>,
         updates: &mpsc::Sender<SessionUpdate>,
         permissions: &mpsc::Sender<PermissionAsk>,
         browser: &mpsc::Sender<BrowserCheckAsk>,
         browser_interact: &mpsc::Sender<BrowserInteractAsk>,
     ) -> StopReason {
+        // `mode` is per-turn: a client can start a `plan` turn, then after
+        // approval (which flips `self.mode` back to `Normal` itself) send the
+        // next prompt as `normal` again, or leave it out for the default.
+        if let Some(mode) = mode {
+            self.mode = mode;
+        }
         // One `session/prompt` = one turn, numbered from 1 so a client's
         // first prompt maps to "turn 1". The rollback journal records files
         // against this value (see `record_turn` below).
@@ -212,8 +277,8 @@ impl HeadlessSession {
 
             let schemas = if budget_left {
                 tools::schemas_for(
-                    Mode::Normal,
-                    false, // no plan mode in v1 -- see module docs
+                    self.mode,
+                    self.active_plan.is_some(),
                     false, // no deploy tool in v1 -- see module docs
                     false, // published-artifact detection not wired yet
                     true, // check_in_browser -- the one action only an ACP client can fulfill
@@ -222,10 +287,10 @@ impl HeadlessSession {
             } else {
                 Vec::new()
             };
-            let system = tools::system_prompt(&self.workspace, &self.config.tools, self.tool_steps, Mode::Normal);
+            let system = tools::system_prompt(&self.workspace, &self.config.tools, self.tool_steps, self.mode);
             let mut history = self.messages.clone();
             history.insert(0, ChatMessage::text("system", system));
-            if let Some(status) = tools::turn_status(&self.config.tools, self.tool_steps, None) {
+            if let Some(status) = tools::turn_status(&self.config.tools, self.tool_steps, self.active_plan.as_ref()) {
                 history.push(ChatMessage::text("user", status));
             }
 
@@ -397,7 +462,7 @@ impl HeadlessSession {
             let verdict = verdict_for(
                 &calls[i],
                 Path::new(self.workspace.root()),
-                Mode::Normal,
+                self.mode,
                 self.config.tools.approval,
             );
 
@@ -415,7 +480,7 @@ impl HeadlessSession {
                         verdict_for(
                             &calls[i],
                             Path::new(self.workspace.root()),
-                            Mode::Normal,
+                            self.mode,
                             self.config.tools.approval,
                         ),
                         Verdict::AutoApprove
@@ -552,19 +617,34 @@ impl HeadlessSession {
         permissions: &mpsc::Sender<PermissionAsk>,
         browser_interact: &mpsc::Sender<BrowserInteractAsk>,
     ) -> (String, Vec<llm::ImageAttachment>) {
+        // A plan proposal is not a file change -- it has no before/after diff
+        // to preview, so it does not take the ordinary `Diff` path below. It
+        // gets its own wire shape (`ToolCallContent::Plan`) and its own
+        // approve/decline effect (write `plan.md` and leave plan mode, or stay
+        // in plan mode and revise).
+        if let Action::Plan(proposal) = action {
+            return self
+                .ask_plan_approval(call, proposal, updates, permissions)
+                .await;
+        }
         // Same call, same reasoning as `App::advance_approvals`'s own
         // `tools::preview_change(&action, ...)`: computed once, here, where
-        // the question is being asked -- not re-derived by whatever renders
-        // it. The text shape (not `preview_change`'s hunked `FileDiff`,
-        // which stays TUI-only) is what an ACP client with its own diff
-        // renderer wants; see `preview_change_text`'s own doc comment.
-        let diff_content = tools::preview_change_text(action, Path::new(self.workspace.root())).map(
-            |(path, before, after)| ToolCallContent::Diff {
+        // the question is being asked. The whole-file before/after text is
+        // what ACP's `Diff` wire shape wants; `diff_hunks_for_review` adds the
+        // pre-computed hunk split so a client can offer per-hunk accept/reject
+        // without reimplementing boxcode's diff (see its own doc comment for
+        // why the hunks are `None` for CRLF or oversized changes).
+        let preview = tools::preview_change_text(action, Path::new(self.workspace.root()));
+        let partial_path = preview.as_ref().map(|(path, _, _)| path.clone());
+        let diff_content = preview.map(|(path, before, after)| {
+            let hunks = diff_hunks_for_review(&before, &after);
+            ToolCallContent::Diff {
                 path,
                 old_text: (!before.is_empty()).then_some(before),
                 new_text: after,
-            },
-        );
+                hunks,
+            }
+        });
         let tool_call_update = ToolCallUpdate {
             tool_call_id: ToolCallId(call.id.clone()),
             title: Some(action.label()),
@@ -592,8 +672,39 @@ impl HeadlessSession {
         if permissions.send(PermissionAsk { request, respond }).await.is_err() {
             return ("The client disconnected before answering.".to_string(), Vec::new());
         }
-        let decision: Decision = match receive.await {
-            Ok(outcome) => outcome.into(),
+        let outcome = receive.await;
+
+        // Per-hunk review: the client accepted some hunks and returned the
+        // merged file text. `Partial` never reaches the `Decision` mapping
+        // below -- it is applied here as an ordinary `write_file`, exactly as
+        // if the model had issued it, and the pending `call` is marked
+        // completed (not re-executed: its content was the diff the client
+        // just edited). Without a `partial_path` (the call previewed no file
+        // diff) the client sent a shape it has no business sending, so fall
+        // through to the binary decision instead of writing to nowhere.
+        if let (Ok(RequestPermissionOutcome::Partial { new_text }), Some(path)) =
+            (&outcome, partial_path.as_ref())
+        {
+            let synthetic = ToolCall {
+                id: call.id.clone(),
+                kind: "function".to_string(),
+                function: llm::FunctionCall {
+                    name: crate::tools::WRITE_FILE.to_string(),
+                    arguments: serde_json::json!({ "path": path.as_str(), "content": new_text.as_str() }).to_string(),
+                },
+            };
+            let mut applied = tools::execute(&synthetic, &self.workspace, &self.config.tools).await;
+            if let Some(record) = applied.rollback.take() {
+                self.rollback.record_turn(record, self.turn);
+            }
+            let _ = updates
+                .send(SessionUpdate::ToolCallUpdate((&applied).into()))
+                .await;
+            return (applied.content, Vec::new());
+        }
+
+        let decision: Decision = match outcome {
+            Ok(o) => o.into(),
             Err(_) => Decision::Refused,
         };
 
@@ -627,6 +738,108 @@ impl HeadlessSession {
                 }))
                 .await;
             ("The user declined this action.".to_string(), Vec::new())
+        }
+    }
+
+    /// `exit_plan_mode` in a headless session: sends the proposal to the
+    /// client as a `ToolCallContent::Plan` (so it renders a plan card, not a
+    /// diff), and maps Approve → adopt the plan (write `plan.md`, leave plan
+    /// mode, implement) / Reject → decline (stay in plan mode, revise). The
+    /// one place `self.mode` flips from `Plan` back to `Normal`.
+    async fn ask_plan_approval(
+        &mut self,
+        call: &ToolCall,
+        proposal: &tools::Proposal,
+        updates: &mpsc::Sender<SessionUpdate>,
+        permissions: &mpsc::Sender<PermissionAsk>,
+    ) -> (String, Vec<llm::ImageAttachment>) {
+        let tool_call_update = ToolCallUpdate {
+            tool_call_id: ToolCallId(call.id.clone()),
+            title: Some(format!("plan: {}", proposal.title)),
+            kind: None,
+            status: Some(ToolCallStatus::Pending),
+            content: Some(ToolCallContent::Plan {
+                title: proposal.title.clone(),
+                summary: proposal.summary.clone(),
+                steps: proposal.steps.clone(),
+                not_doing: proposal.not_doing.clone(),
+            }),
+        };
+        let request = RequestPermissionRequest {
+            session_id: self.session_id.clone(),
+            tool_call: tool_call_update,
+            options: vec![
+                PermissionOption {
+                    option_id: PermissionOptionId("allow".to_string()),
+                    name: "Approve".to_string(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    option_id: PermissionOptionId("reject".to_string()),
+                    name: "Reject".to_string(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ],
+        };
+        let (respond, receive) = oneshot::channel();
+        if permissions.send(PermissionAsk { request, respond }).await.is_err() {
+            return ("The client disconnected before answering.".to_string(), Vec::new());
+        }
+        let outcome = receive.await;
+        let decision: Decision = match outcome {
+            Ok(o) => o.into(),
+            Err(_) => Decision::Refused,
+        };
+
+        if decision.is_allowed() {
+            let root = Path::new(self.workspace.root());
+            let today = crate::quota::today();
+            let plan = crate::plan::Plan {
+                title: proposal.title.clone(),
+                summary: proposal.summary.clone(),
+                steps: proposal.steps.iter().map(crate::plan::Step::new).collect(),
+                not_doing: proposal.not_doing.clone(),
+                created: today.clone(),
+                updated: today,
+                base_commit: crate::plan::head_commit(root),
+                model: self.config.llm.model.clone(),
+                path: crate::plan::path(root),
+            };
+            let shown = plan.display_path(root);
+            let steps = plan.steps.len();
+
+            // Leaving plan mode is unconditional once approved, even if the
+            // file write fails -- see `App::note_plan_save_failure`: losing
+            // the file is bad, but not a reason to refuse what was agreed.
+            self.mode = Mode::Normal;
+            match plan.save() {
+                Ok(()) => {
+                    self.active_plan = Some(plan);
+                    let approved = tools::plan_approved(call, &shown, steps);
+                    let content = approved.content.clone();
+                    let _ = updates.send(SessionUpdate::ToolCallUpdate((&approved).into())).await;
+                    (content, Vec::new())
+                }
+                Err(reason) => {
+                    self.active_plan = None;
+                    let content = tools::plan_save_failed(&reason);
+                    let _ = updates
+                        .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                            tool_call_id: ToolCallId(call.id.clone()),
+                            title: Some(format!("plan: {}", proposal.title)),
+                            kind: None,
+                            status: Some(ToolCallStatus::Completed),
+                            content: Some(ToolCallContent::Text { text: content.clone() }),
+                        }))
+                        .await;
+                    (content, Vec::new())
+                }
+            }
+        } else {
+            let declined = tools::plan_declined(call);
+            let content = declined.content.clone();
+            let _ = updates.send(SessionUpdate::ToolCallUpdate((&declined).into())).await;
+            (content, Vec::new())
         }
     }
 
@@ -996,7 +1209,7 @@ mod tests {
         let (browser_tx, _browser_rx) = mpsc::channel(16);
         let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
-        let stop = session.prompt("hi".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await;
+        let stop = session.prompt("hi".to_string(), Vec::new(), None, &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await;
 
         assert_eq!(stop, StopReason::Refusal);
         let update = updates_rx.recv().await.expect("one chunk explaining why");
@@ -1023,7 +1236,7 @@ mod tests {
         let (browser_tx, _browser_rx) = mpsc::channel(16);
         let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
-        let stop = session.prompt("hi".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await;
+        let stop = session.prompt("hi".to_string(), Vec::new(), None, &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await;
 
         assert_eq!(stop, StopReason::EndTurn);
         let update = updates_rx.recv().await.expect("one chunk");
@@ -1064,7 +1277,7 @@ mod tests {
             .prompt(
                 "what's wrong with this button?".to_string(),
                 images,
-                &updates_tx,
+                None, &updates_tx,
                 &permissions_tx,
                 &browser_tx,
                 &browser_interact_tx,
@@ -1098,7 +1311,7 @@ mod tests {
         let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
         let stop = session
-            .prompt("what does hello.txt say?".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx)
+            .prompt("what does hello.txt say?".to_string(), Vec::new(), None, &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx)
             .await;
 
         assert_eq!(stop, StopReason::EndTurn);
@@ -1133,7 +1346,7 @@ mod tests {
         let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
         let prompt = tokio::spawn(async move {
-            session.prompt("clean the build dir".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await
+            session.prompt("clean the build dir".to_string(), Vec::new(), None, &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await
         });
 
         let ask = permissions_rx.recv().await.expect("a permission ask");
@@ -1182,15 +1395,17 @@ mod tests {
         let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
 
         let prompt = tokio::spawn(async move {
-            session.prompt("say hi in a different way".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await
+            session.prompt("say hi in a different way".to_string(), Vec::new(), None, &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await
         });
 
         let ask = permissions_rx.recv().await.expect("a permission ask");
         match ask.request.tool_call.content {
-            Some(ToolCallContent::Diff { path, old_text, new_text }) => {
+            Some(ToolCallContent::Diff { path, old_text, new_text, hunks }) => {
                 assert_eq!(path, "hello.txt");
                 assert_eq!(old_text.as_deref(), Some("hi\n"));
                 assert_eq!(new_text, "bye\n");
+                // A small, LF-only change carries per-hunk review data too.
+                assert!(hunks.is_some());
             }
             other => panic!("expected a Diff, got {other:?}"),
         }
@@ -1225,7 +1440,7 @@ mod tests {
 
         let prompt = tokio::spawn(async move {
             session
-                .prompt("does the homepage render?".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx)
+                .prompt("does the homepage render?".to_string(), Vec::new(), None, &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx)
                 .await
         });
 
@@ -1286,7 +1501,7 @@ mod tests {
                 .prompt(
                     "click the login button".to_string(),
                     Vec::new(),
-                    &updates_tx,
+                    None, &updates_tx,
                     &permissions_tx,
                     &browser_tx,
                     &browser_interact_tx,
@@ -1360,7 +1575,7 @@ mod tests {
                 .prompt(
                     "type the password into the login form".to_string(),
                     Vec::new(),
-                    &updates_tx,
+                    None, &updates_tx,
                     &permissions_tx,
                     &browser_tx,
                     &browser_interact_tx,
@@ -1404,7 +1619,7 @@ mod tests {
         // `an_auto_approved_read_runs_without_asking_permission`'s own
         // sibling reasoning, just for a write instead of a read.
         let stop = session
-            .prompt("say hi in a different way".to_string(), Vec::new(), &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx)
+            .prompt("say hi in a different way".to_string(), Vec::new(), None, &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx)
             .await;
         assert_eq!(stop, StopReason::EndTurn);
         assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "bye\n");
@@ -1463,7 +1678,7 @@ mod tests {
                 .prompt(
                     "write A".to_string(),
                     Vec::new(),
-                    &updates_tx,
+                    None, &updates_tx,
                     &permissions_tx,
                     &browser_tx,
                     &browser_interact_tx,
@@ -1476,7 +1691,7 @@ mod tests {
                 .prompt(
                     "write B".to_string(),
                     Vec::new(),
-                    &updates_tx,
+                    None, &updates_tx,
                     &permissions_tx,
                     &browser_tx,
                     &browser_interact_tx,
@@ -1551,7 +1766,7 @@ mod tests {
                 .prompt(
                     "add line 1".to_string(),
                     Vec::new(),
-                    &updates_tx,
+                    None, &updates_tx,
                     &permissions_tx,
                     &browser_tx,
                     &browser_interact_tx,
@@ -1564,7 +1779,7 @@ mod tests {
                 .prompt(
                     "add line 2".to_string(),
                     Vec::new(),
-                    &updates_tx,
+                    None, &updates_tx,
                     &permissions_tx,
                     &browser_tx,
                     &browser_interact_tx,
@@ -1596,7 +1811,7 @@ mod tests {
                 .prompt(
                     "add line 2 again".to_string(),
                     Vec::new(),
-                    &updates_tx,
+                    None, &updates_tx,
                     &permissions_tx,
                     &browser_tx,
                     &browser_interact_tx,
@@ -1650,7 +1865,7 @@ mod tests {
                     .prompt(
                         text.to_string(),
                         Vec::new(),
-                        &updates_tx,
+                        None, &updates_tx,
                         &permissions_tx,
                         &browser_tx,
                         &browser_interact_tx,
@@ -1707,7 +1922,7 @@ mod tests {
                     .prompt(
                         text.to_string(),
                         Vec::new(),
-                        &updates_tx,
+                        None, &updates_tx,
                         &permissions_tx,
                         &browser_tx,
                         &browser_interact_tx,
@@ -1754,7 +1969,7 @@ mod tests {
                 .prompt(
                     "add line 4".to_string(),
                     Vec::new(),
-                    &updates_tx,
+                    None, &updates_tx,
                     &permissions_tx,
                     &browser_tx,
                     &browser_interact_tx,
@@ -1763,5 +1978,117 @@ mod tests {
             StopReason::EndTurn
         );
         assert_eq!(session.current_turn(), 3);
+    }
+
+    /// `exit_plan_mode` in a plan-mode turn proposes a plan over the
+    /// permission channel as `ToolCallContent::Plan` (not a file diff); an
+    /// "allow" writes `plan.md`, leaves plan mode, and records the active
+    /// plan. The whole point of the headless plan-mode plumbing: the mode is
+    /// per-turn, the proposal rides the ordinary approval wire, and approval
+    /// is what flips the session back to `Normal`.
+    #[tokio::test]
+    async fn approving_a_plan_writes_plan_md_and_leaves_plan_mode() {
+        let (dir, ws) = workspace();
+        let endpoint = serve_rounds(vec![
+            tool_call_round(
+                tools::EXIT_PLAN_MODE,
+                r#"{"title":"Add tests","summary":"Test the thing.","steps":["write a test","run it"],"not_doing":["shipping"]}"#,
+            ),
+            text_round("Implementing step 1."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
+
+        let prompt = tokio::spawn(async move {
+            let stop = session
+                .prompt(
+                    "plan how to add tests".to_string(),
+                    Vec::new(),
+                    Some(Mode::Plan),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await;
+            (stop, session)
+        });
+
+        let ask = permissions_rx.recv().await.expect("a permission ask carrying the plan");
+        match ask.request.tool_call.content {
+            Some(ToolCallContent::Plan { title, summary, steps, not_doing }) => {
+                assert_eq!(title, "Add tests");
+                assert_eq!(summary, "Test the thing.");
+                assert_eq!(steps, vec!["write a test".to_string(), "run it".to_string()]);
+                assert_eq!(not_doing, vec!["shipping".to_string()]);
+            }
+            other => panic!("expected a Plan, got {other:?}"),
+        }
+        let _ = ask.respond.send(RequestPermissionOutcome::Selected {
+            option_id: PermissionOptionId("allow".to_string()),
+        });
+
+        let (stop, session) = prompt.await.expect("task joins");
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(session.mode, Mode::Normal, "approving must leave plan mode");
+        assert!(session.active_plan.is_some(), "approving must record the active plan");
+        assert!(dir.path().join("plan.md").exists(), "approving must write plan.md");
+    }
+
+    /// The decline half: "reject" keeps the session in plan mode, records no
+    /// active plan, and writes nothing to disk -- the model is told to revise,
+    /// and the very next prompt is still read-only.
+    #[tokio::test]
+    async fn rejecting_a_plan_stays_in_plan_mode_and_writes_nothing() {
+        let (dir, ws) = workspace();
+        let endpoint = serve_rounds(vec![
+            tool_call_round(
+                tools::EXIT_PLAN_MODE,
+                r#"{"title":"Add tests","summary":"Test the thing.","steps":["write a test"]}"#,
+            ),
+            text_round("Understood, revising."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, mut permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
+
+        let prompt = tokio::spawn(async move {
+            let stop = session
+                .prompt(
+                    "plan how to add tests".to_string(),
+                    Vec::new(),
+                    Some(Mode::Plan),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await;
+            (stop, session)
+        });
+
+        let ask = permissions_rx.recv().await.expect("a permission ask carrying the plan");
+        assert!(
+            matches!(ask.request.tool_call.content, Some(ToolCallContent::Plan { .. })),
+            "the proposal must ride the plan wire shape, not a diff"
+        );
+        let _ = ask.respond.send(RequestPermissionOutcome::Selected {
+            option_id: PermissionOptionId("reject".to_string()),
+        });
+
+        let (stop, session) = prompt.await.expect("task joins");
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(session.mode, Mode::Plan, "rejecting must leave the session in plan mode");
+        assert!(session.active_plan.is_none(), "a rejected plan must not become active");
+        assert!(!dir.path().join("plan.md").exists(), "rejecting must write nothing");
     }
 }
