@@ -951,8 +951,10 @@ UPGRADE:
     says nothing at all when it cannot reach the network.
 
     BOXCODE_UPGRADE_URL_BASE
-                          Fetch updates from a fork or internal mirror
-                          instead of github.com
+                          Fetch the installer (and version via Cargo.toml)
+                          from a fork or internal mirror instead of github.com.
+                          When unset, the version check uses the latest GitHub
+                          release tag — the same source install.sh downloads.
     BOXCODE_NO_UPDATE_CHECK
                           Set to anything to skip the startup check. Same as
                           check_on_start = false in the [update] table.
