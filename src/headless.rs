@@ -1243,6 +1243,39 @@ mod tests {
         assert!(matches!(update, SessionUpdate::AgentMessageChunk { .. }));
     }
 
+    /// The truthfulness gap the cost meter closes: exact usage reported by the
+    /// endpoint must reach the client as a real `usage_update`, not a silent
+    /// zero. One streamed answer carrying a `usage` block becomes exactly one
+    /// `usage_update` with `used = prompt + completion`, sent after the token
+    /// chunk and before the turn ends.
+    #[tokio::test]
+    async fn a_streamed_answer_with_usage_emits_a_usage_update() {
+        let (_dir, ws) = workspace();
+        let body = sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello!\"}}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+             data: [DONE]\n\n",
+        );
+        let endpoint = serve_rounds(vec![body]).await;
+        let config = config_for(&endpoint);
+        let mut session =
+            HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, mut updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
+
+        let stop = session.prompt("hi".to_string(), Vec::new(), None, &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await;
+
+        assert_eq!(stop, StopReason::EndTurn);
+        // The token chunk arrives first, then the `usage_update` the meter
+        // sums into "N tokens this turn".
+        let chunk = updates_rx.recv().await.expect("token chunk");
+        assert!(matches!(chunk, SessionUpdate::AgentMessageChunk { .. }));
+        let usage = updates_rx.recv().await.expect("usage update");
+        assert_eq!(usage, SessionUpdate::UsageUpdate { used: 15, size: 0 });
+    }
+
     /// The actual end-to-end proof for `ContentBlock::Image`: an image
     /// passed into `prompt()` must reach the real outbound LLM request as a
     /// base64 data URL (llm.rs's `ChatMessage` vision-content-block
