@@ -265,6 +265,12 @@ pub struct PromptRequest {
     #[serde(rename = "sessionId")]
     pub session_id: SessionId,
     pub prompt: Vec<ContentBlock>,
+    /// Which mode to run this turn in -- `normal` (the default when absent)
+    /// or `plan` (read-only: research and propose a plan, nothing changes on
+    /// disk until the plan is approved). Mirrors the CLI's `Mode`; boxcode-ide
+    /// sets it from the chat mode the user picked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<crate::tools::Mode>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -465,6 +471,19 @@ pub enum ToolCallContent {
         #[serde(rename = "mimeType")]
         mime_type: String,
         data: String,
+    },
+    /// An `exit_plan_mode` proposal -- boxcode in plan mode asking the user to
+    /// approve a plan before it changes anything. Rides the same
+    /// `session/request_permission` wire as a file edit, but carries the
+    /// proposal (`title`/`summary`/`steps`/`notDoing`) instead of a diff, so a
+    /// client can render the plan and offer Approve/Reject.
+    #[serde(rename = "plan")]
+    Plan {
+        title: String,
+        summary: String,
+        steps: Vec<String>,
+        #[serde(rename = "notDoing", default, skip_serializing_if = "Vec::is_empty")]
+        not_doing: Vec<String>,
     },
 }
 
@@ -978,6 +997,7 @@ mod tests {
         let req = PromptRequest {
             session_id: SessionId("sess_1".to_string()),
             prompt: vec![ContentBlock::Text { text: "start a new webapp project".to_string() }],
+            mode: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -997,6 +1017,7 @@ mod tests {
                 ContentBlock::Text { text: "what's wrong with this button?".to_string() },
                 ContentBlock::Image { data: "aGVsbG8=".to_string(), mime_type: "image/png".to_string() },
             ],
+            mode: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(

@@ -100,7 +100,7 @@ fn classify(value: &serde_json::Value) -> Incoming {
 
 /// A message sent to one session's own task.
 enum SessionMsg {
-    Prompt { text: String, images: Vec<crate::llm::ImageAttachment>, respond: oneshot::Sender<PromptResponse> },
+    Prompt { text: String, images: Vec<crate::llm::ImageAttachment>, mode: Option<crate::tools::Mode>, respond: oneshot::Sender<PromptResponse> },
     /// `session/rollback`. Queued behind whatever `Prompt` this actor's
     /// task is already working through -- one message at a time, same as
     /// `Prompt` itself -- which is exactly right: rolling back files the
@@ -143,7 +143,7 @@ impl SessionActor {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    SessionMsg::Prompt { text, images, respond } => {
+                    SessionMsg::Prompt { text, images, mode, respond } => {
                         // A fresh channel per prompt, not one shared for
                         // the session's whole lifetime: a session answers
                         // many `session/prompt` calls over time, and each
@@ -170,7 +170,7 @@ impl SessionActor {
                             }
                         });
                         let stop_reason = session
-                            .prompt(text, images, &updates_tx, &permission_relay, &browser_relay, &browser_interact_relay)
+                            .prompt(text, images, mode, &updates_tx, &permission_relay, &browser_relay, &browser_interact_relay)
                             .await;
                         drop(updates_tx); // let the drain task see the channel close
                         let _ = drain.await;
@@ -444,7 +444,7 @@ impl Router {
         let text = text_parts.join("\n");
 
         let (respond, receive) = oneshot::channel();
-        if handle.send(SessionMsg::Prompt { text, images, respond }).await.is_err() {
+        if handle.send(SessionMsg::Prompt { text, images, mode: req.mode, respond }).await.is_err() {
             let line = error_line(id, -32002, "session actor gone".to_string());
             let _ = outgoing_tx.send(Outgoing::Line(line)).await;
             return;

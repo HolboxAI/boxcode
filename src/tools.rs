@@ -81,7 +81,8 @@ pub const INTERACT_IN_BROWSER: &str = "interact_in_browser";
 /// the model's list at all, so there is nothing to mistakenly approve. The
 /// only way out is `exit_plan_mode`, which puts the plan itself in front of
 /// the user as the thing being approved.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
     /// Every tool available, each write and command approved as it comes.
     #[default]
