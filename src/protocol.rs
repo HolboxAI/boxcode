@@ -668,6 +668,8 @@ pub enum CheckInBrowserOutcome {
         #[serde(rename = "mimeType")]
         mime_type: String,
         data: String,
+        #[serde(rename = "axTree", default, skip_serializing_if = "Option::is_none")]
+        ax_tree: Option<String>,
     },
     #[serde(rename = "failed")]
     Failed { reason: String },
@@ -698,8 +700,8 @@ pub fn standard_options() -> Vec<PermissionOption> {
 impl From<CheckInBrowserOutcome> for BrowserCheckResult {
     fn from(outcome: CheckInBrowserOutcome) -> Self {
         match outcome {
-            CheckInBrowserOutcome::Screenshot { mime_type, data } => {
-                BrowserCheckResult::Screenshot { mime_type, data }
+            CheckInBrowserOutcome::Screenshot { mime_type, data, ax_tree } => {
+                BrowserCheckResult::Screenshot { mime_type, data, ax_tree }
             }
             CheckInBrowserOutcome::Failed { reason } => BrowserCheckResult::Failed(reason),
         }
@@ -732,6 +734,8 @@ pub enum InteractInBrowserOutcome {
         #[serde(rename = "mimeType")]
         mime_type: String,
         data: String,
+        #[serde(rename = "axTree", default, skip_serializing_if = "Option::is_none")]
+        ax_tree: Option<String>,
     },
     #[serde(rename = "failed")]
     Failed { reason: String },
@@ -740,8 +744,8 @@ pub enum InteractInBrowserOutcome {
 impl From<InteractInBrowserOutcome> for BrowserInteractResult {
     fn from(outcome: InteractInBrowserOutcome) -> Self {
         match outcome {
-            InteractInBrowserOutcome::Screenshot { mime_type, data } => {
-                BrowserInteractResult::Screenshot { mime_type, data }
+            InteractInBrowserOutcome::Screenshot { mime_type, data, ax_tree } => {
+                BrowserInteractResult::Screenshot { mime_type, data, ax_tree }
             }
             InteractInBrowserOutcome::Failed { reason } => BrowserInteractResult::Failed(reason),
         }
@@ -1156,6 +1160,47 @@ mod tests {
             value,
             json!({ "type": "image", "mimeType": "image/png", "data": "aGVsbG8=" })
         );
+    }
+
+    /// `check_in_browser`'s reply carries an optional `axTree` -- the
+    /// token-efficient page snapshot the client serializes alongside the
+    /// screenshot. Absent (an older client, or an AX capture that failed) it
+    /// deserializes to `None` and round-trips to no field at all; present, it
+    /// is carried through to `BrowserCheckResult` so the model reads the
+    /// page's actual structure instead of a bare "screenshot captured".
+    #[test]
+    fn a_check_in_browser_outcome_carries_the_optional_ax_tree() {
+        let with: CheckInBrowserOutcome = serde_json::from_value(json!({
+            "outcome": "screenshot",
+            "mimeType": "image/png",
+            "data": "aGVsbG8=",
+            "axTree": "rootwebarea \"My App\"\n  button \"Submit\""
+        }))
+        .unwrap();
+        match BrowserCheckResult::from(with) {
+            BrowserCheckResult::Screenshot { mime_type, data, ax_tree } => {
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(data, "aGVsbG8=");
+                assert_eq!(
+                    ax_tree,
+                    Some("rootwebarea \"My App\"\n  button \"Submit\"".to_string())
+                );
+            }
+            BrowserCheckResult::Failed(_) => panic!("a screenshot outcome must not become Failed"),
+        }
+
+        let without: CheckInBrowserOutcome = serde_json::from_value(json!({
+            "outcome": "screenshot",
+            "mimeType": "image/png",
+            "data": "aGVsbG8="
+        }))
+        .unwrap();
+        // Absent `axTree` is `None` (not an error), and the field is omitted
+        // entirely when serializing back out rather than sent as `null`.
+        match BrowserCheckResult::from(without) {
+            BrowserCheckResult::Screenshot { ax_tree, .. } => assert_eq!(ax_tree, None),
+            BrowserCheckResult::Failed(_) => panic!("a screenshot outcome must not become Failed"),
+        }
     }
 
     #[test]
