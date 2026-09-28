@@ -22,20 +22,42 @@ const REPO: &str = "HolboxAI/boxcode";
 const BRANCH: &str = "main";
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
-/// Where to fetch `Cargo.toml` and `install.sh` from. Overridable so a fork or
-/// an internal mirror (this tool is often run somewhere with no route to
-/// github.com) can serve its own builds.
+/// Where to fetch `install.sh` / `install.ps1` (and, for mirrors, `Cargo.toml`)
+/// from. Overridable so a fork or an internal mirror can serve its own builds.
+///
+/// The **version** check does not use this when unset: it reads the latest
+/// GitHub *release* tag, which is what `install.sh` actually downloads. Bumping
+/// `Cargo.toml` on main without publishing a release used to offer an upgrade
+/// that could never install.
 const URL_BASE_ENV: &str = "BOXCODE_UPGRADE_URL_BASE";
 
 fn join_url(base: &str, path: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), path)
 }
 
+fn default_raw_base() -> String {
+    format!("https://raw.githubusercontent.com/{REPO}/{BRANCH}")
+}
+
+fn release_api_url() -> String {
+    format!("https://api.github.com/repos/{REPO}/releases/latest")
+}
+
 fn base_url() -> String {
     std::env::var(URL_BASE_ENV)
         .ok()
         .filter(|base| !base.trim().is_empty())
-        .unwrap_or_else(|| format!("https://raw.githubusercontent.com/{REPO}/{BRANCH}"))
+        .unwrap_or_else(default_raw_base)
+}
+
+/// What to print when saying where the version check looks.
+fn version_source_label() -> String {
+    let base = base_url();
+    if base.trim_end_matches('/') == default_raw_base() {
+        release_api_url()
+    } else {
+        join_url(&base, "Cargo.toml")
+    }
 }
 
 fn raw_url(path: &str) -> String {
@@ -157,7 +179,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn Error>> {
 }
 
 async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
-    println!("Checking {} for a newer version...", base_url());
+    println!("Checking {} for a newer version...", version_source_label());
 
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
@@ -175,8 +197,8 @@ async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
         Ok(_) => {
             println!("✓ Already up to date ({CURRENT}). Nothing to do.");
             println!();
-            println!("main can also carry changes that haven't been given a new version");
-            println!("number yet. To rebuild from the latest source regardless, run:");
+            println!("A newer commit can land on main before a GitHub release exists.");
+            println!("To rebuild from the latest source regardless, run:");
             println!("    boxcode --upgrade --force");
             return Ok(());
         }
@@ -223,7 +245,38 @@ async fn fetch_latest_version(client: &reqwest::Client) -> Result<String, Box<dy
 
 /// `fetch_latest_version` against an explicit base, so a caller that already
 /// knows where to look does not have to go back through the environment.
+///
+/// Default HolboxAI installs ask the GitHub **releases** API (same source
+/// `install.sh` downloads from). A custom `BOXCODE_UPGRADE_URL_BASE` — forks,
+/// mirrors, and the local test server — still publishes version via
+/// `Cargo.toml` under that base.
 async fn fetch_version_from(
+    client: &reqwest::Client,
+    base: &str,
+) -> Result<String, Box<dyn Error>> {
+    if base.trim_end_matches('/') == default_raw_base() {
+        return fetch_version_from_github_release(client).await;
+    }
+    fetch_version_from_cargo_toml(client, base).await
+}
+
+async fn fetch_version_from_github_release(
+    client: &reqwest::Client,
+) -> Result<String, Box<dyn Error>> {
+    let response = client
+        .get(release_api_url())
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status} fetching releases/latest").into());
+    }
+    let body = response.text().await?;
+    parse_release_tag(&body).ok_or_else(|| "no tag_name in releases/latest".into())
+}
+
+async fn fetch_version_from_cargo_toml(
     client: &reqwest::Client,
     base: &str,
 ) -> Result<String, Box<dyn Error>> {
@@ -234,6 +287,16 @@ async fn fetch_version_from(
     }
     let body = response.text().await?;
     parse_package_version(&body).ok_or_else(|| "no [package] version in Cargo.toml".into())
+}
+
+/// Strip a leading `v` from GitHub release tags (`v1.11.42` → `1.11.42`).
+fn parse_release_tag(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let tag = value.get("tag_name")?.as_str()?.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    Some(tag.strip_prefix('v').unwrap_or(tag).to_string())
 }
 
 fn installer_filename(windows: bool) -> &'static str {
@@ -599,12 +662,26 @@ version = \"9.9.9\"
 
     #[test]
     fn urls_join_without_doubling_the_slash() {
-        let github = format!("https://raw.githubusercontent.com/{REPO}/{BRANCH}");
+        let github = default_raw_base();
         assert_eq!(
             join_url(&github, "install.sh"),
             "https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.sh"
         );
         assert_eq!(join_url("http://mirror.internal/", "Cargo.toml"), "http://mirror.internal/Cargo.toml");
+    }
+
+    #[test]
+    fn release_tags_drop_the_leading_v() {
+        assert_eq!(
+            parse_release_tag(r#"{"tag_name":"v1.11.42"}"#).as_deref(),
+            Some("1.11.42")
+        );
+        assert_eq!(
+            parse_release_tag(r#"{"tag_name":"1.11.42"}"#).as_deref(),
+            Some("1.11.42")
+        );
+        assert_eq!(parse_release_tag(r#"{"tag_name":""}"#), None);
+        assert_eq!(parse_release_tag("not json"), None);
     }
 
     #[test]
