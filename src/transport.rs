@@ -346,6 +346,18 @@ impl Router {
                 let req: NewSessionRequest = serde_json::from_value(params)
                     .map_err(|e| (-32602, format!("invalid params: {e}")))?;
                 let workspace = Workspace::new(&req.cwd).map_err(|e| (-32000, e))?;
+
+                // Validate the requested MCP servers before creating a session.
+                // Doing this synchronously is deliberate: a malformed server
+                // config is a caller error and must come back as an error on
+                // session/new, not as a session that silently connects nothing.
+                // Connecting them is a separate, asynchronous step -- it spawns
+                // processes and can take seconds, which this handler must not do
+                // inline (see the session/prompt comment below on why blocking
+                // here is a deadlock risk).
+                let mcp_configs = crate::mcp::parse_server_configs(&req.mcp_servers)
+                    .map_err(|e| (-32602, format!("invalid mcpServers: {e}")))?;
+
                 let session_id = SessionId(format!("sess_{}", self.sessions.len() + 1));
                 let session = HeadlessSession::new(session_id.clone(), workspace, self.config.clone());
                 let handle = SessionActor::spawn(
@@ -357,6 +369,20 @@ impl Router {
                     session_id.clone(),
                 );
                 self.sessions.insert(session_id.clone(), handle);
+
+                // Not yet connected: the validated configs are carried no
+                // further than this point, so no server is spawned and no MCP
+                // tool reaches the model. Retention and dispatch are the next
+                // step, which needs a registry shared with the session actor.
+                if !mcp_configs.is_empty() {
+                    tracing::info!(
+                        target: "mcp",
+                        session = %session_id.0,
+                        count = mcp_configs.len(),
+                        "validated mcp servers; connection not implemented yet"
+                    );
+                }
+
                 Ok(serde_json::to_value(NewSessionResponse { session_id }).expect("serializes"))
             }
             // Unlike session/prompt, this can be handled synchronously right
