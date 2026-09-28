@@ -49,16 +49,43 @@ pub enum McpServerConfig {
 		command: String,
 		#[serde(default)]
 		args: Vec<String>,
-		#[serde(default)]
+		#[serde(default, deserialize_with = "de_key_values")]
 		env: BTreeMap<String, String>,
 	},
 	#[serde(rename = "streamable-http")]
 	Http {
 		name: String,
 		url: String,
-		#[serde(default)]
+		#[serde(default, deserialize_with = "de_key_values")]
 		headers: BTreeMap<String, String>,
 	},
+}
+
+/// Accepts `env`/`headers` in either shape seen on the wire: a JSON object
+/// (`{"NAME":"value"}`) or the ordered array the extension sends
+/// (`[{"name":"NAME","value":"value"}]`). Rejecting a plausible variant
+/// silently is worse than accepting both.
+fn de_key_values<'de, D>(de: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	#[derive(serde::Deserialize)]
+	struct Entry {
+		name: String,
+		value: String,
+	}
+
+	#[derive(serde::Deserialize)]
+	#[serde(untagged)]
+	enum Both {
+		Map(BTreeMap<String, String>),
+		List(Vec<Entry>),
+	}
+
+	Ok(match Both::deserialize(de)? {
+		Both::Map(map) => map,
+		Both::List(list) => list.into_iter().map(|e| (e.name, e.value)).collect(),
+	})
 }
 
 impl McpServerConfig {
@@ -457,6 +484,64 @@ pub fn descriptors_for(server: &str, tools: &[McpTool]) -> Vec<McpToolDescriptor
 
 #[cfg(test)]
 mod tests {
+
+	#[test]
+	fn env_accepts_the_ordered_array_shape_the_extension_sends() {
+		let raw = serde_json::json!([{
+			"type": "stdio",
+			"name": "demo",
+			"command": "npx",
+			"env": [
+				{ "name": "TOKEN", "value": "abc" },
+				{ "name": "MODE", "value": "dev" }
+			]
+		}]);
+		let parsed = parse_server_configs(raw.as_array().expect("json array")).expect("array-shaped env must be accepted");
+		match &parsed[0] {
+			McpServerConfig::Stdio { env, .. } => {
+				assert_eq!(env.get("TOKEN").map(String::as_str), Some("abc"));
+				assert_eq!(env.get("MODE").map(String::as_str), Some("dev"));
+			}
+			other => panic!("expected a stdio config, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn env_still_accepts_a_plain_object() {
+		let raw = serde_json::json!([{
+			"type": "stdio",
+			"name": "demo",
+			"command": "npx",
+			"env": { "TOKEN": "abc" }
+		}]);
+		let parsed = parse_server_configs(raw.as_array().expect("json array")).expect("object-shaped env must be accepted");
+		match &parsed[0] {
+			McpServerConfig::Stdio { env, .. } => {
+				assert_eq!(env.get("TOKEN").map(String::as_str), Some("abc"));
+			}
+			other => panic!("expected a stdio config, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn headers_accept_the_ordered_array_shape_too() {
+		let raw = serde_json::json!([{
+			"type": "streamable-http",
+			"name": "demo",
+			"url": "https://example.invalid/mcp",
+			"headers": [{ "name": "Authorization", "value": "Bearer x" }]
+		}]);
+		let parsed = parse_server_configs(raw.as_array().expect("json array")).expect("array-shaped headers must be accepted");
+		match &parsed[0] {
+			McpServerConfig::Http { headers, .. } => {
+				assert_eq!(
+					headers.get("Authorization").map(String::as_str),
+					Some("Bearer x")
+				);
+			}
+			other => panic!("expected an http config, got {other:?}"),
+		}
+	}
 	use super::*;
 
 	#[test]
