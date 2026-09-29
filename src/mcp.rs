@@ -695,4 +695,85 @@ mod tests {
 		assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&"2026-07-28"));
 		assert!(!SUPPORTED_PROTOCOL_VERSIONS.is_empty());
 	}
+	fn fake_server_bin() -> std::path::PathBuf {
+		let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+		p.push("target");
+		p.push(if cfg!(debug_assertions) { "debug" } else { "release" });
+		p.push(if cfg!(windows) {
+			"mcp-fake-server.exe"
+		} else {
+			"mcp-fake-server"
+		});
+		p
+	}
+
+	fn stdio_config(name: &str, env: serde_json::Value) -> McpServerConfig {
+		let raw = serde_json::json!([{
+			"type": "stdio",
+			"name": name,
+			"command": fake_server_bin().to_string_lossy(),
+			"args": [],
+			"env": env,
+		}]);
+		let mut parsed = parse_server_configs(raw.as_array().expect("json array"))
+			.expect("fake server config should parse");
+		parsed.remove(0)
+	}
+
+	/// The gap this closes: until now nothing ever spoke to a server, so the
+	/// framing and handshake were compile-verified only.
+	#[tokio::test]
+	async fn connects_to_a_stdio_server_and_lists_its_tools() {
+		let bin = fake_server_bin();
+		assert!(bin.exists(), "cargo test builds bins first; missing {}", bin.display());
+
+		let (registry, problems) = McpRegistry::connect_all(&[stdio_config("fake", serde_json::json!({}))]).await;
+
+		assert!(problems.is_empty(), "unexpected connect problems: {problems:?}");
+		let names: Vec<&str> = registry.server_names().collect();
+		assert!(names.contains(&"fake"), "server not registered: {names:?}");
+		assert_eq!(registry.tool_count(), 2, "the fake advertises echo,add");
+		let described = format!("{:?}", registry.descriptors().collect::<Vec<_>>());
+		assert!(described.contains("echo"), "tool list did not reach the client: {described}");
+		assert!(described.contains("add"), "tool list did not reach the client: {described}");
+	}
+
+	/// A server that fails to handshake is reported and skipped, never fatal.
+	#[tokio::test]
+	async fn a_server_that_fails_initialize_is_reported_not_fatal() {
+		let mut bad = stdio_config("broken", serde_json::json!({}));
+		match &mut bad {
+			McpServerConfig::Stdio { env, .. } => {
+				env.insert("MCP_FAKE_FAIL_INIT".to_string(), "1".to_string());
+			}
+			other => panic!("expected a stdio config, got {other:?}"),
+		}
+
+		let (registry, problems) = McpRegistry::connect_all(&[bad, stdio_config("good", serde_json::json!({}))]).await;
+
+		assert_eq!(problems.len(), 1, "the broken server must be reported: {problems:?}");
+		let names = format!("{:?}", registry.server_names().collect::<Vec<_>>());
+		assert!(names.contains("good"), "the healthy server must still connect: {names}");
+		assert!(!names.contains("broken"), "a failed server must not be registered: {names}");
+	}
+
+	/// The env/headers wire mismatch shipped once because nothing checked that
+	/// configured env actually reaches the child process. This does.
+	#[tokio::test]
+	async fn configured_env_reaches_the_child_process() {
+		let config = stdio_config(
+			"fake",
+			serde_json::json!({
+				"MCP_FAKE_ECHO_ENV": "PROBE_TOKEN",
+				"PROBE_TOKEN": "wire-works"
+			}),
+		);
+
+		let (registry, problems) = McpRegistry::connect_all(&[config]).await;
+
+		assert!(problems.is_empty(), "{problems:?}");
+		let described = format!("{:?}", registry.descriptors().collect::<Vec<_>>());
+		assert!(described.contains("wire-works"), "config env never reached the child: {described}");
+	}
+
 }
