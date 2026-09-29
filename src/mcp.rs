@@ -482,6 +482,79 @@ pub fn descriptors_for(server: &str, tools: &[McpTool]) -> Vec<McpToolDescriptor
 		.collect()
 }
 
+/// Every MCP server connected for one session, with the tools each advertises.
+///
+/// Owned by the session actor task, so a connection lives exactly as long as its
+/// session and dies with it. Tools are listed once, here, and must never be
+/// re-listed: the model-facing schema list has to stay byte-identical across the
+/// rounds of a turn or the prefix cache is busted (see `tools::schemas_for`).
+#[derive(Default)]
+pub struct McpRegistry {
+	servers: Vec<ConnectedServer>,
+}
+
+struct ConnectedServer {
+	name: String,
+	/// Held so `call_tool` can reach it later. Unused until dispatch lands.
+	client: McpClient,
+	tools: Vec<McpToolDescriptor>,
+}
+
+impl McpRegistry {
+	/// Connects every configured server and lists the tools it offers.
+	///
+	/// A server that cannot be reached is reported and skipped, never fatal: one
+	/// bad entry should not cost you the working ones, and a session with no MCP
+	/// tools is still a usable session. The caller gets the problems so it can
+	/// surface them rather than leave a silent hole.
+	///
+	/// Must not be called on the request path -- the handshake spawns a process
+	/// and can take seconds, so `session/new` replies first and this runs after.
+	pub async fn connect_all(configs: &[McpServerConfig]) -> (Self, Vec<String>) {
+		let mut registry = Self::default();
+		let mut problems = Vec::new();
+
+		for config in configs {
+			let name = config.name().to_string();
+			let mut client = match McpClient::connect(config).await {
+				Ok(client) => client,
+				Err(e) => {
+					problems.push(format!("{name}: could not connect: {e}"));
+					continue;
+				}
+			};
+			match client.list_tools().await {
+				Ok(tools) => {
+					let tools = descriptors_for(&name, &tools);
+					registry.servers.push(ConnectedServer { name, client, tools });
+				}
+				Err(e) => problems.push(format!("{name}: could not list tools: {e}")),
+			}
+		}
+
+		(registry, problems)
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.servers.is_empty()
+	}
+
+	/// Every connected server's name, in the order they were configured.
+	pub fn server_names(&self) -> impl Iterator<Item = &str> {
+		self.servers.iter().map(|s| s.name.as_str())
+	}
+
+	/// Every tool across every server, in the shape the model is shown.
+	pub fn descriptors(&self) -> impl Iterator<Item = &McpToolDescriptor> {
+		self.servers.iter().flat_map(|s| s.tools.iter())
+	}
+
+	pub fn tool_count(&self) -> usize {
+		self.servers.iter().map(|s| s.tools.len()).sum()
+	}
+}
+
+
 #[cfg(test)]
 mod tests {
 

@@ -137,10 +137,22 @@ impl SessionActor {
         permission_relay: mpsc::Sender<PermissionAsk>,
         browser_relay: mpsc::Sender<BrowserCheckAsk>,
         browser_interact_relay: mpsc::Sender<BrowserInteractAsk>,
+        mcp_configs: Vec<crate::mcp::McpServerConfig>,
         session_id: SessionId,
     ) -> mpsc::Sender<SessionMsg> {
         let (tx, mut rx) = mpsc::channel::<SessionMsg>(8);
         tokio::spawn(async move {
+            // Connect MCP servers once, before the first prompt. Off the request
+            // path on purpose: spawning a server and handshaking takes seconds, so
+            // session/new replied already. Problems are logged, not fatal -- a
+            // server that will not start should not cost you the ones that work.
+            for problem in session.connect_mcp(&mcp_configs).await {
+                tracing::warn!(target: "mcp", "{}", problem);
+            }
+            tracing::info!(target: "mcp",
+                servers = session.mcp().server_names().count(),
+                tools = session.mcp().tool_count(),
+                "connected mcp servers");
             while let Some(msg) = rx.recv().await {
                 match msg {
                     SessionMsg::Prompt { text, images, respond } => {
@@ -366,6 +378,7 @@ impl Router {
                     self.permission_relay_tx.clone(),
                     self.browser_relay_tx.clone(),
                     self.browser_interact_relay_tx.clone(),
+                    mcp_configs.clone(),
                     session_id.clone(),
                 );
                 self.sessions.insert(session_id.clone(), handle);
