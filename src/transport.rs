@@ -137,10 +137,22 @@ impl SessionActor {
         permission_relay: mpsc::Sender<PermissionAsk>,
         browser_relay: mpsc::Sender<BrowserCheckAsk>,
         browser_interact_relay: mpsc::Sender<BrowserInteractAsk>,
+        mcp_configs: Vec<crate::mcp::McpServerConfig>,
         session_id: SessionId,
     ) -> mpsc::Sender<SessionMsg> {
         let (tx, mut rx) = mpsc::channel::<SessionMsg>(8);
         tokio::spawn(async move {
+            // Connect MCP servers once, before the first prompt. Off the request
+            // path on purpose: spawning a server and handshaking takes seconds, so
+            // session/new replied already. Problems are logged, not fatal -- a
+            // server that will not start should not cost you the ones that work.
+            for problem in session.connect_mcp(&mcp_configs).await {
+                tracing::warn!(target: "mcp", "{}", problem);
+            }
+            tracing::info!(target: "mcp",
+                servers = session.mcp().server_names().count(),
+                tools = session.mcp().tool_count(),
+                "connected mcp servers");
             while let Some(msg) = rx.recv().await {
                 match msg {
                     SessionMsg::Prompt { text, images, mode, respond } => {
@@ -324,7 +336,15 @@ impl Router {
                     // (protocol.rs's own doc comment on that variant) --
                     // omitting it would leave a spec-compliant client
                     // withholding image attachments it otherwise could send.
-                    agent_capabilities: json!({ "session": {}, "promptCapabilities": { "image": true } }),
+                    // `mcp` is not part of the ACP v1 schema, which is exactly
+                    // why it has to be advertised explicitly: the schema makes
+                    // `mcpServers` a required field on `session/new`, so a build
+                    // that does not understand it still accepts the field and
+                    // returns a session id while connecting nothing. A client
+                    // cannot tell that apart from real support. This capability
+                    // is the positive signal to gate on -- absent it, a client
+                    // should refuse to send servers rather than report success.
+                    agent_capabilities: json!({ "session": {}, "mcp": true, "promptCapabilities": { "image": true } }),
                     auth_methods: Vec::new(),
                     agent_info: Some(Implementation {
                         name: "boxcode".to_string(),
@@ -338,6 +358,18 @@ impl Router {
                 let req: NewSessionRequest = serde_json::from_value(params)
                     .map_err(|e| (-32602, format!("invalid params: {e}")))?;
                 let workspace = Workspace::new(&req.cwd).map_err(|e| (-32000, e))?;
+
+                // Validate the requested MCP servers before creating a session.
+                // Doing this synchronously is deliberate: a malformed server
+                // config is a caller error and must come back as an error on
+                // session/new, not as a session that silently connects nothing.
+                // Connecting them is a separate, asynchronous step -- it spawns
+                // processes and can take seconds, which this handler must not do
+                // inline (see the session/prompt comment below on why blocking
+                // here is a deadlock risk).
+                let mcp_configs = crate::mcp::parse_server_configs(&req.mcp_servers)
+                    .map_err(|e| (-32602, format!("invalid mcpServers: {e}")))?;
+
                 let session_id = SessionId(format!("sess_{}", self.sessions.len() + 1));
                 let session = HeadlessSession::new(session_id.clone(), workspace, self.config.clone());
                 let handle = SessionActor::spawn(
@@ -346,9 +378,24 @@ impl Router {
                     self.permission_relay_tx.clone(),
                     self.browser_relay_tx.clone(),
                     self.browser_interact_relay_tx.clone(),
+                    mcp_configs.clone(),
                     session_id.clone(),
                 );
                 self.sessions.insert(session_id.clone(), handle);
+
+                // Not yet connected: the validated configs are carried no
+                // further than this point, so no server is spawned and no MCP
+                // tool reaches the model. Retention and dispatch are the next
+                // step, which needs a registry shared with the session actor.
+                if !mcp_configs.is_empty() {
+                    tracing::info!(
+                        target: "mcp",
+                        session = %session_id.0,
+                        count = mcp_configs.len(),
+                        "validated mcp servers; connection not implemented yet"
+                    );
+                }
+
                 Ok(serde_json::to_value(NewSessionResponse { session_id }).expect("serializes"))
             }
             // Unlike session/prompt, this can be handled synchronously right

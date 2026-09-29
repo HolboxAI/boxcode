@@ -32,6 +32,7 @@ mod ui;
 mod upgrade;
 mod usage;
 mod workspace;
+mod mcp;
 
 use app::App;
 use config::{ApprovalMode, Config};

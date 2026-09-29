@@ -163,6 +163,11 @@ pub struct HeadlessSession {
     session_id: SessionId,
     workspace: Workspace,
     config: Config,
+    /// MCP servers connected for this session, with the tools each
+    /// advertises. Listed once at session start and cached: the model-facing
+    /// schema list must stay byte-identical across a turn's rounds or the
+    /// prefix cache is busted.
+    mcp: crate::mcp::McpRegistry,
     messages: Vec<ChatMessage>,
     request_id: u64,
     tool_steps: usize,
@@ -206,7 +211,28 @@ impl HeadlessSession {
             active_plan: None,
             turn_starts: Vec::new(),
             rollback: crate::rollback::Journal::default(),
+            mcp: crate::mcp::McpRegistry::default(),
         }
+    }
+
+    /// Connects this session's MCP servers and caches what they advertise.
+    ///
+    /// Called once, when the session is created -- never on the request path,
+    /// because the handshake spawns a process and can take seconds. Returns the
+    /// problems so the caller can surface them; a server that fails to start must
+    /// not cost you the ones that work.
+    pub async fn connect_mcp(
+        &mut self,
+        configs: &[crate::mcp::McpServerConfig],
+    ) -> Vec<String> {
+        let (registry, problems) = crate::mcp::McpRegistry::connect_all(configs).await;
+        self.mcp = registry;
+        problems
+    }
+
+    /// The MCP servers connected for this session.
+    pub fn mcp(&self) -> &crate::mcp::McpRegistry {
+        &self.mcp
     }
 
     /// The turn this session is currently on (1-based, incremented at the
