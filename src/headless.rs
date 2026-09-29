@@ -79,7 +79,11 @@ pub struct BrowserCheckAsk {
 /// model text it can react to, the same posture `ask_permission` already
 /// takes toward "the client disconnected."
 pub enum BrowserCheckResult {
-    Screenshot { mime_type: String, data: String },
+    Screenshot {
+        mime_type: String,
+        data: String,
+        ax_tree: Option<String>,
+    },
     Failed(String),
 }
 
@@ -99,7 +103,11 @@ pub struct BrowserInteractAsk {
 /// interaction still ends in a screenshot, the same proof-of-result
 /// `check_in_browser` already gives the model.
 pub enum BrowserInteractResult {
-    Screenshot { mime_type: String, data: String },
+    Screenshot {
+        mime_type: String,
+        data: String,
+        ax_tree: Option<String>,
+    },
     Failed(String),
 }
 
@@ -902,7 +910,7 @@ impl HeadlessSession {
         };
 
         match result {
-            BrowserCheckResult::Screenshot { mime_type, data } => {
+            BrowserCheckResult::Screenshot { mime_type, data, ax_tree } => {
                 let _ = updates
                     .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                         tool_call_id: ToolCallId(call.id.clone()),
@@ -917,7 +925,13 @@ impl HeadlessSession {
                 } else {
                     Vec::new()
                 };
-                (format!("Screenshot of {url} captured and shown to the user."), images)
+                let text = match ax_tree {
+                    Some(ax_tree) => format!(
+                        "Page structure of {url} (accessibility tree):\n\n{ax_tree}\n\n(Screenshot also shown to the user.)"
+                    ),
+                    None => format!("Screenshot of {url} captured and shown to the user."),
+                };
+                (text, images)
             }
             BrowserCheckResult::Failed(reason) => {
                 let _ = updates
@@ -982,7 +996,7 @@ impl HeadlessSession {
         };
 
         match result {
-            BrowserInteractResult::Screenshot { mime_type, data } => {
+            BrowserInteractResult::Screenshot { mime_type, data, ax_tree } => {
                 let _ = updates
                     .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                         tool_call_id: ToolCallId(call.id.clone()),
@@ -997,13 +1011,17 @@ impl HeadlessSession {
                 } else {
                     Vec::new()
                 };
-                (
-                    format!(
+                let text = match ax_tree {
+                    Some(ax_tree) => format!(
+                        "Page structure of {url} after {} (accessibility tree):\n\n{ax_tree}\n\n(Screenshot also shown to the user.)",
+                        interaction.describe()
+                    ),
+                    None => format!(
                         "{} in {url}, then screenshot captured and shown to the user.",
                         interaction.describe()
                     ),
-                    images,
-                )
+                };
+                (text, images)
             }
             BrowserInteractResult::Failed(reason) => {
                 let _ = updates
@@ -1487,6 +1505,7 @@ mod tests {
         let _ = ask.respond.send(BrowserCheckResult::Screenshot {
             mime_type: "image/png".to_string(),
             data: "aGVsbG8=".to_string(),
+            ax_tree: None,
         });
 
         let stop = prompt.await.expect("task joins");
@@ -1505,6 +1524,77 @@ mod tests {
             }
         }
         assert!(saw_image, "the screenshot must reach the client as an Image, for the human to see");
+    }
+
+    /// The token-efficient half of `check_in_browser`: when the client also
+    /// sends an `ax_tree`, that text -- not a bare "screenshot captured"
+    /// receipt -- must reach the real outbound LLM request as the tool
+    /// result, so the model can actually *read* the page. Doesn't use
+    /// `serve_rounds` (it discards the request body); captures the second
+    /// round's request directly, the same primitives
+    /// `an_attached_image_reaches_the_real_llm_request` is built on.
+    #[tokio::test]
+    async fn check_in_browser_puts_the_ax_tree_text_in_the_tool_result() {
+        let (_dir, ws) = workspace();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            // Round 1: the user prompt, answered with the tool call.
+            let (mut socket, _) = listener.accept().await.expect("accept 1");
+            let _ = read_request(&mut socket).await;
+            let _ = socket
+                .write_all(tool_call_round(tools::CHECK_IN_BROWSER, r#"{"url":"http://localhost:3000"}"#).as_bytes())
+                .await;
+            let _ = socket.shutdown().await;
+
+            // Round 2: the tool result, which is what we want to inspect.
+            let (mut socket, _) = listener.accept().await.expect("accept 2");
+            let request = read_request(&mut socket).await;
+            let _ = captured_tx.send(request);
+            let _ = socket.write_all(text_round("It renders correctly.").as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        let config = config_for(&format!("http://{addr}"));
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, _updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, mut browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
+
+        let prompt = tokio::spawn(async move {
+            session
+                .prompt(
+                    "does the homepage render?".to_string(),
+                    Vec::new(),
+                    None,
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await
+        });
+
+        let ask = browser_rx.recv().await.expect("a browser check ask");
+        let _ = ask.respond.send(BrowserCheckResult::Screenshot {
+            mime_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+            ax_tree: Some("rootwebarea MyApp\n  button Submit".to_string()),
+        });
+
+        let stop = prompt.await.expect("task joins");
+        assert_eq!(stop, StopReason::EndTurn);
+
+        let request = captured_rx.await.expect("tool-result request was captured");
+        assert!(
+            request.contains("Page structure of http://localhost:3000 (accessibility tree):"),
+            "the tool result must be framed as page structure, not a bare receipt: {request}"
+        );
+        assert!(
+            request.contains("rootwebarea MyApp"),
+            "the AX tree text never reached the real LLM request body: {request}"
+        );
     }
 
     /// Unlike `check_in_browser`, `interact_in_browser` is `Risk::Dangerous`
@@ -1563,6 +1653,7 @@ mod tests {
         let _ = interact_ask.respond.send(BrowserInteractResult::Screenshot {
             mime_type: "image/png".to_string(),
             data: "aGVsbG8=".to_string(),
+            ax_tree: None,
         });
 
         let stop = prompt.await.expect("task joins");
