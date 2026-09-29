@@ -1171,6 +1171,27 @@ mod tests {
         );
     }
 
+    /// `usage_update` is the boxcode-ide cost meter's data feed, so its exact
+    /// wire shape is a contract: `used` is prompt + completion (cache hits are
+    /// deliberately *not* added -- a cached token is a discounted prompt token
+    /// already inside `prompt_tokens`), and `size` is still 0 because boxcode
+    /// does not track the model's context-window limit yet.
+    #[test]
+    fn an_api_usage_becomes_a_usage_update_with_used_as_total() {
+        let usage = ApiUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            prompt_cache_hit_tokens: 7,
+            prompt_tokens_details: Default::default(),
+        };
+        let update: SessionUpdate = usage.into();
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            value,
+            json!({ "sessionUpdate": "usage_update", "used": 15, "size": 0 })
+        );
+    }
+
     #[test]
     fn a_selected_permission_outcome_becomes_the_matching_decision() {
         assert_eq!(
