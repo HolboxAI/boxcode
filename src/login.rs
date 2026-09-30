@@ -81,7 +81,7 @@ impl LoginStatus {
                  Session:  ~/.boxcode/account.token\n\
                  Proof:    heartbeat hits https://boxcode.sh/api/heartbeat\n\n\
                  To link another machine: exit (^c) then run `boxcode login`\n\
-                 and Authorize in the browser."
+                 and Authorize in the browser.",
                 self.endpoint, self.model, self.key_prefix
             )
         } else if self.via_boxcode_proxy && !self.key_prefix.is_empty() {
