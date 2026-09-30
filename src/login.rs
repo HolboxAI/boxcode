@@ -81,7 +81,7 @@ impl LoginStatus {
                  Session:  ~/.boxcode/account.token\n\
                  Proof:    heartbeat hits https://boxcode.sh/api/heartbeat\n\n\
                  To link another machine: exit (^c) then run `boxcode login`\n\
-                 and confirm the Device ID on https://boxcode.sh/login/device.",
+                 and Authorize in the browser."
                 self.endpoint, self.model, self.key_prefix
             )
         } else if self.via_boxcode_proxy && !self.key_prefix.is_empty() {
@@ -174,11 +174,11 @@ pub async fn login() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("boxcode login");
     println!();
-    println!("  Device ID:  {}", start.user_code);
-    println!("  Open:       {verify}");
+    println!("  Opening the browser to authorize this device…");
+    println!("  {verify}");
     println!();
-    println!("Sign in with Google in the browser, then approve this device.");
-    println!("The website will show the same Device ID — confirm it matches.");
+    println!("Sign in with Google if asked, then click Authorize.");
+    println!("Return here when the browser says you're connected.");
     print!("Waiting");
     let _ = io::stdout().flush();
     open_browser(&verify);
