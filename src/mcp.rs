@@ -162,6 +162,25 @@ pub fn tool_id(server: &str, tool: &str) -> String {
 	)
 }
 
+/// The inverse of [`tool_id`]: `"mcp__github__create_issue"` -> server
+/// `"github"`, tool `"create_issue"`.
+///
+/// Splitting on the *first* `__` after the prefix is unambiguous because
+/// `server_id_fragment` maps every `_` to `-`, so a server fragment can never
+/// contain the separator. Two server names that would collapse onto the same
+/// fragment are rejected when the config is parsed, so a name that reaches here
+/// has a well-defined origin.
+///
+/// A tool name may itself contain `__`, which is why only the first one splits.
+pub fn parse_tool_id(id: &str) -> Option<(&str, &str)> {
+	let rest = id.strip_prefix(TOOL_PREFIX)?.strip_prefix("__")?;
+	let (server, tool) = rest.split_once("__")?;
+	if server.is_empty() || tool.is_empty() {
+		return None;
+	}
+	Some((server, tool))
+}
+
 /// Parse the `mcpServers` array as it arrives from the editor.
 ///
 /// The ACP schema makes `type` optional and defaults to stdio, and accepts
@@ -774,6 +793,22 @@ mod tests {
 		assert!(problems.is_empty(), "{problems:?}");
 		let described = format!("{:?}", registry.descriptors().collect::<Vec<_>>());
 		assert!(described.contains("wire-works"), "config env never reached the child: {described}");
+	}
+
+
+	#[test]
+	fn parse_tool_id_is_the_inverse_of_tool_id() {
+		for (server, tool) in [("github", "create_issue"), ("aws", "s3__get_object"), ("srv-with-dash", "a")] {
+			let id = tool_id(server, tool);
+			assert_eq!(parse_tool_id(&id), Some((server, tool)), "round trip for {id}");
+		}
+	}
+
+	#[test]
+	fn parse_tool_id_rejects_names_that_are_not_mcp_tools() {
+		for id in ["", "mcp", "mcp_github_create_issue", "mcp__", "mcp__github__", "github__create_issue", "read_file"] {
+			assert_eq!(parse_tool_id(id), None, "{id} should not parse");
+		}
 	}
 
 }
