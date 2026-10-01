@@ -91,11 +91,22 @@ pub enum Mode {
     /// work as usual; anything that could change the project is refused
     /// before it is ever offered for approval.
     Plan,
+    /// File-scoped, propose-only. Reads/search/list/glob run as usual;
+    /// `write_file` and `edit_file` do NOT touch disk -- each proposed change
+    /// is sent to the client as a reviewable diff and applied only if the
+    /// user accepts it in the editor. No shell escape hatch, so a change
+    /// cannot land on disk without crossing that review. Used by the IDE's
+    /// Ctrl+I inline edit.
+    Edit,
 }
 
 impl Mode {
     pub fn is_plan(self) -> bool {
         self == Mode::Plan
+    }
+
+    pub fn is_edit(self) -> bool {
+        self == Mode::Edit
     }
 }
 
@@ -1110,6 +1121,29 @@ pub fn schemas_for(
                 && name != RESOLVE_CHANGE_REQUEST
         });
     }
+    if mode.is_edit() {
+        // Inline edit is file-scoped and approval-free, so the list shrinks to
+        // the tools that can express a change as a reviewable diff (write_file/
+        // edit_file) plus the read-only ways to see the project. No
+        // run_command, deploy/publish, browser, web, or subagent -- none of
+        // those can be rendered as an accept/reject diff, and a shell escape
+        // hatch would let a change land on disk without ever crossing the
+        // editor. A whitelist rather than a blocklist, so a tool added later
+        // defaults to absent from this mode until someone deliberately opts it in.
+        schemas.retain(|schema| {
+            let name = schema["function"]["name"].as_str().unwrap_or_default();
+            matches!(
+                name,
+                READ_FILE
+                    | WRITE_FILE
+                    | EDIT_FILE
+                    | LIST_DIR
+                    | GLOB
+                    | GREP_SEARCH
+                    | UPDATE_TODOS
+            )
+        });
+    }
     if mode.is_plan() {
         schemas.retain(|schema| {
             let name = schema["function"]["name"].as_str().unwrap_or_default();
@@ -1340,6 +1374,36 @@ pub fn subagent_system_prompt(workspace: &Workspace, steps_used: usize, max_step
     )
 }
 
+/// The system prompt for inline-edit mode -- short and single-purpose, because
+/// the inline surface has no room for the full terminal tool list or the
+/// deploy/web guidance, and the propose-only contract is the one thing the
+/// model must have exactly right.
+fn inline_edit_system_prompt(workspace: &Workspace) -> String {
+    format!(
+        "You are boxcode's inline edit assistant, working in {}. You help rewrite a region of \
+         one file; you do not run shell commands.\n\n\
+         Tools:\n\
+         - {READ_FILE}(path, offset, limit): read a file, or a slice of a big one.\n\
+         - {WRITE_FILE}(path, content): propose new contents for a file.\n\
+         - {EDIT_FILE}(path, old_string, new_string, replace_all): propose a precise edit to a \
+           file. Several edits to the SAME file belong in one call as edits: [{{old_string, \
+           new_string}}, ...].\n\
+         - {LIST_DIR}(path), {GLOB}(pattern), {GREP_SEARCH}(pattern, path, context): inspect the \
+           project (read-only).\n\
+         - {UPDATE_TODOS}(todos): a short checklist if the change has several steps.\n\n\
+         Rules:\n\
+         - NOTHING you propose touches disk. {WRITE_FILE}/{EDIT_FILE} only propose a diff, which \
+           is shown to the user and applied only if they accept it. Never say a file was changed, \
+           saved, or written -- say you proposed a change.\n\
+         - The user pasted the file's current contents (including any unsaved edits) in their \
+           message. Match {EDIT_FILE}'s old_string against that text byte-for-byte.\n\
+         - Propose the smallest change that does the job, and cover the whole request in one \
+           call when it is a single file.\n\
+         - After proposing, reply in one short sentence saying what you proposed.\n",
+        workspace.root().display()
+    )
+}
+
 /// What the model is told about its situation.
 ///
 /// The operating system is stated outright because the single most common way
@@ -1362,6 +1426,14 @@ pub fn system_prompt(
              from what you have already seen. Do not ask to run anything else.",
             workspace.root().display()
         );
+    }
+
+    // Inline edit gets its own short, single-purpose prompt: the full terminal
+    // assistant's tool list and deploy/web guidance would only invite tool calls
+    // the inline surface refuses, and the propose-only contract is the one thing
+    // the model must have exactly right.
+    if mode.is_edit() {
+        return inline_edit_system_prompt(workspace);
     }
 
     let (shell_name, shell_flag) = shell();

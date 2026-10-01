@@ -1654,6 +1654,9 @@ impl App {
         self.mode = match self.mode {
             Mode::Normal => Mode::Plan,
             Mode::Plan => Mode::Normal,
+            // Inline edit is headless-only; the TUI never enters it, but the
+            // match must stay exhaustive now that `Mode` has a third variant.
+            Mode::Edit => Mode::Normal,
         };
         let note = match self.mode {
             Mode::Plan =>
@@ -1663,6 +1666,7 @@ impl App {
             Mode::Normal =>
                 "Plan mode off. Writes and commands are available again, each one still asking \
                  before it happens.",
+            Mode::Edit => "Inline edit is headless-only and not available in the terminal.",
         };
         self.messages.push(Message::new(Role::System, note));
         self.greeted = true;

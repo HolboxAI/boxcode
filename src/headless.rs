@@ -493,6 +493,54 @@ impl HeadlessSession {
         let mut results = Vec::with_capacity(calls.len());
         let mut i = 0;
         while i < calls.len() {
+            // Inline edit is file-scoped and approval-free. write_file/edit_file
+            // propose a reviewable diff without touching disk (the editor buffer
+            // is the source of truth), pure reads fall through to the ordinary
+            // auto-approve path below, and everything else -- shell commands,
+            // deploy/publish, browser, web search, subagents -- is refused
+            // outright, because none of it can be rendered as an accept/reject
+            // diff and the inline surface has no room for an approval prompt.
+            if self.mode.is_edit() {
+                let action = tools::describe_action(&calls[i]);
+                let is_write_or_edit = matches!(
+                    &action,
+                    Some(crate::tools::Action::Write { .. }) | Some(crate::tools::Action::Edit { .. })
+                );
+                let is_read = matches!(
+                    &action,
+                    Some(crate::tools::Action::Read { .. })
+                        | Some(crate::tools::Action::List { .. })
+                        | Some(crate::tools::Action::Glob { .. })
+                        | Some(crate::tools::Action::Grep { .. })
+                        | Some(crate::tools::Action::Progress { .. })
+                        | Some(crate::tools::Action::Todos(_))
+                );
+                if is_write_or_edit {
+                    if let Some(a) = action {
+                        results.push(self.propose_inline_edit(&calls[i], &a, updates).await);
+                        i += 1;
+                        continue;
+                    }
+                } else if !is_read {
+                    let reason = "Inline edit is file-scoped: only reading files and proposing \
+                                  write_file/edit_file changes are allowed -- not shell commands, \
+                                  deploy, publish, web search, or browser actions."
+                        .to_string();
+                    let _ = updates
+                        .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                            tool_call_id: ToolCallId(calls[i].id.clone()),
+                            title: None,
+                            kind: None,
+                            status: Some(ToolCallStatus::Failed),
+                            content: Some(ToolCallContent::Text { text: reason.clone() }),
+                        }))
+                        .await;
+                    results.push((calls[i].id.clone(), reason, Vec::new()));
+                    i += 1;
+                    continue;
+                }
+            }
+
             let verdict = verdict_for(
                 &calls[i],
                 Path::new(self.workspace.root()),
@@ -641,6 +689,55 @@ impl HeadlessSession {
             results.push((call.id.clone(), content, images));
         }
         results
+    }
+
+    /// `write_file`/`edit_file` in inline-edit mode: compute the before/after
+    /// text with the same `preview_change_text` the approval path uses, send it
+    /// as a `ToolCallContent::Diff` for the client to render as an inline
+    /// accept/reject diff, and return a "proposed, not applied" result to the
+    /// model. Nothing touches disk and nothing is journaled -- the editor
+    /// buffer is the source of truth, and the user's accept/save is what
+    /// commits.
+    async fn propose_inline_edit(
+        &mut self,
+        call: &ToolCall,
+        action: &crate::tools::Action,
+        updates: &mpsc::Sender<SessionUpdate>,
+    ) -> (String, String, Vec<llm::ImageAttachment>) {
+        let preview = tools::preview_change_text(action, Path::new(self.workspace.root()));
+
+        // What the model reads. `preview_change_text` is `None` when the path
+        // does not resolve or the change has nothing to show -- a "proposed,
+        // not applied" receipt is still the honest answer.
+        let model_text = match &preview {
+            Some((path, _, _)) => format!(
+                "Proposed a change to {path} (shown in the editor as a reviewable diff; nothing \
+                 was written to disk)."
+            ),
+            None => "Proposed a change, but its diff could not be previewed.".to_string(),
+        };
+
+        let diff_content = preview.map(|(path, before, after)| {
+            let hunks = diff_hunks_for_review(&before, &after);
+            ToolCallContent::Diff {
+                path,
+                old_text: (!before.is_empty()).then_some(before),
+                new_text: after,
+                hunks,
+            }
+        });
+
+        let _ = updates
+            .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                tool_call_id: ToolCallId(call.id.clone()),
+                title: Some(action.label()),
+                kind: None,
+                status: Some(ToolCallStatus::Completed),
+                content: diff_content,
+            }))
+            .await;
+
+        (call.id.clone(), model_text, Vec::new())
     }
 
     async fn ask_permission(
@@ -2278,5 +2375,60 @@ mod tests {
         assert_eq!(session.mode, Mode::Plan, "rejecting must leave the session in plan mode");
         assert!(session.active_plan.is_none(), "a rejected plan must not become active");
         assert!(!dir.path().join("plan.md").exists(), "rejecting must write nothing");
+    }
+
+    /// The whole point of inline-edit mode in one test: a `write_file` call
+    /// proposes a `Diff` for the client to render as an accept/reject inline
+    /// diff, writes nothing to disk, and still lets the turn end normally.
+    #[tokio::test]
+    async fn inline_edit_proposes_a_diff_without_writing_disk() {
+        let (dir, ws) = workspace();
+        let endpoint = serve_rounds(vec![
+            tool_call_round(tools::WRITE_FILE, r#"{"path":"new.txt","content":"hello"}"#),
+            text_round("Done."),
+        ])
+        .await;
+        let config = config_for(&endpoint);
+        let mut session = HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, mut updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
+
+        let prompt = tokio::spawn(async move {
+            let stop = session
+                .prompt(
+                    "add new.txt".to_string(),
+                    Vec::new(),
+                    Some(Mode::Edit),
+                    &updates_tx,
+                    &permissions_tx,
+                    &browser_tx,
+                    &browser_interact_tx,
+                )
+                .await;
+            (stop, session)
+        });
+
+        let (stop, _session) = prompt.await.expect("task joins");
+        assert_eq!(stop, StopReason::EndTurn);
+
+        let mut saw_diff = false;
+        while let Ok(update) = updates_rx.try_recv() {
+            if let SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                content: Some(ToolCallContent::Diff { path, new_text, .. }),
+                ..
+            }) = update
+            {
+                assert_eq!(path, "new.txt");
+                assert_eq!(new_text, "hello");
+                saw_diff = true;
+            }
+        }
+        assert!(saw_diff, "the write_file proposal must ride a Diff tool update");
+        assert!(
+            !dir.path().join("new.txt").exists(),
+            "inline edit must propose without writing disk"
+        );
     }
 }
