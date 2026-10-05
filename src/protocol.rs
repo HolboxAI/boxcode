@@ -265,10 +265,12 @@ pub struct PromptRequest {
     #[serde(rename = "sessionId")]
     pub session_id: SessionId,
     pub prompt: Vec<ContentBlock>,
-    /// Which mode to run this turn in -- `normal` (the default when absent)
-    /// or `plan` (read-only: research and propose a plan, nothing changes on
-    /// disk until the plan is approved). Mirrors the CLI's `Mode`; boxcode-ide
-    /// sets it from the chat mode the user picked.
+    /// Which mode to run this turn in -- `normal` (the default when absent),
+    /// `plan` (read-only: research and propose a plan, nothing changes on
+    /// disk until the plan is approved), or `edit` (file-scoped propose-only:
+    /// `write_file`/`edit_file` come back as reviewable diffs and write nothing).
+    /// Mirrors the CLI's `Mode`; boxcode-ide sets it from the chat mode the user
+    /// picked (`edit` for the Ctrl+I inline chat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<crate::tools::Mode>,
 }
