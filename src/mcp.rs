@@ -162,6 +162,25 @@ pub fn tool_id(server: &str, tool: &str) -> String {
 	)
 }
 
+/// The inverse of [`tool_id`]: `"mcp__github__create_issue"` -> server
+/// `"github"`, tool `"create_issue"`.
+///
+/// Splitting on the *first* `__` after the prefix is unambiguous because
+/// `server_id_fragment` maps every `_` to `-`, so a server fragment can never
+/// contain the separator. Two server names that would collapse onto the same
+/// fragment are rejected when the config is parsed, so a name that reaches here
+/// has a well-defined origin.
+///
+/// A tool name may itself contain `__`, which is why only the first one splits.
+pub fn parse_tool_id(id: &str) -> Option<(&str, &str)> {
+	let rest = id.strip_prefix(TOOL_PREFIX)?.strip_prefix("__")?;
+	let (server, tool) = rest.split_once("__")?;
+	if server.is_empty() || tool.is_empty() {
+		return None;
+	}
+	Some((server, tool))
+}
+
 /// Parse the `mcpServers` array as it arrives from the editor.
 ///
 /// The ACP schema makes `type` optional and defaults to stdio, and accepts
@@ -501,6 +520,18 @@ struct ConnectedServer {
 }
 
 impl McpRegistry {
+	/// The client for the server a tool id names.
+	///
+	/// `None` when no connected server answers to that name, which is the
+	/// honest answer for an id naming a server this session never reached,
+	/// rather than an error the caller has to decode.
+	pub fn client_mut(&mut self, server: &str) -> Option<&mut McpClient> {
+		self.servers
+			.iter_mut()
+			.find(|s| s.name == server)
+			.map(|s| &mut s.client)
+	}
+
 	/// Connects every configured server and lists the tools it offers.
 	///
 	/// A server that cannot be reached is reported and skipped, never fatal: one
@@ -695,4 +726,101 @@ mod tests {
 		assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&"2026-07-28"));
 		assert!(!SUPPORTED_PROTOCOL_VERSIONS.is_empty());
 	}
+	fn fake_server_bin() -> std::path::PathBuf {
+		let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+		p.push("target");
+		p.push(if cfg!(debug_assertions) { "debug" } else { "release" });
+		p.push(if cfg!(windows) {
+			"mcp-fake-server.exe"
+		} else {
+			"mcp-fake-server"
+		});
+		p
+	}
+
+	fn stdio_config(name: &str, env: serde_json::Value) -> McpServerConfig {
+		let raw = serde_json::json!([{
+			"type": "stdio",
+			"name": name,
+			"command": fake_server_bin().to_string_lossy(),
+			"args": [],
+			"env": env,
+		}]);
+		let mut parsed = parse_server_configs(raw.as_array().expect("json array"))
+			.expect("fake server config should parse");
+		parsed.remove(0)
+	}
+
+	/// The gap this closes: until now nothing ever spoke to a server, so the
+	/// framing and handshake were compile-verified only.
+	#[tokio::test]
+	async fn connects_to_a_stdio_server_and_lists_its_tools() {
+		let bin = fake_server_bin();
+		assert!(bin.exists(), "cargo test builds bins first; missing {}", bin.display());
+
+		let (registry, problems) = McpRegistry::connect_all(&[stdio_config("fake", serde_json::json!({}))]).await;
+
+		assert!(problems.is_empty(), "unexpected connect problems: {problems:?}");
+		let names: Vec<&str> = registry.server_names().collect();
+		assert!(names.contains(&"fake"), "server not registered: {names:?}");
+		assert_eq!(registry.tool_count(), 2, "the fake advertises echo,add");
+		let described = format!("{:?}", registry.descriptors().collect::<Vec<_>>());
+		assert!(described.contains("echo"), "tool list did not reach the client: {described}");
+		assert!(described.contains("add"), "tool list did not reach the client: {described}");
+	}
+
+	/// A server that fails to handshake is reported and skipped, never fatal.
+	#[tokio::test]
+	async fn a_server_that_fails_initialize_is_reported_not_fatal() {
+		let mut bad = stdio_config("broken", serde_json::json!({}));
+		match &mut bad {
+			McpServerConfig::Stdio { env, .. } => {
+				env.insert("MCP_FAKE_FAIL_INIT".to_string(), "1".to_string());
+			}
+			other => panic!("expected a stdio config, got {other:?}"),
+		}
+
+		let (registry, problems) = McpRegistry::connect_all(&[bad, stdio_config("good", serde_json::json!({}))]).await;
+
+		assert_eq!(problems.len(), 1, "the broken server must be reported: {problems:?}");
+		let names = format!("{:?}", registry.server_names().collect::<Vec<_>>());
+		assert!(names.contains("good"), "the healthy server must still connect: {names}");
+		assert!(!names.contains("broken"), "a failed server must not be registered: {names}");
+	}
+
+	/// The env/headers wire mismatch shipped once because nothing checked that
+	/// configured env actually reaches the child process. This does.
+	#[tokio::test]
+	async fn configured_env_reaches_the_child_process() {
+		let config = stdio_config(
+			"fake",
+			serde_json::json!({
+				"MCP_FAKE_ECHO_ENV": "PROBE_TOKEN",
+				"PROBE_TOKEN": "wire-works"
+			}),
+		);
+
+		let (registry, problems) = McpRegistry::connect_all(&[config]).await;
+
+		assert!(problems.is_empty(), "{problems:?}");
+		let described = format!("{:?}", registry.descriptors().collect::<Vec<_>>());
+		assert!(described.contains("wire-works"), "config env never reached the child: {described}");
+	}
+
+
+	#[test]
+	fn parse_tool_id_is_the_inverse_of_tool_id() {
+		for (server, tool) in [("github", "create_issue"), ("aws", "s3__get_object"), ("srv-with-dash", "a")] {
+			let id = tool_id(server, tool);
+			assert_eq!(parse_tool_id(&id), Some((server, tool)), "round trip for {id}");
+		}
+	}
+
+	#[test]
+	fn parse_tool_id_rejects_names_that_are_not_mcp_tools() {
+		for id in ["", "mcp", "mcp_github_create_issue", "mcp__", "mcp__github__", "github__create_issue", "read_file"] {
+			assert_eq!(parse_tool_id(id), None, "{id} should not parse");
+		}
+	}
+
 }

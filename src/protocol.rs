@@ -888,6 +888,9 @@ fn tool_kind_for(action: &Action) -> ToolKind {
         | Action::Publish { .. }
         | Action::CheckInBrowser { .. }
         | Action::InteractInBrowser { .. } => ToolKind::Fetch,
+        // A call out to a server, so it reads the same way as the other
+        // network actions rather than looking like a local edit.
+        Action::Mcp { .. } => ToolKind::Fetch,
         Action::Plan(_) | Action::Progress { .. } | Action::Todos(_) => ToolKind::SwitchMode,
     }
 }

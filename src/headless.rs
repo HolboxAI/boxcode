@@ -852,6 +852,44 @@ impl HeadlessSession {
                     .interact_browser(call, url, interaction, updates, browser_interact)
                     .await;
             }
+            // An MCP call is executed by the server it names, not by this
+            // process, so it is dispatched here rather than falling through
+            // to `tools::execute` -- the same reason `InteractInBrowser` is
+            // intercepted just above.
+            //
+            // Reaching this point already means `verdict_for` classified the
+            // call as `Dangerous` and the user allowed it. Nothing below
+            // re-checks that, and no call runs that was not approved.
+            if let Action::Mcp { server, tool, arguments } = action {
+                let (result, ok) = match self.mcp.client_mut(server) {
+                    None => (
+                        format!(
+                            "No MCP server named `{server}` is connected, so `{tool}` was not run."
+                        ),
+                        false,
+                    ),
+                    Some(client) => match client.call_tool(tool, arguments.clone()).await {
+                        Ok(text) => (text, true),
+                        Err(err) => {
+                            (format!("{server} could not run `{tool}`: {err}"), false)
+                        }
+                    },
+                };
+                let _ = updates
+                    .send(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                        tool_call_id: ToolCallId(call.id.clone()),
+                        title: Some(format!("mcp: {server} / {tool}")),
+                        kind: None,
+                        status: Some(if ok {
+                            ToolCallStatus::Completed
+                        } else {
+                            ToolCallStatus::Failed
+                        }),
+                        content: Some(ToolCallContent::Text { text: result.clone() }),
+                    }))
+                    .await;
+                return (result, Vec::new());
+            }
             let mut outcome = tools::execute(call, &self.workspace, &self.config.tools).await;
             if let Some(record) = outcome.rollback.take() {
                 self.rollback.record_turn(record, self.turn);

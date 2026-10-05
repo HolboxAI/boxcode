@@ -1617,6 +1617,33 @@ fn tool_approval_parts(
     // model goes on without that one thing. Declining a plan skips nothing;
     // it sends the whole proposal back, so it says so.
     let (title, verb, deny) = match action {
+        Action::Mcp { server, tool, arguments } => {
+            for wrapped in wrap(&format!("{server} · {tool}"), inner) {
+                lines.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(theme::p().text).add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            // The one thing the user cannot work out for themselves: this is not
+            // a boxcode tool with known behaviour.
+            for wrapped in wrap(
+                "Runs a tool on a configured MCP server. Boxcode cannot tell what it \
+                 does -- the server decides, and the server supplies its own \
+                 description. Treat it as running someone else's code with your \
+                 credentials.",
+                inner,
+            ) {
+                lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+            }
+            if !arguments.is_null() {
+                lines.push(Line::from(""));
+                for wrapped in wrap(&format!("arguments: {arguments}"), inner) {
+                    lines.push(Line::from(Span::styled(wrapped, theme::faint())));
+                }
+            }
+            (" Run this MCP tool? ", "run", "skip")
+        }
         Action::Publish { path } => {
             for wrapped in wrap(path, inner) {
                 lines.push(Line::from(Span::styled(

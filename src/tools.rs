@@ -2264,6 +2264,24 @@ pub enum Action {
     /// -- so unlike `CheckInBrowser` it is `Risk::Dangerous` (always asks,
     /// see `action_risk`) and blocked in plan mode (see `plan_mode_block`).
     InteractInBrowser { url: String, interaction: BrowserInteraction },
+    /// A tool on a configured MCP server, named `mcp__<server>__<tool>`.
+    ///
+    /// This variant exists to make MCP calls *approvable*. Without it the name is
+    /// unknown to `describe_action`, and the approval layer treats an unknown
+    /// action as `Risk::Normal` with `needs_approval = false` -- harmless only
+    /// because the runner rejects unknown names outright. A variant the runner
+    /// *can* execute without a matching arm here would be approved and then run,
+    /// so the classifier arms below are as load-bearing as the dispatch itself.
+    ///
+    /// There is deliberately no read-only path: what an arbitrary server's tool
+    /// does is not knowable from its name, and a read-only hint would be supplied
+    /// by the server, so it cannot be trusted to grant lasting access.
+    Mcp {
+        server: String,
+        tool: String,
+        /// Carried through verbatim so the runner need not re-parse it.
+        arguments: serde_json::Value,
+    },
 }
 
 /// One replacement within an `Action::Edit` -- what `edit_file` shows the
@@ -2341,6 +2359,9 @@ impl Action {
             Action::InteractInBrowser { url, interaction } => {
                 format!("interact in browser — {url} ({})", interaction.describe())
             }
+            // Named, not summarised: the approval prompt is the only place the
+            // user sees which server and tool is about to run.
+            Action::Mcp { server, tool, .. } => format!("mcp → {server}: {tool}"),
         }
     }
 }
@@ -2388,6 +2409,14 @@ pub fn action_risk(action: &Action, workspace_root: &Path) -> danger::Risk {
              actually do until after it happens"
                 .to_string(),
         ),
+        // MCP tools always ask, and this arm must never be removed: without it
+        // the catch-all below classifies them as `Normal`, which auto-approves.
+        // What the tool does is decided by the server, so there is nothing here
+        // to reason about -- only the name of what will run.
+        Action::Mcp { server, tool, .. } => danger::Risk::Dangerous(format!(
+            "calls {tool} on the MCP server {server} -- boxcode cannot tell what a \
+             server's tool does, and the server supplies its own description"
+        )),
         // Reads and writes are already confined to the workspace by
         // `resolve_in_workspace`, and cannot invoke a shell.
         _ => danger::Risk::Normal,
@@ -2493,6 +2522,13 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
             "Plan mode is read-only, so nothing was clicked or typed in {url}. Describe the \
              interaction in your plan, then call {EXIT_PLAN_MODE}."
         )),
+        // Blocked, not merely denied: plan mode explores without asking, and what
+        // an MCP tool does is not knowable from its name, so there is no safe
+        // subset to allow.
+        Action::Mcp { server, tool, .. } => Some(format!(
+            "MCP tool {server}:{tool} is not available while planning — boxcode \
+             cannot tell what a server's tool does, and plan mode does not ask."
+        )),
     }
 }
 
@@ -2501,6 +2537,16 @@ pub fn plan_mode_block(action: &Action) -> Option<String> {
 /// arguments), in which case there is nothing to approve -- the runner
 /// reports the malformed arguments back to the model instead.
 pub fn describe_action(call: &ToolCall) -> Option<Action> {
+    // Checked before the name match: MCP tool names are dynamic and cannot be
+    // listed as constants.
+    if let Some((server, tool)) = crate::mcp::parse_tool_id(&call.function.name) {
+        return Some(Action::Mcp {
+            server: server.to_string(),
+            tool: tool.to_string(),
+            arguments: serde_json::from_str(&call.function.arguments)
+                .unwrap_or(serde_json::Value::Null),
+        });
+    }
     match call.function.name.as_str() {
         RUN_COMMAND => {
             let args: RunArgs = serde_json::from_str(&call.function.arguments).ok()?;
@@ -9232,4 +9278,93 @@ mod tests {
             out.content
         );
     }
+
+	// --- MCP approval invariants ------------------------------------------
+	//
+	// These pin the property the MCP dispatch path depends on. MCP tool names
+	// are dynamic, so `describe_action` cannot list them as constants, and a
+	// name it does not recognise is classified `Risk::Normal` with
+	// `needs_approval = false` -- i.e. auto-approved. That is only harmless
+	// because the runner rejects unknown names outright, so these tests fail if
+	// MCP ever stops asking *before* it can start executing.
+
+	#[test]
+	fn an_mcp_tool_name_is_recognised_as_an_action() {
+		let call = tool_call("mcp__github__create_issue", serde_json::json!({"title": "x"}));
+		match describe_action(&call) {
+			Some(Action::Mcp { server, tool, arguments }) => {
+				assert_eq!(server, "github");
+				assert_eq!(tool, "create_issue");
+				assert_eq!(arguments["title"], "x");
+			}
+			other => panic!("expected Action::Mcp, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn an_mcp_tool_asks_even_in_always_mode() {
+		// `is_read_only_action` exists twice (tools.rs and approval.rs), both with
+		// a `_ => false` catch-all. This fails if either grows an MCP arm
+		// returning true.
+		let call = tool_call("mcp__github__get_me", serde_json::json!({}));
+		let verdict = crate::approval::verdict_for(
+			&call, Path::new("."), Mode::Normal, crate::config::ApprovalMode::Always,
+		);
+		assert!(matches!(verdict, crate::approval::Verdict::Ask(_)), "an MCP tool must ask, got {verdict:?}");
+	}
+
+	#[test]
+	fn an_mcp_tool_asks_even_with_approval_switched_off() {
+		// Reads are auto-approved in the default mode. MCP must not inherit that:
+		// the risk is dangerous, which short-circuits every approval mode.
+		let call = tool_call("mcp__aws__terminate_instance", serde_json::json!({}));
+		let verdict = crate::approval::verdict_for(
+			&call, Path::new("."), Mode::Normal, crate::config::ApprovalMode::Destructive,
+		);
+		assert!(matches!(verdict, crate::approval::Verdict::Ask(_)), "an MCP tool must not be auto-approved, got {verdict:?}");
+	}
+
+	#[test]
+	fn an_mcp_tool_is_refused_in_plan_mode() {
+		let call = tool_call("mcp__github__create_issue", serde_json::json!({}));
+		let verdict = crate::approval::verdict_for(
+			&call, Path::new("."), Mode::Plan, crate::config::ApprovalMode::Destructive,
+		);
+		assert!(matches!(verdict, crate::approval::Verdict::PlanRefused(_)), "got {verdict:?}");
+	}
+
+	#[test]
+	fn an_mcp_tool_is_dangerous_not_merely_normal() {
+		// The `action_risk` catch-all returns `Risk::Normal`, which auto-approves.
+		// This is the direct test that MCP never falls through to it.
+		let action = Action::Mcp {
+			server: "github".to_string(),
+			tool: "create_issue".to_string(),
+			arguments: serde_json::Value::Null,
+		};
+		assert!(action_risk(&action, Path::new(".")).is_dangerous());
+	}
+
+	#[test]
+	fn an_mcp_tool_splits_at_the_first_separator() {
+		// A tool name may contain `__`; a server fragment cannot, because
+		// `server_id_fragment` maps `_` to `-`.
+		let call = tool_call("mcp__srv__a__b", serde_json::json!({}));
+		match describe_action(&call) {
+			Some(Action::Mcp { server, tool, .. }) => {
+				assert_eq!(server, "srv");
+				assert_eq!(tool, "a__b");
+			}
+			other => panic!("expected Action::Mcp, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn a_lookalike_name_is_not_treated_as_mcp() {
+		for name in ["mcp", "mcp_srv_tool", "mcp__", "mcp__srv__", "x__y__z", "read_file"] {
+			let call = tool_call(name, serde_json::json!({}));
+			assert!(!matches!(describe_action(&call), Some(Action::Mcp { .. })), "{name} must not parse as an MCP tool");
+		}
+	}
+
 }

@@ -383,16 +383,16 @@ impl Router {
                 );
                 self.sessions.insert(session_id.clone(), handle);
 
-                // Not yet connected: the validated configs are carried no
-                // further than this point, so no server is spawned and no MCP
-                // tool reaches the model. Retention and dispatch are the next
-                // step, which needs a registry shared with the session actor.
+                // Configs are validated here; the handshake itself happens in
+                // SessionActor::spawn, which calls session.connect_mcp() off the
+                // request path. That is deliberate: connecting takes seconds, so
+                // session/new must reply before the servers are up.
                 if !mcp_configs.is_empty() {
                     tracing::info!(
                         target: "mcp",
                         session = %session_id.0,
                         count = mcp_configs.len(),
-                        "validated mcp servers; connection not implemented yet"
+                        "mcp servers validated; connecting off the request path"
                     );
                 }
 
