@@ -520,6 +520,18 @@ struct ConnectedServer {
 }
 
 impl McpRegistry {
+	/// The client for the server a tool id names.
+	///
+	/// `None` when no connected server answers to that name, which is the
+	/// honest answer for an id naming a server this session never reached,
+	/// rather than an error the caller has to decode.
+	pub fn client_mut(&mut self, server: &str) -> Option<&mut McpClient> {
+		self.servers
+			.iter_mut()
+			.find(|s| s.name == server)
+			.map(|s| &mut s.client)
+	}
+
 	/// Connects every configured server and lists the tools it offers.
 	///
 	/// A server that cannot be reached is reported and skipped, never fatal: one
