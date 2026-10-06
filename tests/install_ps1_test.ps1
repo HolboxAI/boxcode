@@ -63,6 +63,23 @@ Test-Arch -Architecture '' -Architew6432 $null -Expected 'unsupported' -Descript
 if ($null -ne $savedArchitecture) { $env:PROCESSOR_ARCHITECTURE = $savedArchitecture } else { Remove-Item Env:\PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue }
 if ($null -ne $savedArchitew6432) { $env:PROCESSOR_ARCHITEW6432 = $savedArchitew6432 } else { Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue }
 
+# --- Get-WindowsAssetCandidates ------------------------------------------------
+# ARM64 must fall back to the published x86_64 asset; without that,
+# --upgrade on WoA machines fails every release even when a Windows binary
+# exists.
+$x64Candidates = @(Get-WindowsAssetCandidates -Arch 'x86_64')
+if ($x64Candidates.Count -eq 1 -and $x64Candidates[0] -eq 'boxcode-windows-x86_64.exe') {
+    Test-Pass 'Get-WindowsAssetCandidates: x86_64 asks only for the native asset'
+} else {
+    Test-Fail "Get-WindowsAssetCandidates(x86_64) returned: $($x64Candidates -join ', ')"
+}
+$armCandidates = @(Get-WindowsAssetCandidates -Arch 'arm64')
+if ($armCandidates.Count -eq 2 -and $armCandidates[0] -eq 'boxcode-windows-arm64.exe' -and $armCandidates[1] -eq 'boxcode-windows-x86_64.exe') {
+    Test-Pass 'Get-WindowsAssetCandidates: arm64 falls back to x86_64'
+} else {
+    Test-Fail "Get-WindowsAssetCandidates(arm64) returned: $($armCandidates -join ', ')"
+}
+
 # --- Get-AssetDownloadUrl ------------------------------------------------------
 # Pure and fixture-driven, like asset_download_url's own bash tests -- no
 # network needed to prove the lookup logic itself is right.

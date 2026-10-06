@@ -30,9 +30,24 @@ function Get-ReleaseApiBase {
     return 'https://api.github.com/repos/HolboxAI/boxcode'
 }
 
-# Only `x86_64` is actually built by release.yml today; this still reports
-# `arm64` distinctly (rather than folding it into "unsupported") so the
-# no-prebuilt-binary error message can say which architecture it looked for.
+# Ordered list of release asset names to try for this architecture. Native
+# first; on Windows ARM64, the published x86_64 build is a working second
+# choice because WoA emulates it. Without that fallback, `boxcode --upgrade`
+# on Snapdragon/Copilot+ PCs fails every release with "no prebuilt binary
+# for windows-arm64" even though a Windows x86_64 binary shipped.
+function Get-WindowsAssetCandidates {
+    param([Parameter(Mandatory)] [string] $Arch)
+    $names = @("boxcode-windows-$Arch.exe")
+    if ($Arch -eq 'arm64') {
+        $names += 'boxcode-windows-x86_64.exe'
+    }
+    return ,$names
+}
+
+# Only `x86_64` is actually built by release.yml today. `Get-Arch` still
+# reports `arm64` distinctly so logs/errors can name the real machine, and
+# `Main` falls back to the x86_64 asset on ARM64 Windows (Prism/WoA runs
+# those under emulation) rather than failing with "no prebuilt binary".
 function Get-Arch {
     # Deliberately not [System.Runtime.InteropServices.RuntimeInformation]::
     # OSArchitecture -- confirmed on a real Windows machine (Windows
@@ -337,20 +352,32 @@ function Main {
     Write-Host ''
 
     $arch = Get-Arch
-    $assetName = "boxcode-windows-$arch.exe"
+    $candidates = @(Get-WindowsAssetCandidates -Arch $arch)
     $installDir = Join-Path $env:LOCALAPPDATA 'Programs\boxcode'
     $installedAt = Join-Path $installDir 'boxcode.exe'
 
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
     $tempDest = Join-Path $installDir 'boxcode.exe.new'
 
-    Write-Host "Looking for a prebuilt $arch binary..."
-    try {
-        Get-PrebuiltBinary -AssetName $assetName -Dest $tempDest
-    } catch {
-        Remove-Item -Force $tempDest -ErrorAction SilentlyContinue
+    Write-Host "Looking for a prebuilt Windows binary ($arch)..."
+    $downloaded = $false
+    $lastError = $null
+    foreach ($assetName in $candidates) {
+        try {
+            if ($assetName -ne "boxcode-windows-$arch.exe") {
+                Write-Host "  No native $arch build yet; trying $assetName (runs under Windows on ARM emulation)..."
+            }
+            Get-PrebuiltBinary -AssetName $assetName -Dest $tempDest
+            $downloaded = $true
+            break
+        } catch {
+            $lastError = $_.Exception.Message
+            Remove-Item -Force $tempDest -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not $downloaded) {
         Write-Host ''
-        Write-Host "No prebuilt binary is available for windows-$arch right now ($($_.Exception.Message))."
+        Write-Host "No prebuilt binary is available for windows-$arch right now ($lastError)."
         Write-Host ''
         Write-Host 'There is no automatic source-build fallback on Windows (it needs the MSVC'
         Write-Host 'Build Tools, which this installer will not set up unasked). Options:'
