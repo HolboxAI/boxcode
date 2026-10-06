@@ -175,7 +175,6 @@ pub async fn login() -> Result<(), Box<dyn std::error::Error>> {
     println!("boxcode login");
     println!();
     println!("  Opening the browser to authorize this device…");
-    println!("  {verify}");
     println!();
     println!("Sign in with Google if asked, then click Authorize.");
     println!("Return here when the browser says you're connected.");
