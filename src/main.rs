@@ -109,7 +109,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("✗ Login failed: {e}");
             std::process::exit(1);
         }
-        return Ok(());
+        // Fall through into the TUI — signing in and then having to type
+        // `boxcode` again is the flow users bounce off.
+        println!();
+        println!("Starting boxcode…");
+        println!();
     }
     if do_logout {
         if let Err(e) = login::logout().await {
@@ -738,6 +742,21 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
+        // `/login` needs the real terminal the same way a vendor CLI login
+        // does: print progress, open the browser, poll until Authorize.
+        if app.login_request {
+            app.login_request = false;
+            restore_terminal(enhanced, alternate_screen)?;
+            println!();
+            let result = match login::login().await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            };
+            setup_terminal()?;
+            terminal.clear()?;
+            app.finish_login(result);
+        }
+
         // The only place `finish_stream`/`fail_stream`/`cancel`'s queued
         // usage actually reaches disk -- see `App::pending_usage`'s doc
         // comment on why `app.rs` itself never writes this directly. Catches
@@ -923,9 +942,9 @@ FLAGS:
 
 
 COMMANDS:
-    login            Sign in with Google in the browser. Writes
-                       llm.boxcode.sh credentials to ~/.boxcode/config.toml —
-                       the IDE reads the same file.
+    login            Sign in with Google in the browser, then open the TUI.
+                       Writes llm.boxcode.sh credentials to ~/.boxcode/config.toml
+                       — the IDE reads the same file.
     logout           Clear the local account session (and promo proxy key if
                        pointed at llm.boxcode.sh).
 
@@ -961,7 +980,8 @@ UPGRADE:
                           check_on_start = false in the [update] table.
 
 COMMANDS (type in the input box, press Enter):
-    /login                Show whether this machine is linked to boxcode.sh
+    /login                Sign in with Google in the browser (or show status
+                            if this machine is already linked)
     /logout               Clear the local boxcode.sh session and promo key
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider

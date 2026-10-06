@@ -218,7 +218,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/plan", "research first, change nothing until you approve"),
     ("/provider", "switch provider or endpoint"),
     ("/model", "switch model"),
-    ("/login", "show boxcode.sh sign-in status (run boxcode login to link)"),
+    ("/login", "sign in with Google in the browser, or show status if linked"),
     ("/logout", "clear the local boxcode.sh session and promo key"),
     ("/init", "write a BOXCODE.md the model reads every session"),
     ("/resume", "pick up this directory's last session"),
@@ -694,6 +694,11 @@ pub struct App {
     /// Drained by `main.rs` exactly like `plan_dirty` and for the same reason:
     /// `App` does no I/O, so its tests never touch a real disk.
     pub rollback_request: Option<Vec<crate::rollback::Step>>,
+    /// `/login` asked for the browser device flow. The event loop tears the
+    /// TUI down, runs `login::login`, then rebuilds — same shape as
+    /// `DeployAction::RunInteractive`, because two things cannot own one
+    /// terminal.
+    pub login_request: bool,
 }
 
 impl App {
@@ -762,6 +767,7 @@ impl App {
             deploy_tool_call: None,
             rollback: crate::rollback::Journal::default(),
             rollback_request: None,
+            login_request: false,
         }
     }
 
@@ -844,7 +850,7 @@ impl App {
             "/plan" => self.toggle_plan_mode(),
             "/provider" => self.open_provider_picker(),
             "/model" => self.open_model_picker_from_config(),
-            "/login" => self.show_login_status(),
+            "/login" => self.start_login(),
             "/logout" => self.run_logout(),
             "/init" => self.start_init(),
             "/resume" => self.resume_latest(),
@@ -861,14 +867,50 @@ impl App {
         }
     }
 
-    /// `/login` — show whether this machine is linked to boxcode.sh. The
-    /// browser device flow needs a free terminal, so linking happens via
-    /// `boxcode login` outside the TUI.
-    fn show_login_status(&mut self) {
+    /// `/login` — if already linked, show status. Otherwise ask the event
+    /// loop to hand the terminal to the browser device flow (same pattern as
+    /// a deploy vendor login): `/login` used to only print "exit and run
+    /// `boxcode login`", which felt broken from inside the TUI.
+    fn start_login(&mut self) {
         self.follow_tail = true;
+        if self.is_busy() {
+            self.messages.push(Message::new(
+                Role::System,
+                "Wait for the current turn to finish, then run /login.",
+            ));
+            return;
+        }
         let status = crate::login::LoginStatus::load(&self.config);
-        self.messages
-            .push(Message::new(Role::System, status.readout()));
+        if status.is_signed_in() {
+            self.messages
+                .push(Message::new(Role::System, status.readout()));
+            return;
+        }
+        self.messages.push(Message::new(
+            Role::System,
+            "Handing the terminal to the browser for boxcode.sh sign-in…",
+        ));
+        self.login_request = true;
+    }
+
+    /// After the event loop finishes `login::login`, reload credentials and
+    /// show the linked-account readout (or the error).
+    pub fn finish_login(&mut self, result: Result<(), String>) {
+        self.follow_tail = true;
+        match result {
+            Ok(()) => {
+                if let Ok(cfg) = crate::config::Config::load() {
+                    self.config = cfg;
+                }
+                let status = crate::login::LoginStatus::load(&self.config);
+                self.messages
+                    .push(Message::new(Role::System, status.readout()));
+            }
+            Err(e) => {
+                self.messages
+                    .push(Message::new(Role::Error, format!("Login failed: {e}")));
+            }
+        }
     }
 
     /// `/logout` — clear the device session and promo key locally.
@@ -4869,6 +4911,36 @@ mod tests {
         assert_eq!(a.selected_command(), Some("/rollback"));
         a.handle_key(key(KeyCode::Enter));
         assert!(a.input_buffer.is_empty(), "the command ran");
+    }
+
+    /// `/login` must queue the browser flow for the event loop when this
+    /// machine is not linked — not dump "exit and run boxcode login".
+    #[test]
+    fn login_queues_the_browser_flow_when_unsigned() {
+        let mut a = app();
+        assert!(COMMANDS.iter().any(|(name, _)| *name == "/login"));
+        assert!(!a.login_request);
+        a.run_command("/login");
+        assert!(a.login_request, "/login should hand off to main");
+        assert!(
+            a.messages
+                .iter()
+                .any(|m| m.role == Role::System && m.content.contains("browser")),
+            "should tell the user the terminal is being handed over"
+        );
+    }
+
+    /// A failed device login surfaces as an Error message, not a silent stall.
+    #[test]
+    fn finish_login_reports_failure() {
+        let mut a = app();
+        a.finish_login(Err("device code expired".into()));
+        let err = a
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Error)
+            .expect("an error");
+        assert!(err.content.contains("device code expired"));
     }
 
     // ---- /diff -------------------------------------------------------

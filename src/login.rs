@@ -68,9 +68,15 @@ impl LoginStatus {
         }
     }
 
+    /// True when this machine has a promo key on llm.boxcode.sh and a device
+    /// session token — the state `/login` treats as "already linked".
+    pub fn is_signed_in(&self) -> bool {
+        self.has_session_token && self.via_boxcode_proxy && !self.key_prefix.is_empty()
+    }
+
     /// Human-readable status for `/login` in the TUI.
     pub fn readout(&self) -> String {
-        if self.has_session_token && self.via_boxcode_proxy && !self.key_prefix.is_empty() {
+        if self.is_signed_in() {
             let who = self.email.as_deref().unwrap_or("(email on next login)");
             format!(
                 "Signed in via boxcode.sh\n\n\
@@ -80,8 +86,7 @@ impl LoginStatus {
                  Key:      {}\n\n\
                  Session:  ~/.boxcode/account.token\n\
                  Proof:    heartbeat hits https://boxcode.sh/api/heartbeat\n\n\
-                 To link another machine: exit (^c) then run `boxcode login`\n\
-                 and Authorize in the browser.",
+                 To re-link: /logout, then /login (or exit and run `boxcode login`).",
                 self.endpoint, self.model, self.key_prefix
             )
         } else if self.via_boxcode_proxy && !self.key_prefix.is_empty() {
@@ -89,18 +94,14 @@ impl LoginStatus {
                 "Using llm.boxcode.sh, but no device session yet.\n\n\
                  Endpoint: {}\n\
                  Key:      {}\n\n\
-                 Exit (^c) and run:\n\
-                   boxcode login\n\n\
-                 That signs in with Google on boxcode.sh and links this machine.",
+                 Run /login to finish linking this machine in the browser.",
                 self.endpoint, self.key_prefix
             )
         } else {
             "Not signed in via boxcode.sh.\n\n\
-             Exit (^c) and run:\n\
-               boxcode login\n\n\
-             Browser opens https://boxcode.sh — Google sign-in, then this CLI\n\
-             receives your promo key. Same file the IDE reads:\n\
-               ~/.boxcode/config.toml"
+             Run /login — the browser opens https://boxcode.sh for Google\n\
+             sign-in, then this session receives your promo key.\n\
+             Same file the IDE reads: ~/.boxcode/config.toml"
                 .to_string()
         }
     }
