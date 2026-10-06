@@ -80,6 +80,50 @@ if ($armCandidates.Count -eq 2 -and $armCandidates[0] -eq 'boxcode-windows-arm64
     Test-Fail "Get-WindowsAssetCandidates(arm64) returned: $($armCandidates -join ', ')"
 }
 
+# --- Install-BoxcodeBinary -----------------------------------------------------
+# Replacing an existing destination must succeed (rename-aside), which is the
+# path `boxcode --upgrade` takes while the old exe is still on disk.
+$replaceDir = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-replace-$PID"
+Remove-Item -Recurse -Force $replaceDir -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $replaceDir | Out-Null
+$replaceDest = Join-Path $replaceDir 'boxcode.exe'
+$replaceSrc = Join-Path $replaceDir 'boxcode-new.exe'
+Set-Content -LiteralPath $replaceDest -Value 'old-binary' -NoNewline
+Set-Content -LiteralPath $replaceSrc -Value 'new-binary' -NoNewline
+try {
+    Install-BoxcodeBinary -Source $replaceSrc -Destination $replaceDest
+    $got = Get-Content -LiteralPath $replaceDest -Raw
+    if ($got -eq 'new-binary' -and -not (Test-Path -LiteralPath $replaceSrc)) {
+        Test-Pass 'Install-BoxcodeBinary replaces an existing destination'
+    } else {
+        Test-Fail "Install-BoxcodeBinary replace failed (content='$got', srcStillThere=$(Test-Path -LiteralPath $replaceSrc))"
+    }
+} catch {
+    Test-Fail "Install-BoxcodeBinary threw: $($_.Exception.Message)"
+} finally {
+    Remove-Item -Recurse -Force $replaceDir -ErrorAction SilentlyContinue
+}
+
+# Fresh install (no destination yet) must also work.
+$freshDir = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-fresh-$PID"
+Remove-Item -Recurse -Force $freshDir -ErrorAction SilentlyContinue
+$freshDest = Join-Path $freshDir 'boxcode.exe'
+$freshSrc = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-fresh-src-$PID.exe"
+Set-Content -LiteralPath $freshSrc -Value 'fresh-binary' -NoNewline
+try {
+    Install-BoxcodeBinary -Source $freshSrc -Destination $freshDest
+    if ((Get-Content -LiteralPath $freshDest -Raw) -eq 'fresh-binary') {
+        Test-Pass 'Install-BoxcodeBinary installs when the destination is missing'
+    } else {
+        Test-Fail 'Install-BoxcodeBinary fresh install wrote the wrong content'
+    }
+} catch {
+    Test-Fail "Install-BoxcodeBinary fresh threw: $($_.Exception.Message)"
+} finally {
+    Remove-Item -Recurse -Force $freshDir -ErrorAction SilentlyContinue
+    Remove-Item -Force $freshSrc -ErrorAction SilentlyContinue
+}
+
 # --- Get-AssetDownloadUrl ------------------------------------------------------
 # Pure and fixture-driven, like asset_download_url's own bash tests -- no
 # network needed to prove the lookup logic itself is right.

@@ -47,6 +47,43 @@ function Get-WindowsAssetCandidates {
     }
 }
 
+# Place a freshly downloaded binary at the install path, replacing any
+# previous one. See the call site in Main for why a plain Move-Item -Force
+# onto a running boxcode.exe fails on Windows.
+function Install-BoxcodeBinary {
+    param(
+        [Parameter(Mandatory)] [string] $Source,
+        [Parameter(Mandatory)] [string] $Destination
+    )
+    if (-not (Test-Path -LiteralPath $Source)) {
+        throw "download missing at $Source"
+    }
+    $destDir = Split-Path -Parent $Destination
+    if ($destDir) {
+        New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+    }
+
+    if (Test-Path -LiteralPath $Destination) {
+        $aside = "$Destination.old"
+        if (Test-Path -LiteralPath $aside) {
+            Remove-Item -LiteralPath $aside -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $aside) {
+            $aside = "$Destination.old-$PID-$(Get-Random)"
+        }
+        Move-Item -LiteralPath $Destination -Destination $aside -Force
+        try {
+            Move-Item -LiteralPath $Source -Destination $Destination -Force
+        } catch {
+            Move-Item -LiteralPath $aside -Destination $Destination -Force -ErrorAction SilentlyContinue
+            throw
+        }
+        Remove-Item -LiteralPath $aside -Force -ErrorAction SilentlyContinue
+    } else {
+        Move-Item -LiteralPath $Source -Destination $Destination -Force
+    }
+}
+
 # Only `x86_64` is actually built by release.yml today. `Get-Arch` still
 # reports `arm64` distinctly so logs/errors can name the real machine, and
 # `Main` falls back to the x86_64 asset on ARM64 Windows (Prism/WoA runs
@@ -399,12 +436,13 @@ function Main {
         throw 'no prebuilt binary available'
     }
 
-    # Move-Item -Force replaces the destination even while boxcode.exe
-    # (the very binary being replaced, under --upgrade) is running -- Windows
-    # allows renaming an in-use executable's directory entry even though it
-    # blocks overwriting its content directly, the same reason install.sh's
-    # install_binary renames into place rather than writing over the target.
-    Move-Item -Force -Path $tempDest -Destination $installedAt
+    # Never Move-Item -Force straight onto a live boxcode.exe. PowerShell's
+    # Move-Item refuses that with "Cannot create a file when that file already
+    # exists" when the destination is the running upgrade process (startup
+    # prompt / `boxcode --upgrade`). Windows *does* allow renaming a running
+    # image aside, then moving the new file into the freed name — same idea as
+    # install.sh's rename-over-target for ETXTBSY.
+    Install-BoxcodeBinary -Source $tempDest -Destination $installedAt
     Write-Host "Installed to $installedAt"
 
     $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
