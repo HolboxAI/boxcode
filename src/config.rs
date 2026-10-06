@@ -230,6 +230,14 @@ pub struct LlmConfig {
     /// by leaving it unset and picking a provider with no opinion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// The model's context window, in tokens, reported to the IDE as
+    /// `usage_update.size` so the cost/usage meter can show occupancy ("N of M")
+    /// instead of a bare count. `0` means "not set" -- boxcode then falls back
+    /// to the provider's known window (see `effective_context_window`), and to
+    /// `0` (unknown) for a custom endpoint. A real window is never 0, so 0 is a
+    /// safe sentinel rather than a separate `Option`.
+    #[serde(default)]
+    pub context_window: u64,
 }
 
 impl LlmConfig {
@@ -239,6 +247,19 @@ impl LlmConfig {
     /// without a specific reason to disagree with the endpoint's own default.
     pub fn effective_temperature(&self) -> Option<f32> {
         self.temperature.or_else(|| crate::providers::default_temperature(&self.provider))
+    }
+
+    /// The context window to report as `usage_update.size`: the configured value
+    /// when set, else the provider's known default (see
+    /// `providers::default_context_window`), else `0` for a custom endpoint.
+    /// `0` means "unknown" and the client omits the "of M" half rather than
+    /// inventing a limit.
+    pub fn effective_context_window(&self) -> u64 {
+        if self.context_window > 0 {
+            self.context_window
+        } else {
+            crate::providers::default_context_window(&self.provider)
+        }
     }
 }
 
@@ -942,6 +963,7 @@ impl Default for LlmConfig {
             max_tokens: default_max_tokens(),
             provider: String::new(),
             temperature: None,
+            context_window: 0,
         }
     }
 }
@@ -1096,6 +1118,7 @@ mod tests {
                     max_tokens: 8192,
                     provider: "deepseek".to_string(),
                     temperature: Some(0.5),
+                    context_window: 131_072,
                 },
                 tools: ToolsConfig::default(),
             };
@@ -1107,6 +1130,7 @@ mod tests {
             assert_eq!(loaded.llm.api_key, "sk-test-key");
             assert_eq!(loaded.llm.provider, "deepseek");
             assert_eq!(loaded.llm.temperature, Some(0.5));
+            assert_eq!(loaded.llm.context_window, 131_072);
 
             for (k, v) in saved_env {
                 match v {
