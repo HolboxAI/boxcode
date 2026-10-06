@@ -231,6 +231,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/hosted", "projects this machine is hosting, and whether they are live"),
     ("/rollback", "undo every file the model wrote this session"),
     ("/diff", "show everything changed on disk this session"),
+    ("/exit", "leave boxcode"),
 ];
 
 /// Roughly how many characters one token is worth.
@@ -863,6 +864,7 @@ impl App {
             "/hosted" => self.start_hosted(),
             "/rollback" => self.start_rollback(),
             "/diff" => self.show_diff(),
+            "/exit" => self.exit_now(),
             other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
         }
     }
@@ -942,6 +944,12 @@ impl App {
             filter: String::new(),
             selected: 0,
         });
+    }
+
+    /// `/exit` — leave the TUI. Explicit typed command, so no second-press
+    /// confirm the way Ctrl-C needs (that one is a reflex; this is not).
+    fn exit_now(&mut self) {
+        self.should_exit = true;
     }
 
     /// Ctrl-C. Returns `true` when the app should actually quit.
@@ -5701,6 +5709,15 @@ mod tests {
         let mut a = app();
         a.request_quit();
         assert!(a.request_quit(), "the second press quits");
+        assert!(a.should_exit);
+    }
+
+    /// `/exit` is an explicit decision — quit on the first Enter, no arming.
+    #[test]
+    fn exit_command_quits_immediately() {
+        let mut a = app();
+        assert!(COMMANDS.iter().any(|(name, _)| *name == "/exit"));
+        a.run_command("/exit");
         assert!(a.should_exit);
     }
 
