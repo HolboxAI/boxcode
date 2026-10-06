@@ -1109,11 +1109,11 @@ impl HeadlessSession {
         }
     }
 
-    /// Fulfills an `interact_in_browser` call by asking the client to click
-    /// or type into the tab, then screenshot the result -- boxcode itself
-    /// has no browser tab, only the client does. Mirrors `check_browser`'s
-    /// own shape exactly (send an ask, await one reply on a fresh
-    /// `oneshot`) rather than duplicating the timeout/relay reasoning
+    /// Fulfills an `interact_in_browser` call by asking the client to click,
+    /// type, press a key, or navigate in the tab, then screenshot the result
+    /// -- boxcode itself has no browser tab, only the client does. Mirrors
+    /// `check_browser`'s own shape exactly (send an ask, await one reply on a
+    /// fresh `oneshot`) rather than duplicating the timeout/relay reasoning
     /// documented on that method -- read its doc comment for why the 90s
     /// bound exists, it applies here unchanged.
     async fn interact_browser(

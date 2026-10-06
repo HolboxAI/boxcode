@@ -1905,6 +1905,8 @@ fn tool_approval_parts(
             let verb = match interaction {
                 crate::tools::BrowserInteraction::Click { .. } => "click",
                 crate::tools::BrowserInteraction::Type { .. } => "type",
+                crate::tools::BrowserInteraction::Key { .. } => "press",
+                crate::tools::BrowserInteraction::Navigate { .. } => "navigate",
             };
             (" Interact in browser? ", verb, "skip")
         }
