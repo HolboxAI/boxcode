@@ -56,9 +56,11 @@ pub fn fire_request(
     // stops a runaway loop: the model has nothing left to call, so it
     // answers. Saying "stop" in the prompt alone would only be a request.
     let budget_left = app.tool_steps < app.config.tools.max_steps;
-    // Exact counts make the quota real; without them it falls back to the
-    // same character estimate `usage.rs` uses.
-    let include_usage = app.config.quota.enabled && app.config.quota.include_usage;
+    // Exact counts make quota and `/usage` real; without them they fall back
+    // to the same character estimate `usage.rs` uses. Deliberately not gated
+    // on `quota.enabled`: the same stream_options flag also feeds the always-
+    // visible cost/usage meter, which must stay truthful with quota off.
+    let include_usage = app.config.quota.include_usage;
     // A `/compact` request reads the conversation and writes a summary
     // of it; it has nothing to run. Withholding the schemas is what
     // makes that true rather than merely asked for -- and a tool call
@@ -429,7 +431,7 @@ pub async fn run_subagent(
                 model: &config.llm.model,
                 api_key: &config.llm.api_key,
                 max_tokens: config.llm.max_tokens,
-                include_usage: config.quota.enabled && config.quota.include_usage,
+                include_usage: config.quota.include_usage,
                 temperature: config.llm.effective_temperature(),
             },
             history.clone(),

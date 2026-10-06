@@ -944,16 +944,14 @@ impl From<&ToolOutcome> for ToolCallUpdate {
     }
 }
 
-impl From<ApiUsage> for SessionUpdate {
-    fn from(usage: ApiUsage) -> Self {
-        // ACP's usage_update models context-window occupancy (used/size),
-        // not cumulative billing -- a real impedance mismatch with
-        // ApiUsage's prompt/completion split, confirmed against the schema
-        // before writing this, not guessed. `used` is the closest available
-        // proxy (total tokens spent this turn); `size` has no source in
-        // ApiUsage at all -- boxcode doesn't track the model's context
-        // limit anywhere yet, so this is a real gap, not a rounding choice.
-        SessionUpdate::UsageUpdate { used: usage.total() as u64, size: 0 }
+impl ApiUsage {
+    /// Build the ACP `usage_update` this response becomes. `used` is prompt +
+    /// completion (cache hits are deliberately *not* added -- a cached token is
+    /// a discounted prompt token already inside `prompt_tokens`); `size` is the
+    /// model's context window, `0` when boxcode doesn't know it (the client
+    /// then omits the "of M" half rather than inventing a limit).
+    pub fn to_usage_update(&self, size: u64) -> SessionUpdate {
+        SessionUpdate::UsageUpdate { used: self.total() as u64, size }
     }
 }
 
@@ -1224,21 +1222,21 @@ mod tests {
     /// `usage_update` is the boxcode-ide cost meter's data feed, so its exact
     /// wire shape is a contract: `used` is prompt + completion (cache hits are
     /// deliberately *not* added -- a cached token is a discounted prompt token
-    /// already inside `prompt_tokens`), and `size` is still 0 because boxcode
-    /// does not track the model's context-window limit yet.
+    /// already inside `prompt_tokens`), and `size` is the model's context
+    /// window carried through verbatim.
     #[test]
-    fn an_api_usage_becomes_a_usage_update_with_used_as_total() {
+    fn an_api_usage_becomes_a_usage_update_with_used_as_total_and_size_preserved() {
         let usage = ApiUsage {
             prompt_tokens: 10,
             completion_tokens: 5,
             prompt_cache_hit_tokens: 7,
             prompt_tokens_details: Default::default(),
         };
-        let update: SessionUpdate = usage.into();
+        let update: SessionUpdate = usage.to_usage_update(131_072);
         let value = serde_json::to_value(&update).unwrap();
         assert_eq!(
             value,
-            json!({ "sessionUpdate": "usage_update", "used": 15, "size": 0 })
+            json!({ "sessionUpdate": "usage_update", "used": 15, "size": 131072 })
         );
     }
 

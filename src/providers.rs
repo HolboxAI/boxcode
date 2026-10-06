@@ -77,6 +77,22 @@ pub fn default_temperature(provider_id: &str) -> Option<f32> {
     }
 }
 
+/// The model context window, in tokens, reported to the IDE as
+/// `usage_update.size` so the cost/usage meter can show occupancy ("N of M").
+/// `0` means "unknown" -- the client then shows a bare token count without the
+/// "of M" half rather than asserting a limit boxcode cannot verify.
+///
+/// Only DeepSeek is on record: its current lineup exposes a 128k window, the
+/// same assumption `CompactConfig::auto_at_tokens`'s default already bakes in.
+/// Every other provider -- including a custom endpoint -- gets `0` rather than
+/// a guessed number, which would make a "truthful" meter untruthful.
+pub fn default_context_window(provider_id: &str) -> u64 {
+    match provider_id {
+        "deepseek" => 131_072,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -409,7 +409,7 @@ impl HeadlessSession {
             model: &self.config.llm.model,
             api_key: &self.config.llm.api_key,
             max_tokens: self.config.llm.max_tokens,
-            include_usage: self.config.quota.enabled && self.config.quota.include_usage,
+            include_usage: self.config.quota.include_usage,
             temperature: self.config.llm.effective_temperature(),
         };
         let stream = llm::stream_chat(target, history.clone(), schemas, self.request_id, tx);
@@ -453,7 +453,9 @@ impl HeadlessSession {
         }
 
         if let Some(u) = usage {
-            let _ = updates.send(u.into()).await;
+            let _ = updates
+                .send(u.to_usage_update(self.config.llm.effective_context_window()))
+                .await;
         }
 
         if !calls.is_empty() {
@@ -1426,7 +1428,8 @@ mod tests {
     /// endpoint must reach the client as a real `usage_update`, not a silent
     /// zero. One streamed answer carrying a `usage` block becomes exactly one
     /// `usage_update` with `used = prompt + completion`, sent after the token
-    /// chunk and before the turn ends.
+    /// chunk and before the turn ends. `size` is the model's context window;
+    /// it is `0` here because the test config has no provider/`context_window`.
     #[tokio::test]
     async fn a_streamed_answer_with_usage_emits_a_usage_update() {
         let (_dir, ws) = workspace();
@@ -1453,6 +1456,33 @@ mod tests {
         assert!(matches!(chunk, SessionUpdate::AgentMessageChunk { .. }));
         let usage = updates_rx.recv().await.expect("usage update");
         assert_eq!(usage, SessionUpdate::UsageUpdate { used: 15, size: 0 });
+    }
+
+    /// The other half of the size fix: once boxcode knows the model's context
+    /// window, it must carry that through to `usage_update.size` so the IDE can
+    /// render "N of M" occupancy rather than a bare count.
+    #[tokio::test]
+    async fn a_configured_context_window_is_reported_as_usage_size() {
+        let (_dir, ws) = workspace();
+        let body = sse(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+             data: [DONE]\n\n",
+        );
+        let endpoint = serve_rounds(vec![body]).await;
+        let mut config = config_for(&endpoint);
+        config.llm.context_window = 131_072;
+        let mut session =
+            HeadlessSession::new(SessionId("s1".to_string()), ws, config);
+        let (updates_tx, mut updates_rx) = mpsc::channel(16);
+        let (permissions_tx, _permissions_rx) = mpsc::channel(16);
+        let (browser_tx, _browser_rx) = mpsc::channel(16);
+        let (browser_interact_tx, _browser_interact_rx) = mpsc::channel(16);
+
+        let stop = session.prompt("hi".to_string(), Vec::new(), None, &updates_tx, &permissions_tx, &browser_tx, &browser_interact_tx).await;
+
+        assert_eq!(stop, StopReason::EndTurn);
+        let usage = updates_rx.recv().await.expect("usage update");
+        assert_eq!(usage, SessionUpdate::UsageUpdate { used: 15, size: 131_072 });
     }
 
     /// The actual end-to-end proof for `ContentBlock::Image`: an image
