@@ -849,13 +849,16 @@ async fn offer_upgrade(latest: &str) -> bool {
         return false;
     }
 
-    // Said before the installer starts, not left to be discovered. It writes
-    // to /usr/local/bin via `sudo`, so on most machines a password prompt is
-    // about to appear -- and an unexplained "Password:" arriving in the middle
-    // of starting a coding assistant reads as the app having hung, which is
-    // exactly how it was reported.
+    // Said before the installer starts, not left to be discovered. On Unix
+    // it writes to /usr/local/bin via `sudo`, so a password prompt is about
+    // to appear -- and an unexplained "Password:" mid-startup reads as a
+    // hang. On Windows there is no sudo; say where the binary actually goes.
     println!();
-    println!("   Installing to /usr/local/bin — sudo may ask for your password.");
+    if cfg!(windows) {
+        println!("   Installing under %LOCALAPPDATA%\\Programs\\boxcode…");
+    } else {
+        println!("   Installing to /usr/local/bin — sudo may ask for your password.");
+    }
     println!();
 
     let outcome = upgrade::run(true).await;

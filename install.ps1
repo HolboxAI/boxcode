@@ -35,13 +35,16 @@ function Get-ReleaseApiBase {
 # choice because WoA emulates it. Without that fallback, `boxcode --upgrade`
 # on Snapdragon/Copilot+ PCs fails every release with "no prebuilt binary
 # for windows-arm64" even though a Windows x86_64 binary shipped.
+#
+# Emits one name per pipeline item (not a nested array): PowerShell unwraps
+# a returned `@(...)` unless the caller is careful, and a nested array made
+# the arm64 unit test see a single `System.Object[]` entry.
 function Get-WindowsAssetCandidates {
     param([Parameter(Mandatory)] [string] $Arch)
-    $names = @("boxcode-windows-$Arch.exe")
+    Write-Output "boxcode-windows-$Arch.exe"
     if ($Arch -eq 'arm64') {
-        $names += 'boxcode-windows-x86_64.exe'
+        Write-Output 'boxcode-windows-x86_64.exe'
     }
-    return ,$names
 }
 
 # Only `x86_64` is actually built by release.yml today. `Get-Arch` still
@@ -357,7 +360,17 @@ function Main {
     $installedAt = Join-Path $installDir 'boxcode.exe'
 
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-    $tempDest = Join-Path $installDir 'boxcode.exe.new'
+    # Stale fixed-name leftovers from older installers; ignore failures if
+    # Defender still has one open — we no longer download to that path.
+    Remove-Item -Force (Join-Path $installDir 'boxcode.exe.new') -ErrorAction SilentlyContinue
+    # Download to a unique temp name under %TEMP%, not a fixed
+    # `boxcode.exe.new` next to the live binary. Startup `--upgrade` runs
+    # while the current `boxcode.exe` is still alive; a leftover `.new` from a
+    # previous attempt (or Defender scanning it) stays locked and makes
+    # Invoke-WebRequest fail with "being used by another process" — which we
+    # used to mis-report as "no prebuilt binary available".
+    $tempDest = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-dl-$PID-$(Get-Random).exe"
+    Remove-Item -Force $tempDest -ErrorAction SilentlyContinue
 
     Write-Host "Looking for a prebuilt Windows binary ($arch)..."
     $downloaded = $false
