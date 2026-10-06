@@ -983,6 +983,7 @@ COMMANDS (type in the input box, press Enter):
     /login                Sign in with Google in the browser (or show status
                             if this machine is already linked)
     /logout               Clear the local boxcode.sh session and promo key
+    /exit                 Leave boxcode
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider
     /new                  Forget the conversation and start fresh
@@ -1016,7 +1017,8 @@ KEYS:
     Enter                 Send prompt
     Alt/Shift-Enter       New line
     Esc                   Cancel request
-    Ctrl-C                Exit"
+    Ctrl-C                Exit (press twice)
+    /exit                 Leave boxcode"
     );
 }
 
