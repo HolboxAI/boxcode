@@ -674,7 +674,7 @@ pub fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // lands flush regardless of which side is taller.
     let beside: [Vec<Span>; 5] = [
         vec![
-            Span::styled("boxcode", theme::accent_bold()),
+            Span::styled("covexcode", theme::accent_bold()),
             Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), theme::faint()),
         ],
         vec![Span::styled("a terminal coding assistant", theme::faint())],
@@ -4468,10 +4468,10 @@ mod tests {
         };
 
         // Wide: the wordmark shares its row with the mascot's first line.
-        assert_eq!(row_of(96, "boxcode"), row_of(96, theme::MASCOT[0]));
+        assert_eq!(row_of(96, "covexcode"), row_of(96, theme::MASCOT[0]));
         // Narrow: it has moved below the mascot's last line.
         assert!(
-            row_of(42, "boxcode") > row_of(42, theme::MASCOT[4]),
+            row_of(42, "covexcode") > row_of(42, theme::MASCOT[4]),
             "the wordmark should stack under the mascot on a narrow terminal"
         );
     }
