@@ -45,6 +45,7 @@ fn release_api_url() -> String {
 
 fn base_url() -> String {
     std::env::var(URL_BASE_ENV)
+        .or_else(|_| std::env::var("BOXCODE_UPGRADE_URL_BASE"))
         .ok()
         .filter(|base| !base.trim().is_empty())
         .unwrap_or_else(default_raw_base)
@@ -129,7 +130,9 @@ pub async fn check_on_start(enabled: bool) -> Option<String> {
     if !enabled {
         return None;
     }
-    if std::env::var_os(NO_CHECK_ENV).is_some() {
+    if std::env::var_os(NO_CHECK_ENV).is_some()
+        || std::env::var_os("BOXCODE_NO_UPDATE_CHECK").is_some()
+    {
         return None;
     }
 
