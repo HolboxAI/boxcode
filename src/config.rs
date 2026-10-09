@@ -608,34 +608,34 @@ impl Config {
 
         // Environment variables win over the file, so exporting a key works even
         // when a stale config.toml is on disk.
-        if let Some(v) = env_var("BOXCODE_ENDPOINT") {
+        if let Some(v) = env_var("COVEXCODE_ENDPOINT") {
             config.llm.endpoint = v;
         }
-        if let Some(v) = env_var("BOXCODE_MODEL") {
+        if let Some(v) = env_var("COVEXCODE_MODEL") {
             config.llm.model = v;
         }
-        if let Some(v) = env_var("BOXCODE_API_KEY") {
+        if let Some(v) = env_var("COVEXCODE_API_KEY") {
             config.llm.api_key = v;
         }
         // Registry id (e.g. "deepseek"), same meaning as the `/provider`
         // overlay's own write to this field -- without it, a session started
         // this way (an ACP client setting env vars, not the TUI) never gets a
         // provider's `default_temperature()` (see `LlmConfig::effective_temperature`).
-        if let Some(v) = env_var("BOXCODE_PROVIDER") {
+        if let Some(v) = env_var("COVEXCODE_PROVIDER") {
             config.llm.provider = v;
         }
-        if let Some(v) = env_var("BOXCODE_WORKSPACE") {
+        if let Some(v) = env_var("COVEXCODE_WORKSPACE") {
             config.tools.workspace = v;
         }
-        if let Some(v) = env_var("BOXCODE_TOOLS_ENABLED") {
+        if let Some(v) = env_var("COVEXCODE_TOOLS_ENABLED") {
             config.tools.enabled = truthy(&v);
         }
-        if let Some(v) = env_var("BOXCODE_QUOTA_ENABLED") {
+        if let Some(v) = env_var("COVEXCODE_QUOTA_ENABLED") {
             config.quota.enabled = truthy(&v);
         }
         for (name, slot) in [
-            ("BOXCODE_MAX_REQUESTS_PER_DAY", 0),
-            ("BOXCODE_MAX_TOKENS_PER_DAY", 1),
+            ("COVEXCODE_MAX_REQUESTS_PER_DAY", 0),
+            ("COVEXCODE_MAX_TOKENS_PER_DAY", 1),
         ] {
             if let Some(v) = env_var(name) {
                 if let Ok(n) = v.trim().parse::<u64>() {
@@ -646,12 +646,12 @@ impl Config {
                 }
             }
         }
-        if let Some(v) = env_var("BOXCODE_MAX_USD_PER_DAY") {
+        if let Some(v) = env_var("COVEXCODE_MAX_USD_PER_DAY") {
             if let Ok(n) = v.trim().parse::<f64>() {
                 config.quota.max_usd_per_day = n;
             }
         }
-        if let Some(v) = env_var("BOXCODE_TOOLS_APPROVAL") {
+        if let Some(v) = env_var("COVEXCODE_TOOLS_APPROVAL") {
             // The mode names, plus the truthy spellings this variable always
             // took. `=1` is unambiguous here in a way the config key is not:
             // nothing ever wrote this variable on a user's behalf, so setting
@@ -753,7 +753,7 @@ impl Config {
         let mut warnings = Vec::new();
         if self.llm.api_key.is_empty() {
             warnings.push(
-                "No API key set. Export BOXCODE_API_KEY or add api_key to ~/.boxcode/config.toml."
+                "No API key set. Export COVEXCODE_API_KEY or add api_key to ~/.covexcode/config.toml."
                     .to_string(),
             );
         }
@@ -797,7 +797,7 @@ impl Config {
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        let dir = home.join(".boxcode");
+        let dir = home.join(".covexcode");
         adopt_legacy_dir(&home, &dir);
         dir
     }
@@ -859,7 +859,8 @@ fn truthy(value: &str) -> bool {
     )
 }
 
-/// Take over `~/.tuisample-code` when this install has no directory of its own.
+/// Take over `~/.boxcode` (and, failing that, `~/.tuisample-code`) when this
+/// install has no `~/.covexcode` of its own.
 ///
 /// Renamed rather than copied, and only when there is nothing to overwrite, so
 /// this can run on every launch and does exactly nothing after the first.
@@ -872,16 +873,19 @@ fn adopt_legacy_dir(home: &std::path::Path, dir: &std::path::Path) {
     if dir.exists() {
         return;
     }
-    let legacy = home.join(".tuisample-code");
-    if !legacy.is_dir() {
-        return;
+    for name in [".boxcode", ".tuisample-code"] {
+        let legacy = home.join(name);
+        if legacy.is_dir() {
+            // A failure here is not worth interrupting startup for: the app
+            // carries on with a fresh directory, which is exactly what would
+            // have happened anyway.
+            let _ = std::fs::rename(&legacy, dir);
+            return;
+        }
     }
-    // A failure here is not worth interrupting startup for: the app carries on
-    // with a fresh directory, which is exactly what would have happened anyway.
-    let _ = std::fs::rename(&legacy, dir);
 }
 
-/// Whether this launch is the one that will inherit the pre-1.0 directory.
+/// Whether this launch is the one that will inherit a pre-covexcode directory.
 ///
 /// Has to be asked *before* anything calls `Config::config_dir`, since that is
 /// what performs the adoption. Purely so the app can say it happened: a silent
@@ -893,26 +897,31 @@ pub fn legacy_dir_pending() -> bool {
     else {
         return false;
     };
-    !home.join(".boxcode").exists() && home.join(".tuisample-code").is_dir()
+    !home.join(".covexcode").exists()
+        && (home.join(".boxcode").is_dir() || home.join(".tuisample-code").is_dir())
 }
 
-/// Deprecated `TUISAMPLE_*` variables that are actually doing something.
+/// Deprecated `TUISAMPLE_*` / `BOXCODE_*` variables that are actually doing
+/// something (not shadowed by a newer name).
 ///
-/// One shadowed by its `BOXCODE_*` replacement is inert and not worth a
+/// One shadowed by its `COVEXCODE_*` replacement is inert and not worth a
 /// warning -- naming it would train people to ignore the line.
 pub fn deprecated_env_vars_in_use() -> Vec<String> {
     let mut found: Vec<String> = std::env::vars()
         .map(|(key, _)| key)
-        .filter(|key| key.starts_with("TUISAMPLE_"))
+        .filter(|key| key.starts_with("TUISAMPLE_") || key.starts_with("BOXCODE_"))
         .filter(|key| {
-            read_env(&format!("BOXCODE_{}", key.trim_start_matches("TUISAMPLE_"))).is_none()
+            let rest = key
+                .trim_start_matches("TUISAMPLE_")
+                .trim_start_matches("BOXCODE_");
+            read_env(&format!("COVEXCODE_{rest}")).is_none()
         })
         .collect();
     found.sort();
     found
 }
 
-/// Read `BOXCODE_*`, falling back to the `TUISAMPLE_*` name it replaced.
+/// Read `COVEXCODE_*`, falling back to `BOXCODE_*` then `TUISAMPLE_*`.
 ///
 /// The old names stay readable so a shell profile, a CI job or an intern's
 /// half-remembered setup keeps working across the rename. The new name wins
@@ -922,8 +931,13 @@ fn env_var(name: &str) -> Option<String> {
     if let Some(value) = read_env(name) {
         return Some(value);
     }
-    let legacy = name.strip_prefix("BOXCODE_")?;
-    read_env(&format!("TUISAMPLE_{legacy}"))
+    let rest = name
+        .strip_prefix("COVEXCODE_")
+        .or_else(|| name.strip_prefix("BOXCODE_"))?;
+    if let Some(value) = read_env(&format!("BOXCODE_{rest}")) {
+        return Some(value);
+    }
+    read_env(&format!("TUISAMPLE_{rest}"))
 }
 
 fn read_env(name: &str) -> Option<String> {
@@ -1028,7 +1042,7 @@ mod tests {
     #[test]
     fn saving_over_an_existing_config_still_replaces_its_contents() {
         with_isolated_home(|| {
-            for key in ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY"] {
+            for key in ["COVEXCODE_ENDPOINT", "COVEXCODE_MODEL", "COVEXCODE_API_KEY"] {
                 std::env::remove_var(key);
             }
             let mut config = Config::default();
@@ -1051,10 +1065,10 @@ mod tests {
     #[test]
     fn boxcode_provider_env_var_sets_config_llm_provider() {
         with_isolated_home(|| {
-            for key in ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY", "BOXCODE_PROVIDER"] {
+            for key in ["COVEXCODE_ENDPOINT", "COVEXCODE_MODEL", "COVEXCODE_API_KEY", "COVEXCODE_PROVIDER"] {
                 std::env::remove_var(key);
             }
-            std::env::set_var("BOXCODE_PROVIDER", "deepseek");
+            std::env::set_var("COVEXCODE_PROVIDER", "deepseek");
 
             let loaded = Config::load().expect("load should succeed");
             assert_eq!(loaded.llm.provider, "deepseek");
@@ -1064,18 +1078,18 @@ mod tests {
                 "provider set via env var must still pick up its default_temperature"
             );
 
-            std::env::remove_var("BOXCODE_PROVIDER");
+            std::env::remove_var("COVEXCODE_PROVIDER");
         });
     }
 
     #[test]
     fn save_then_load_round_trips_all_llm_fields_including_provider() {
         with_isolated_home(|| {
-            // BOXCODE_* env vars win over the file (by design), so a developer
+            // COVEXCODE_* env vars win over the file (by design), so a developer
             // machine that happens to have one exported must not leak into this
             // assertion.
             let saved_env: Vec<(&str, Option<String>)> =
-                ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY", "BOXCODE_PROVIDER"]
+                ["COVEXCODE_ENDPOINT", "COVEXCODE_MODEL", "COVEXCODE_API_KEY", "COVEXCODE_PROVIDER"]
                     .iter()
                     .map(|&k| (k, std::env::var(k).ok()))
                     .collect();
@@ -1303,11 +1317,11 @@ mod tests {
                 ("destructive", ApprovalMode::Destructive),
                 ("0", ApprovalMode::Destructive),
             ] {
-                std::env::set_var("BOXCODE_TOOLS_APPROVAL", value);
+                std::env::set_var("COVEXCODE_TOOLS_APPROVAL", value);
                 let loaded = Config::load().expect("loads");
                 assert_eq!(loaded.tools.approval, expected, "for {value:?}");
             }
-            std::env::remove_var("BOXCODE_TOOLS_APPROVAL");
+            std::env::remove_var("COVEXCODE_TOOLS_APPROVAL");
         });
     }
 
@@ -1371,7 +1385,7 @@ mod tests {
             std::fs::write(legacy.join("device_id"), "device-kept").unwrap();
 
             let dir = Config::config_dir();
-            assert!(dir.ends_with(".boxcode"), "{dir:?}");
+            assert!(dir.ends_with(".covexcode"), "{dir:?}");
             assert!(!legacy.exists(), "the old directory should have been moved, not copied");
             assert_eq!(
                 std::fs::read_to_string(dir.join("device_id")).unwrap(),
@@ -1379,7 +1393,7 @@ mod tests {
                 "the free-tier identity must survive the rename"
             );
 
-            for key in ["BOXCODE_ENDPOINT", "BOXCODE_MODEL", "BOXCODE_API_KEY"] {
+            for key in ["COVEXCODE_ENDPOINT", "COVEXCODE_MODEL", "COVEXCODE_API_KEY"] {
                 std::env::remove_var(key);
             }
             let loaded = Config::load().expect("the adopted config still loads");
@@ -1393,8 +1407,8 @@ mod tests {
     fn an_existing_directory_is_never_overwritten_by_the_old_one() {
         with_isolated_home(|| {
             let home = PathBuf::from(std::env::var("HOME").unwrap());
-            std::fs::create_dir_all(home.join(".boxcode")).unwrap();
-            std::fs::write(home.join(".boxcode/device_id"), "current").unwrap();
+            std::fs::create_dir_all(home.join(".covexcode")).unwrap();
+            std::fs::write(home.join(".covexcode/device_id"), "current").unwrap();
             std::fs::create_dir_all(home.join(".tuisample-code")).unwrap();
             std::fs::write(home.join(".tuisample-code/device_id"), "stale").unwrap();
 
@@ -1412,7 +1426,7 @@ mod tests {
     #[test]
     fn the_old_environment_variable_names_still_work() {
         with_isolated_home(|| {
-            for key in ["BOXCODE_MODEL", "TUISAMPLE_MODEL"] {
+            for key in ["COVEXCODE_MODEL", "TUISAMPLE_MODEL"] {
                 std::env::remove_var(key);
             }
             std::env::set_var("TUISAMPLE_MODEL", "from-the-old-name");
@@ -1424,10 +1438,10 @@ mod tests {
 
             // ...and the new name wins when both are set, so migrating means
             // adding the new one rather than hunting down the old.
-            std::env::set_var("BOXCODE_MODEL", "from-the-new-name");
+            std::env::set_var("COVEXCODE_MODEL", "from-the-new-name");
             assert_eq!(Config::load().unwrap().llm.model, "from-the-new-name");
 
-            for key in ["BOXCODE_MODEL", "TUISAMPLE_MODEL"] {
+            for key in ["COVEXCODE_MODEL", "TUISAMPLE_MODEL"] {
                 std::env::remove_var(key);
             }
         });
