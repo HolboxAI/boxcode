@@ -533,16 +533,16 @@ if [ -z "$BINARY_PATH" ]; then
 fi
 
 # Install binary
-SYSTEM_BIN=/usr/local/bin/boxcode
-USER_BIN="$HOME/.local/bin/boxcode"
+SYSTEM_BIN=/usr/local/bin/covexcode
+USER_BIN="$HOME/.local/bin/covexcode"
 
-echo "📍 Installing to /usr/local/bin..."
+echo "📍 Installing covexcode to /usr/local/bin..."
 if install_binary "$BINARY_PATH" "$SYSTEM_BIN" sudo; then
   INSTALLED_AT="$SYSTEM_BIN"
   OTHER_COPY="$USER_BIN"
-  echo "✓ Installed to /usr/local/bin"
+  echo "✓ Installed covexcode to /usr/local/bin"
 else
-  echo "⚠️  Could not write to /usr/local/bin, using ~/.local/bin instead..."
+  echo "⚠️  Could not write to /usr/local/bin, using ~/.local/bin/covexcode instead..."
 
   mkdir -p "$HOME/.local/bin"
   install_binary "$BINARY_PATH" "$USER_BIN" || {
@@ -579,6 +579,10 @@ fi
 # A stale copy can also live in some *other* directory entirely (a custom bin
 # dir, homebrew, etc.) — not just the two locations above.
 sweep_path_for_stale_copies "$INSTALLED_AT"
+# Drop the pre-rebrand binary name if it still shadows PATH.
+for stale in /usr/local/bin/boxcode "$HOME/.local/bin/boxcode"; do
+  if [ -f "$stale" ] && [ "$stale" != "$INSTALLED_AT" ]; then rm -f "$stale" 2>/dev/null || true; fi
+done
 
 # Confirm the shell actually resolves to what we just installed.
 hash -r 2>/dev/null || true
