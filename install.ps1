@@ -42,7 +42,7 @@ function Invoke-BoxcodeGitHub {
     )
     Enable-BoxcodeTls
     $headers = @{
-        'User-Agent' = 'boxcode-install'
+        'User-Agent' = 'covexcode-install'
         'Accept'     = $Accept
     }
     if ($OutFile) {
@@ -433,25 +433,25 @@ function Send-InstallPing {
 }
 
 function Main {
-    Write-Host 'Installing boxcode...'
+    Write-Host 'Installing covexcode...'
     Write-Host ''
 
     $arch = Get-Arch
     $candidates = @(Get-WindowsAssetCandidates -Arch $arch)
-    $installDir = Join-Path $env:LOCALAPPDATA 'Programs\boxcode'
-    $installedAt = Join-Path $installDir 'boxcode.exe'
+    $installDir = Join-Path $env:LOCALAPPDATA 'Programs\covexcode'
+    $installedAt = Join-Path $installDir 'covexcode.exe'
 
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
     # Stale fixed-name leftovers from older installers; ignore failures if
     # Defender still has one open — we no longer download to that path.
-    Remove-Item -Force (Join-Path $installDir 'boxcode.exe.new') -ErrorAction SilentlyContinue
+    Remove-Item -Force (Join-Path $installDir 'covexcode.exe.new') -ErrorAction SilentlyContinue
     # Download to a unique temp name under %TEMP%, not a fixed
     # `boxcode.exe.new` next to the live binary. Startup `--upgrade` runs
     # while the current `boxcode.exe` is still alive; a leftover `.new` from a
     # previous attempt (or Defender scanning it) stays locked and makes
     # Invoke-WebRequest fail with "being used by another process" — which we
     # used to mis-report as "no prebuilt binary available".
-    $tempDest = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-dl-$PID-$(Get-Random).exe"
+    $tempDest = Join-Path ([System.IO.Path]::GetTempPath()) "covexcode-dl-$PID-$(Get-Random).exe"
     Remove-Item -Force $tempDest -ErrorAction SilentlyContinue
 
     Write-Host "Looking for a prebuilt Windows binary ($arch)..."
@@ -501,10 +501,10 @@ function Main {
         Write-Host "Added $installDir to your PATH (open a new shell for it to take effect)."
     }
 
-    $resolved = Get-Command boxcode -ErrorAction SilentlyContinue | Select-Object -First 1
+    $resolved = Get-Command covexcode -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($resolved -and $resolved.Source -ne $installedAt) {
         Write-Host ''
-        Write-Host "WARNING: 'boxcode' currently resolves to $($resolved.Source),"
+        Write-Host "WARNING: 'covexcode' currently resolves to $($resolved.Source),"
         Write-Host "  but this build was installed to $installedAt."
         Write-Host '  Remove the other copy, or fix your PATH order, or you will keep'
         Write-Host '  running the old version.'

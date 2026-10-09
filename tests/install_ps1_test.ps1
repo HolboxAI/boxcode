@@ -86,7 +86,7 @@ if ($armCandidates.Count -eq 2 -and $armCandidates[0] -eq 'boxcode-windows-arm64
 $replaceDir = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-replace-$PID"
 Remove-Item -Recurse -Force $replaceDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $replaceDir | Out-Null
-$replaceDest = Join-Path $replaceDir 'boxcode.exe'
+$replaceDest = Join-Path $replaceDir 'covexcode.exe'
 $replaceSrc = Join-Path $replaceDir 'boxcode-new.exe'
 Set-Content -LiteralPath $replaceDest -Value 'old-binary' -NoNewline
 Set-Content -LiteralPath $replaceSrc -Value 'new-binary' -NoNewline
@@ -107,7 +107,7 @@ try {
 # Fresh install (no destination yet) must also work.
 $freshDir = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-fresh-$PID"
 Remove-Item -Recurse -Force $freshDir -ErrorAction SilentlyContinue
-$freshDest = Join-Path $freshDir 'boxcode.exe'
+$freshDest = Join-Path $freshDir 'covexcode.exe'
 $freshSrc = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-fresh-src-$PID.exe"
 Set-Content -LiteralPath $freshSrc -Value 'fresh-binary' -NoNewline
 try {
@@ -415,7 +415,7 @@ $env:PROCESSOR_ARCHITECTURE = 'AMD64'
 Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
 try {
     Main
-    $installedExe = Join-Path $sandboxAppData 'Programs\boxcode\boxcode.exe'
+    $installedExe = Join-Path $sandboxAppData 'Programs\covexcode\covexcode.exe'
     if ((Test-Path $installedExe) -and (Get-Item $installedExe).Length -gt 0) {
         Test-Pass 'Main runs end-to-end and installs a real, non-empty binary'
     } else {
