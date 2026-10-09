@@ -1,4 +1,4 @@
-//! `boxcode --upgrade` — pull the latest build without having to
+//! `covexcode --upgrade` — pull the latest build without having to
 //! remember (or re-paste) the curl one-liner.
 //!
 //! The install itself is delegated to `install.sh` (or, on Windows,
@@ -29,7 +29,7 @@ const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// GitHub *release* tag, which is what `install.sh` actually downloads. Bumping
 /// `Cargo.toml` on main without publishing a release used to offer an upgrade
 /// that could never install.
-const URL_BASE_ENV: &str = "BOXCODE_UPGRADE_URL_BASE";
+const URL_BASE_ENV: &str = "COVEXCODE_UPGRADE_URL_BASE";
 
 fn join_url(base: &str, path: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), path)
@@ -66,7 +66,7 @@ fn raw_url(path: &str) -> String {
 
 /// Turns the startup check off from the environment, for the cases config
 /// cannot reach: a CI job, a container, a scripted run.
-const NO_CHECK_ENV: &str = "BOXCODE_NO_UPDATE_CHECK";
+const NO_CHECK_ENV: &str = "COVEXCODE_NO_UPDATE_CHECK";
 
 /// How long the startup check may take before it is abandoned.
 ///
@@ -141,7 +141,7 @@ pub async fn check_on_start(enabled: bool) -> Option<String> {
 ///
 /// Where it looks and where it remembers are arguments rather than globals, so
 /// the tests drive it against a local server and a temporary file. The
-/// alternative -- reaching for `$HOME` and `BOXCODE_UPGRADE_URL_BASE` from
+/// alternative -- reaching for `$HOME` and `COVEXCODE_UPGRADE_URL_BASE` from
 /// inside a test -- mutates process-wide state that every other test in this
 /// file shares, and duly broke two of them.
 ///
@@ -155,7 +155,7 @@ async fn check_against(base: &str, cache: &std::path::Path) -> Option<String> {
     let client = reqwest::Client::builder()
         .connect_timeout(CHECK_TIMEOUT)
         .timeout(CHECK_TIMEOUT)
-        .user_agent(format!("boxcode/{CURRENT}"))
+        .user_agent(format!("covexcode/{CURRENT}"))
         .build()
         .ok()?;
 
@@ -184,7 +184,7 @@ async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(30))
-        .user_agent(format!("boxcode/{CURRENT}"))
+        .user_agent(format!("covexcode/{CURRENT}"))
         .build()?;
 
     match fetch_latest_version(&client).await {
@@ -199,7 +199,7 @@ async fn run_for(force: bool, windows: bool) -> Result<(), Box<dyn Error>> {
             println!();
             println!("A newer commit can land on main before a GitHub release exists.");
             println!("To rebuild from the latest source regardless, run:");
-            println!("    boxcode --upgrade --force");
+            println!("    covexcode --upgrade --force");
             return Ok(());
         }
         Err(e) => {
@@ -247,7 +247,7 @@ async fn fetch_latest_version(client: &reqwest::Client) -> Result<String, Box<dy
 /// knows where to look does not have to go back through the environment.
 ///
 /// Default HolboxAI installs ask the GitHub **releases** API (same source
-/// `install.sh` downloads from). A custom `BOXCODE_UPGRADE_URL_BASE` — forks,
+/// `install.sh` downloads from). A custom `COVEXCODE_UPGRADE_URL_BASE` — forks,
 /// mirrors, and the local test server — still publishes version via
 /// `Cargo.toml` under that base.
 async fn fetch_version_from(
