@@ -1,4 +1,4 @@
-# boxcode
+# covexcode
 
 A coding assistant that lives in your terminal. It reads your files and runs
 your commands — and waits for you before every one. Connects to any
@@ -8,9 +8,9 @@ OpenAI-compatible LLM endpoint.
 
 > ### Renamed in v1.0.0
 >
-> `tuisample-code` is now **`boxcode`**. Reinstall with the command below —
+> `tuisample-code` is now **`covexcode`**. Reinstall with the command below —
 > `~/.tuisample-code/` and `TUISAMPLE_*` env vars still migrate/work
-> automatically, but are deprecated in favor of `~/.boxcode/`/`BOXCODE_*`.
+> automatically, but are deprecated in favor of `~/.covexcode/`/`COVEXCODE_*`.
 
 ```
  ◈
@@ -56,20 +56,20 @@ git clone https://github.com/HolboxAI/boxcode && cd boxcode
 cargo build --release && ./target/release/boxcode
 ```
 
-**Configure** — launch `boxcode` and run `/provider`: pick a provider, then a
+**Configure** — launch `covexcode` and run `/provider`: pick a provider, then a
 model. An existing `{PROVIDER}_API_KEY` env var (e.g. `DEEPSEEK_API_KEY`) is
 picked up automatically; otherwise you're prompted for it. Not on the list?
 Pick **"Custom endpoint..."** for any OpenAI-compatible endpoint. Or skip the
-picker and edit `~/.boxcode/config.toml` / set `BOXCODE_ENDPOINT`,
-`BOXCODE_MODEL`, `BOXCODE_API_KEY` directly.
+picker and edit `~/.covexcode/config.toml` / set `COVEXCODE_ENDPOINT`,
+`COVEXCODE_MODEL`, `COVEXCODE_API_KEY` directly.
 
-**Run** — `boxcode`
+**Run** — `covexcode`
 
 **Update** — it checks on every startup and asks before installing anything
 (default answer is no), so a pending update is mentioned every time rather than
 once and then not again until tomorrow. Reinstall by hand any time with
-`boxcode --upgrade` (always a force-install, so it also fixes a broken
-install). Turn the automatic check off with `BOXCODE_NO_UPDATE_CHECK=1` or
+`covexcode --upgrade` (always a force-install, so it also fixes a broken
+install). Turn the automatic check off with `COVEXCODE_NO_UPDATE_CHECK=1` or
 `check_on_start = false` under `[update]`.
 
 ## What it does
@@ -124,7 +124,7 @@ to ask for the same thing.
   [docs/deploying.md](docs/deploying.md).
 - **`BOXCODE.md`** (or `AGENTS.md`) at your project root rides along with
   every request — run `/init` to have the model write one. **Sessions**
-  persist to `~/.boxcode/sessions/` per directory; `--resume`/`/resume` picks
+  persist to `~/.covexcode/sessions/` per directory; `--resume`/`/resume` picks
   up where you left off, even after a crash. **`/compact`** summarizes a long
   conversation (automatically, past a token threshold, or on demand) instead
   of losing it with `/new`.
@@ -170,7 +170,7 @@ to ask for the same thing.
 | `/usage` | Local token usage — today, last 7 days, all time |
 | `/rollback` | Undo every file the model wrote this session (asks first) |
 
-`/provider` and `/model` write to `~/.boxcode/config.toml` and apply
+`/provider` and `/model` write to `~/.covexcode/config.toml` and apply
 immediately, no restart needed.
 
 `/rollback` undoes files, not history. Every `write_file` and `edit_file`
@@ -221,7 +221,7 @@ means the destructive tier is now carrying more of that weight on its own.
 No login, no way to attribute usage to a person. Two anonymous pings only
 (`{anon_id, event, version, os, date}`, no prompts/paths/content): one on
 install, one per active day. `/usage` (local-only, never sent) is separate.
-Opt out entirely with `BOXCODE_TELEMETRY_URL=""` (or `=off` on Windows) before
+Opt out entirely with `COVEXCODE_TELEMETRY_URL=""` (or `=off` on Windows) before
 installing. Aggregate counts are public: see `src/telemetry.rs`.
 
 ## Architecture
