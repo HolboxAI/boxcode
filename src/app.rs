@@ -231,7 +231,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/hosted", "projects this machine is hosting, and whether they are live"),
     ("/rollback", "undo every file the model wrote this session"),
     ("/diff", "show everything changed on disk this session"),
-    ("/exit", "leave boxcode"),
+    ("/exit", "leave covexcode"),
 ];
 
 /// Roughly how many characters one token is worth.
@@ -1893,7 +1893,7 @@ impl App {
             self.messages.push(Message::new(
                 Role::System,
                 "No recorded session for this directory yet. Sessions are saved as you work, \
-                 under ~/.boxcode/sessions/.",
+                 under ~/.covexcode/sessions/.",
             ));
             return;
         };
@@ -2324,7 +2324,7 @@ impl App {
             && self.config.quota.price_for(&self.config.llm.model).is_none();
 
         let saved = match self.config.save() {
-            Ok(()) => "Saved to ~/.boxcode/config.toml.",
+            Ok(()) => "Saved to ~/.covexcode/config.toml.",
             Err(_) => "Active for this session, but could not be written to config.toml.",
         };
         let mut text = format!("Your daily limit is now {described}. {saved}");
@@ -3270,7 +3270,7 @@ impl App {
                     "Stopped after {} tool rounds — the per-turn command budget. The model \
                      tried to keep going and wrote its next command out as text, so nothing \
                      ran. Say \"continue\", or raise `max_steps` under [tools] in \
-                     ~/.boxcode/config.toml.",
+                     ~/.covexcode/config.toml.",
                     self.tool_steps
                 )
             } else {
@@ -3286,7 +3286,7 @@ impl App {
                 format!(
                     "Stopped after {} tool rounds — the per-turn command budget. Say \
                      \"continue\" to keep going, or raise `max_steps` under [tools] in \
-                     ~/.boxcode/config.toml.",
+                     ~/.covexcode/config.toml.",
                     self.tool_steps
                 ),
             ));
@@ -3332,7 +3332,7 @@ impl App {
             format!(
                 "The conversation has reached ~{context} tokens, past the auto-compact \
                  threshold ({threshold}), so it is being summarised to free up context. \
-                 `[compact] auto = false` in ~/.boxcode/config.toml turns this off; \
+                 `[compact] auto = false` in ~/.covexcode/config.toml turns this off; \
                  `auto_at_tokens` moves it."
             ),
         ));
@@ -3621,7 +3621,7 @@ impl App {
 
     /// Lists projects this machine has published in the last
     /// `artifacts::EXPIRY_HOURS` (`artifacts::all_local` -- a plain read of
-    /// `~/.boxcode/artifacts.json`, no network call) so the user can switch
+    /// `~/.covexcode/artifacts.json`, no network call) so the user can switch
     /// to one that is not the directory this session started in. Refused
     /// while busy, same reasoning as `/resume`: mid-turn is not a moment to
     /// hand the workspace to a different project out from under it.
@@ -4255,7 +4255,7 @@ impl App {
     ///
     /// Any test that reaches this function MUST wrap the call in
     /// `config::test_support::with_isolated_home`, or it will write to the real
-    /// developer/CI `~/.boxcode/config.toml`.
+    /// developer/CI `~/.covexcode/config.toml`.
     fn apply_llm_config(&mut self, provider: String, endpoint: String, model: String, api_key: String) {
         self.config.llm.provider = provider;
         self.config.llm.endpoint = endpoint;
@@ -7936,7 +7936,7 @@ mod tests {
             call_id: "call_1".to_string(),
             display: "agent \"map the config loading\" — done (1 tool round, ~2k tokens)"
                 .to_string(),
-            content: "It loads from ~/.boxcode/config.toml.".to_string(),
+            content: "It loads from ~/.covexcode/config.toml.".to_string(),
             diff: None,
             rollback: None,
         }]);
