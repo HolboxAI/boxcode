@@ -20,6 +20,38 @@
 
 $ErrorActionPreference = 'Stop'
 
+# GitHub rejects anonymous downloads that look like a bare bot. Windows
+# PowerShell's default User-Agent has historically gotten HTTP 403 on
+# release asset URLs even when /releases/latest JSON succeeds -- which the
+# installer then mis-reports as "no prebuilt binary". Pin TLS 1.2 (needed on
+# older Windows PowerShell 5.1) and send an explicit UA on every call.
+function Enable-BoxcodeTls {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch {
+        # Best-effort: some locked-down hosts forbid touching this.
+    }
+}
+
+function Invoke-BoxcodeGitHub {
+    param(
+        [Parameter(Mandatory)] [string] $Uri,
+        [string] $OutFile,
+        [string] $Accept = 'application/vnd.github+json',
+        [int] $TimeoutSec = 60
+    )
+    Enable-BoxcodeTls
+    $headers = @{
+        'User-Agent' = 'boxcode-install'
+        'Accept'     = $Accept
+    }
+    if ($OutFile) {
+        Invoke-WebRequest -Uri $Uri -OutFile $OutFile -Headers $headers -TimeoutSec $TimeoutSec | Out-Null
+    } else {
+        return Invoke-RestMethod -Uri $Uri -Headers $headers -TimeoutSec $TimeoutSec
+    }
+}
+
 # Where release assets and checksums are published. Overridable so a fork or
 # an internal mirror can serve its own builds -- mirrors install.sh's own
 # BOXCODE_RELEASE_API_BASE.
@@ -141,17 +173,30 @@ function Get-PrebuiltBinary {
         [Parameter(Mandatory)] [string] $Dest
     )
 
-    $release = Invoke-RestMethod -Uri "$(Get-ReleaseApiBase)/releases/latest" -TimeoutSec 15
+    $release = Invoke-BoxcodeGitHub -Uri "$(Get-ReleaseApiBase)/releases/latest" -TimeoutSec 15
     $downloadUrl = Get-AssetDownloadUrl -Release $release -AssetName $AssetName
     if (-not $downloadUrl) {
         throw "no '$AssetName' asset in the latest release"
     }
 
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $Dest -TimeoutSec 60
+    # Prefer the CDN browser_download_url; if GitHub 403s that (common from
+    # Windows PowerShell without a UA — now set above), fall back to the
+    # releases/assets API which streams the same bytes with Accept:
+    # application/octet-stream.
+    try {
+        Invoke-BoxcodeGitHub -Uri $downloadUrl -OutFile $Dest -Accept '*/*' -TimeoutSec 60
+    } catch {
+        $asset = $release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+        if (-not $asset -or -not $asset.id) {
+            throw $_.Exception.Message
+        }
+        $apiUrl = "$(Get-ReleaseApiBase)/releases/assets/$($asset.id)"
+        Invoke-BoxcodeGitHub -Uri $apiUrl -OutFile $Dest -Accept 'application/octet-stream' -TimeoutSec 60
+    }
 
     $sumsUrl = Get-AssetDownloadUrl -Release $release -AssetName 'SHA256SUMS.txt'
     if ($sumsUrl) {
-        $sums = Invoke-RestMethod -Uri $sumsUrl -TimeoutSec 15
+        $sums = Invoke-BoxcodeGitHub -Uri $sumsUrl -Accept '*/*' -TimeoutSec 15
         $expectedLine = ($sums -split "`n") | Where-Object { $_ -match "\s$([regex]::Escape($AssetName))\s*$" } | Select-Object -First 1
         if ($expectedLine) {
             $expected = ($expectedLine -split '\s+')[0].Trim().ToLowerInvariant()
