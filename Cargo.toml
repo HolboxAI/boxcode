@@ -1,6 +1,6 @@
 [package]
-name = "boxcode"
-version = "1.11.50"
+name = "covexcode"
+version = "1.11.51"
 edition = "2021"
 
 [dependencies]
