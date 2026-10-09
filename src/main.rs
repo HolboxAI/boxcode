@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-V" | "--version" => {
-                println!("boxcode {VERSION}");
+                println!("covexcode {VERSION}");
                 return Ok(());
             }
             // An ACP client (boxcode-ide) shells out to this to build its own
@@ -110,9 +110,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             std::process::exit(1);
         }
         // Fall through into the TUI — signing in and then having to type
-        // `boxcode` again is the flow users bounce off.
+        // `covexcode` again is the flow users bounce off.
         println!();
-        println!("Starting boxcode…");
+        println!("Starting covexcode…");
         println!();
     }
     if do_logout {
@@ -179,7 +179,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // this is how the new process knows both where to root itself and that
     // it should check for pending change requests below, instead of every
     // ordinary launch paying for that check.
-    let pull_dir = std::env::var("BOXCODE_PULL_DIR").ok();
+    let pull_dir = std::env::var("COVEXCODE_PULL_DIR")
+        .or_else(|_| std::env::var("BOXCODE_PULL_DIR"))
+        .ok();
     let (workspace, workspace_status) = open_workspace(&config, pull_dir.as_deref());
 
     // Detached, not awaited: a slow or unreachable telemetry endpoint must
@@ -238,14 +240,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // one nobody can verify.
     if migrating {
         app.startup_notices.push(
-            "Renamed to boxcode: your settings and history moved from ~/.tuisample-code to \
-             ~/.boxcode."
+            "Renamed to boxcode: your settings and history moved into ~/.covexcode."
                 .to_string(),
         );
     }
     for name in config::deprecated_env_vars_in_use() {
         app.startup_notices.push(format!(
-            "{name} is deprecated. Rename it to BOXCODE_{} — the old name still works for now.",
+            "{name} is deprecated. Rename it to COVEXCODE_{} — the old name still works for now.",
             name.trim_start_matches("TUISAMPLE_")
         ));
     }
@@ -485,6 +486,8 @@ fn should_clear_on_exit(ui: &config::UiConfig, alternate_screen: bool, ok: bool)
 fn relaunch_in(dir: &std::path::Path) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
+    cmd.env("COVEXCODE_PULL_DIR", dir);
+    // Keep the old name so a mid-upgrade relaunch still finds the pull root.
     cmd.env("BOXCODE_PULL_DIR", dir);
     #[cfg(unix)]
     {
@@ -835,7 +838,7 @@ async fn offer_upgrade(latest: &str) -> bool {
     }
 
     println!();
-    println!("↑ boxcode {latest} is available (you have {VERSION}).");
+    println!("↑ covexcode {latest} is available (you have {VERSION}).");
     print!("   Install it now? [y/N] ");
     let _ = io::stdout().flush();
 
@@ -844,7 +847,7 @@ async fn offer_upgrade(latest: &str) -> bool {
         return false;
     }
     if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        println!("   Skipped. Run `boxcode --upgrade` whenever you want it.");
+        println!("   Skipped. Run `covexcode --upgrade` whenever you want it.");
         println!();
         return false;
     }
@@ -855,7 +858,7 @@ async fn offer_upgrade(latest: &str) -> bool {
     // hang. On Windows there is no sudo; say where the binary actually goes.
     println!();
     if cfg!(windows) {
-        println!("   Installing under %LOCALAPPDATA%\\Programs\\boxcode…");
+        println!("   Installing under %LOCALAPPDATA%\\Programs\\covexcode…");
     } else {
         println!("   Installing to /usr/local/bin — sudo may ask for your password.");
     }
@@ -884,7 +887,7 @@ async fn offer_upgrade(latest: &str) -> bool {
         return false;
     }
     println!();
-    println!("✓ Updated to {latest}. Start boxcode again to use it.");
+    println!("✓ Updated to {latest}. Start covexcode again to use it.");
     true
 }
 
@@ -918,19 +921,19 @@ fn restore_cooked_mode() {
 
 fn print_help() {
     println!(
-        "boxcode {VERSION}
+        "covexcode {VERSION}
 Terminal UI for an OpenAI-compatible LLM endpoint.
 
 USAGE:
-    boxcode [FLAGS]
-    boxcode login
-    boxcode logout
+    covexcode [FLAGS]
+    covexcode login
+    covexcode logout
 
 FLAGS:
     -V, --version    Print version and exit
     -h, --help       Print this help and exit
     -u, --upgrade    Reinstall the latest release, whether or not the version
-                       number changed. Starting boxcode already offers an
+                       number changed. Starting covexcode already offers an
                        upgrade when there is a newer release, so reaching for
                        this by hand means \"reinstall regardless\".
     -f, --force      Accepted and now redundant: --upgrade always forces.
@@ -940,28 +943,31 @@ FLAGS:
                        any time with /plan.
     -r, --resume     Pick up this directory's most recent session where it
                        left off. Sessions are recorded as you work, under
-                       ~/.boxcode/sessions/. Also available mid-session
+                       ~/.covexcode/sessions/. Also available mid-session
                        as /resume.
 
 
 COMMANDS:
     login            Sign in with Google in the browser, then open the TUI.
-                       Writes llm.boxcode.sh credentials to ~/.boxcode/config.toml
+                       Writes llm.boxcode.sh credentials to ~/.covexcode/config.toml
                        — the IDE reads the same file.
     logout           Clear the local account session (and promo proxy key if
                        pointed at llm.boxcode.sh).
 
-CONFIG (environment overrides ~/.boxcode/config.toml):
-    BOXCODE_ENDPOINT    Base URL, e.g. https://llm.boxcode.sh/v1
-    BOXCODE_MODEL       Model name
-    BOXCODE_API_KEY     Bearer token
-    BOXCODE_AUTH_URL    Website for device login (default https://boxcode.sh)
+CONFIG (environment overrides ~/.covexcode/config.toml):
+    COVEXCODE_ENDPOINT  Base URL, e.g. https://llm.boxcode.sh/v1
+    BOXCODE_ENDPOINT    Legacy alias for COVEXCODE_ENDPOINT
+    COVEXCODE_MODEL     Model name
+    BOXCODE_MODEL       Legacy alias for COVEXCODE_MODEL
+    COVEXCODE_API_KEY   Bearer token
+    BOXCODE_API_KEY     Legacy alias for COVEXCODE_API_KEY
+    COVEXCODE_AUTH_URL  Website for device login (default https://boxcode.sh)
 
 TOOLS (read_file, write_file, run_command; writes and commands need your
        approval each time -- see the [tools] table in config.toml):
-    BOXCODE_WORKSPACE       Directory these operate in (default: cwd)
-    BOXCODE_TOOLS_ENABLED   Set to 0 to send no tool schema at all
-    BOXCODE_TOOLS_APPROVAL  Set to 0 to stop asking before each write/command.
+    COVEXCODE_WORKSPACE     Directory these operate in (default: cwd)
+    COVEXCODE_TOOLS_ENABLED Set to 0 to send no tool schema at all
+    COVEXCODE_TOOLS_APPROVAL Set to 0 to stop asking before each write/command.
                               For scripted testing only -- it hands the model
                               unattended file and shell access.
                               See the [tools] table in config.toml for
@@ -969,16 +975,16 @@ TOOLS (read_file, write_file, run_command; writes and commands need your
                               max_output_bytes, max_steps.
 
 UPGRADE:
-    Starting boxcode checks for a newer release on every launch and offers
+    Starting covexcode checks for a newer release on every launch and offers
     to install it. It answers no by default, gives up after two seconds, and
     says nothing at all when it cannot reach the network.
 
-    BOXCODE_UPGRADE_URL_BASE
+    COVEXCODE_UPGRADE_URL_BASE
                           Fetch the installer (and version via Cargo.toml)
                           from a fork or internal mirror instead of github.com.
                           When unset, the version check uses the latest GitHub
                           release tag — the same source install.sh downloads.
-    BOXCODE_NO_UPDATE_CHECK
+    COVEXCODE_NO_UPDATE_CHECK
                           Set to anything to skip the startup check. Same as
                           check_on_start = false in the [update] table.
 
@@ -986,7 +992,7 @@ COMMANDS (type in the input box, press Enter):
     /login                Sign in with Google in the browser (or show status
                             if this machine is already linked)
     /logout               Clear the local boxcode.sh session and promo key
-    /exit                 Leave boxcode
+    /exit                 Leave covexcode
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider
     /new                  Forget the conversation and start fresh
@@ -1005,7 +1011,7 @@ DEPLOYMENT (ask the model, e.g. 'deploy this to Vercel'; see [deploy] in
     without asking. Signing in hands the terminal to the provider's own
     browser login; no secret is typed into this app. Environment-variable
     values and tokens are never logged, shown, or written to
-    ~/.boxcode/deployments.jsonl.
+    ~/.covexcode/deployments.jsonl.
 
 DAILY LIMITS (optional, off by default -- every limit is 0 = no limit, so this
               only counts until you set one. See [quota] in config.toml):
