@@ -1,4 +1,4 @@
-//! `boxcode login` / `boxcode logout` — Cursor-style device auth via boxcode.sh.
+//! `covexcode login` / `boxcode logout` — Cursor-style device auth via boxcode.sh.
 
 use crate::config::Config;
 use serde::Deserialize;
@@ -9,7 +9,9 @@ use std::time::Duration;
 const DEFAULT_AUTH_BASE: &str = "https://boxcode.sh";
 
 fn auth_base() -> String {
-    std::env::var("BOXCODE_AUTH_URL")
+    std::env::var("COVEXCODE_AUTH_URL")
+        .or_else(|_| std::env::var("BOXCODE_AUTH_URL"))
+        .or_else(|_| std::env::var("COVEXCODE_SITE_URL"))
         .or_else(|_| std::env::var("BOXCODE_SITE_URL"))
         .unwrap_or_else(|_| DEFAULT_AUTH_BASE.to_string())
         .trim_end_matches('/')
@@ -21,7 +23,7 @@ fn boxcode_dir() -> PathBuf {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".boxcode")
+    home.join(".covexcode")
 }
 
 fn account_token_path() -> PathBuf {
@@ -84,9 +86,9 @@ impl LoginStatus {
                  Endpoint: {}\n\
                  Model:    {}\n\
                  Key:      {}\n\n\
-                 Session:  ~/.boxcode/account.token\n\
+                 Session:  ~/.covexcode/account.token\n\
                  Proof:    heartbeat hits https://boxcode.sh/api/heartbeat\n\n\
-                 To re-link: /logout, then /login (or exit and run `boxcode login`).",
+                 To re-link: /logout, then /login (or exit and run `covexcode login`).",
                 self.endpoint, self.model, self.key_prefix
             )
         } else if self.via_boxcode_proxy && !self.key_prefix.is_empty() {
@@ -101,7 +103,7 @@ impl LoginStatus {
             "Not signed in via boxcode.sh.\n\n\
              Run /login — the browser opens https://boxcode.sh for Google\n\
              sign-in, then this session receives your promo key.\n\
-             Same file the IDE reads: ~/.boxcode/config.toml"
+             Same file the IDE reads: ~/.covexcode/config.toml"
                 .to_string()
         }
     }
@@ -173,7 +175,7 @@ pub async fn login() -> Result<(), Box<dyn std::error::Error>> {
         .verification_uri_complete
         .unwrap_or_else(|| format!("{}?code={}", start.verification_uri, start.user_code));
 
-    println!("boxcode login");
+    println!("covexcode login");
     println!();
     println!("  Opening the browser to authorize this device…");
     println!();
@@ -197,7 +199,7 @@ pub async fn login() -> Result<(), Box<dyn std::error::Error>> {
 
         if res.status() == reqwest::StatusCode::GONE {
             println!();
-            return Err("device code expired — run boxcode login again".into());
+            return Err("device code expired — run covexcode login again".into());
         }
 
         let body: PollResponse = res.json().await?;
@@ -233,7 +235,7 @@ pub async fn login() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             println!(
-                "✓ Signed in as {}. Credentials saved to ~/.boxcode/config.toml",
+                "✓ Signed in as {}. Credentials saved to ~/.covexcode/config.toml",
                 body.email.unwrap_or_else(|| "you".into())
             );
             println!("  Endpoint: {}", config.llm.endpoint);
@@ -248,7 +250,7 @@ pub async fn login() -> Result<(), Box<dyn std::error::Error>> {
             Some("pending") | None => continue,
             Some("expired") => {
                 println!();
-                return Err("device code expired — run boxcode login again".into());
+                return Err("device code expired — run covexcode login again".into());
             }
             _ => {
                 if let Some(err) = body.error {
@@ -283,7 +285,7 @@ pub fn logout_local() -> Result<String, Box<dyn std::error::Error>> {
     if endpoint.contains("llm.boxcode.sh") {
         config.llm.api_key.clear();
         config.save()?;
-        Ok("✓ Cleared llm.boxcode.sh credentials from ~/.boxcode/config.toml".into())
+        Ok("✓ Cleared llm.boxcode.sh credentials from ~/.covexcode/config.toml".into())
     } else {
         Ok("✓ Cleared local session token (left custom endpoint/api_key untouched)".into())
     }
