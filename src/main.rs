@@ -949,19 +949,19 @@ FLAGS:
 
 COMMANDS:
     login            Sign in with Google in the browser, then open the TUI.
-                       Writes llm.boxcode.sh credentials to ~/.covexcode/config.toml
+                       Writes llm.covexcode.com credentials to ~/.covexcode/config.toml
                        — the IDE reads the same file.
     logout           Clear the local account session (and promo proxy key if
-                       pointed at llm.boxcode.sh).
+                       pointed at llm.covexcode.com).
 
 CONFIG (environment overrides ~/.covexcode/config.toml):
-    COVEXCODE_ENDPOINT  Base URL, e.g. https://llm.boxcode.sh/v1
+    COVEXCODE_ENDPOINT  Base URL, e.g. https://llm.covexcode.com/v1
     BOXCODE_ENDPOINT    Legacy alias for COVEXCODE_ENDPOINT
     COVEXCODE_MODEL     Model name
     BOXCODE_MODEL       Legacy alias for COVEXCODE_MODEL
     COVEXCODE_API_KEY   Bearer token
     BOXCODE_API_KEY     Legacy alias for COVEXCODE_API_KEY
-    COVEXCODE_AUTH_URL  Website for device login (default https://boxcode.sh)
+    COVEXCODE_AUTH_URL  Website for device login (default https://covexcode.com)
 
 TOOLS (read_file, write_file, run_command; writes and commands need your
        approval each time -- see the [tools] table in config.toml):
@@ -991,7 +991,7 @@ UPGRADE:
 COMMANDS (type in the input box, press Enter):
     /login                Sign in with Google in the browser (or show status
                             if this machine is already linked)
-    /logout               Clear the local boxcode.sh session and promo key
+    /logout               Clear the local covexcode.com session and promo key
     /exit                 Leave covexcode
     /provider             Pick a provider + model + API key, saved to config.toml
     /model                Pick a model for the currently configured provider

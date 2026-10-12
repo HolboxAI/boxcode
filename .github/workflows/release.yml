@@ -106,9 +106,11 @@ jobs:
         run: |
           mkdir -p release-assets
           find all-artifacts -type f -exec cp {} release-assets/ \;
-          for f in release-assets/boxcode-*; do
+          # Also publish under the pre-rename `boxcode-*` names so older
+          # installers keep finding a binary until everyone has upgraded.
+          for f in release-assets/covexcode-*; do
             [ -e "$f" ] || continue
-            cp "$f" "release-assets/$(basename "$f" | sed 's/^boxcode-/tuisample-code-/')"
+            cp "$f" "release-assets/$(basename "$f" | sed 's/^covexcode-/boxcode-/')"
           done
           ls -la release-assets/
 
@@ -126,7 +128,7 @@ jobs:
         run: |
           cd release-assets
           failed=0
-          for asset in boxcode-*; do
+          for asset in covexcode-*; do
             [ -e "$asset" ] || continue
             size=$(stat -c%s "$asset")
             # A real build is megabytes. Anything tiny is a truncated upload
@@ -164,7 +166,7 @@ jobs:
         # install.sh verifies a downloaded binary against this before
         # installing it -- see fetch_prebuilt_binary there. Generated after
         # every binary is in place and named the way install.sh expects
-        # (`boxcode-$os-$arch`), so the sums line up with what it
+        # (`covexcode-$os-$arch`), so the sums line up with what it
         # will actually ask for.
         run: |
           cd release-assets

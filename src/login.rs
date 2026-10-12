@@ -1,4 +1,4 @@
-//! `covexcode login` / `boxcode logout` — Cursor-style device auth via boxcode.sh.
+//! `covexcode login` / `covexcode logout` — device auth via covexcode.com.
 
 use crate::config::Config;
 use serde::Deserialize;
@@ -6,7 +6,12 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const DEFAULT_AUTH_BASE: &str = "https://boxcode.sh";
+const DEFAULT_AUTH_BASE: &str = "https://covexcode.com";
+
+fn is_promo_proxy(endpoint: &str) -> bool {
+    let e = endpoint.to_lowercase();
+    e.contains("llm.covexcode.com") || e.contains("llm.boxcode.sh")
+}
 
 fn auth_base() -> String {
     std::env::var("COVEXCODE_AUTH_URL")
@@ -34,7 +39,7 @@ fn account_email_path() -> PathBuf {
     boxcode_dir().join("account.email")
 }
 
-/// Snapshot of the local boxcode.sh device-login session (no network).
+/// Snapshot of the local covexcode.com device-login session (no network).
 pub struct LoginStatus {
     pub has_session_token: bool,
     pub email: Option<String>,
@@ -59,7 +64,7 @@ impl LoginStatus {
             key.to_string()
         };
         let endpoint = config.llm.endpoint.trim().to_string();
-        let via_boxcode_proxy = endpoint.to_lowercase().contains("llm.boxcode.sh");
+        let via_boxcode_proxy = is_promo_proxy(&endpoint);
         Self {
             has_session_token: account_token_path().is_file(),
             email,
@@ -70,8 +75,8 @@ impl LoginStatus {
         }
     }
 
-    /// True when this machine has a promo key on llm.boxcode.sh and a device
-    /// session token — the state `/login` treats as "already linked".
+    /// True when this machine has a promo key on llm.covexcode.com (or the
+    /// legacy llm.boxcode.sh host) and a device session token.
     pub fn is_signed_in(&self) -> bool {
         self.has_session_token && self.via_boxcode_proxy && !self.key_prefix.is_empty()
     }
@@ -81,27 +86,27 @@ impl LoginStatus {
         if self.is_signed_in() {
             let who = self.email.as_deref().unwrap_or("(email on next login)");
             format!(
-                "Signed in via boxcode.sh\n\n\
+                "Signed in via covexcode.com\n\n\
                  Account:  {who}\n\
                  Endpoint: {}\n\
                  Model:    {}\n\
                  Key:      {}\n\n\
                  Session:  ~/.covexcode/account.token\n\
-                 Proof:    heartbeat hits https://boxcode.sh/api/heartbeat\n\n\
+                 Proof:    heartbeat hits https://covexcode.com/api/heartbeat\n\n\
                  To re-link: /logout, then /login (or exit and run `covexcode login`).",
                 self.endpoint, self.model, self.key_prefix
             )
         } else if self.via_boxcode_proxy && !self.key_prefix.is_empty() {
             format!(
-                "Using llm.boxcode.sh, but no device session yet.\n\n\
+                "Using the promo LLM proxy, but no device session yet.\n\n\
                  Endpoint: {}\n\
                  Key:      {}\n\n\
                  Run /login to finish linking this machine in the browser.",
                 self.endpoint, self.key_prefix
             )
         } else {
-            "Not signed in via boxcode.sh.\n\n\
-             Run /login — the browser opens https://boxcode.sh for Google\n\
+            "Not signed in via covexcode.com.\n\n\
+             Run /login — the browser opens https://covexcode.com for Google\n\
              sign-in, then this session receives your promo key.\n\
              Same file the IDE reads: ~/.covexcode/config.toml"
                 .to_string()
@@ -269,8 +274,8 @@ pub async fn logout() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Clear device session (+ promo key when pointed at llm.boxcode.sh). Used by
-/// both `boxcode logout` and the `/logout` slash command.
+/// Clear device session (+ promo key when pointed at the promo LLM proxy).
+/// Used by both `covexcode logout` and the `/logout` slash command.
 pub fn logout_local() -> Result<String, Box<dyn std::error::Error>> {
     let token_path = account_token_path();
     if token_path.exists() {
@@ -282,10 +287,10 @@ pub fn logout_local() -> Result<String, Box<dyn std::error::Error>> {
     }
     let mut config = Config::load().unwrap_or_default();
     let endpoint = config.llm.endpoint.to_lowercase();
-    if endpoint.contains("llm.boxcode.sh") {
+    if is_promo_proxy(&endpoint) {
         config.llm.api_key.clear();
         config.save()?;
-        Ok("✓ Cleared llm.boxcode.sh credentials from ~/.covexcode/config.toml".into())
+        Ok("✓ Cleared promo LLM credentials from ~/.covexcode/config.toml".into())
     } else {
         Ok("✓ Cleared local session token (left custom endpoint/api_key untouched)".into())
     }

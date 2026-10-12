@@ -219,7 +219,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/provider", "switch provider or endpoint"),
     ("/model", "switch model"),
     ("/login", "sign in with Google in the browser, or show status if linked"),
-    ("/logout", "clear the local boxcode.sh session and promo key"),
+    ("/logout", "clear the local covexcode.com session and promo key"),
     ("/init", "write a BOXCODE.md the model reads every session"),
     ("/resume", "pick up this directory's last session"),
     ("/pull", "switch to a different local project"),
@@ -890,7 +890,7 @@ impl App {
         }
         self.messages.push(Message::new(
             Role::System,
-            "Handing the terminal to the browser for boxcode.sh sign-in…",
+            "Handing the terminal to the browser for covexcode.com sign-in…",
         ));
         self.login_request = true;
     }

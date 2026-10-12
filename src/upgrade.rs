@@ -18,7 +18,7 @@ use std::error::Error;
 use std::process::Command;
 use std::time::Duration;
 
-const REPO: &str = "HolboxAI/boxcode";
+const REPO: &str = "HolboxAI/covexcode";
 const BRANCH: &str = "main";
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 

@@ -3,7 +3,7 @@
 # The PowerShell counterpart to install.sh: `curl | bash` doesn't work in
 # native PowerShell (no bash, and `|` pipes objects, not text), so Windows
 # users need their own entry point --
-#   irm https://boxcode.sh/install.ps1 | iex
+#   irm https://covexcode.com/install.ps1 | iex
 # is that platform's equivalent one-liner (Invoke-RestMethod | Invoke-Expression).
 #
 # Unlike install.sh, there is no source-build fallback here: building Rust on
@@ -56,10 +56,13 @@ function Invoke-BoxcodeGitHub {
 # an internal mirror can serve its own builds -- mirrors install.sh's own
 # BOXCODE_RELEASE_API_BASE.
 function Get-ReleaseApiBase {
+    if ($env:COVEXCODE_RELEASE_API_BASE) {
+        return $env:COVEXCODE_RELEASE_API_BASE
+    }
     if ($env:BOXCODE_RELEASE_API_BASE) {
         return $env:BOXCODE_RELEASE_API_BASE
     }
-    return 'https://api.github.com/repos/HolboxAI/boxcode'
+    return 'https://api.github.com/repos/HolboxAI/covexcode'
 }
 
 # Ordered list of release asset names to try for this architecture. Native
@@ -73,8 +76,10 @@ function Get-ReleaseApiBase {
 # the arm64 unit test see a single `System.Object[]` entry.
 function Get-WindowsAssetCandidates {
     param([Parameter(Mandatory)] [string] $Arch)
+    Write-Output "covexcode-windows-$Arch.exe"
     Write-Output "boxcode-windows-$Arch.exe"
     if ($Arch -eq 'arm64') {
+        Write-Output 'covexcode-windows-x86_64.exe'
         Write-Output 'boxcode-windows-x86_64.exe'
     }
 }
@@ -580,7 +585,7 @@ function Main {
     Write-Host '2. Open a new shell (so the updated PATH takes effect), then run:'
     Write-Host '   boxcode'
     Write-Host ''
-    Write-Host 'For more info: https://boxcode.sh'
+    Write-Host 'For more info: https://covexcode.com'
 }
 
 if ($MyInvocation.InvocationName -ne '.') {

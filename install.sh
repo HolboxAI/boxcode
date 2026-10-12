@@ -4,7 +4,7 @@ set -e
 # Where release assets and checksums are published. Overridable so a fork or
 # an internal mirror can serve its own builds -- mirrors how upgrade.rs lets
 # BOXCODE_UPGRADE_URL_BASE redirect its own fetches.
-RELEASE_API_BASE="${BOXCODE_RELEASE_API_BASE:-https://api.github.com/repos/HolboxAI/boxcode}"
+RELEASE_API_BASE="${COVEXCODE_RELEASE_API_BASE:-${BOXCODE_RELEASE_API_BASE:-https://api.github.com/repos/HolboxAI/covexcode}}"
 
 # Remove any other "boxcode" executable found on $PATH so a stale
 # build from a previous install can't shadow (or be shadowed by) the one we
@@ -434,14 +434,25 @@ sha256_of() {
 # reason to abort the install, so this function itself never calls `exit`.
 fetch_prebuilt_binary() {
   local os="$1" arch="$2" dest="$3"
-  local asset_name="boxcode-$os-$arch"
+  local asset_name=""
+  local candidate
+  for candidate in "covexcode-$os-$arch" "boxcode-$os-$arch"; do
+    asset_name="$candidate"
+    break
+  done
 
   local release_json
   release_json=$(curl -fsSL -m 15 "$RELEASE_API_BASE/releases/latest" 2>/dev/null) || return 1
   [ -n "$release_json" ] || return 1
 
-  local download_url
-  download_url=$(asset_download_url "$release_json" "$asset_name")
+  local download_url=""
+  for candidate in "covexcode-$os-$arch" "boxcode-$os-$arch"; do
+    download_url=$(asset_download_url "$release_json" "$candidate")
+    if [ -n "$download_url" ]; then
+      asset_name="$candidate"
+      break
+    fi
+  done
   [ -n "$download_url" ] || return 1
 
   curl -fsSL -m 60 -o "$dest" "$download_url" || return 1
@@ -468,7 +479,7 @@ fetch_prebuilt_binary() {
 }
 
 main() {
-echo "🚀 Installing boxcode..."
+echo "🚀 Installing covexcode..."
 echo ""
 
 TEMP_DIR=$(mktemp -d)
@@ -518,12 +529,12 @@ if [ -z "$BINARY_PATH" ]; then
   fi
 
   echo "📥 Cloning repository..."
-  git clone https://github.com/HolboxAI/boxcode.git "$TEMP_DIR/src"
+  git clone https://github.com/HolboxAI/covexcode.git "$TEMP_DIR/src"
 
-  echo "⚙️  Building boxcode (this takes 2-3 minutes)..."
+  echo "⚙️  Building covexcode (this takes 2-3 minutes)..."
   (cd "$TEMP_DIR/src" && cargo build --release)
 
-  BINARY_PATH="$TEMP_DIR/src/target/release/boxcode"
+  BINARY_PATH="$TEMP_DIR/src/target/release/covexcode"
   if [ ! -f "$BINARY_PATH" ]; then
     echo "❌ Error: Binary not found at $BINARY_PATH"
     echo "Build may have failed. Check the output above."
@@ -617,14 +628,14 @@ echo "✅ Installation complete!"
 echo ""
 echo "🎯 Next steps:"
 echo "1. Configure your LLM endpoint:"
-echo "   export BOXCODE_ENDPOINT=https://api.openai.com"
-echo "   export BOXCODE_MODEL=gpt-4"
-echo "   export BOXCODE_API_KEY=sk-..."
+echo "   export COVEXCODE_ENDPOINT=https://api.openai.com"
+echo "   export COVEXCODE_MODEL=gpt-4"
+echo "   export COVEXCODE_API_KEY=sk-..."
 echo ""
-echo "2. Run boxcode:"
-echo "   boxcode"
+echo "2. Run covexcode:"
+echo "   covexcode"
 echo ""
-echo "📖 For more info: https://boxcode.sh"
+echo "📖 For more info: https://covexcode.com"
 echo ""
 }
 

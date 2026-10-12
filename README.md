@@ -4,18 +4,16 @@ A coding assistant that lives in your terminal. It reads your files and runs
 your commands — and waits for you before every one. Connects to any
 OpenAI-compatible LLM endpoint.
 
-**[boxcode.sh](https://boxcode.sh)**
+**[covexcode.com](https://covexcode.com)**
 
-> ### Renamed in v1.0.0
->
-> `tuisample-code` is now **`covexcode`**. Reinstall with the command below —
-> `~/.tuisample-code/` and `TUISAMPLE_*` env vars still migrate/work
-> automatically, but are deprecated in favor of `~/.covexcode/`/`COVEXCODE_*`.
+> Formerly **boxcode**. The binary, config dir, and env vars are now
+> `covexcode` / `~/.covexcode/` / `COVEXCODE_*`. Legacy `boxcode` /
+> `~/.boxcode/` / `BOXCODE_*` still migrate and work.
 
 ```
  ◈
 
-  ▟█▙       ▟█▙    boxcode  v1.11.0
+  ▟█▙       ▟█▙    covexcode  v1.11.0
   ▜███████████▛    a terminal coding assistant
   ██  █████  ██
   ▜███████████▛    Welcome back, you!
@@ -25,7 +23,7 @@ OpenAI-compatible LLM endpoint.
 
   model     deepseek-chat
   endpoint  https://api.deepseek.com
-  cwd       ~/Desktop/HolboxAI/boxcode
+  cwd       ~/Desktop/HolboxAI/covexcode
 
   /provider switch provider or endpoint
   /model    switch model
@@ -42,8 +40,8 @@ OpenAI-compatible LLM endpoint.
 
 ## Quick Start
 
-**Install** — macOS/Linux: `curl -fsSL https://boxcode.sh/install.sh | bash`
-Windows (PowerShell): `irm https://boxcode.sh/install.ps1 | iex`
+**Install** — macOS/Linux: `curl -fsSL https://covexcode.com/install.sh | bash`
+Windows (PowerShell): `irm https://covexcode.com/install.ps1 | iex`
 
 Downloads a prebuilt binary (no Rust toolchain needed) and verifies it against
 a published checksum. No prebuilt for your platform? It falls back to
@@ -52,8 +50,8 @@ install Rust yourself and run `cargo build --release`, or use WSL). Or build
 from source directly:
 
 ```bash
-git clone https://github.com/HolboxAI/boxcode && cd boxcode
-cargo build --release && ./target/release/boxcode
+git clone https://github.com/HolboxAI/covexcode && cd covexcode
+cargo build --release && ./target/release/covexcode
 ```
 
 **Configure** — launch `covexcode` and run `/provider`: pick a provider, then a
