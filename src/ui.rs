@@ -4485,7 +4485,7 @@ mod tests {
         let shown = welcome_text(&app, 96);
 
         assert!(shown.contains("Before you start"), "{shown}");
-        assert!(shown.contains("BOXCODE_API_KEY"), "{shown}");
+        assert!(shown.contains("COVEXCODE_API_KEY"), "{shown}");
     }
 
 
@@ -4502,7 +4502,7 @@ mod tests {
         for width in [42, 60, 96, 200] {
             let shown = welcome_text(&app, width);
             assert!(
-                shown.contains("BOXCODE_API_KEY"),
+                shown.contains("COVEXCODE_API_KEY"),
                 "the setup warning went missing at width {width}: {shown}"
             );
         }

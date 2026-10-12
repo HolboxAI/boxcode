@@ -668,7 +668,7 @@ version = \"9.9.9\"
         let github = default_raw_base();
         assert_eq!(
             join_url(&github, "install.sh"),
-            "https://raw.githubusercontent.com/HolboxAI/boxcode/main/install.sh"
+            "https://raw.githubusercontent.com/HolboxAI/covexcode/main/install.sh"
         );
         assert_eq!(join_url("http://mirror.internal/", "Cargo.toml"), "http://mirror.internal/Cargo.toml");
     }
