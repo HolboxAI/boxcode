@@ -1064,14 +1064,14 @@ pub fn schemas_for(
         "type": "function",
         "function": {
             "name": INTERACT_IN_BROWSER,
-            "description": "Click or type into the SAME tab check_in_browser just looked at, \
-                            then get a screenshot back so you can see the result. Use this to \
-                            actually verify a flow (fill a form and submit it, click a button and \
-                            see what happens) instead of guessing from source alone. This is NOT \
-                            read-only -- it acts inside whatever session/login state is already \
-                            in that tab, so the user is always asked before it runs, even with \
-                            approval otherwise relaxed. Needs a URL already opened via \
-                            check_in_browser in this turn or a recent one.",
+            "description": "Click, type, press a key, or navigate in the SAME tab check_in_browser \
+                            just looked at, then get a screenshot back so you can see the result. \
+                            Use this to actually verify a flow (fill a form and submit it, click a \
+                            button and see what happens, follow a link) instead of guessing from \
+                            source alone. This is NOT read-only -- it acts inside whatever \
+                            session/login state is already in that tab, so the user is always \
+                            asked before it runs, even with approval otherwise relaxed. Needs a \
+                            URL already opened via check_in_browser in this turn or a recent one.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1081,8 +1081,8 @@ pub fn schemas_for(
                     },
                     "action": {
                         "type": "string",
-                        "enum": ["click", "type"],
-                        "description": "'click' needs x/y. 'type' needs text -- it inserts at whatever element currently has focus, so click into a field first if one needs it."
+                        "enum": ["click", "type", "key", "navigate"],
+                        "description": "'click' needs x/y. 'type' needs text -- it inserts at whatever element currently has focus, so click into a field first if one needs it. 'key' needs key -- a named key to press (Enter to submit, Tab, Escape, arrows). 'navigate' needs target -- the URL to send the tab to."
                     },
                     "x": {
                         "type": "number",
@@ -1095,6 +1095,14 @@ pub fn schemas_for(
                     "text": {
                         "type": "string",
                         "description": "Text to type into whatever element currently has focus. Required when action is 'type'."
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Named key to press: Enter, Tab, Escape, Backspace, Delete, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, or F5. Required when action is 'key'."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "URL to navigate the tab to, e.g. a link href or a route. Required when action is 'navigate'."
                     }
                 },
                 "required": ["url", "action"]
@@ -1809,6 +1817,8 @@ struct CheckInBrowserArgs {
 pub enum BrowserInteraction {
     Click { x: f64, y: f64 },
     Type { text: String },
+    Key { key: String },
+    Navigate { target: String },
 }
 
 impl BrowserInteraction {
@@ -1817,6 +1827,8 @@ impl BrowserInteraction {
         match self {
             BrowserInteraction::Click { x, y } => format!("click ({x:.0}, {y:.0})"),
             BrowserInteraction::Type { text } => format!("type \"{}\"", clip(text, 40)),
+            BrowserInteraction::Key { key } => format!("press {key}"),
+            BrowserInteraction::Navigate { target } => format!("navigate to {target}"),
         }
     }
 }
@@ -2252,17 +2264,18 @@ pub enum Action {
     /// than reaching `tools::execute`, which has no local implementation for
     /// this at all.
     CheckInBrowser { url: String },
-    /// `interact_in_browser`: clicks or types into the same live tab
-    /// `check_in_browser` looks at -- fulfilled the same way, entirely on
-    /// the client side of the wire (see `headless.rs`'s `check_browser`,
-    /// which this reuses rather than duplicating the relay/timeout
-    /// machinery for).
+    /// `interact_in_browser`: clicks, types, presses a key, or navigates in
+    /// the same live tab `check_in_browser` looks at -- fulfilled the same
+    /// way, entirely on the client side of the wire (see `headless.rs`'s
+    /// `check_browser`, which this reuses rather than duplicating the
+    /// relay/timeout machinery for).
     ///
     /// Deliberately NOT read-only like `CheckInBrowser`: this acts inside
     /// whatever session/cookies/login state is already in that tab -- a
-    /// click can submit a real form, `Type` can fill a real password field
-    /// -- so unlike `CheckInBrowser` it is `Risk::Dangerous` (always asks,
-    /// see `action_risk`) and blocked in plan mode (see `plan_mode_block`).
+    /// click can submit a real form, `Type` can fill a real password field,
+    /// `Navigate` can send the tab anywhere -- so unlike `CheckInBrowser` it
+    /// is `Risk::Dangerous` (always asks, see `action_risk`) and blocked in
+    /// plan mode (see `plan_mode_block`).
     InteractInBrowser { url: String, interaction: BrowserInteraction },
     /// A tool on a configured MCP server, named `mcp__<server>__<tool>`.
     ///
@@ -2404,9 +2417,9 @@ pub fn action_risk(action: &Action, workspace_root: &Path) -> danger::Risk {
         // as `Publish`/`Deploy` above, it always asks, even with approval
         // switched off entirely.
         Action::InteractInBrowser { .. } => danger::Risk::Dangerous(
-            "acts inside the browser tab's current session -- a click or typed text uses \
-             whatever login/cookie state is already there, and boxcode cannot see what it will \
-             actually do until after it happens"
+            "acts inside the browser tab's current session -- a click, a typed string, a \
+             key press, or a navigation uses whatever login/cookie state is already there, and \
+             boxcode cannot see what it will actually do until after it happens"
                 .to_string(),
         ),
         // MCP tools always ask, and this arm must never be removed: without it
@@ -7066,6 +7079,42 @@ mod tests {
             Action::InteractInBrowser {
                 url: "http://localhost:3000".to_string(),
                 interaction: BrowserInteraction::Type { text: "hello".to_string() },
+            }
+        );
+
+        let key_call = ToolCall {
+            function: crate::llm::FunctionCall {
+                name: INTERACT_IN_BROWSER.to_string(),
+                arguments: r#"{"url":"http://localhost:3000","action":"key","key":"Enter"}"#
+                    .to_string(),
+            },
+            ..Default::default()
+        };
+        let action = describe_action(&key_call).expect("parses");
+        assert_eq!(
+            action,
+            Action::InteractInBrowser {
+                url: "http://localhost:3000".to_string(),
+                interaction: BrowserInteraction::Key { key: "Enter".to_string() },
+            }
+        );
+
+        let navigate_call = ToolCall {
+            function: crate::llm::FunctionCall {
+                name: INTERACT_IN_BROWSER.to_string(),
+                arguments: r#"{"url":"http://localhost:3000","action":"navigate","target":"http://localhost:3000/about"}"#
+                    .to_string(),
+            },
+            ..Default::default()
+        };
+        let action = describe_action(&navigate_call).expect("parses");
+        assert_eq!(
+            action,
+            Action::InteractInBrowser {
+                url: "http://localhost:3000".to_string(),
+                interaction: BrowserInteraction::Navigate {
+                    target: "http://localhost:3000/about".to_string(),
+                },
             }
         );
     }
