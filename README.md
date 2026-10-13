@@ -46,10 +46,11 @@ OpenAI-compatible LLM endpoint.
 Windows (PowerShell): `irm https://boxcode.sh/install.ps1 | iex`
 
 Downloads a prebuilt binary (no Rust toolchain needed) and verifies it against
-a published checksum. No prebuilt for your platform? It falls back to
-installing Rust and building from source (macOS/Linux only — on Windows,
-install Rust yourself and run `cargo build --release`, or use WSL). Or build
-from source directly:
+a published checksum. No prebuilt for your platform? The installer falls back
+to building from source when Rust is available — on macOS/Linux it installs
+Rust automatically, and on Windows it builds from source if `cargo` is already
+on PATH (otherwise install Rust yourself and re-run the installer, or use
+WSL). Or build from source directly:
 
 ```bash
 git clone https://github.com/HolboxAI/boxcode && cd boxcode

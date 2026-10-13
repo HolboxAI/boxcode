@@ -194,6 +194,146 @@ try {
 }
 Remove-Item -Force $realDest -ErrorAction SilentlyContinue
 
+# --- Test-CargoAvailable ---------------------------------------------------------
+# Fake `git`/`cargo` shell scripts, the same trick Install-Ddgs's own test
+# uses for its fake python.exe: PATH is *prepended* (never replaced) so the
+# fakes win for `git`/`cargo` while mkdir/printf/dirname still resolve to the
+# real system tools the scripts themselves call.
+$buildToolsDir = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-buildtools-$PID"
+Remove-Item -Recurse -Force $buildToolsDir -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $buildToolsDir | Out-Null
+
+$fakeGit = Join-Path $buildToolsDir 'git'
+Set-Content -Path $fakeGit -Value @'
+#!/bin/sh
+# `git clone --depth 1 URL DEST` -> create DEST (the last argument).
+if [ "$1" = "clone" ]; then
+  for last do :; done
+  mkdir -p "$last"
+fi
+exit 0
+'@
+chmod +x $fakeGit
+
+$fakeCargo = Join-Path $buildToolsDir 'cargo'
+Set-Content -Path $fakeCargo -Value @'
+#!/bin/sh
+# `cargo build --release` -> drop a stand-in boxcode.exe under target/release.
+if [ "$1" = "build" ]; then
+  mkdir -p target/release
+  printf 'fake-boxcode-binary' > target/release/boxcode.exe
+fi
+exit 0
+'@
+chmod +x $fakeCargo
+
+$oldPathForBuild = $env:PATH
+$env:PATH = "$buildToolsDir$([System.IO.Path]::PathSeparator)$env:PATH"
+
+if (Test-CargoAvailable) {
+    Test-Pass 'Test-CargoAvailable finds cargo when it is on PATH'
+} else {
+    Test-Fail 'Test-CargoAvailable should find the fake cargo on PATH'
+}
+
+$emptyDir = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-empty-$PID"
+New-Item -ItemType Directory -Force -Path $emptyDir | Out-Null
+$env:PATH = $emptyDir
+if (Test-CargoAvailable) {
+    Test-Fail 'Test-CargoAvailable should return $false when cargo is not on PATH'
+} else {
+    Test-Pass 'Test-CargoAvailable returns $false when cargo is not on PATH'
+}
+$env:PATH = "$buildToolsDir$([System.IO.Path]::PathSeparator)$oldPathForBuild"
+
+# --- Build-BoxcodeFromSource -----------------------------------------------------
+# Success path: with the fake git/cargo above, this must clone (mkdir), build
+# (drop the stand-in exe), and hand back a staged, non-empty copy -- while
+# leaving no build tree behind for the caller to worry about.
+try {
+    $staged = Build-BoxcodeFromSource
+    if ((Test-Path -LiteralPath $staged) -and (Get-Item -LiteralPath $staged).Length -gt 0) {
+        Test-Pass 'Build-BoxcodeFromSource builds via cargo and stages a non-empty exe'
+    } else {
+        Test-Fail 'Build-BoxcodeFromSource should have returned a staged, non-empty exe'
+    }
+    Remove-Item -Force $staged -ErrorAction SilentlyContinue
+} catch {
+    Test-Fail "Build-BoxcodeFromSource threw unexpectedly: $($_.Exception.Message)"
+}
+
+# Failure path: a `cargo` that always fails must surface as a thrown error (not
+# a silent success) -- that throw is what Main catches and reports to the user.
+Set-Content -Path $fakeCargo -Value @'
+#!/bin/sh
+exit 1
+'@
+chmod +x $fakeCargo
+$threw = $false
+try {
+    $null = Build-BoxcodeFromSource
+} catch {
+    $threw = $true
+}
+if ($threw) {
+    Test-Pass 'Build-BoxcodeFromSource throws when cargo build fails'
+} else {
+    Test-Fail 'Build-BoxcodeFromSource should throw when the build fails'
+}
+
+# Restore the succeeding cargo for the end-to-end Main test below.
+Set-Content -Path $fakeCargo -Value @'
+#!/bin/sh
+# `cargo build --release` -> drop a stand-in boxcode.exe under target/release.
+if [ "$1" = "build" ]; then
+  mkdir -p target/release
+  printf 'fake-boxcode-binary' > target/release/boxcode.exe
+fi
+exit 0
+'@
+chmod +x $fakeCargo
+
+# --- Main: download fails -> source build succeeds --------------------------------
+# Force the prebuilt download to fail (unreachable release API) while the fake
+# cargo/git are on PATH; Main must still install a binary by building from
+# source -- the exact recovery a student with Rust already installed gets when
+# GitHub 403s the download. The binary is installed before Main's trailing
+# PATH/version steps, so the assertion checks the install happened regardless
+# of whether those trailing steps succeed on the host running this test.
+$fallbackSandboxHome = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-src-sandbox-$PID"
+$fallbackSandboxAppData = Join-Path $fallbackSandboxHome 'LocalAppData'
+Remove-Item -Recurse -Force $fallbackSandboxHome -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $fallbackSandboxAppData | Out-Null
+
+$env:USERPROFILE = $fallbackSandboxHome
+$env:LOCALAPPDATA = $fallbackSandboxAppData
+$env:BOXCODE_TELEMETRY_URL = 'off'
+$env:PROCESSOR_ARCHITECTURE = 'AMD64'
+Remove-Item Env:\PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
+$env:BOXCODE_RELEASE_API_BASE = 'http://127.0.0.1:1'
+$env:PATH = "$buildToolsDir$([System.IO.Path]::PathSeparator)$oldPathForBuild"
+
+try {
+    Main
+} catch {
+    # Main's trailing `& boxcode.exe --version` and PATH-scope write can fail
+    # on a host that cannot run the (fake) exe -- the install it was asked to
+    # perform already happened by then, so this is not a test failure.
+}
+$installedExe = Join-Path $fallbackSandboxAppData 'Programs\boxcode\boxcode.exe'
+if ((Test-Path $installedExe) -and (Get-Item $installedExe).Length -gt 0) {
+    Test-Pass 'Main falls back to a source build and installs a binary when the download fails'
+} else {
+    Test-Fail 'Main should have installed a source-built binary after the download failed'
+}
+
+Remove-Item Env:\BOXCODE_RELEASE_API_BASE -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $fallbackSandboxHome -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $buildToolsDir -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $emptyDir -ErrorAction SilentlyContinue
+$env:PATH = $oldPathForBuild
+$env:LOCALAPPDATA = $null
+
 # --- Send-InstallPing -----------------------------------------------------------
 $fakeHome = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-ps1-test-home-$PID"
 Remove-Item -Recurse -Force $fakeHome -ErrorAction SilentlyContinue
