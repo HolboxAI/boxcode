@@ -6,12 +6,13 @@
 #   irm https://boxcode.sh/install.ps1 | iex
 # is that platform's equivalent one-liner (Invoke-RestMethod | Invoke-Expression).
 #
-# Unlike install.sh, there is no source-build fallback here: building Rust on
-# Windows needs the MSVC Build Tools, a much bigger ask than `rustup` alone,
-# so this only ever fetches the prebuilt binary release.yml already produces.
-# If that's ever missing (no release published, or this platform genuinely
-# isn't built), this fails with a clear message rather than trying to set up
-# a C++ toolchain unasked.
+# Like install.sh, this prefers the prebuilt binary release.yml already
+# produces, and falls back to building from source when that download fails
+# (a 403 from GitHub, a blocked CDN, no release published yet) *if* a usable
+# `cargo` is already on PATH. It deliberately does not try to install Rust or
+# the MSVC Build Tools unasked -- both are a much bigger commitment than
+# `rustup` alone, so when cargo is missing it stops at explicit instructions
+# instead of setting up a whole C++ toolchain behind the user's back.
 #
 # Functions only below `Main` is never called automatically when this file is
 # dot-sourced (`. .\install.ps1`) rather than run directly -- that's what
@@ -206,6 +207,70 @@ function Get-PrebuiltBinary {
                 throw "checksum mismatch for $AssetName -- refusing to install a corrupted download"
             }
         }
+    }
+}
+
+# --- source-build fallback ---------------------------------------------------
+#
+# The prebuilt download is the fast path, not the only path. It can still
+# legitimately fail on a student's machine -- GitHub 403s anonymous downloads
+# from some default PowerShell configurations, a corporate proxy blocks the
+# CDN, or no release has been published yet -- and every one of those must be
+# recoverable the way install.sh's source build makes them recoverable on
+# macOS/Linux, not a dead end. Building needs `cargo` on PATH *and* a working
+# C linker (the MSVC Build Tools, or the GNU toolchain), so this only tries
+# when cargo is already there and leaves a clear message otherwise.
+
+# Whether a usable `cargo` is on PATH. A function (not an inline Get-Command)
+# so Main's decision reads as a plain question and so tests can drive it.
+function Test-CargoAvailable {
+    return $null -ne (Get-Command cargo -ErrorAction SilentlyContinue)
+}
+
+# Clones the repo and builds boxcode from source, returning the path to a
+# staged copy of the built exe. Mirrors install.sh's own source-build
+# fallback: clone into a fresh temp dir, `cargo build --release`, copy the
+# resulting boxcode.exe out of the (large) build tree, then drop the tree so
+# the caller just installs a single file and never has to know where the
+# build happened. Throws on any failure -- the caller turns that into the
+# same clear "no prebuilt binary" error rather than a stack trace, so a
+# half-configured Rust toolchain (cargo present, linker absent) still ends as
+# a legible message telling the student exactly what to install.
+function Build-BoxcodeFromSource {
+    $workDir = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-src-$PID-$(Get-Random)"
+    New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+
+    try {
+        Write-Host '  Cloning the repository to build from source...'
+        & git clone --depth 1 https://github.com/HolboxAI/boxcode.git (Join-Path $workDir 'src')
+        if ($LASTEXITCODE -ne 0) {
+            throw 'git clone failed -- is git installed and on PATH?'
+        }
+
+        Write-Host '  Running cargo build --release (this takes a few minutes)...'
+        Push-Location (Join-Path $workDir 'src')
+        try {
+            & cargo build --release
+            if ($LASTEXITCODE -ne 0) {
+                throw 'cargo build failed -- on Windows this is usually a missing C linker (the MSVC Build Tools). Install "Desktop development with C++" from https://visualstudio.microsoft.com/visual-cpp-build-tools/ and retry, or switch to the GNU toolchain with: rustup toolchain install stable-x86_64-pc-windows-gnu'
+            }
+        } finally {
+            Pop-Location
+        }
+
+        $builtExe = [System.IO.Path]::Combine($workDir, 'src', 'target', 'release', 'boxcode.exe')
+        if (-not (Test-Path -LiteralPath $builtExe)) {
+            throw "build finished but no binary was produced at $builtExe"
+        }
+        Write-Host '  Built from source successfully.'
+
+        $staged = Join-Path ([System.IO.Path]::GetTempPath()) "boxcode-src-built-$PID-$(Get-Random).exe"
+        Copy-Item -LiteralPath $builtExe -Destination $staged
+        Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
+        return $staged
+    } catch {
+        Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
+        throw
     }
 }
 
@@ -470,14 +535,41 @@ function Main {
             Remove-Item -Force $tempDest -ErrorAction SilentlyContinue
         }
     }
+    # The prebuilt download is the fast path, not the only path. When it
+    # fails and cargo is already on the machine, recover the way install.sh
+    # does -- build from source -- so a 403 from GitHub or a blocked CDN is a
+    # hiccup on a machine that has Rust, not a dead end.
+    if (-not $downloaded -and (Test-CargoAvailable)) {
+        Write-Host ''
+        Write-Host "No prebuilt binary for windows-$arch ($lastError). Building from source instead..."
+        try {
+            $tempDest = Build-BoxcodeFromSource
+            $downloaded = $true
+        } catch {
+            $lastError = $_.Exception.Message
+            Write-Host ''
+            Write-Host "Source build failed too: $lastError"
+        }
+    }
+
     if (-not $downloaded) {
         Write-Host ''
         Write-Host "No prebuilt binary is available for windows-$arch right now ($lastError)."
         Write-Host ''
-        Write-Host 'There is no automatic source-build fallback on Windows (it needs the MSVC'
-        Write-Host 'Build Tools, which this installer will not set up unasked). Options:'
-        Write-Host '  - Install Rust (https://rustup.rs) and run: cargo build --release'
-        Write-Host '  - Use WSL and the regular install.sh instead'
+        Write-Host 'To fix this yourself, run one of the following in a new PowerShell window:'
+        Write-Host ''
+        Write-Host '  1. Re-run the installer (it now sends the headers GitHub requires):'
+        Write-Host '       irm https://boxcode.sh/install.ps1 | iex'
+        Write-Host ''
+        Write-Host '  2. Build from source (needs Rust -- see https://rustup.rs):'
+        Write-Host '       git clone https://github.com/HolboxAI/boxcode.git'
+        Write-Host '       cd boxcode'
+        Write-Host '       cargo build --release'
+        Write-Host '       .\target\release\boxcode.exe --version'
+        Write-Host ''
+        Write-Host '  3. Or install via WSL and the regular installer:'
+        Write-Host '       wsl --install'
+        Write-Host '       curl -fsSL https://boxcode.sh/install.sh | bash'
         throw 'no prebuilt binary available'
     }
 
