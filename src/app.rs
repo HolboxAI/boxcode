@@ -3238,7 +3238,7 @@ impl App {
         // as prose instead, in whatever markup it was trained on. That is not
         // an answer and must not be shown as one -- see `split_leaked_markup`.
         let (prose, leaked) = split_leaked_markup(&response);
-        let budget_spent = self.tool_steps >= self.config.tools.max_steps;
+        let budget_spent = self.config.tools.max_steps != 0 && self.tool_steps >= self.config.tools.max_steps;
 
         if !prose.trim().is_empty() {
             // Whatever was already streamed above the viewport must not be
@@ -3270,7 +3270,7 @@ impl App {
                     "Stopped after {} tool rounds — the per-turn command budget. The model \
                      tried to keep going and wrote its next command out as text, so nothing \
                      ran. Say \"continue\", or raise `max_steps` under [tools] in \
-                     ~/.boxcode/config.toml.",
+                     ~/.boxcode/config.toml (`max_steps = 0` removes the limit).",
                     self.tool_steps
                 )
             } else {
@@ -3286,7 +3286,7 @@ impl App {
                 format!(
                     "Stopped after {} tool rounds — the per-turn command budget. Say \
                      \"continue\" to keep going, or raise `max_steps` under [tools] in \
-                     ~/.boxcode/config.toml.",
+                     ~/.boxcode/config.toml (`max_steps = 0` removes the limit).",
                     self.tool_steps
                 ),
             ));

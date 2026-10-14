@@ -1037,7 +1037,12 @@ pub fn schemas_for(
             "name": CHECK_IN_BROWSER,
             "description": "Open a URL in the user's own Integrated Browser and capture a \
                             screenshot back as an image, so you can see what a change actually \
-                            rendered as instead of assuming it worked. This is the only way to \
+                            rendered as instead of assuming it worked. The result ALSO includes a \
+                            text accessibility tree (element roles and labels) that works even \
+                            when the model cannot read images -- always use that tree to resolve \
+                            what the user is pointing at ('this option', 'the leftmost pane', \
+                            'the button at the very bottom') instead of guessing a file path. \
+                            This is the only way to \
                             show the user a page or verify one -- always reach for this, never a \
                             shell command like `open`/`start`/`xdg-open`, whenever the user asks \
                             to see, open, or check something in a browser, or after a frontend \
@@ -1419,7 +1424,7 @@ pub fn system_prompt(
     steps_used: usize,
     mode: Mode,
 ) -> String {
-    if steps_used >= config.max_steps {
+    if config.max_steps != 0 && steps_used >= config.max_steps {
         return format!(
             "You are boxcode, a terminal coding assistant working in {}.\n\
              You have used up this turn's command budget. Answer the user now, in text, \
@@ -1540,6 +1545,10 @@ pub fn system_prompt(
            with {GREP_SEARCH} before guessing at what a file says. Prefer all three over \
            `ls`/`find`/`grep` through {RUN_COMMAND}: they need no approval, so they cost the \
            user nothing to answer.\n\
+         - When the user points at something on screen without naming it (\"this option\", \"the \
+           leftmost pane\", \"the button at the very bottom\"), do not guess a target. Resolve it \
+           against the real page or UI first; if you still cannot tell what they mean, ask one short \
+           clarifying question before changing anything.\n\
          - To change part of an existing file use {EDIT_FILE}, not {WRITE_FILE}. {WRITE_FILE} \
            replaces the entire file, so it silently destroys anything you did not reproduce; \
            reserve it for creating a file or rewriting one wholesale. Read the file first so \
@@ -1758,7 +1767,7 @@ pub fn turn_status(
     // withheld, and a call it was halfway through composing dies as leaked
     // text (see `App::finish_stream`). A model that knows the budget can
     // land the turn; one that discovers it cannot.
-    if steps_used * 4 >= config.max_steps * 3 {
+    if config.max_steps != 0 && steps_used * 4 >= config.max_steps * 3 {
         let steps_left = config.max_steps - steps_used;
         status.push_str(&format!(
             "\n\nBUDGET: {steps_used} of {} tool rounds used this turn -- {steps_left} left. \

@@ -55,7 +55,7 @@ pub fn fire_request(
     // Withholding the schemas once the budget is spent is what actually
     // stops a runaway loop: the model has nothing left to call, so it
     // answers. Saying "stop" in the prompt alone would only be a request.
-    let budget_left = app.tool_steps < app.config.tools.max_steps;
+    let budget_left = app.config.tools.max_steps == 0 || app.tool_steps < app.config.tools.max_steps;
     // Exact counts make the quota real; without them it falls back to the
     // same character estimate `usage.rs` uses.
     let include_usage = app.config.quota.enabled && app.config.quota.include_usage;
