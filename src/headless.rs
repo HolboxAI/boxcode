@@ -302,7 +302,7 @@ impl HeadlessSession {
         }
 
         loop {
-            let budget_left = self.tool_steps < self.config.tools.max_steps;
+            let budget_left = self.config.tools.max_steps == 0 || self.tool_steps < self.config.tools.max_steps;
             if !budget_left {
                 // Same reasoning as agent::fire_request: withholding the
                 // schemas is what actually stops a runaway loop, not asking

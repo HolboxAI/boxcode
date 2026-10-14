@@ -716,7 +716,14 @@ impl Config {
         // bad setting.
         self.tools.max_output_bytes = self.tools.max_output_bytes.clamp(1024, 8 * 1024 * 1024);
         self.tools.command_timeout_secs = self.tools.command_timeout_secs.clamp(1, 3600);
-        self.tools.max_steps = self.tools.max_steps.clamp(1, 50);
+        // 0 means "no per-turn limit": the agent keeps going until it
+        // stops on its own or the user interrupts. Anything else is clamped
+        // to a sane ceiling (was 1..=50; now 1..=10_000).
+        self.tools.max_steps = if self.tools.max_steps == 0 {
+            0
+        } else {
+            self.tools.max_steps.clamp(1, 10_000)
+        };
 
         self.tools.python_bin = self.tools.python_bin.trim().to_string();
         if self.tools.python_bin.is_empty() {
@@ -1446,7 +1453,9 @@ mod tests {
 
         assert_eq!(config.tools.max_output_bytes, 1024);
         assert_eq!(config.tools.command_timeout_secs, 1);
-        assert_eq!(config.tools.max_steps, 1);
+        // 0 is now a meaningful sentinel: "no per-turn limit", so it must
+        // survive normalize() unchanged (a positive value would clamp to 10_000).
+        assert_eq!(config.tools.max_steps, 0);
         assert_eq!(config.tools.workspace, ".");
         assert_eq!(config.tools.python_bin, "python3");
         assert_eq!(config.tools.search_timeout_secs, 1);
