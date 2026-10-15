@@ -194,6 +194,9 @@ approval = "destructive"  # what stops to ask:
                           #   "destructive" (default) — only actions that destroy
                           #     something or put something on the public internet
                           #   "always" — every write and every command, sparing reads
+max_steps = 40           # tool calls per turn before it pauses and asks you to
+                         #   say "continue". 0 = no limit (keep going); anything
+                         #   else is clamped to 1..=10000. Default is 40.
 
 [deploy]
 enabled = true            # false removes the deploy_project tool entirely
