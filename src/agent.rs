@@ -397,7 +397,9 @@ pub async fn run_subagent(
     let mut overtime = 0usize;
 
     loop {
-        let budget_left = steps < max_steps && spent < token_budget;
+        // `0` means "no limit" for both budgets, matching `max_steps`'s own
+        // convention -- an unlimited child keeps its schemas until it answers.
+        let budget_left = (max_steps == 0 || steps < max_steps) && (token_budget == 0 || spent < token_budget);
         // Telling the prompt the budget is gone (whichever budget it was) is
         // what makes the last round an answer instead of another search.
         history[0] = ChatMessage::text(
@@ -831,22 +833,36 @@ mod tests {
         assert_eq!(activities[1].1, 2);
     }
 
-    /// With the step budget already spent, the one request made carries the
-    /// answer-now prompt and no schemas: the report is forced, not asked for.
+    /// With the step budget already spent, the request that follows carries
+    /// the answer-now prompt and no schemas: the report is forced, not asked
+    /// for.
     #[tokio::test]
     async fn a_spent_budget_forces_the_report() {
         let (_dir, ws) = workspace_with_hello();
-        let (endpoint, requests) = serve_rounds(vec![text_round("Forced report.")]).await;
+        let (endpoint, requests) = serve_rounds(vec![
+            tool_call_round(tools::READ_FILE, r#"{"path":"hello.txt"}"#),
+            text_round("Forced report."),
+        ])
+        .await;
         let mut config = config_for(&endpoint);
-        config.tools.subagent_max_steps = 0;
+        // One allowed round, then the schemas are withheld and the child is
+        // made to answer. (`0` now means "no limit", so a spent budget has to
+        // be a positive one.)
+        config.tools.subagent_max_steps = 1;
 
         let outcome =
             run_subagent(&agent_call(json!({ "task": "anything" })), &ws, &config, None).await;
 
         assert_eq!(outcome.content, "Forced report.");
-        let requests = requests.await.expect("round served");
-        assert!(requests[0].contains("Write your report now"), "the prompt demands an answer");
-        assert!(!requests[0].contains("\"tools\""), "no schemas: stopping is enforced, not requested");
+        let requests = requests.await.expect("both rounds served");
+        assert!(
+            requests[1].contains("Write your report now"),
+            "the prompt demands an answer"
+        );
+        assert!(
+            !requests[1].contains("\"tools\""),
+            "no schemas: stopping is enforced, not requested"
+        );
     }
 
     // -- Phase 1 parallel read-only fan-out (`run_calls`) --------------------

@@ -388,7 +388,7 @@ pub struct ToolsConfig {
     pub max_output_bytes: usize,
     /// How many command rounds one prompt may take before the schema is withheld
     /// and the model is made to answer. Without this a model that keeps running
-    /// commands burns tokens until the user notices.
+    /// commands burns tokens until the user notices. `0` removes the limit.
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
     /// The Python interpreter `web_search` shells out to. Not on every machine's
@@ -443,14 +443,14 @@ pub struct ToolsConfig {
     /// How many request rounds one subagent may take before its schemas are
     /// withheld and it is made to answer. Separate from `max_steps`: a child
     /// exists to answer one focused question, so its budget is deliberately
-    /// smaller than the loop that spawned it.
+    /// smaller than the loop that spawned it. `0` removes the limit.
     #[serde(default = "default_subagent_max_steps")]
     pub subagent_max_steps: usize,
     /// Ceiling on the tokens one subagent may spend across all of its rounds
     /// (exact counts when the endpoint reports them, the usual character
     /// estimate when it does not). Steps bound how many *turns* a child takes;
-    /// this bounds how much each of those turns is allowed to cost -- without
-    /// it, fifteen rounds over a growing transcript is an unbounded bill.
+    /// this bounds how much each of those turns is allowed to cost. `0`
+    /// removes the limit.
     #[serde(default = "default_subagent_token_budget")]
     pub subagent_token_budget: usize,
     /// Attach `check_in_browser`'s screenshot to the model's own next
@@ -503,12 +503,11 @@ fn default_max_output_bytes() -> usize {
 }
 
 fn default_max_steps() -> usize {
-    // 10 was set when the model had three tools and made one-shot edits. With
-    // six tools and an agentic loop, real work blows through ten rounds while
-    // it is still gathering context -- and the failure mode is bad: the schemas
-    // are withheld mid-task, so the model writes its next call out as text and
-    // the turn dies. See `App::finish_stream`.
-    40
+    // 0 means "no per-turn limit": the agent keeps going until it stops on
+    // its own or the user interrupts. The opt-in safety valve against a
+    // runaway loop stays available -- set a positive value to cap how many
+    // tool rounds one prompt may take before the schemas are withheld.
+    0
 }
 
 fn default_python_bin() -> String {
@@ -548,17 +547,16 @@ fn default_search_timeout() -> u64 {
 }
 
 fn default_subagent_max_steps() -> usize {
-    // Enough to explore a question properly (a child that greps, reads five
-    // files and answers uses six), small enough that a child which has lost
-    // the thread is cut off well before the parent's own 40-round budget.
-    15
+    // 0 means "no limit": a child keeps its tool schemas until it answers on
+    // its own. Matches `default_max_steps`'s convention; a positive value is
+    // the opt-in ceiling for anyone who wants a runaway child cut off early.
+    0
 }
 
 fn default_subagent_token_budget() -> usize {
-    // Roomy for research over a real codebase, but a hard ceiling: at typical
-    // per-round transcript growth this is the cost of one thorough child, not
-    // a runaway one.
-    200_000
+    // 0 means "no token ceiling" for a child, mirroring `default_max_steps`.
+    // A positive value still caps a subagent's spend across all its rounds.
+    0
 }
 
 impl Default for ToolsConfig {

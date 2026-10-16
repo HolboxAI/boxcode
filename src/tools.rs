@@ -1342,7 +1342,7 @@ pub fn subagent_call_allowed(call: &ToolCall) -> Result<(), String> {
 /// and the final message *is* the deliverable, because it is the only thing
 /// the requester ever sees.
 pub fn subagent_system_prompt(workspace: &Workspace, steps_used: usize, max_steps: usize) -> String {
-    if steps_used >= max_steps {
+    if max_steps != 0 && steps_used >= max_steps {
         return format!(
             "You are a read-only research subagent working in {}.\n\
              You have used up your tool budget. Write your report now, in text, from what \
@@ -1354,6 +1354,17 @@ pub fn subagent_system_prompt(workspace: &Workspace, steps_used: usize, max_step
         "This is Windows: use `dir`, `type`, `findstr`. Do NOT use ls/cat/grep."
     } else {
         "This is a Unix-like system: use `ls`, `cat`, `grep`, `find`."
+    };
+    // `max_steps == 0` means "no limit", so there is no countdown to report
+    // (and no `max_steps - steps_used` subtraction to underflow on `usize`).
+    let budget_line = if max_steps == 0 {
+        String::new()
+    } else {
+        format!(
+            " You have {} tool round{} left; be economical, then answer.",
+            max_steps - steps_used,
+            if max_steps - steps_used == 1 { "" } else { "s" },
+        )
     };
     format!(
         "You are a read-only research subagent inside boxcode, a terminal coding assistant. \
@@ -1370,12 +1381,10 @@ pub fn subagent_system_prompt(workspace: &Workspace, steps_used: usize, max_step
          Tools: {READ_FILE}(path, offset?, limit?), {LIST_DIR}(path?), {GLOB}(pattern), \
          {GREP_SEARCH}(pattern, path?, context?), and {RUN_COMMAND} for read-only commands \
          only (`git log`, `cargo tree`, ...) -- anything that could change files, state or \
-         the network is refused, so do not try. You have {steps_left} tool round{plural} \
-         left; be economical, then answer.",
+         the network is refused, so do not try.{budget_line}",
         root = workspace.root().display(),
         os = std::env::consts::OS,
-        steps_left = max_steps - steps_used,
-        plural = if max_steps - steps_used == 1 { "" } else { "s" },
+        budget_line = budget_line,
     )
 }
 
@@ -6784,7 +6793,7 @@ mod tests {
     /// Windows, so the prompt has to name the platform outright.
     #[test]
     fn the_system_prompt_names_the_platform_and_the_shell() {
-        let (_dir, ws, cfg) = fixture();
+        let (_dir, ws, mut cfg) = fixture();
         let prompt = system_prompt(&ws, &cfg, 0, Mode::Normal);
 
         assert!(prompt.contains(std::env::consts::OS), "{prompt}");
@@ -6796,6 +6805,9 @@ mod tests {
             assert!(prompt.contains("Unix-like"), "{prompt}");
         }
 
+        // The default `max_steps` is 0 ("no limit"), so an explicit positive
+        // budget is what exercises the answer-now branch.
+        cfg.max_steps = 40;
         let exhausted = system_prompt(&ws, &cfg, cfg.max_steps, Mode::Normal);
         assert!(exhausted.contains("Answer the user now"), "{exhausted}");
     }
@@ -6809,7 +6821,10 @@ mod tests {
     /// provider's cache prefix on every request past the threshold.
     #[test]
     fn the_turn_status_warns_at_three_quarters_of_the_step_budget() {
-        let (_dir, ws, cfg) = fixture();
+        let (_dir, ws, mut cfg) = fixture();
+        // `max_steps = 0` means "no limit", so this warning path needs an
+        // explicit positive budget.
+        cfg.max_steps = 40;
         let three_quarters = cfg.max_steps * 3 / 4;
 
         assert_eq!(
@@ -6842,7 +6857,10 @@ mod tests {
     /// bill. So it must not vary, however far into the budget the turn is.
     #[test]
     fn the_system_prompt_does_not_vary_between_rounds_of_one_turn() {
-        let (_dir, ws, cfg) = fixture();
+        let (_dir, ws, mut cfg) = fixture();
+        // A positive budget, so the "spent" case at the end of this test has a
+        // real threshold (`max_steps = 0` would mean no limit and no spent case).
+        cfg.max_steps = 40;
         let first = system_prompt(&ws, &cfg, 0, Mode::Normal);
 
         for steps in [1, 5, cfg.max_steps * 3 / 4, cfg.max_steps - 1] {
@@ -7366,6 +7384,12 @@ mod tests {
         assert!(fresh.contains("15 tool rounds left"));
         let spent = subagent_system_prompt(&ws, 15, 15);
         assert!(spent.contains("Write your report now"));
+        // `0` means no limit: no "used up" verdict and no countdown, even
+        // after many rounds.
+        let unlimited = subagent_system_prompt(&ws, 1000, 0);
+        assert!(unlimited.contains("read-only research subagent"));
+        assert!(!unlimited.contains("used up"), "{unlimited}");
+        assert!(!unlimited.contains("tool round"), "{unlimited}");
     }
 
     // ---- get_design_starter / check_contrast ------------------------------
