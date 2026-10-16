@@ -274,6 +274,12 @@ impl HeadlessSession {
         // first prompt maps to "turn 1". The rollback journal records files
         // against this value (see `record_turn` below).
         self.turn += 1;
+        // The step budget is *per turn*, not per session: without this reset a
+        // long-lived ACP session would accumulate tool rounds across turns and
+        // eventually withhold the schemas on every later turn, permanently
+        // stranding the chat with no way to call a tool. `App` resets its own
+        // counter the same way at the start of each TUI turn.
+        self.tool_steps = 0;
         self.turn_starts.push(self.messages.len());
 
         let mut user_message = ChatMessage::text("user", text);
