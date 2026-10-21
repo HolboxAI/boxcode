@@ -482,8 +482,17 @@ if [ "$OS_NAME" != "unsupported" ] && [ "$ARCH_NAME" != "unsupported" ]; then
   echo "🔍 Looking for a prebuilt $OS_NAME-$ARCH_NAME binary..."
   CANDIDATE="$TEMP_DIR/boxcode"
   if fetch_prebuilt_binary "$OS_NAME" "$ARCH_NAME" "$CANDIDATE"; then
-    BINARY_PATH="$CANDIDATE"
-    echo "✓ Downloaded a prebuilt binary — no build required"
+    # A prebuilt binary built on a newer glibc than this host won't even start
+    # ("GLIBC_x.yy not found" at load time, before main runs). Smoke-test it
+    # with `--version` -- handled before any terminal work -- and fall back to
+    # a source build, which links against the host's own glibc, rather than
+    # installing a binary that crashes on every launch.
+    if "$CANDIDATE" --version >/dev/null 2>&1; then
+      BINARY_PATH="$CANDIDATE"
+      echo "✓ Downloaded a prebuilt binary — no build required"
+    else
+      echo "⚠️  The prebuilt binary won't run on this system (glibc too old?). Building from source instead..."
+    fi
   else
     echo "⚠️  No usable prebuilt binary for $OS_NAME-$ARCH_NAME yet. Building from source instead..."
   fi

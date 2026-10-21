@@ -21,9 +21,16 @@ jobs:
             arch: aarch64
             runner: macos-15
             target: aarch64-apple-darwin
+          # x86_64 builds natively, so its glibc floor is the runner's. Pin
+          # ubuntu-22.04 (glibc 2.35) rather than the floating `ubuntu-latest`
+          # (glibc 2.39 today, heading to 2.43): glibc is backward- but not
+          # forward-compatible, so a binary built on `ubuntu-latest` refuses to
+          # start on any distro with an older glibc ("GLIBC_x.yy not found").
+          # aarch64 is built with `cross` below, so its glibc comes from the
+          # cross Docker image rather than this runner.
           - os: linux
             arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: linux
             arch: aarch64
