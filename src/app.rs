@@ -232,6 +232,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/rollback", "undo every file the model wrote this session"),
     ("/diff", "show everything changed on disk this session"),
     ("/exit", "leave boxcode"),
+    ("/doctor", "check this install's health"),
+    ("/help", "list every slash command"),
 ];
 
 /// Roughly how many characters one token is worth.
@@ -865,6 +867,8 @@ impl App {
             "/rollback" => self.start_rollback(),
             "/diff" => self.show_diff(),
             "/exit" => self.exit_now(),
+            "/doctor" => self.show_doctor(),
+            "/help" => self.show_help(),
             other => unreachable!("COMMANDS names {other:?}, not dispatched here"),
         }
     }
@@ -3103,6 +3107,99 @@ impl App {
         self.follow_tail = true;
     }
 
+    /// `/help`: every slash command in one message, read straight from
+    /// `COMMANDS` so it can never drift out of sync with the autocomplete menu
+    /// and the Ctrl+P palette.
+    fn show_help(&mut self) {
+        self.print_readout(Self::help_readout);
+    }
+
+    fn help_readout(&self) -> String {
+        let mut lines = vec![format!("boxcode {} — slash commands", env!("CARGO_PKG_VERSION"))];
+        for (name, desc) in self.available_commands() {
+            lines.push(format!("  {name:<12} {desc}"));
+        }
+        lines.push(String::new());
+        lines.push("  / starts autocomplete · Tab completes · Ctrl+P opens the palette".to_string());
+        lines.join("\n")
+    }
+
+    /// `/doctor`: a read-only health report about this install. Everything it
+    /// shows is already in memory or a single `exists()` away, so it returns
+    /// instantly and never stalls the input loop the way a connectivity probe
+    /// would. The API key is reported as present/absent, never its value.
+    fn show_doctor(&mut self) {
+        self.print_readout(Self::doctor_readout);
+    }
+
+    fn doctor_readout(&self) -> String {
+        let config_path = crate::config::Config::config_path();
+        let state_dir = crate::config::Config::config_dir();
+
+        let provider = if self.config.llm.provider.is_empty() {
+            "custom endpoint".to_string()
+        } else {
+            self.config.llm.provider.clone()
+        };
+        let model = if self.config.llm.model.is_empty() {
+            "not set".to_string()
+        } else {
+            self.config.llm.model.clone()
+        };
+        let endpoint = if self.config.llm.endpoint.is_empty() {
+            "not set".to_string()
+        } else {
+            self.config.llm.endpoint.clone()
+        };
+        let api_key = if self.config.llm.api_key.is_empty() {
+            "not set"
+        } else {
+            "set (not shown)"
+        };
+
+        let workspace = if self.workspace_root.is_empty() {
+            "not set".to_string()
+        } else {
+            let is_git = Path::new(&self.workspace_root).join(".git").exists();
+            format!(
+                "{} ({})",
+                self.workspace_root,
+                if is_git { "git repo" } else { "not a git repo" }
+            )
+        };
+
+        let lines = vec![
+            "boxcode doctor".to_string(),
+            String::new(),
+            format!("  Version:    {}", env!("CARGO_PKG_VERSION")),
+            format!(
+                "  Platform:   {} / {}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+            format!(
+                "  Config:     {} ({})",
+                config_path.display(),
+                if config_path.exists() { "found" } else { "missing" }
+            ),
+            format!("  Provider:   {provider}"),
+            format!("  Model:      {model}"),
+            format!("  Endpoint:   {endpoint}"),
+            format!("  API key:    {api_key}"),
+            format!("  Workspace:  {workspace}"),
+            format!(
+                "  State dir:  {} ({})",
+                state_dir.display(),
+                if state_dir.exists() { "found" } else { "missing" }
+            ),
+            format!(
+                "  Quota:      {}",
+                if self.config.quota.enabled { "on" } else { "off" }
+            ),
+        ];
+        lines.join("\n")
+    }
+
     pub fn push_tool_outcome(&mut self, mut outcome: ToolOutcome) {
         // Before the outcome is taken apart into a Message, which has no field
         // for this and no reason to grow one -- the journal is state about the
@@ -4949,6 +5046,44 @@ mod tests {
             .find(|m| m.role == Role::Error)
             .expect("an error");
         assert!(err.content.contains("device code expired"));
+    }
+
+    /// `/help` and `/doctor` are reachable the same way every other command is
+    /// and both emit a System readout rather than sending a prompt to the model.
+    #[test]
+    fn help_and_doctor_are_dispatched_and_emit_readouts() {
+        with_isolated_home(|| {
+            let mut a = app();
+            assert!(COMMANDS.iter().any(|(name, _)| *name == "/help"));
+            assert!(COMMANDS.iter().any(|(name, _)| *name == "/doctor"));
+
+            a.run_command("/help");
+            let help = a
+                .messages
+                .iter()
+                .find(|m| m.role == Role::System)
+                .expect("/help prints a system readout");
+            assert!(help.content.contains("slash commands"), "{}", help.content);
+            assert!(help.content.contains("/plan"), "lists the commands: {}", help.content);
+
+            a.run_command("/doctor");
+            let doctor = a
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .last()
+                .expect("/doctor prints a system readout");
+            assert!(
+                doctor.content.contains("boxcode doctor"),
+                "{}",
+                doctor.content
+            );
+            assert!(
+                doctor.content.contains("API key"),
+                "reports credential presence: {}",
+                doctor.content
+            );
+        });
     }
 
     // ---- /diff -------------------------------------------------------

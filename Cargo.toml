@@ -1,6 +1,6 @@
 [package]
 name = "boxcode"
-version = "1.11.54"
+version = "1.11.55"
 edition = "2021"
 
 [dependencies]
