@@ -996,6 +996,8 @@ COMMANDS (type in the input box, press Enter):
     /quota clear          Remove your own limits
     /quota override       Keep working past today's limit
     /quota reset          Cancel an override
+    /doctor               Check this install's health
+    /help                 List every slash command
 
 DEPLOYMENT (ask the model, e.g. 'deploy this to Vercel'; see [deploy] in
             config.toml):
